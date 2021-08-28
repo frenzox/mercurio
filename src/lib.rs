@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod control_packet;
 mod endec;
 mod packets;

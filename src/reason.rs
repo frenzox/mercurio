@@ -4,7 +4,6 @@ use bytes::Buf;
 use crate::{control_packet::ControlPacketType, endec::{DecoderWithContext, Encoder}};
 
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub enum ReasonCode {
     Success,
     NormalDisconnection,
@@ -54,7 +53,6 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
-    #[allow(dead_code)]
     pub fn get_code(&self) -> u8 {
         match *self {
             ReasonCode::Success => 0x00,
