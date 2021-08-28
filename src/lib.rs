@@ -1,4 +1,5 @@
+mod control_packet;
 mod endec;
 mod packets;
-mod control_packet;
 mod properties;
+mod reason;

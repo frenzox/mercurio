@@ -1,5 +1,3 @@
-use bytes::{Bytes, BytesMut};
-
 #[repr(u8)]
 pub enum ControlPacketType {
     Connect = 0x01,
