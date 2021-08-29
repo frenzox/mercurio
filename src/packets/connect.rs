@@ -446,6 +446,7 @@ impl Encoder for ConnectPacket {
 
 impl Decoder for ConnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+        buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer); //Remaining length
 
         if let Some(protocol_name) = String::decode(buffer)? {
@@ -514,7 +515,6 @@ mod tests {
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
-        bytes.advance(1); // Packet type is checked before decoding
 
         let new_packet = ConnectPacket::decode(&mut bytes)
             .expect("Unexpected error")
@@ -575,7 +575,6 @@ mod tests {
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
-        bytes.advance(1); // Packet type is checked before decoding
 
         let new_packet = ConnectPacket::decode(&mut bytes)
             .expect("Unexpected error")
