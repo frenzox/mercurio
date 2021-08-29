@@ -143,8 +143,7 @@ impl Decoder for ConnAckProperties {
                 }
 
                 Property::MaximumQoS => {
-                    connack_properties.maximum_qos =
-                        MaximumQoS::decode(&mut encoded_properties)?
+                    connack_properties.maximum_qos = MaximumQoS::decode(&mut encoded_properties)?
                 }
 
                 Property::RetainAvailable => {
@@ -239,7 +238,7 @@ impl Decoder for ConnAckProperties {
 pub struct ConnAckPacket {
     flags: ConnAckFlags,
     reason_code: ReasonCode,
-    properties: ConnAckProperties,
+    properties: Option<ConnAckProperties>,
 }
 
 impl Encoder for ConnAckPacket {
@@ -250,11 +249,8 @@ impl Encoder for ConnAckPacket {
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
         remaining_len += self.flags.get_encoded_size();
         remaining_len += self.reason_code.get_encoded_size();
-        if self.properties.get_encoded_size() > 0 {
-            remaining_len +=
-                VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        }
-
+        remaining_len +=
+            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
@@ -274,7 +270,7 @@ impl Decoder for ConnAckPacket {
 
         let flags = ConnAckFlags::decode(buffer)?.unwrap();
         let reason_code = ReasonCode::decode(buffer, &ControlPacketType::ConnAck)?.unwrap();
-        let properties = ConnAckProperties::decode(buffer)?.unwrap();
+        let properties = ConnAckProperties::decode(buffer)?;
 
         Ok(Some(ConnAckPacket {
             flags,
@@ -295,7 +291,7 @@ mod tests {
     use crate::packets::connack::*;
 
     #[test]
-    fn test_connack_encode_decode() {
+    fn test_connack_packet_encode_decode() {
         let expected = vec![
             0x20, 0x45, 0x0, 0x0, 0x42, 0x25, 0x1, 0x27, 0x0, 0x10, 0x0, 0x0, 0x12, 0x0, 0x2f,
             0x4d, 0x7a, 0x41, 0x77, 0x4e, 0x7a, 0x45, 0x7a, 0x4e, 0x54, 0x55, 0x32, 0x4d, 0x6a,
@@ -326,7 +322,7 @@ mod tests {
         let packet = ConnAckPacket {
             flags,
             reason_code,
-            properties,
+            properties: properties.into(),
         };
 
         let mut encoded = BytesMut::new();

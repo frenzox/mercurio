@@ -1,35 +1,10 @@
-use bytes::*;
 use crate::control_packet::*;
 use crate::endec::*;
 use crate::properties::*;
+use crate::qos::QoS;
 use crate::reason::ReasonCode;
+use bytes::*;
 use std::mem;
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum QoS {
-    AtMostOnce = 0,
-    AtLeastOnce = 1,
-    ExactlyOnce = 2,
-    Invalid = 0xff,
-}
-
-impl From<u8> for QoS {
-    fn from(n: u8) -> Self {
-        match n {
-            0x00 => QoS::AtMostOnce,
-            0x01 => QoS::AtLeastOnce,
-            0x02 => QoS::ExactlyOnce,
-            _ => QoS::Invalid,
-        }
-    }
-}
-
-impl Default for QoS {
-    fn default() -> Self {
-        QoS::AtMostOnce
-    }
-}
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnectFlags {
@@ -427,7 +402,7 @@ impl DecoderWithContext<ConnectFlags> for ConnectPayload {
 pub struct ConnectPacket {
     flags: ConnectFlags,
     keepalive: u16,
-    properties: ConnectProperties,
+    properties: Option<ConnectProperties>,
     payload: ConnectPayload,
 }
 
@@ -444,31 +419,27 @@ impl Encoder for ConnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        // fixed header
+        // Fixed header
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
         remaining_len += Self::PROTOCOL_NAME.get_encoded_size();
         remaining_len += Self::PROTOCOL_VERSION.get_encoded_size();
         remaining_len += self.flags.get_encoded_size();
         remaining_len += self.keepalive.get_encoded_size();
-        if self.properties.get_encoded_size() > 0 {
-            remaining_len +=
-                VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        }
+        remaining_len +=
+            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
         remaining_len += self.payload.get_encoded_size();
-
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
-        // variable header
+        // Variable header
         Self::PROTOCOL_NAME.encode(buffer);
         Self::PROTOCOL_VERSION.encode(buffer);
         self.flags.encode(buffer);
         self.keepalive.encode(buffer);
-
         VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
 
-        // payload
+        // Payload
         self.payload.encode(buffer);
     }
 }
@@ -491,7 +462,7 @@ impl Decoder for ConnectPacket {
 
         let flags = ConnectFlags::decode(buffer)?.unwrap();
         let keepalive = u16::decode(buffer)?.unwrap();
-        let properties = ConnectProperties::decode(buffer)?.unwrap();
+        let properties = ConnectProperties::decode(buffer)?;
         let payload = ConnectPayload::decode(buffer, &flags)?.unwrap();
 
         Ok(Some(ConnectPacket {
@@ -512,7 +483,7 @@ mod tests {
         let expected = vec![
             0x10, 0x10, 0x00, 0x04, 0x4d, 0x51, //
             0x54, 0x54, 0x05, 0x02, 0x00, 0x3c, //
-            0x03, 0x21, 0x00, 0x14, 0x00, 0x00, //
+            0x03, 0x21, 0x00, 0x14, 0x00, 0x00,
         ];
 
         let flags = ConnectFlags {
@@ -533,7 +504,7 @@ mod tests {
         let packet = ConnectPacket {
             flags,
             keepalive: 60,
-            properties,
+            properties: properties.into(),
             payload,
         };
 
@@ -594,7 +565,7 @@ mod tests {
         let packet = ConnectPacket {
             flags,
             keepalive: 60,
-            properties,
+            properties: properties.into(),
             payload,
         };
 
@@ -610,24 +581,5 @@ mod tests {
             .expect("Unexpected error")
             .unwrap();
         assert_eq!(packet, new_packet);
-    }
-
-    #[test]
-    fn test_qos_from_u8() {
-        let at_most_once = 0x0u8;
-        let mut result: QoS = at_most_once.into();
-        assert_eq!(QoS::AtMostOnce, result);
-
-        let at_least_once = 0x01u8;
-        result = at_least_once.into();
-        assert_eq!(QoS::AtLeastOnce, result);
-
-        let exactly_once = 0x02u8;
-        result = exactly_once.into();
-        assert_eq!(QoS::ExactlyOnce, result);
-
-        let invalid = 0x03u8;
-        result = invalid.into();
-        assert_eq!(QoS::Invalid, result);
     }
 }

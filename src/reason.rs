@@ -1,10 +1,12 @@
-use std::{error, fmt};
 use bytes::Buf;
+use std::{error, fmt};
 
-use crate::{control_packet::ControlPacketType, endec::{DecoderWithContext, Encoder}};
+use crate::{
+    control_packet::ControlPacketType,
+    endec::{DecoderWithContext, Encoder},
+};
 
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub enum ReasonCode {
     Success,
     NormalDisconnection,
@@ -54,7 +56,6 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
-    #[allow(dead_code)]
     pub fn get_code(&self) -> u8 {
         match *self {
             ReasonCode::Success => 0x00,
@@ -117,14 +118,15 @@ impl Encoder for ReasonCode {
 }
 
 impl DecoderWithContext<ControlPacketType> for ReasonCode {
-    fn decode<T: Buf>(buffer: &mut T, context: &ControlPacketType) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        context: &ControlPacketType,
+    ) -> Result<Option<Self>, ReasonCode> {
         let reason = match buffer.get_u8() {
-            0x00 => {
-                match context {
-                    ControlPacketType::SubAck => ReasonCode::GrantedQoS0,
-                    ControlPacketType::Disconnect => ReasonCode::NormalDisconnection,
-                    _ => ReasonCode::Success,
-                }
+            0x00 => match context {
+                ControlPacketType::SubAck => ReasonCode::GrantedQoS0,
+                ControlPacketType::Disconnect => ReasonCode::NormalDisconnection,
+                _ => ReasonCode::Success,
             },
             0x01 => ReasonCode::GrantedQoS1,
             0x02 => ReasonCode::GrantedQoS2,
@@ -225,11 +227,17 @@ impl fmt::Display for ReasonCode {
             ReasonCode::QoSNotSupported => write!(f, "QoS not supported"),
             ReasonCode::UseAnotherServer => write!(f, "User another server"),
             ReasonCode::ServerMoved => write!(f, "Server moved"),
-            ReasonCode::SharedSubscriptionsNotSupported => write!(f, "Shared subscriptions not supported"),
+            ReasonCode::SharedSubscriptionsNotSupported => {
+                write!(f, "Shared subscriptions not supported")
+            }
             ReasonCode::ConnectionRateExceeded => write!(f, "Connection rate exceeded"),
             ReasonCode::MaximumConnectTime => write!(f, "Maximum connect time"),
-            ReasonCode::SubscriptionIdentifiersNotSupported => write!(f, "Subscription indentifiers not supported"),
-            ReasonCode::WildcardSubscriptionsNotSupported => write!(f, "Wildcard subscriptions not supported"),
+            ReasonCode::SubscriptionIdentifiersNotSupported => {
+                write!(f, "Subscription indentifiers not supported")
+            }
+            ReasonCode::WildcardSubscriptionsNotSupported => {
+                write!(f, "Wildcard subscriptions not supported")
+            }
         }
     }
 }
