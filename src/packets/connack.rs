@@ -250,11 +250,8 @@ impl Encoder for ConnAckPacket {
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
         remaining_len += self.flags.get_encoded_size();
         remaining_len += self.reason_code.get_encoded_size();
-        if self.properties.get_encoded_size() > 0 {
-            remaining_len +=
-                VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        }
-
+        remaining_len +=
+            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
 

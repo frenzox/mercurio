@@ -425,10 +425,8 @@ impl Encoder for ConnectPacket {
         remaining_len += Self::PROTOCOL_VERSION.get_encoded_size();
         remaining_len += self.flags.get_encoded_size();
         remaining_len += self.keepalive.get_encoded_size();
-        if self.properties.get_encoded_size() > 0 {
-            remaining_len +=
-                VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        }
+        remaining_len +=
+            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
         remaining_len += self.payload.get_encoded_size();
 
