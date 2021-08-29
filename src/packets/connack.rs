@@ -1,11 +1,10 @@
-use bytes::Buf;
-use bytes::BufMut;
-use std::mem;
-
 use crate::control_packet::*;
 use crate::endec::*;
 use crate::properties::*;
 use crate::reason::ReasonCode;
+use bytes::Buf;
+use bytes::BufMut;
+use std::mem;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnAckFlags {

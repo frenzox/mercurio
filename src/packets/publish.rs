@@ -1,10 +1,8 @@
-use crate::{
-    control_packet::*,
-    endec::{Decoder, Encoder, VariableByteInteger},
-    properties::*,
-    qos::QoS,
-    reason::ReasonCode,
-};
+use crate::control_packet::*;
+use crate::endec::{Decoder, Encoder, VariableByteInteger};
+use crate::properties::*;
+use crate::qos::QoS;
+use crate::reason::ReasonCode;
 use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Default, Debug, PartialEq)]
