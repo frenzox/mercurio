@@ -238,7 +238,7 @@ impl Decoder for ConnAckProperties {
 pub struct ConnAckPacket {
     flags: ConnAckFlags,
     reason_code: ReasonCode,
-    properties: ConnAckProperties,
+    properties: Option<ConnAckProperties>,
 }
 
 impl Encoder for ConnAckPacket {
@@ -270,7 +270,7 @@ impl Decoder for ConnAckPacket {
 
         let flags = ConnAckFlags::decode(buffer)?.unwrap();
         let reason_code = ReasonCode::decode(buffer, &ControlPacketType::ConnAck)?.unwrap();
-        let properties = ConnAckProperties::decode(buffer)?.unwrap();
+        let properties = ConnAckProperties::decode(buffer)?;
 
         Ok(Some(ConnAckPacket {
             flags,
@@ -322,7 +322,7 @@ mod tests {
         let packet = ConnAckPacket {
             flags,
             reason_code,
-            properties,
+            properties: properties.into(),
         };
 
         let mut encoded = BytesMut::new();

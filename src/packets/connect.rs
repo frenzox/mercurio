@@ -402,7 +402,7 @@ impl DecoderWithContext<ConnectFlags> for ConnectPayload {
 pub struct ConnectPacket {
     flags: ConnectFlags,
     keepalive: u16,
-    properties: ConnectProperties,
+    properties: Option<ConnectProperties>,
     payload: ConnectPayload,
 }
 
@@ -462,7 +462,7 @@ impl Decoder for ConnectPacket {
 
         let flags = ConnectFlags::decode(buffer)?.unwrap();
         let keepalive = u16::decode(buffer)?.unwrap();
-        let properties = ConnectProperties::decode(buffer)?.unwrap();
+        let properties = ConnectProperties::decode(buffer)?;
         let payload = ConnectPayload::decode(buffer, &flags)?.unwrap();
 
         Ok(Some(ConnectPacket {
@@ -504,7 +504,7 @@ mod tests {
         let packet = ConnectPacket {
             flags,
             keepalive: 60,
-            properties,
+            properties: properties.into(),
             payload,
         };
 
@@ -565,7 +565,7 @@ mod tests {
         let packet = ConnectPacket {
             flags,
             keepalive: 60,
-            properties,
+            properties: properties.into(),
             payload,
         };
 
