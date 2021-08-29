@@ -1,5 +1,5 @@
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::reason::ReasonCode;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::mem;
 
 pub trait Encoder {

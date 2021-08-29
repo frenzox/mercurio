@@ -143,8 +143,7 @@ impl Decoder for ConnAckProperties {
                 }
 
                 Property::MaximumQoS => {
-                    connack_properties.maximum_qos =
-                        MaximumQoS::decode(&mut encoded_properties)?
+                    connack_properties.maximum_qos = MaximumQoS::decode(&mut encoded_properties)?
                 }
 
                 Property::RetainAvailable => {

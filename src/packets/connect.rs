@@ -1,9 +1,9 @@
-use bytes::*;
 use crate::control_packet::*;
 use crate::endec::*;
 use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
+use bytes::*;
 use std::mem;
 
 #[derive(Default, Debug, PartialEq)]
@@ -419,7 +419,7 @@ impl Encoder for ConnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        // fixed header
+        // Fixed header
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
         remaining_len += Self::PROTOCOL_NAME.get_encoded_size();
         remaining_len += Self::PROTOCOL_VERSION.get_encoded_size();
@@ -429,19 +429,17 @@ impl Encoder for ConnectPacket {
             VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
         remaining_len += self.payload.get_encoded_size();
-
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
-        // variable header
+        // Variable header
         Self::PROTOCOL_NAME.encode(buffer);
         Self::PROTOCOL_VERSION.encode(buffer);
         self.flags.encode(buffer);
         self.keepalive.encode(buffer);
-
         VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
 
-        // payload
+        // Payload
         self.payload.encode(buffer);
     }
 }
@@ -485,7 +483,7 @@ mod tests {
         let expected = vec![
             0x10, 0x10, 0x00, 0x04, 0x4d, 0x51, //
             0x54, 0x54, 0x05, 0x02, 0x00, 0x3c, //
-            0x03, 0x21, 0x00, 0x14, 0x00, 0x00, //
+            0x03, 0x21, 0x00, 0x14, 0x00, 0x00,
         ];
 
         let flags = ConnectFlags {
