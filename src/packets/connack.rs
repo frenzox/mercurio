@@ -67,13 +67,7 @@ impl Encoder for ConnAckProperties {
         self.assigned_client_id.encode(buffer);
         self.topic_alias_max.encode(buffer);
         self.reason_string.encode(buffer);
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                property.encode(buffer);
-            }
-        }
-
+        self.user_property.encode(buffer);
         self.wildcard_subscription_available.encode(buffer);
         self.subscription_identifier_available.encode(buffer);
         self.shared_subscription_available.encode(buffer);
@@ -95,13 +89,7 @@ impl Encoder for ConnAckProperties {
         len += self.assigned_client_id.get_encoded_size();
         len += self.topic_alias_max.get_encoded_size();
         len += self.reason_string.get_encoded_size();
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                len += property.get_encoded_size();
-            }
-        }
-
+        len += self.user_property.get_encoded_size();
         len += self.wildcard_subscription_available.get_encoded_size();
         len += self.subscription_identifier_available.get_encoded_size();
         len += self.shared_subscription_available.get_encoded_size();
@@ -286,9 +274,8 @@ impl ControlPacket for ConnAckPacket {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Bytes, BytesMut};
-
     use crate::packets::connack::*;
+    use bytes::{Bytes, BytesMut};
 
     #[test]
     fn test_connack_packet_encode_decode() {

@@ -102,13 +102,7 @@ impl Encoder for ConnectProperties {
         self.topic_alias_maximum.encode(buffer);
         self.request_response_information.encode(buffer);
         self.request_problem_information.encode(buffer);
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                property.encode(buffer);
-            }
-        }
-
+        self.user_property.encode(buffer);
         self.authentication_method.encode(buffer);
         self.authentication_data.encode(buffer);
     }
@@ -122,13 +116,7 @@ impl Encoder for ConnectProperties {
         len += self.topic_alias_maximum.get_encoded_size();
         len += self.request_response_information.get_encoded_size();
         len += self.request_problem_information.get_encoded_size();
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                len += property.get_encoded_size();
-            }
-        }
-
+        len += self.user_property.get_encoded_size();
         len += self.authentication_method.get_encoded_size();
         len += self.authentication_data.get_encoded_size();
 
@@ -234,12 +222,7 @@ impl Encoder for WillProperties {
         self.content_type.encode(buffer);
         self.response_topic.encode(buffer);
         self.correlation_data.encode(buffer);
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                property.encode(buffer);
-            }
-        }
+        self.user_property.encode(buffer);
     }
 
     fn get_encoded_size(&self) -> usize {
@@ -251,12 +234,7 @@ impl Encoder for WillProperties {
         len += self.content_type.get_encoded_size();
         len += self.response_topic.get_encoded_size();
         len += self.correlation_data.get_encoded_size();
-        if let Some(props) = &self.user_property {
-            for property in props {
-                len += property.get_encoded_size();
-            }
-        }
-
+        len += self.user_property.get_encoded_size();
         len
     }
 }
