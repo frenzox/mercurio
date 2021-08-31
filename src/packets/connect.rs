@@ -1,10 +1,12 @@
-use crate::control_packet::*;
-use crate::endec::*;
+use std::mem;
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::control_packet::{ControlPacket, ControlPacketType};
+use crate::endec::{Decoder, DecoderWithContext, Encoder, VariableByteInteger};
 use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
-use bytes::*;
-use std::mem;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnectFlags {

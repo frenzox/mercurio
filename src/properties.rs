@@ -1,8 +1,9 @@
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::reason::ReasonCode;
+use std::mem;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use std::mem;
+use crate::endec::{Decoder, Encoder, VariableByteInteger};
+use crate::reason::ReasonCode;
 
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Debug)]

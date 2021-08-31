@@ -1,9 +1,10 @@
-use crate::control_packet::*;
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
-use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PublishProperties {

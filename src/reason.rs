@@ -1,10 +1,9 @@
-use bytes::Buf;
 use std::{error, fmt};
 
-use crate::{
-    control_packet::ControlPacketType,
-    endec::{DecoderWithContext, Encoder},
-};
+use bytes::Buf;
+
+use crate::control_packet::ControlPacketType;
+use crate::endec::{DecoderWithContext, Encoder};
 
 #[derive(Debug, PartialEq)]
 pub enum ReasonCode {
