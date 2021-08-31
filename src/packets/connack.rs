@@ -4,7 +4,24 @@ use bytes::{Buf, BufMut};
 
 use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, DecoderWithContext, Encoder, VariableByteInteger};
-use crate::properties::*;
+use crate::properties::AssignedClientIdentifier;
+use crate::properties::AuthenticationData;
+use crate::properties::AuthenticationMethod;
+use crate::properties::MaximumPacketSize;
+use crate::properties::MaximumQoS;
+use crate::properties::Property;
+use crate::properties::ReasonString;
+use crate::properties::ReceiveMaximum;
+use crate::properties::ResponseInformation;
+use crate::properties::RetainAvailable;
+use crate::properties::ServerKeepAlive;
+use crate::properties::ServerReference;
+use crate::properties::SessionExpiryInterval;
+use crate::properties::SharedSubscriptionAvailable;
+use crate::properties::SubscriptionIdentifierAvailable;
+use crate::properties::TopicAliasMaximum;
+use crate::properties::UserProperty;
+use crate::properties::WildcardSubscriptionAvailable;
 use crate::reason::ReasonCode;
 
 #[derive(Default, Debug, PartialEq)]
