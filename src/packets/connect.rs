@@ -4,7 +4,22 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, DecoderWithContext, Encoder, VariableByteInteger};
-use crate::properties::*;
+use crate::properties::AuthenticationData;
+use crate::properties::AuthenticationMethod;
+use crate::properties::ContentType;
+use crate::properties::CorrelationData;
+use crate::properties::MaximumPacketSize;
+use crate::properties::MessageExpiryInterval;
+use crate::properties::PayloadFormatIndicator;
+use crate::properties::Property;
+use crate::properties::ReceiveMaximum;
+use crate::properties::RequestProblemInformation;
+use crate::properties::RequestResponseInformation;
+use crate::properties::ResponseTopic;
+use crate::properties::SessionExpiryInterval;
+use crate::properties::TopicAliasMaximum;
+use crate::properties::UserProperty;
+use crate::properties::WillDelayInterval;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
 

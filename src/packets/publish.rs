@@ -2,7 +2,15 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::properties::*;
+use crate::properties::ContentType;
+use crate::properties::CorrelationData;
+use crate::properties::MessageExpiryInterval;
+use crate::properties::PayloadFormatIndicator;
+use crate::properties::Property;
+use crate::properties::ResponseTopic;
+use crate::properties::SubscriptionIdentifier;
+use crate::properties::TopicAlias;
+use crate::properties::UserProperty;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
 
