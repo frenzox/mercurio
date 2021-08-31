@@ -1,9 +1,10 @@
-use crate::control_packet::*;
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
-use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PublishProperties {
@@ -24,13 +25,7 @@ impl Encoder for PublishProperties {
         self.topic_alias.encode(buffer);
         self.response_topic.encode(buffer);
         self.correlation_data.encode(buffer);
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                property.encode(buffer);
-            }
-        }
-
+        self.user_property.encode(buffer);
         self.subscription_identifier.encode(buffer);
         self.content_type.encode(buffer);
     }
@@ -43,13 +38,7 @@ impl Encoder for PublishProperties {
         len += self.topic_alias.get_encoded_size();
         len += self.response_topic.get_encoded_size();
         len += self.correlation_data.get_encoded_size();
-
-        if let Some(props) = &self.user_property {
-            for property in props {
-                property.get_encoded_size();
-            }
-        }
-
+        len += self.user_property.get_encoded_size();
         len += self.subscription_identifier.get_encoded_size();
         len += self.content_type.get_encoded_size();
         len

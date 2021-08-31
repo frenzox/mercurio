@@ -1,6 +1,8 @@
-use crate::reason::ReasonCode;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::mem;
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::reason::ReasonCode;
 
 pub trait Encoder {
     fn encode(&self, buffer: &mut BytesMut);
