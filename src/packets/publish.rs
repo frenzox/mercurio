@@ -132,7 +132,7 @@ pub struct PublishPacket {
     retain: bool,
     topic_name: String,
     packet_id: Option<u16>,
-    properties: PublishProperties,
+    properties: Option<PublishProperties>,
     payload: Option<Bytes>,
 }
 
@@ -148,7 +148,7 @@ impl Encoder for PublishPacket {
         // Fixed header
         fixed_header = (Self::PACKET_TYPE as u8) << 4;
         fixed_header |= (self.dup as u8) << 3;
-        fixed_header |= (self.qos_level as u8) << 2;
+        fixed_header |= (self.qos_level as u8) << 1;
         fixed_header |= self.retain as u8;
         fixed_header.encode(buffer);
 
@@ -157,7 +157,11 @@ impl Encoder for PublishPacket {
         remaining_len +=
             VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
         remaining_len += self.properties.get_encoded_size();
-        remaining_len += self.payload.get_encoded_size();
+
+        if let Some(payload) = &self.payload {
+            remaining_len += payload.len();
+        }
+
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         // Variable header
@@ -178,23 +182,26 @@ impl Decoder for PublishPacket {
         // Fixed header
         let fixed_header = buffer.get_u8();
         let dup = (fixed_header & 0b0000_1000) != 0;
-        let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 2);
+        let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 1);
         let retain = (fixed_header & 0b0000_0001) != 0;
         let remaining_len = VariableByteInteger::decode(buffer)?.unwrap().0 as usize;
 
         // Variable header
         let topic_name = String::decode(buffer)?.unwrap();
         let packet_id = u16::decode(buffer)?;
-        let properties = PublishProperties::decode(buffer)?.unwrap();
+        let properties = PublishProperties::decode(buffer)?;
 
         // Payload
         let payload_len = remaining_len
             - (topic_name.get_encoded_size()
                 + packet_id.get_encoded_size()
-                + properties.get_encoded_size());
+                + properties.get_encoded_size()
+                + VariableByteInteger(properties.get_encoded_size() as u32).get_encoded_size());
+
         if buffer.remaining() != payload_len {
             return Err(ReasonCode::MalformedPacket);
         }
+
         let payload = Some(buffer.copy_to_bytes(payload_len));
 
         Ok(Some(PublishPacket {
@@ -211,6 +218,41 @@ impl Decoder for PublishPacket {
 
 #[cfg(test)]
 mod tests {
+    use crate::packets::publish::*;
+
     #[test]
-    fn test_publish_packet_encode_decode() {}
+    fn test_publish_packet_encode_decode() {
+        let expected = vec![
+            0x32, 0x28, 0x00, 0x0a, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x74, 0x6f, 0x70, 0x69, 0x63,
+            0x00, 0x01, 0x0d, 0x26, 0x00, 0x03, 0x6b, 0x65, 0x79, 0x00, 0x05, 0x76, 0x61, 0x6c,
+            0x75, 0x65, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65,
+        ];
+
+        let packet = PublishPacket {
+            dup: false,
+            qos_level: QoS::AtLeastOnce,
+            retain: false,
+            topic_name: "test_topic".to_string(),
+            packet_id: Some(1),
+            properties: PublishProperties {
+                user_property: vec![UserProperty::new("key".to_string(), "value".to_string())]
+                    .into(),
+                ..Default::default()
+            }
+            .into(),
+            payload: Bytes::from("test_message").into(),
+        };
+
+        let mut encoded = BytesMut::new();
+        packet.encode(&mut encoded);
+
+        assert_eq!(encoded, expected);
+
+        let mut bytes = Bytes::from(expected);
+
+        let new_packet = PublishPacket::decode(&mut bytes)
+            .expect("Unexpected error")
+            .unwrap();
+        assert_eq!(packet, new_packet);
+    }
 }
