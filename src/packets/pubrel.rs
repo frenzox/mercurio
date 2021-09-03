@@ -126,11 +126,11 @@ mod tests {
 
     #[test]
     fn test_pubrel_packet_encode_decode() {
-        let expected = vec![0x62, 0x04, 0x00, 0x01, 0x10, 0x00];
+        let expected = vec![0x62, 0x04, 0x00, 0x01, 0x92, 0x00];
 
         let packet = PubRelPacket {
             packet_id: 1,
-            reason: ReasonCode::NoMatchingSubscribers,
+            reason: ReasonCode::PacketIdentifierNotFound,
             properties: None,
         };
 
