@@ -3,7 +3,7 @@ use std::mem;
 use bytes::{Buf, BufMut};
 
 use crate::control_packet::{ControlPacket, ControlPacketType};
-use crate::endec::{Decoder, DecoderWithContext, Encoder, VariableByteInteger};
+use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::AssignedClientIdentifier;
 use crate::properties::AuthenticationData;
 use crate::properties::AuthenticationMethod;
@@ -41,7 +41,12 @@ impl Encoder for ConnAckFlags {
 }
 
 impl Decoder for ConnAckFlags {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         let encoded = buffer.get_u8();
 
         if (0b1111_1110 & encoded) != 0 {
@@ -122,8 +127,13 @@ impl Encoder for ConnAckProperties {
 }
 
 impl Decoder for ConnAckProperties {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let len = VariableByteInteger::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
@@ -134,50 +144,52 @@ impl Decoder for ConnAckProperties {
         let mut connack_properties = ConnAckProperties::default();
 
         loop {
-            let p = Property::decode(&mut encoded_properties)?.unwrap();
+            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
 
             match p {
                 Property::SessionExpiryInterval => {
                     connack_properties.session_expiry_interval =
-                        SessionExpiryInterval::decode(&mut encoded_properties)?
+                        SessionExpiryInterval::decode(&mut encoded_properties, None)?
                 }
 
                 Property::ReceiveMaximum => {
                     connack_properties.receive_maximum =
-                        ReceiveMaximum::decode(&mut encoded_properties)?
+                        ReceiveMaximum::decode(&mut encoded_properties, None)?
                 }
 
                 Property::MaximumQoS => {
-                    connack_properties.maximum_qos = MaximumQoS::decode(&mut encoded_properties)?
+                    connack_properties.maximum_qos =
+                        MaximumQoS::decode(&mut encoded_properties, None)?
                 }
 
                 Property::RetainAvailable => {
                     connack_properties.retain_available =
-                        RetainAvailable::decode(&mut encoded_properties)?
+                        RetainAvailable::decode(&mut encoded_properties, None)?
                 }
 
                 Property::MaximumPacketSize => {
                     connack_properties.maximum_packet_size =
-                        MaximumPacketSize::decode(&mut encoded_properties)?
+                        MaximumPacketSize::decode(&mut encoded_properties, None)?
                 }
 
                 Property::AssignedClientIdentifier => {
                     connack_properties.assigned_client_id =
-                        AssignedClientIdentifier::decode(&mut encoded_properties)?
+                        AssignedClientIdentifier::decode(&mut encoded_properties, None)?
                 }
 
                 Property::TopicAliasMaximum => {
                     connack_properties.topic_alias_max =
-                        TopicAliasMaximum::decode(&mut encoded_properties)?
+                        TopicAliasMaximum::decode(&mut encoded_properties, None)?
                 }
 
                 Property::ReasonString => {
                     connack_properties.reason_string =
-                        ReasonString::decode(&mut encoded_properties)?
+                        ReasonString::decode(&mut encoded_properties, None)?
                 }
 
                 Property::UserProperty => {
-                    let user_property = UserProperty::decode(&mut encoded_properties)?.unwrap();
+                    let user_property =
+                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
 
                     if let Some(v) = &mut connack_properties.user_property {
                         v.push(user_property);
@@ -189,42 +201,42 @@ impl Decoder for ConnAckProperties {
 
                 Property::WildcardSubscriptionAvailable => {
                     connack_properties.wildcard_subscription_available =
-                        WildcardSubscriptionAvailable::decode(&mut encoded_properties)?
+                        WildcardSubscriptionAvailable::decode(&mut encoded_properties, None)?
                 }
 
                 Property::SubscriptionIdentifierAvailable => {
                     connack_properties.subscription_identifier_available =
-                        SubscriptionIdentifierAvailable::decode(&mut encoded_properties)?
+                        SubscriptionIdentifierAvailable::decode(&mut encoded_properties, None)?
                 }
 
                 Property::SharedSubscriptionAvailable => {
                     connack_properties.shared_subscription_available =
-                        SharedSubscriptionAvailable::decode(&mut encoded_properties)?
+                        SharedSubscriptionAvailable::decode(&mut encoded_properties, None)?
                 }
 
                 Property::ServerKeepAlive => {
                     connack_properties.server_keepalive =
-                        ServerKeepAlive::decode(&mut encoded_properties)?
+                        ServerKeepAlive::decode(&mut encoded_properties, None)?
                 }
 
                 Property::ResponseInformation => {
                     connack_properties.response_information =
-                        ResponseInformation::decode(&mut encoded_properties)?
+                        ResponseInformation::decode(&mut encoded_properties, None)?
                 }
 
                 Property::ServerReference => {
                     connack_properties.server_reference =
-                        ServerReference::decode(&mut encoded_properties)?
+                        ServerReference::decode(&mut encoded_properties, None)?
                 }
 
                 Property::AuthenticationMethod => {
                     connack_properties.authentication_method =
-                        AuthenticationMethod::decode(&mut encoded_properties)?
+                        AuthenticationMethod::decode(&mut encoded_properties, None)?
                 }
 
                 Property::AuthenticationData => {
                     connack_properties.authentication_data =
-                        AuthenticationData::decode(&mut encoded_properties)?
+                        AuthenticationData::decode(&mut encoded_properties, None)?
                 }
 
                 _ => return Err(ReasonCode::MalformedPacket),
@@ -269,13 +281,18 @@ impl Encoder for ConnAckPacket {
 }
 
 impl Decoder for ConnAckPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer); //Remaining length
+    type Context = ();
 
-        let flags = ConnAckFlags::decode(buffer)?.unwrap();
-        let reason_code = ReasonCode::decode(buffer, &ControlPacketType::ConnAck)?.unwrap();
-        let properties = ConnAckProperties::decode(buffer)?;
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        buffer.advance(1); // Packet type
+        let _ = VariableByteInteger::decode(buffer, None); //Remaining length
+
+        let flags = ConnAckFlags::decode(buffer, None)?.unwrap();
+        let reason_code = ReasonCode::decode(buffer, Some(&ControlPacketType::ConnAck))?.unwrap();
+        let properties = ConnAckProperties::decode(buffer, None)?;
 
         Ok(Some(ConnAckPacket {
             flags,
@@ -336,7 +353,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnAckPacket::decode(&mut bytes)
+        let new_packet = ConnAckPacket::decode(&mut bytes, None)
             .expect("Unexpected error")
             .unwrap();
 

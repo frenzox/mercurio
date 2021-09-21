@@ -31,8 +31,13 @@ impl Encoder for SubscribeProperties {
 }
 
 impl Decoder for SubscribeProperties {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let len = VariableByteInteger::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
@@ -43,16 +48,17 @@ impl Decoder for SubscribeProperties {
         let mut subscribe_properties = SubscribeProperties::default();
 
         loop {
-            let p = Property::decode(&mut encoded_properties)?.unwrap();
+            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
 
             match p {
                 Property::SubscriptionIdentifier => {
                     subscribe_properties.subscription_id =
-                        SubscriptionIdentifier::decode(&mut encoded_properties)?
+                        SubscriptionIdentifier::decode(&mut encoded_properties, None)?
                 }
 
                 Property::UserProperty => {
-                    let user_property = UserProperty::decode(&mut encoded_properties)?.unwrap();
+                    let user_property =
+                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
 
                     if let Some(v) = &mut subscribe_properties.user_property {
                         v.push(user_property);
@@ -127,7 +133,12 @@ impl Encoder for SubscriptionOptions {
 }
 
 impl Decoder for SubscriptionOptions {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         let opt = buffer.get_u8();
 
         let qos: QoS = (opt & 0b0000_0011).into();
@@ -176,9 +187,14 @@ impl Encoder for SubscribePayload {
 }
 
 impl Decoder for SubscribePayload {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let topic_filter = String::decode(buffer)?.unwrap();
-        let subs_opt = SubscriptionOptions::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let topic_filter = String::decode(buffer, None)?.unwrap();
+        let subs_opt = SubscriptionOptions::decode(buffer, None)?.unwrap();
 
         Ok(Some(SubscribePayload {
             topic_filter,
@@ -219,12 +235,17 @@ impl Encoder for SubscribePacket {
 }
 
 impl Decoder for SubscribePacket {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
+    type Context = ();
 
-        let packet_id = u16::decode(buffer)?.unwrap();
-        let properties = SubscribeProperties::decode(buffer)?;
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        buffer.advance(1); // Packet type
+        let _ = VariableByteInteger::decode(buffer, None)?; //Remaining length
+
+        let packet_id = u16::decode(buffer, None)?.unwrap();
+        let properties = SubscribeProperties::decode(buffer, None)?;
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError);
@@ -233,7 +254,7 @@ impl Decoder for SubscribePacket {
         let mut payload = Vec::new();
 
         while buffer.has_remaining() {
-            payload.push(SubscribePayload::decode(buffer)?.unwrap());
+            payload.push(SubscribePayload::decode(buffer, None)?.unwrap());
         }
 
         Ok(Some(SubscribePacket {
@@ -290,7 +311,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = SubscribePacket::decode(&mut bytes)
+        let new_packet = SubscribePacket::decode(&mut bytes, None)
             .expect("Unexpected error")
             .unwrap();
         assert_eq!(packet, new_packet);

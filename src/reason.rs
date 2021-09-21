@@ -3,7 +3,7 @@ use std::{error, fmt};
 use bytes::Buf;
 
 use crate::control_packet::ControlPacketType;
-use crate::endec::{DecoderWithContext, Encoder};
+use crate::endec::{Decoder, Encoder};
 
 #[derive(Debug, PartialEq)]
 pub enum ReasonCode {
@@ -116,13 +116,14 @@ impl Encoder for ReasonCode {
     }
 }
 
-impl DecoderWithContext<ControlPacketType> for ReasonCode {
+impl Decoder for ReasonCode {
+    type Context = ControlPacketType;
     fn decode<T: Buf>(
         buffer: &mut T,
-        context: &ControlPacketType,
+        context: Option<&Self::Context>,
     ) -> Result<Option<Self>, ReasonCode> {
         let reason = match buffer.get_u8() {
-            0x00 => match context {
+            0x00 => match context.unwrap() {
                 ControlPacketType::SubAck => ReasonCode::GrantedQoS0,
                 ControlPacketType::Disconnect => ReasonCode::NormalDisconnection,
                 _ => ReasonCode::Success,

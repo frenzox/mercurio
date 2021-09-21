@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::control_packet::{ControlPacket, ControlPacketType};
-use crate::endec::{Decoder, DecoderWithContext, Encoder, VariableByteInteger};
+use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::{Property, ReasonString, UserProperty};
 use crate::reason::ReasonCode;
 
@@ -28,8 +28,13 @@ impl Encoder for PubCompProperties {
 }
 
 impl Decoder for PubCompProperties {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let len = VariableByteInteger::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
@@ -40,15 +45,17 @@ impl Decoder for PubCompProperties {
         let mut puback_properties = PubCompProperties::default();
 
         loop {
-            let p = Property::decode(&mut encoded_properties)?.unwrap();
+            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
 
             match p {
                 Property::ReasonString => {
-                    puback_properties.reason_str = ReasonString::decode(&mut encoded_properties)?
+                    puback_properties.reason_str =
+                        ReasonString::decode(&mut encoded_properties, None)?
                 }
 
                 Property::UserProperty => {
-                    let user_property = UserProperty::decode(&mut encoded_properties)?.unwrap();
+                    let user_property =
+                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
 
                     if let Some(v) = &mut puback_properties.user_property {
                         v.push(user_property);
@@ -99,12 +106,17 @@ impl Encoder for PubCompPacket {
 }
 
 impl Decoder for PubCompPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         buffer.advance(1);
-        let _ = VariableByteInteger::decode(buffer);
-        let packet_id = u16::decode(buffer)?.unwrap();
-        let reason = ReasonCode::decode(buffer, &Self::PACKET_TYPE)?.unwrap();
-        let properties = PubCompProperties::decode(buffer)?;
+        let _ = VariableByteInteger::decode(buffer, None);
+        let packet_id = u16::decode(buffer, None)?.unwrap();
+        let reason = ReasonCode::decode(buffer, Some(&Self::PACKET_TYPE))?.unwrap();
+        let properties = PubCompProperties::decode(buffer, None)?;
 
         Ok(Some(PubCompPacket {
             packet_id,
@@ -140,7 +152,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PubCompPacket::decode(&mut bytes)
+        let new_packet = PubCompPacket::decode(&mut bytes, None)
             .expect("Unexpected error")
             .unwrap();
         assert_eq!(packet, new_packet);
