@@ -17,11 +17,11 @@ impl Encoder for PubRecProperties {
         self.user_property.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
-        len += self.reason_str.get_encoded_size();
-        len += self.user_property.get_encoded_size();
+        len += self.reason_str.encoded_size();
+        len += self.user_property.encoded_size();
 
         len
     }
@@ -80,21 +80,20 @@ impl Encoder for PubRecPacket {
 
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
 
-        remaining_len += self.packet_id.get_encoded_size();
-        remaining_len += self.reason.get_encoded_size();
-        remaining_len +=
-            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        remaining_len += self.properties.get_encoded_size();
+        remaining_len += self.packet_id.encoded_size();
+        remaining_len += self.reason.encoded_size();
+        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+        remaining_len += self.properties.encoded_size();
 
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
         self.reason.encode(buffer);
-        VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         unimplemented!()
     }
 }

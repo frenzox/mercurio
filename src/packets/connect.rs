@@ -61,7 +61,7 @@ impl Encoder for ConnectFlags {
         buffer.put_u8(flags);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         mem::size_of::<u8>()
     }
 }
@@ -124,18 +124,18 @@ impl Encoder for ConnectProperties {
         self.authentication_data.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
-        len += self.session_expiry_interval.get_encoded_size();
-        len += self.receive_maximum.get_encoded_size();
-        len += self.maximum_packet_size.get_encoded_size();
-        len += self.topic_alias_maximum.get_encoded_size();
-        len += self.request_response_information.get_encoded_size();
-        len += self.request_problem_information.get_encoded_size();
-        len += self.user_property.get_encoded_size();
-        len += self.authentication_method.get_encoded_size();
-        len += self.authentication_data.get_encoded_size();
+        len += self.session_expiry_interval.encoded_size();
+        len += self.receive_maximum.encoded_size();
+        len += self.maximum_packet_size.encoded_size();
+        len += self.topic_alias_maximum.encoded_size();
+        len += self.request_response_information.encoded_size();
+        len += self.request_problem_information.encoded_size();
+        len += self.user_property.encoded_size();
+        len += self.authentication_method.encoded_size();
+        len += self.authentication_data.encoded_size();
 
         len
     }
@@ -242,16 +242,16 @@ impl Encoder for WillProperties {
         self.user_property.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
-        len += self.will_delay_interval.get_encoded_size();
-        len += self.payload_format_indicator.get_encoded_size();
-        len += self.message_expiry_interval.get_encoded_size();
-        len += self.content_type.get_encoded_size();
-        len += self.response_topic.get_encoded_size();
-        len += self.correlation_data.get_encoded_size();
-        len += self.user_property.get_encoded_size();
+        len += self.will_delay_interval.encoded_size();
+        len += self.payload_format_indicator.encoded_size();
+        len += self.message_expiry_interval.encoded_size();
+        len += self.content_type.encoded_size();
+        len += self.response_topic.encoded_size();
+        len += self.correlation_data.encoded_size();
+        len += self.user_property.encoded_size();
         len
     }
 }
@@ -337,8 +337,8 @@ impl Encoder for ConnectPayload {
     fn encode(&self, buffer: &mut BytesMut) {
         self.client_id.encode(buffer);
 
-        if self.will_properties.get_encoded_size() > 0 {
-            VariableByteInteger(self.will_properties.get_encoded_size() as u32).encode(buffer);
+        if self.will_properties.encoded_size() > 0 {
+            VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
             self.will_properties.encode(buffer);
         }
 
@@ -348,20 +348,19 @@ impl Encoder for ConnectPayload {
         self.password.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
-        len += self.client_id.get_encoded_size();
-        if self.will_properties.get_encoded_size() > 0 {
-            len += VariableByteInteger(self.will_properties.get_encoded_size() as u32)
-                .get_encoded_size();
-            len += self.will_properties.get_encoded_size();
+        len += self.client_id.encoded_size();
+        if self.will_properties.encoded_size() > 0 {
+            len += VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
+            len += self.will_properties.encoded_size();
         }
 
-        len += self.will_topic.get_encoded_size();
-        len += self.will_payload.get_encoded_size();
-        len += self.user_name.get_encoded_size();
-        len += self.password.get_encoded_size();
+        len += self.will_topic.encoded_size();
+        len += self.will_payload.encoded_size();
+        len += self.user_name.encoded_size();
+        len += self.password.encoded_size();
 
         len
     }
@@ -416,14 +415,13 @@ impl Encoder for ConnectPacket {
 
         // Fixed header
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
-        remaining_len += Self::PROTOCOL_NAME.get_encoded_size();
-        remaining_len += Self::PROTOCOL_VERSION.get_encoded_size();
-        remaining_len += self.flags.get_encoded_size();
-        remaining_len += self.keepalive.get_encoded_size();
-        remaining_len +=
-            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        remaining_len += self.properties.get_encoded_size();
-        remaining_len += self.payload.get_encoded_size();
+        remaining_len += Self::PROTOCOL_NAME.encoded_size();
+        remaining_len += Self::PROTOCOL_VERSION.encoded_size();
+        remaining_len += self.flags.encoded_size();
+        remaining_len += self.keepalive.encoded_size();
+        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+        remaining_len += self.properties.encoded_size();
+        remaining_len += self.payload.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         // Variable header
@@ -431,7 +429,7 @@ impl Encoder for ConnectPacket {
         Self::PROTOCOL_VERSION.encode(buffer);
         self.flags.encode(buffer);
         self.keepalive.encode(buffer);
-        VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
 
         // Payload

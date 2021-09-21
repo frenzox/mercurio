@@ -35,7 +35,7 @@ impl Encoder for ConnAckFlags {
         buffer.put_u8(flags);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         mem::size_of::<u8>()
     }
 }
@@ -96,26 +96,26 @@ impl Encoder for ConnAckProperties {
         self.authentication_data.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len: usize = 0;
 
-        len += self.session_expiry_interval.get_encoded_size();
-        len += self.receive_maximum.get_encoded_size();
-        len += self.maximum_qos.get_encoded_size();
-        len += self.retain_available.get_encoded_size();
-        len += self.maximum_packet_size.get_encoded_size();
-        len += self.assigned_client_id.get_encoded_size();
-        len += self.topic_alias_max.get_encoded_size();
-        len += self.reason_string.get_encoded_size();
-        len += self.user_property.get_encoded_size();
-        len += self.wildcard_subscription_available.get_encoded_size();
-        len += self.subscription_identifier_available.get_encoded_size();
-        len += self.shared_subscription_available.get_encoded_size();
-        len += self.server_keepalive.get_encoded_size();
-        len += self.response_information.get_encoded_size();
-        len += self.server_reference.get_encoded_size();
-        len += self.authentication_method.get_encoded_size();
-        len += self.authentication_data.get_encoded_size();
+        len += self.session_expiry_interval.encoded_size();
+        len += self.receive_maximum.encoded_size();
+        len += self.maximum_qos.encoded_size();
+        len += self.retain_available.encoded_size();
+        len += self.maximum_packet_size.encoded_size();
+        len += self.assigned_client_id.encoded_size();
+        len += self.topic_alias_max.encoded_size();
+        len += self.reason_string.encoded_size();
+        len += self.user_property.encoded_size();
+        len += self.wildcard_subscription_available.encoded_size();
+        len += self.subscription_identifier_available.encoded_size();
+        len += self.shared_subscription_available.encoded_size();
+        len += self.server_keepalive.encoded_size();
+        len += self.response_information.encoded_size();
+        len += self.server_reference.encoded_size();
+        len += self.authentication_method.encoded_size();
+        len += self.authentication_data.encoded_size();
 
         len
     }
@@ -252,11 +252,10 @@ impl Encoder for ConnAckPacket {
 
         // Fixed header
         buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
-        remaining_len += self.flags.get_encoded_size();
-        remaining_len += self.reason_code.get_encoded_size();
-        remaining_len +=
-            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        remaining_len += self.properties.get_encoded_size();
+        remaining_len += self.flags.encoded_size();
+        remaining_len += self.reason_code.encoded_size();
+        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+        remaining_len += self.properties.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         // Variable header
@@ -264,7 +263,7 @@ impl Encoder for ConnAckPacket {
         self.reason_code.encode(buffer);
 
         // Properties
-        VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
     }
 }

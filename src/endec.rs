@@ -6,7 +6,7 @@ use crate::reason::ReasonCode;
 
 pub trait Encoder {
     fn encode(&self, buffer: &mut BytesMut);
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         mem::size_of_val(self)
     }
 }
@@ -78,7 +78,7 @@ impl Encoder for VariableByteInteger {
         encode_var_byte_integer(self.0, buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         match self.0 {
             0..=127 => 1,
             128..=16383 => 2,
@@ -104,7 +104,7 @@ impl Encoder for String {
         buffer.put(self.as_bytes());
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         self.len() + mem::size_of::<u16>()
     }
 }
@@ -135,7 +135,7 @@ impl Encoder for &'static str {
         buffer.put(self.as_bytes());
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         self.len() + mem::size_of::<u16>()
     }
 }
@@ -210,7 +210,7 @@ impl Encoder for Bytes {
         buffer.extend(self);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         mem::size_of::<u16>() + self.len()
     }
 }
@@ -241,9 +241,9 @@ where
         }
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         match self {
-            Some(v) => v.get_encoded_size(),
+            Some(v) => v.encoded_size(),
             None => 0,
         }
     }
@@ -259,11 +259,11 @@ where
         }
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
         for e in self {
-            len += e.get_encoded_size();
+            len += e.encoded_size();
         }
 
         len
