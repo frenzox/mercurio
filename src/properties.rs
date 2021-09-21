@@ -49,7 +49,12 @@ impl Encoder for Property {
 }
 
 impl Decoder for Property {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         match buffer.get_u8() {
             0x01 => Ok(Some(Property::PayloadFormatIndicator)),
             0x02 => Ok(Some(Property::MessageExpiryInterval)),
@@ -119,8 +124,10 @@ macro_rules! endecable_property {
         }
 
         impl Decoder for $t {
-            fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-                Ok(Some($t::new($(<$s>::decode(buffer)?.unwrap(),)*)))
+            type Context = ();
+
+            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>, ReasonCode> {
+                Ok(Some($t::new($(<$s>::decode(buffer, None)?.unwrap(),)*)))
             }
         }
     }

@@ -12,18 +12,22 @@ pub trait Encoder {
 }
 
 pub trait Decoder {
-    fn decode<T>(buffer: &mut T) -> Result<Option<Self>, ReasonCode>
+    type Context;
+
+    fn decode<T>(
+        buffer: &mut T,
+        context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode>
     where
         Self: Sized,
         T: Buf;
 }
 
-pub trait DecoderWithContext<U> {
-    fn decode<T>(buffer: &mut T, context: &U) -> Result<Option<Self>, ReasonCode>
-    where
-        Self: Sized,
-        T: Buf;
-}
+// pub trait DecoderWithContext {
+//     where
+//         Self: Sized,
+//         T: Buf;
+// }
 
 fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
     let mut x = value;
@@ -90,7 +94,12 @@ impl Encoder for VariableByteInteger {
 }
 
 impl Decoder for VariableByteInteger {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         match decode_var_byte_integer(buffer) {
             Ok(v) => Ok(Some(v)),
             Err(e) => Err(e),
@@ -110,7 +119,12 @@ impl Encoder for String {
 }
 
 impl Decoder for String {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
@@ -147,7 +161,12 @@ impl Encoder for u8 {
 }
 
 impl Decoder for u8 {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if !buffer.has_remaining() {
             return Ok(None);
         }
@@ -163,7 +182,12 @@ impl Encoder for u16 {
 }
 
 impl Decoder for u16 {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
@@ -179,7 +203,12 @@ impl Encoder for u32 {
 }
 
 impl Decoder for u32 {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if buffer.remaining() < 4 {
             return Ok(None);
         }
@@ -195,7 +224,12 @@ impl Encoder for bool {
 }
 
 impl Decoder for bool {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if buffer.remaining() < 1 {
             return Ok(None);
         }
@@ -216,7 +250,12 @@ impl Encoder for Bytes {
 }
 
 impl Decoder for Bytes {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
@@ -282,7 +321,7 @@ mod tests {
         VariableByteInteger(value as u32).encode(&mut encoded);
         assert_eq!(encoded, Bytes::from(vec![0xc5, 0x02]));
 
-        let decoded = VariableByteInteger::decode(&mut encoded)?.unwrap();
+        let decoded = VariableByteInteger::decode(&mut encoded, None)?.unwrap();
         assert_eq!(decoded.0 as u16, value);
 
         Ok(())
@@ -292,7 +331,7 @@ mod tests {
     fn test_decoder_malformed_integer() {
         let mut encoded = Bytes::from(vec![0xc5, 0xc5, 0xc5, 0xc5, 0x02]);
 
-        match VariableByteInteger::decode(&mut encoded) {
+        match VariableByteInteger::decode(&mut encoded, None) {
             Ok(_) => panic!("Succesfully decoded invalid packet, should never happen"),
             Err(e) => assert_eq!(e, ReasonCode::MalformedPacket),
         };

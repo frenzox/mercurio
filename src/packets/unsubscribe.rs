@@ -26,8 +26,13 @@ impl Encoder for UnsubscribeProperties {
 }
 
 impl Decoder for UnsubscribeProperties {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let len = VariableByteInteger::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
@@ -38,11 +43,12 @@ impl Decoder for UnsubscribeProperties {
         let mut unsubscribe_properties = UnsubscribeProperties::default();
 
         loop {
-            let p = Property::decode(&mut encoded_properties)?.unwrap();
+            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
 
             match p {
                 Property::UserProperty => {
-                    let user_property = UserProperty::decode(&mut encoded_properties)?.unwrap();
+                    let user_property =
+                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
 
                     if let Some(v) = &mut unsubscribe_properties.user_property {
                         v.push(user_property);
@@ -84,8 +90,13 @@ impl Encoder for UnsubscribePayload {
 }
 
 impl Decoder for UnsubscribePayload {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        let topic_filter = String::decode(buffer)?.unwrap();
+    type Context = ();
+
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        let topic_filter = String::decode(buffer, None)?.unwrap();
 
         Ok(Some(UnsubscribePayload { topic_filter }))
     }
@@ -123,12 +134,17 @@ impl Encoder for UnsubscribePacket {
 }
 
 impl Decoder for UnsubscribePacket {
-    fn decode<T: Buf>(buffer: &mut T) -> Result<Option<Self>, ReasonCode> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
+    type Context = ();
 
-        let packet_id = u16::decode(buffer)?.unwrap();
-        let properties = UnsubscribeProperties::decode(buffer)?;
+    fn decode<T: Buf>(
+        buffer: &mut T,
+        _context: Option<&Self::Context>,
+    ) -> Result<Option<Self>, ReasonCode> {
+        buffer.advance(1); // Packet type
+        let _ = VariableByteInteger::decode(buffer, None)?; //Remaining length
+
+        let packet_id = u16::decode(buffer, None)?.unwrap();
+        let properties = UnsubscribeProperties::decode(buffer, None)?;
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError);
@@ -137,7 +153,7 @@ impl Decoder for UnsubscribePacket {
         let mut payload = Vec::new();
 
         while buffer.has_remaining() {
-            payload.push(UnsubscribePayload::decode(buffer)?.unwrap());
+            payload.push(UnsubscribePayload::decode(buffer, None)?.unwrap());
         }
 
         Ok(Some(UnsubscribePacket {
@@ -184,7 +200,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = UnsubscribePacket::decode(&mut bytes)
+        let new_packet = UnsubscribePacket::decode(&mut bytes, None)
             .expect("Unexpected error")
             .unwrap();
         assert_eq!(packet, new_packet);
