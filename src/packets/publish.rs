@@ -38,17 +38,17 @@ impl Encoder for PublishProperties {
         self.content_type.encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         let mut len = 0;
 
-        len += self.payload_format_indicator.get_encoded_size();
-        len += self.message_expiry_interval.get_encoded_size();
-        len += self.topic_alias.get_encoded_size();
-        len += self.response_topic.get_encoded_size();
-        len += self.correlation_data.get_encoded_size();
-        len += self.user_property.get_encoded_size();
-        len += self.subscription_identifier.get_encoded_size();
-        len += self.content_type.get_encoded_size();
+        len += self.payload_format_indicator.encoded_size();
+        len += self.message_expiry_interval.encoded_size();
+        len += self.topic_alias.encoded_size();
+        len += self.response_topic.encoded_size();
+        len += self.correlation_data.encoded_size();
+        len += self.user_property.encoded_size();
+        len += self.subscription_identifier.encoded_size();
+        len += self.content_type.encoded_size();
         len
     }
 }
@@ -152,11 +152,10 @@ impl Encoder for PublishPacket {
         fixed_header |= self.retain as u8;
         fixed_header.encode(buffer);
 
-        remaining_len += self.topic_name.get_encoded_size();
-        remaining_len += self.packet_id.get_encoded_size();
-        remaining_len +=
-            VariableByteInteger(self.properties.get_encoded_size() as u32).get_encoded_size();
-        remaining_len += self.properties.get_encoded_size();
+        remaining_len += self.topic_name.encoded_size();
+        remaining_len += self.packet_id.encoded_size();
+        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+        remaining_len += self.properties.encoded_size();
 
         if let Some(payload) = &self.payload {
             remaining_len += payload.len();
@@ -167,7 +166,7 @@ impl Encoder for PublishPacket {
         // Variable header
         self.topic_name.encode(buffer);
         self.packet_id.encode(buffer);
-        VariableByteInteger(self.properties.get_encoded_size() as u32).encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
 
         // Payload. Here it goes raw, shouldn't be encoded
@@ -193,10 +192,10 @@ impl Decoder for PublishPacket {
 
         // Payload
         let payload_len = remaining_len
-            - (topic_name.get_encoded_size()
-                + packet_id.get_encoded_size()
-                + properties.get_encoded_size()
-                + VariableByteInteger(properties.get_encoded_size() as u32).get_encoded_size());
+            - (topic_name.encoded_size()
+                + packet_id.encoded_size()
+                + properties.encoded_size()
+                + VariableByteInteger(properties.encoded_size() as u32).encoded_size());
 
         if buffer.remaining() != payload_len {
             return Err(ReasonCode::MalformedPacket);

@@ -43,7 +43,7 @@ impl Encoder for Property {
         buffer.put_u8(*self as u8);
     }
 
-    fn get_encoded_size(&self) -> usize {
+    fn encoded_size(&self) -> usize {
         mem::size_of::<u8>()
     }
 }
@@ -105,13 +105,13 @@ macro_rules! endecable_property {
                 )*
             }
 
-            fn get_encoded_size(&self) -> usize {
+            fn encoded_size(&self) -> usize {
                 let mut len = 0;
 
-                len += Property::$t.get_encoded_size();
+                len += Property::$t.encoded_size();
 
                 $(
-                    len += self.$n.get_encoded_size();
+                    len += self.$n.encoded_size();
                 )*
 
                 len

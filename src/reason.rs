@@ -111,8 +111,8 @@ impl Encoder for ReasonCode {
         self.get_code().encode(buffer);
     }
 
-    fn get_encoded_size(&self) -> usize {
-        self.get_code().get_encoded_size()
+    fn encoded_size(&self) -> usize {
+        self.get_code().encoded_size()
     }
 }
 
