@@ -23,12 +23,6 @@ pub trait Decoder {
         T: Buf;
 }
 
-// pub trait DecoderWithContext {
-//     where
-//         Self: Sized,
-//         T: Buf;
-// }
-
 fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
     let mut x = value;
 

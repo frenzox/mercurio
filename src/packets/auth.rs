@@ -101,14 +101,16 @@ pub struct AuthPacket {
 }
 
 impl ControlPacket for AuthPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::Auth;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::Auth
+    }
 }
 
 impl Encoder for AuthPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
         remaining_len += self.reason.encoded_size();
         remaining_len += self.properties.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);

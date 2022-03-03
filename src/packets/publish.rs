@@ -145,16 +145,17 @@ pub struct PublishPacket {
 }
 
 impl ControlPacket for PublishPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::Publish;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::Publish
+    }
 }
 
 impl Encoder for PublishPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut fixed_header: u8;
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (Self::PACKET_TYPE as u8) << 4;
+        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
         fixed_header |= (self.dup as u8) << 3;
         fixed_header |= (self.qos_level as u8) << 1;
         fixed_header |= self.retain as u8;
