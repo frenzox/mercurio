@@ -110,9 +110,7 @@ pub struct SubscriptionOptions {
 
 impl Encoder for SubscriptionOptions {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut encoded: u8;
-
-        encoded = self.qos as u8;
+        let mut encoded: u8 = self.qos as u8;
 
         if self.no_local {
             encoded |= 0b0000_0100;
@@ -212,11 +210,10 @@ pub struct SubscribePacket {
 
 impl Encoder for SubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut fixed_header: u8;
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (self.packet_type() as u8) << 4;
+        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 

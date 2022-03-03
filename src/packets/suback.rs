@@ -120,11 +120,10 @@ pub struct SubAckPacket {
 
 impl Encoder for SubAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let fixed_header: u8;
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (self.packet_type() as u8) << 4;
+        let fixed_header: u8 = (self.packet_type() as u8) << 4;
         fixed_header.encode(buffer);
 
         remaining_len += self.packet_id.encoded_size();

@@ -111,11 +111,10 @@ pub struct UnsubscribePacket {
 
 impl Encoder for UnsubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut fixed_header: u8;
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (self.packet_type() as u8) << 4;
+        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
