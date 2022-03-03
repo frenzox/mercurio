@@ -78,14 +78,16 @@ pub struct PubRecPacket {
 }
 
 impl ControlPacket for PubRecPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::PubRec;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::PubRec
+    }
 }
 
 impl Encoder for PubRecPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
 
         remaining_len += self.packet_id.encoded_size();
         remaining_len += self.reason.encoded_size();
@@ -115,7 +117,7 @@ impl Decoder for PubRecPacket {
         buffer.advance(1);
         let _ = VariableByteInteger::decode(buffer, None);
         let packet_id = u16::decode(buffer, None)?.unwrap();
-        let reason = ReasonCode::decode(buffer, Some(&Self::PACKET_TYPE))?.unwrap();
+        let reason = ReasonCode::decode(buffer, Some(&ControlPacketType::PubRec))?.unwrap();
         let properties = PubRecProperties::decode(buffer, None)?;
 
         Ok(Some(PubRecPacket {

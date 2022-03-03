@@ -115,7 +115,7 @@ impl Encoder for UnsubscribePacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (Self::PACKET_TYPE as u8) << 4;
+        fixed_header = (self.packet_type() as u8) << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
@@ -165,7 +165,9 @@ impl Decoder for UnsubscribePacket {
 }
 
 impl ControlPacket for UnsubscribePacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::Unsubscribe;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::Unsubscribe
+    }
 }
 
 #[cfg(test)]

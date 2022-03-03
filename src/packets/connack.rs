@@ -263,7 +263,7 @@ impl Encoder for ConnAckPacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
         remaining_len += self.flags.encoded_size();
         remaining_len += self.reason_code.encoded_size();
         remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
@@ -303,7 +303,9 @@ impl Decoder for ConnAckPacket {
 }
 
 impl ControlPacket for ConnAckPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::ConnAck;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::ConnAck
+    }
 }
 
 #[cfg(test)]

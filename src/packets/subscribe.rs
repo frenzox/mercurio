@@ -216,7 +216,7 @@ impl Encoder for SubscribePacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        fixed_header = (Self::PACKET_TYPE as u8) << 4;
+        fixed_header = (self.packet_type() as u8) << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
@@ -266,7 +266,9 @@ impl Decoder for SubscribePacket {
 }
 
 impl ControlPacket for SubscribePacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::Subscribe;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::Subscribe
+    }
 }
 
 #[cfg(test)]

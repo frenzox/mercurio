@@ -78,14 +78,16 @@ pub struct PubCompPacket {
 }
 
 impl ControlPacket for PubCompPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::PubComp;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::PubComp
+    }
 }
 
 impl Encoder for PubCompPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
 
         remaining_len += self.packet_id.encoded_size();
         remaining_len += self.reason.encoded_size();
@@ -115,7 +117,7 @@ impl Decoder for PubCompPacket {
         buffer.advance(1);
         let _ = VariableByteInteger::decode(buffer, None);
         let packet_id = u16::decode(buffer, None)?.unwrap();
-        let reason = ReasonCode::decode(buffer, Some(&Self::PACKET_TYPE))?.unwrap();
+        let reason = ReasonCode::decode(buffer, Some(&ControlPacketType::PubComp))?.unwrap();
         let properties = PubCompProperties::decode(buffer, None)?;
 
         Ok(Some(PubCompPacket {

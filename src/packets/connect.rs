@@ -430,7 +430,9 @@ impl ConnectPacket {
 }
 
 impl ControlPacket for ConnectPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::Connect;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::Connect
+    }
 }
 
 impl Encoder for ConnectPacket {
@@ -438,7 +440,7 @@ impl Encoder for ConnectPacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
         remaining_len += Self::PROTOCOL_NAME.encoded_size();
         remaining_len += Self::PROTOCOL_VERSION.encoded_size();
         remaining_len += self.flags.encoded_size();

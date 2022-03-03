@@ -7,12 +7,14 @@ use crate::reason::ReasonCode;
 pub struct PingReqPacket {}
 
 impl ControlPacket for PingReqPacket {
-    const PACKET_TYPE: ControlPacketType = ControlPacketType::PingReq;
+    fn packet_type(&self) -> ControlPacketType {
+        ControlPacketType::PingReq
+    }
 }
 
 impl Encoder for PingReqPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        buffer.put_u8((Self::PACKET_TYPE as u8) << 4);
+        buffer.put_u8((self.packet_type() as u8) << 4);
 
         let remaining_len = 0;
         VariableByteInteger(remaining_len).encode(buffer);
