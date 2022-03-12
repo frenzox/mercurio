@@ -1,9 +1,11 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::{Property, ReasonString, UserProperty};
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PubAckProperties {
@@ -30,15 +32,12 @@ impl Encoder for PubAckProperties {
 impl Decoder for PubAckProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -64,7 +63,7 @@ impl Decoder for PubAckProperties {
                         puback_properties.user_property = Some(v);
                     }
                 }
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
         }
     }
@@ -77,17 +76,15 @@ pub struct PubAckPacket {
     properties: Option<PubAckProperties>,
 }
 
-impl ControlPacket for PubAckPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::PubAck
-    }
+impl ControlPacketType for PubAckPacket {
+    const PACKET_TYPE: u8 = 0x04;
 }
 
 impl Encoder for PubAckPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((self.packet_type() as u8) << 4);
+        buffer.put_u8(Self::PACKET_TYPE << 4);
 
         remaining_len += self.packet_id.encoded_size();
         remaining_len += self.reason.encoded_size();
@@ -110,14 +107,11 @@ impl Encoder for PubAckPacket {
 impl Decoder for PubAckPacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         buffer.advance(1);
         let _ = VariableByteInteger::decode(buffer, None);
         let packet_id = u16::decode(buffer, None)?.unwrap();
-        let reason = ReasonCode::decode(buffer, Some(&ControlPacketType::PubAck))?.unwrap();
+        let reason = ReasonCode::decode(buffer, None)?.unwrap();
         let properties = PubAckProperties::decode(buffer, None)?;
 
         Ok(Some(PubAckPacket {

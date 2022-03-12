@@ -1,6 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::ContentType;
 use crate::properties::CorrelationData;
@@ -13,6 +12,9 @@ use crate::properties::TopicAlias;
 use crate::properties::UserProperty;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PublishProperties {
@@ -56,15 +58,12 @@ impl Encoder for PublishProperties {
 impl Decoder for PublishProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -121,7 +120,7 @@ impl Decoder for PublishProperties {
                         ContentType::decode(&mut encoded_properties, None)?
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -144,10 +143,8 @@ pub struct PublishPacket {
     payload: Option<Bytes>,
 }
 
-impl ControlPacket for PublishPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Publish
-    }
+impl ControlPacketType for PublishPacket {
+    const PACKET_TYPE: u8 = 0x03;
 }
 
 impl Encoder for PublishPacket {
@@ -155,7 +152,7 @@ impl Encoder for PublishPacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
+        let mut fixed_header: u8 = Self::PACKET_TYPE << 4;
         fixed_header |= (self.dup as u8) << 3;
         fixed_header |= (self.qos_level as u8) << 1;
         fixed_header |= self.retain as u8;
@@ -188,10 +185,7 @@ impl Encoder for PublishPacket {
 impl Decoder for PublishPacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         // Fixed header
         let fixed_header = buffer.get_u8();
         let dup = (fixed_header & 0b0000_1000) != 0;
@@ -212,7 +206,7 @@ impl Decoder for PublishPacket {
                 + VariableByteInteger(properties.encoded_size() as u32).encoded_size());
 
         if buffer.remaining() != payload_len {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let payload = Some(buffer.copy_to_bytes(payload_len));

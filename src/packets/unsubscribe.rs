@@ -1,10 +1,12 @@
 use bytes::Buf;
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::Property;
 use crate::properties::UserProperty;
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct UnsubscribeProperties {
@@ -28,15 +30,12 @@ impl Encoder for UnsubscribeProperties {
 impl Decoder for UnsubscribeProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -58,7 +57,7 @@ impl Decoder for UnsubscribeProperties {
                     }
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -92,10 +91,7 @@ impl Encoder for UnsubscribePayload {
 impl Decoder for UnsubscribePayload {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let topic_filter = String::decode(buffer, None)?.unwrap();
 
         Ok(Some(UnsubscribePayload { topic_filter }))
@@ -114,7 +110,7 @@ impl Encoder for UnsubscribePacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
+        let mut fixed_header: u8 = Self::PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
@@ -135,10 +131,7 @@ impl Encoder for UnsubscribePacket {
 impl Decoder for UnsubscribePacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None)?; //Remaining length
 
@@ -146,7 +139,7 @@ impl Decoder for UnsubscribePacket {
         let properties = UnsubscribeProperties::decode(buffer, None)?;
 
         if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError);
+            return Err(ReasonCode::ProtocolError.into());
         }
 
         let mut payload = Vec::new();
@@ -163,10 +156,8 @@ impl Decoder for UnsubscribePacket {
     }
 }
 
-impl ControlPacket for UnsubscribePacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Unsubscribe
-    }
+impl ControlPacketType for UnsubscribePacket {
+    const PACKET_TYPE: u8 = 0x0a;
 }
 
 #[cfg(test)]

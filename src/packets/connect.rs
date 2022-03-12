@@ -2,7 +2,6 @@ use std::mem;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::AuthenticationData;
 use crate::properties::AuthenticationMethod;
@@ -22,6 +21,9 @@ use crate::properties::UserProperty;
 use crate::properties::WillDelayInterval;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnectFlags {
@@ -69,17 +71,14 @@ impl Encoder for ConnectFlags {
 impl Decoder for ConnectFlags {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if !buffer.has_remaining() {
             return Ok(None);
         }
 
         let byte = buffer.get_u8();
         if (byte & 0b0000_0001) != 0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut flags = ConnectFlags {
@@ -98,7 +97,7 @@ impl Decoder for ConnectFlags {
         if flags.will_qos != QoS::Invalid {
             Ok(Some(flags))
         } else {
-            Err(ReasonCode::MalformedPacket)
+            Err(ReasonCode::MalformedPacket.into())
         }
     }
 }
@@ -149,15 +148,12 @@ impl Encoder for ConnectProperties {
 impl Decoder for ConnectProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -219,7 +215,7 @@ impl Decoder for ConnectProperties {
                     }
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -270,15 +266,12 @@ impl Encoder for WillProperties {
 impl Decoder for WillProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -330,7 +323,7 @@ impl Decoder for WillProperties {
                     }
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -388,10 +381,7 @@ impl Encoder for ConnectPayload {
 impl Decoder for ConnectPayload {
     type Context = ConnectFlags;
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Option<Self>> {
         let mut payload = ConnectPayload::default();
 
         if let Some(client_id) = String::decode(buffer, None)? {
@@ -429,10 +419,8 @@ impl ConnectPacket {
     const PROTOCOL_VERSION: u8 = 5;
 }
 
-impl ControlPacket for ConnectPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Connect
-    }
+impl ControlPacketType for ConnectPacket {
+    const PACKET_TYPE: u8 = 0x01;
 }
 
 impl Encoder for ConnectPacket {
@@ -440,7 +428,7 @@ impl Encoder for ConnectPacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8((self.packet_type() as u8) << 4);
+        buffer.put_u8(Self::PACKET_TYPE << 4);
         remaining_len += Self::PROTOCOL_NAME.encoded_size();
         remaining_len += Self::PROTOCOL_VERSION.encoded_size();
         remaining_len += self.flags.encoded_size();
@@ -465,22 +453,19 @@ impl Encoder for ConnectPacket {
 
 impl Decoder for ConnectPacket {
     type Context = ();
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None); //Remaining length
 
         if let Some(protocol_name) = String::decode(buffer, None)? {
             if protocol_name != Self::PROTOCOL_NAME {
-                return Err(ReasonCode::MalformedPacket);
+                return Err(ReasonCode::MalformedPacket.into());
             }
         }
 
         if let Some(protocol_version) = u8::decode(buffer, None)? {
             if protocol_version != 5 {
-                return Err(ReasonCode::MalformedPacket);
+                return Err(ReasonCode::UnsupportedProtocolVersion.into());
             }
         }
 

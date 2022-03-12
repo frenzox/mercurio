@@ -1,14 +1,16 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::AuthenticationData;
 use crate::properties::AuthenticationMethod;
 use crate::properties::UserProperty;
 use crate::properties::{Property, ReasonString};
 use crate::reason::ReasonCode;
+use crate::result::Result;
 
-#[derive(Default)]
+use super::control_packet_type::ControlPacketType;
+
+#[derive(Default, PartialEq, Debug)]
 pub struct AuthProperties {
     auth_method: Option<AuthenticationMethod>,
     auth_data: Option<AuthenticationData>,
@@ -39,15 +41,12 @@ impl Encoder for AuthProperties {
 impl Decoder for AuthProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -83,7 +82,7 @@ impl Decoder for AuthProperties {
                     }
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -95,22 +94,21 @@ impl Decoder for AuthProperties {
     }
 }
 
+#[derive(PartialEq, Debug)]
 pub struct AuthPacket {
     reason: ReasonCode,
     properties: Option<AuthProperties>,
 }
 
-impl ControlPacket for AuthPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Auth
-    }
+impl ControlPacketType for AuthPacket {
+    const PACKET_TYPE: u8 = 0x0e;
 }
 
 impl Encoder for AuthPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((self.packet_type() as u8) << 4);
+        buffer.put_u8(0x0d << 4);
         remaining_len += self.reason.encoded_size();
         remaining_len += self.properties.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
@@ -123,14 +121,11 @@ impl Encoder for AuthPacket {
 impl Decoder for AuthPacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let reserved = buffer.get_u8() & 0xF;
 
         if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let reason = ReasonCode::decode(buffer, None)?.unwrap();

@@ -2,7 +2,6 @@ use std::mem;
 
 use bytes::{Buf, BufMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::AssignedClientIdentifier;
 use crate::properties::AuthenticationData;
@@ -23,6 +22,9 @@ use crate::properties::TopicAliasMaximum;
 use crate::properties::UserProperty;
 use crate::properties::WildcardSubscriptionAvailable;
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnAckFlags {
@@ -43,14 +45,11 @@ impl Encoder for ConnAckFlags {
 impl Decoder for ConnAckFlags {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let encoded = buffer.get_u8();
 
         if (0b1111_1110 & encoded) != 0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         Ok(Some(ConnAckFlags {
@@ -129,15 +128,12 @@ impl Encoder for ConnAckProperties {
 impl Decoder for ConnAckProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -239,7 +235,7 @@ impl Decoder for ConnAckProperties {
                         AuthenticationData::decode(&mut encoded_properties, None)?
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -263,7 +259,7 @@ impl Encoder for ConnAckPacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8((self.packet_type() as u8) << 4);
+        buffer.put_u8(Self::PACKET_TYPE << 4);
         remaining_len += self.flags.encoded_size();
         remaining_len += self.reason_code.encoded_size();
         remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
@@ -283,15 +279,12 @@ impl Encoder for ConnAckPacket {
 impl Decoder for ConnAckPacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None); //Remaining length
 
         let flags = ConnAckFlags::decode(buffer, None)?.unwrap();
-        let reason_code = ReasonCode::decode(buffer, Some(&ControlPacketType::ConnAck))?.unwrap();
+        let reason_code = ReasonCode::decode(buffer, None)?.unwrap();
         let properties = ConnAckProperties::decode(buffer, None)?;
 
         Ok(Some(ConnAckPacket {
@@ -302,10 +295,8 @@ impl Decoder for ConnAckPacket {
     }
 }
 
-impl ControlPacket for ConnAckPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::ConnAck
-    }
+impl ControlPacketType for ConnAckPacket {
+    const PACKET_TYPE: u8 = 0x02;
 }
 
 #[cfg(test)]

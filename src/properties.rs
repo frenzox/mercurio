@@ -4,6 +4,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::reason::ReasonCode;
+use crate::result::Result;
 
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -51,10 +52,7 @@ impl Encoder for Property {
 impl Decoder for Property {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         match buffer.get_u8() {
             0x01 => Ok(Some(Property::PayloadFormatIndicator)),
             0x02 => Ok(Some(Property::MessageExpiryInterval)),
@@ -83,7 +81,7 @@ impl Decoder for Property {
             0x28 => Ok(Some(Property::WildcardSubscriptionAvailable)),
             0x29 => Ok(Some(Property::SubscriptionIdentifierAvailable)),
             0x2a => Ok(Some(Property::SharedSubscriptionAvailable)),
-            _ => Err(ReasonCode::MalformedPacket),
+            _ => Err(ReasonCode::MalformedPacket.into()),
         }
     }
 }
@@ -126,7 +124,7 @@ macro_rules! endecable_property {
         impl Decoder for $t {
             type Context = ();
 
-            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>, ReasonCode> {
+            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
                 Ok(Some($t::new($(<$s>::decode(buffer, None)?.unwrap(),)*)))
             }
         }

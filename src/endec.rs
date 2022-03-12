@@ -2,7 +2,7 @@ use std::mem;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::reason::ReasonCode;
+use crate::{reason::ReasonCode, result::Result};
 
 pub trait Encoder {
     fn encode(&self, buffer: &mut BytesMut);
@@ -14,10 +14,7 @@ pub trait Encoder {
 pub trait Decoder {
     type Context;
 
-    fn decode<T>(
-        buffer: &mut T,
-        context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode>
+    fn decode<T>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Option<Self>>
     where
         Self: Sized,
         T: Buf;
@@ -42,7 +39,7 @@ fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
     }
 }
 
-fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<VariableByteInteger, ReasonCode> {
+fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<Option<VariableByteInteger>> {
     let mut multiplier = 1;
     let mut value: u32 = 0;
 
@@ -52,7 +49,7 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<VariableByteIntege
             value += (encoded_byte & 0b0111_1111) as u32 * multiplier;
 
             if multiplier > (128 * 128 * 128) {
-                return Err(ReasonCode::MalformedPacket);
+                return Err(ReasonCode::MalformedPacket.into());
             }
 
             multiplier *= 128;
@@ -61,11 +58,11 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<VariableByteIntege
                 break;
             }
         } else {
-            return Err(ReasonCode::MalformedPacket);
+            return Ok(None);
         }
     }
 
-    Ok(VariableByteInteger(value))
+    Ok(Some(VariableByteInteger(value)))
 }
 
 #[derive(PartialEq, Debug)]
@@ -90,12 +87,9 @@ impl Encoder for VariableByteInteger {
 impl Decoder for VariableByteInteger {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         match decode_var_byte_integer(buffer) {
-            Ok(v) => Ok(Some(v)),
+            Ok(v) => Ok(v),
             Err(e) => Err(e),
         }
     }
@@ -115,23 +109,20 @@ impl Encoder for String {
 impl Decoder for String {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
 
         let length = buffer.get_u16();
         if buffer.remaining() < length as usize {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let bytes = buffer.copy_to_bytes(length.into());
 
         match String::from_utf8(bytes.to_vec()) {
-            Err(_) => Err(ReasonCode::MalformedPacket),
+            Err(_) => Err(ReasonCode::MalformedPacket.into()),
             Ok(s) => Ok(Some(s)),
         }
     }
@@ -157,10 +148,7 @@ impl Encoder for u8 {
 impl Decoder for u8 {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if !buffer.has_remaining() {
             return Ok(None);
         }
@@ -178,10 +166,7 @@ impl Encoder for u16 {
 impl Decoder for u16 {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
@@ -199,10 +184,7 @@ impl Encoder for u32 {
 impl Decoder for u32 {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if buffer.remaining() < 4 {
             return Ok(None);
         }
@@ -220,10 +202,7 @@ impl Encoder for bool {
 impl Decoder for bool {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if buffer.remaining() < 1 {
             return Ok(None);
         }
@@ -246,17 +225,14 @@ impl Encoder for Bytes {
 impl Decoder for Bytes {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         if buffer.remaining() < 2 {
             return Ok(None);
         }
 
         let length = buffer.get_u16();
         if buffer.remaining() < length as usize {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         Ok(Some(buffer.copy_to_bytes(length.into())))
@@ -306,9 +282,10 @@ where
 #[cfg(test)]
 mod tests {
     use crate::endec::*;
+    use crate::error::Error;
 
     #[test]
-    fn test_endec_encode_decode() -> Result<(), ReasonCode> {
+    fn test_endec_encode_decode() -> Result<()> {
         let value: u16 = 325;
         let mut encoded = BytesMut::new();
 
@@ -326,8 +303,8 @@ mod tests {
         let mut encoded = Bytes::from(vec![0xc5, 0xc5, 0xc5, 0xc5, 0x02]);
 
         match VariableByteInteger::decode(&mut encoded, None) {
-            Ok(_) => panic!("Succesfully decoded invalid packet, should never happen"),
-            Err(e) => assert_eq!(e, ReasonCode::MalformedPacket),
+            Err(Error::MQTTReasonCode(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
+            _ => unreachable!(),
         };
     }
 }

@@ -1,12 +1,14 @@
 use bytes::{Buf, BufMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
 use crate::endec::{Decoder, Encoder, VariableByteInteger};
 use crate::properties::Property;
 use crate::properties::SubscriptionIdentifier;
 use crate::properties::UserProperty;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
+use crate::result::Result;
+
+use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct SubscribeProperties {
@@ -33,15 +35,12 @@ impl Encoder for SubscribeProperties {
 impl Decoder for SubscribeProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let len = VariableByteInteger::decode(buffer, None)?.unwrap();
         if len.0 == 0 {
             return Ok(None);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
@@ -68,7 +67,7 @@ impl Decoder for SubscribeProperties {
                     }
                 }
 
-                _ => return Err(ReasonCode::MalformedPacket),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
 
             if !encoded_properties.has_remaining() {
@@ -133,16 +132,13 @@ impl Encoder for SubscriptionOptions {
 impl Decoder for SubscriptionOptions {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let opt = buffer.get_u8();
 
         let qos: QoS = (opt & 0b0000_0011).into();
 
         if qos == QoS::Invalid {
-            return Err(ReasonCode::ProtocolError);
+            return Err(ReasonCode::ProtocolError.into());
         }
 
         let no_local = (opt & 0b0000_0100) != 0;
@@ -150,7 +146,7 @@ impl Decoder for SubscriptionOptions {
         let retain_handling: RetainHandling = (opt >> 4).into();
 
         if retain_handling == RetainHandling::Invalid {
-            return Err(ReasonCode::ProtocolError);
+            return Err(ReasonCode::ProtocolError.into());
         }
 
         Ok(Some(SubscriptionOptions {
@@ -187,10 +183,7 @@ impl Encoder for SubscribePayload {
 impl Decoder for SubscribePayload {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         let topic_filter = String::decode(buffer, None)?.unwrap();
         let subs_opt = SubscriptionOptions::decode(buffer, None)?.unwrap();
 
@@ -213,7 +206,7 @@ impl Encoder for SubscribePacket {
         let mut remaining_len = 0;
 
         // Fixed header
-        let mut fixed_header: u8 = (self.packet_type() as u8) << 4;
+        let mut fixed_header: u8 = Self::PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
@@ -234,10 +227,7 @@ impl Encoder for SubscribePacket {
 impl Decoder for SubscribePacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None)?; //Remaining length
 
@@ -245,7 +235,7 @@ impl Decoder for SubscribePacket {
         let properties = SubscribeProperties::decode(buffer, None)?;
 
         if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError);
+            return Err(ReasonCode::ProtocolError.into());
         }
 
         let mut payload = Vec::new();
@@ -262,10 +252,8 @@ impl Decoder for SubscribePacket {
     }
 }
 
-impl ControlPacket for SubscribePacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Subscribe
-    }
+impl ControlPacketType for SubscribePacket {
+    const PACKET_TYPE: u8 = 0x08;
 }
 
 #[cfg(test)]

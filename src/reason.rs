@@ -2,8 +2,8 @@ use std::{error, fmt};
 
 use bytes::Buf;
 
-use crate::control_packet::ControlPacketType;
 use crate::endec::{Decoder, Encoder};
+use crate::result::Result;
 
 #[derive(Debug, PartialEq)]
 pub enum ReasonCode {
@@ -117,17 +117,11 @@ impl Encoder for ReasonCode {
 }
 
 impl Decoder for ReasonCode {
-    type Context = ControlPacketType;
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    type Context = ();
+
+    fn decode<T: Buf>(buffer: &mut T, _: Option<&Self::Context>) -> Result<Option<Self>> {
         let reason = match buffer.get_u8() {
-            0x00 => match context.unwrap() {
-                ControlPacketType::SubAck => ReasonCode::GrantedQoS0,
-                ControlPacketType::Disconnect => ReasonCode::NormalDisconnection,
-                _ => ReasonCode::Success,
-            },
+            0x00 => ReasonCode::Success,
             0x01 => ReasonCode::GrantedQoS1,
             0x02 => ReasonCode::GrantedQoS2,
             0x04 => ReasonCode::DisconnectWithWillMessage,
@@ -170,7 +164,7 @@ impl Decoder for ReasonCode {
             0xa0 => ReasonCode::MaximumConnectTime,
             0xa1 => ReasonCode::SubscriptionIdentifiersNotSupported,
             0xa2 => ReasonCode::WildcardSubscriptionsNotSupported,
-            _ => return Err(ReasonCode::MalformedPacket),
+            _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 
         Ok(Some(reason))
