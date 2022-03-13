@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod connack;
 pub mod connect;
+pub mod control_packet_type;
 pub mod disconnect;
 pub mod pingreq;
 pub mod pingresp;

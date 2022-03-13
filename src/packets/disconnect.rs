@@ -1,14 +1,14 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::control_packet::{ControlPacket, ControlPacketType};
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::properties::ServerReference;
-use crate::properties::SessionExpiryInterval;
-use crate::properties::UserProperty;
-use crate::properties::{Property, ReasonString};
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
+use crate::error::Error;
+use crate::properties::*;
 use crate::reason::ReasonCode;
+use crate::result::Result;
 
-#[derive(Default)]
+use super::control_packet_type::ControlPacketType;
+
+#[derive(Default, PartialEq, Debug)]
 pub struct DisconnectProperties {
     session_expiry_interval: Option<SessionExpiryInterval>,
     reason_string: Option<ReasonString>,
@@ -39,78 +39,56 @@ impl Encoder for DisconnectProperties {
 impl Decoder for DisconnectProperties {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
-        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        use Property::*;
+
+        let len = VariableByteInteger::decode(buffer, None)?;
+        let mut properties = DisconnectProperties::default();
+
         if len.0 == 0 {
-            return Ok(None);
+            return Ok(properties);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(Error::PacketIncomplete);
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
-        let mut properties = DisconnectProperties::default();
 
-        loop {
-            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
-
-            match p {
-                Property::SessionExpiryInterval => {
-                    properties.session_expiry_interval =
-                        SessionExpiryInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ReasonString => {
-                    properties.reason_string = ReasonString::decode(&mut encoded_properties, None)?
-                }
-
-                Property::UserProperty => {
-                    let user_property =
-                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
-
-                    if let Some(v) = &mut properties.user_property {
-                        v.push(user_property);
+        while encoded_properties.has_remaining() {
+            match Property::decode(&mut encoded_properties, None)? {
+                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
+                ReasonString(v) => properties.reason_string = Some(v),
+                UserProperty(v) => {
+                    if let Some(vec) = &mut properties.user_property {
+                        vec.push(v);
                     } else {
-                        let v = vec![user_property];
-                        properties.user_property = Some(v);
+                        let vec = vec![v];
+                        properties.user_property = Some(vec);
                     }
                 }
-
-                Property::ServerReference => {
-                    properties.server_reference =
-                        ServerReference::decode(&mut encoded_properties, None)?
-                }
-
-                _ => return Err(ReasonCode::MalformedPacket),
-            }
-
-            if !encoded_properties.has_remaining() {
-                break;
+                ServerReference(v) => properties.server_reference = Some(v),
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             }
         }
 
-        Ok(Some(properties))
+        Ok(properties)
     }
 }
 
+#[derive(PartialEq, Debug)]
 pub struct DisconnectPacket {
     reason: ReasonCode,
     properties: Option<DisconnectProperties>,
 }
 
-impl ControlPacket for DisconnectPacket {
-    fn packet_type(&self) -> ControlPacketType {
-        ControlPacketType::Disconnect
-    }
+impl ControlPacketType for DisconnectPacket {
+    const PACKET_TYPE: u8 = 0x0d;
 }
 
 impl Encoder for DisconnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8((self.packet_type() as u8) << 4);
+        buffer.put_u8(Self::PACKET_TYPE << 4);
         remaining_len += self.reason.encoded_size();
         remaining_len += self.properties.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
@@ -123,21 +101,17 @@ impl Encoder for DisconnectPacket {
 impl Decoder for DisconnectPacket {
     type Context = ();
 
-    fn decode<T: Buf>(
-        buffer: &mut T,
-        _context: Option<&Self::Context>,
-    ) -> Result<Option<Self>, ReasonCode> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         let reserved = buffer.get_u8() & 0xF;
 
         if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket);
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let reason = ReasonCode::decode(buffer, None)?.unwrap();
-        let properties = DisconnectProperties::decode(buffer, None)?;
-
         let _ = VariableByteInteger::decode(buffer, None); //Remaining length
+        let reason = ReasonCode::decode(buffer, None)?;
+        let properties = Some(DisconnectProperties::decode(buffer, None)?);
 
-        Ok(Some(DisconnectPacket { reason, properties }))
+        Ok(DisconnectPacket { reason, properties })
     }
 }
