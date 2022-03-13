@@ -1,0 +1,48 @@
+name: Rust
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Format
+      run: |
+        rustup component add rustfmt
+        cargo fmt --all -- --check
+
+    - name: Lint
+      run: |
+        rustup component add clippy
+        cargo clippy -- -D warnings
+
+    - name: Build
+      run: cargo build --verbose --release
+
+    - name: Run tests
+      run: cargo test --verbose --lib
+
+    - name: Code audit
+      run: |
+        cargo install cargo-audit
+        cargo audit
+
+    - name: Coverage report
+      uses: actions-rs/tarpaulin@v0.1
+      with:
+        args: "--ignore-tests --out Lcov"
+        
+    - name: Upload to Coveralls
+      uses: coverallsapp/github-action@1.1.3
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        path-to-lcov: "lcov.info"
