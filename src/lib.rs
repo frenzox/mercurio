@@ -2,9 +2,8 @@
 mod result {
     pub type Result<T> = std::result::Result<T, crate::error::Error>;
 }
-mod endec;
+mod codec;
 mod control_packet;
-mod endec;
 mod error;
 mod packets;
 mod properties;

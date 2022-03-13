@@ -2,23 +2,9 @@ use std::mem;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::properties::AuthenticationData;
-use crate::properties::AuthenticationMethod;
-use crate::properties::ContentType;
-use crate::properties::CorrelationData;
-use crate::properties::MaximumPacketSize;
-use crate::properties::MessageExpiryInterval;
-use crate::properties::PayloadFormatIndicator;
-use crate::properties::Property;
-use crate::properties::ReceiveMaximum;
-use crate::properties::RequestProblemInformation;
-use crate::properties::RequestResponseInformation;
-use crate::properties::ResponseTopic;
-use crate::properties::SessionExpiryInterval;
-use crate::properties::TopicAliasMaximum;
-use crate::properties::UserProperty;
-use crate::properties::WillDelayInterval;
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
+use crate::error::Error;
+use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
 use crate::result::Result;
@@ -71,9 +57,9 @@ impl Encoder for ConnectFlags {
 impl Decoder for ConnectFlags {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         if !buffer.has_remaining() {
-            return Ok(None);
+            return Err(Error::PacketIncomplete);
         }
 
         let byte = buffer.get_u8();
@@ -95,7 +81,7 @@ impl Decoder for ConnectFlags {
         }
 
         if flags.will_qos != QoS::Invalid {
-            Ok(Some(flags))
+            Ok(flags)
         } else {
             Err(ReasonCode::MalformedPacket.into())
         }
@@ -148,82 +134,42 @@ impl Encoder for ConnectProperties {
 impl Decoder for ConnectProperties {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        use Property::*;
+
+        let len = VariableByteInteger::decode(buffer, None)?;
+        let mut properties = ConnectProperties::default();
+
         if len.0 == 0 {
-            return Ok(None);
+            return Ok(properties);
         } else if (buffer.remaining() as u32) < len.0 {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
-        let mut connect_properties = ConnectProperties::default();
 
-        loop {
-            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
-
-            match p {
-                Property::SessionExpiryInterval => {
-                    connect_properties.session_expiry_interval =
-                        SessionExpiryInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::AuthenticationMethod => {
-                    connect_properties.authentication_method =
-                        AuthenticationMethod::decode(&mut encoded_properties, None)?
-                }
-
-                Property::AuthenticationData => {
-                    connect_properties.authentication_data =
-                        AuthenticationData::decode(&mut encoded_properties, None)?
-                }
-
-                Property::RequestProblemInformation => {
-                    connect_properties.request_problem_information =
-                        RequestProblemInformation::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ResponseInformation => {
-                    connect_properties.request_response_information =
-                        RequestResponseInformation::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ReceiveMaximum => {
-                    connect_properties.receive_maximum =
-                        ReceiveMaximum::decode(&mut encoded_properties, None)?
-                }
-
-                Property::TopicAliasMaximum => {
-                    connect_properties.topic_alias_maximum =
-                        TopicAliasMaximum::decode(&mut encoded_properties, None)?
-                }
-
-                Property::MaximumPacketSize => {
-                    connect_properties.maximum_packet_size =
-                        MaximumPacketSize::decode(&mut encoded_properties, None)?
-                }
-
-                Property::UserProperty => {
-                    let user_property =
-                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
-
-                    if let Some(v) = &mut connect_properties.user_property {
-                        v.push(user_property);
+        while encoded_properties.has_remaining() {
+            match Property::decode(&mut encoded_properties, None)? {
+                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
+                AuthenticationMethod(v) => properties.authentication_method = Some(v),
+                AuthenticationData(v) => properties.authentication_data = Some(v),
+                RequestProblemInformation(v) => properties.request_problem_information = Some(v),
+                ReceiveMaximum(v) => properties.receive_maximum = Some(v),
+                TopicAliasMaximum(v) => properties.topic_alias_maximum = Some(v),
+                MaximumPacketSize(v) => properties.maximum_packet_size = Some(v),
+                UserProperty(v) => {
+                    if let Some(vec) = &mut properties.user_property {
+                        vec.push(v);
                     } else {
-                        let v = vec![user_property];
-                        connect_properties.user_property = Some(v);
+                        let vec = vec![v];
+                        properties.user_property = Some(vec);
                     }
                 }
-
                 _ => return Err(ReasonCode::MalformedPacket.into()),
-            }
-
-            if !encoded_properties.has_remaining() {
-                break;
             }
         }
 
-        Ok(Some(connect_properties))
+        Ok(properties)
     }
 }
 
@@ -259,6 +205,7 @@ impl Encoder for WillProperties {
         len += self.response_topic.encoded_size();
         len += self.correlation_data.encoded_size();
         len += self.user_property.encoded_size();
+
         len
     }
 }
@@ -266,72 +213,42 @@ impl Encoder for WillProperties {
 impl Decoder for WillProperties {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        use Property::*;
+
+        let len = VariableByteInteger::decode(buffer, None)?;
+        let mut properties = WillProperties::default();
+
         if len.0 == 0 {
-            return Ok(None);
+            return Ok(properties);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
+            return Err(Error::PacketIncomplete);
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
-        let mut will_properties = WillProperties::default();
 
-        loop {
-            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
-
-            match p {
-                Property::WillDelayInterval => {
-                    will_properties.will_delay_interval =
-                        WillDelayInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::PayloadFormatIndicator => {
-                    will_properties.payload_format_indicator =
-                        PayloadFormatIndicator::decode(&mut encoded_properties, None)?
-                }
-
-                Property::MessageExpiryInterval => {
-                    will_properties.message_expiry_interval =
-                        MessageExpiryInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ContentType => {
-                    will_properties.content_type =
-                        ContentType::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ResponseTopic => {
-                    will_properties.response_topic =
-                        ResponseTopic::decode(&mut encoded_properties, None)?
-                }
-
-                Property::CorrelationData => {
-                    will_properties.correlation_data =
-                        CorrelationData::decode(&mut encoded_properties, None)?
-                }
-
-                Property::UserProperty => {
-                    let user_property =
-                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
-
-                    if let Some(v) = &mut will_properties.user_property {
-                        v.push(user_property);
+        while encoded_properties.has_remaining() {
+            match Property::decode(&mut encoded_properties, None)? {
+                WillDelayInterval(v) => properties.will_delay_interval = Some(v),
+                PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
+                MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
+                ContentType(v) => properties.content_type = Some(v),
+                ResponseTopic(v) => properties.response_topic = Some(v),
+                CorrelationData(v) => properties.correlation_data = Some(v),
+                UserProperty(v) => {
+                    if let Some(vec) = &mut properties.user_property {
+                        vec.push(v);
                     } else {
-                        let v = vec![user_property];
-                        will_properties.user_property = Some(v);
+                        let vec = vec![v];
+                        properties.user_property = Some(vec);
                     }
                 }
 
                 _ => return Err(ReasonCode::MalformedPacket.into()),
             }
-
-            if !encoded_properties.has_remaining() {
-                break;
-            }
         }
 
-        Ok(Some(will_properties))
+        Ok(properties)
     }
 }
 
@@ -381,28 +298,27 @@ impl Encoder for ConnectPayload {
 impl Decoder for ConnectPayload {
     type Context = ConnectFlags;
 
-    fn decode<T: Buf>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Option<Self>> {
-        let mut payload = ConnectPayload::default();
-
-        if let Some(client_id) = String::decode(buffer, None)? {
-            payload.client_id = client_id;
-        }
+    fn decode<T: Buf>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Self> {
+        let mut payload = ConnectPayload {
+            client_id: String::decode(buffer, None)?,
+            ..Default::default()
+        };
 
         if context.unwrap().will_flag {
-            payload.will_properties = WillProperties::decode(buffer, None)?;
-            payload.will_topic = String::decode(buffer, None)?;
-            payload.will_payload = Bytes::decode(buffer, None)?;
+            payload.will_properties = Some(WillProperties::decode(buffer, None)?);
+            payload.will_topic = Some(String::decode(buffer, None)?);
+            payload.will_payload = Some(Bytes::decode(buffer, None)?);
         }
 
         if context.unwrap().user_name {
-            payload.user_name = String::decode(buffer, None)?;
+            payload.user_name = Some(String::decode(buffer, None)?);
         }
 
         if context.unwrap().password {
-            payload.password = Bytes::decode(buffer, None)?;
+            payload.password = Some(Bytes::decode(buffer, None)?);
         }
 
-        Ok(Some(payload))
+        Ok(payload)
     }
 }
 
@@ -453,33 +369,31 @@ impl Encoder for ConnectPacket {
 
 impl Decoder for ConnectPacket {
     type Context = ();
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None); //Remaining length
 
-        if let Some(protocol_name) = String::decode(buffer, None)? {
-            if protocol_name != Self::PROTOCOL_NAME {
-                return Err(ReasonCode::MalformedPacket.into());
-            }
+        let protocol_name = String::decode(buffer, None)?;
+        if protocol_name != Self::PROTOCOL_NAME {
+            return Err(ReasonCode::MalformedPacket.into());
         }
 
-        if let Some(protocol_version) = u8::decode(buffer, None)? {
-            if protocol_version != 5 {
-                return Err(ReasonCode::UnsupportedProtocolVersion.into());
-            }
+        let protocol_version = u8::decode(buffer, None)?;
+        if protocol_version != 5 {
+            return Err(ReasonCode::UnsupportedProtocolVersion.into());
         }
 
-        let flags = ConnectFlags::decode(buffer, None)?.unwrap();
-        let keepalive = u16::decode(buffer, None)?.unwrap();
-        let properties = ConnectProperties::decode(buffer, None)?;
-        let payload = ConnectPayload::decode(buffer, Some(&flags))?.unwrap();
+        let flags = ConnectFlags::decode(buffer, None)?;
+        let keepalive = u16::decode(buffer, None)?;
+        let properties = Some(ConnectProperties::decode(buffer, None)?);
+        let payload = ConnectPayload::decode(buffer, Some(&flags))?;
 
-        Ok(Some(ConnectPacket {
+        Ok(ConnectPacket {
             flags,
             keepalive,
             properties,
             payload,
-        }))
+        })
     }
 }
 
@@ -524,9 +438,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes, None)
-            .expect("Unexpected error")
-            .unwrap();
+        let new_packet = ConnectPacket::decode(&mut bytes, None).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -584,9 +496,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes, None)
-            .expect("Unexpected error")
-            .unwrap();
+        let new_packet = ConnectPacket::decode(&mut bytes, None).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

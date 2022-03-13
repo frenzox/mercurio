@@ -1,98 +1,17 @@
-use std::mem;
+use bytes::{Buf, Bytes, BytesMut};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
 use crate::reason::ReasonCode;
 use crate::result::Result;
 
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[allow(clippy::enum_variant_names)] // Warns because of UserProperty
-pub enum Property {
-    PayloadFormatIndicator = 0x01,
-    MessageExpiryInterval = 0x02,
-    ContentType = 0x03,
-    ResponseTopic = 0x08,
-    CorrelationData = 0x09,
-    SubscriptionIdentifier = 0x0b,
-    SessionExpiryInterval = 0x11,
-    AssignedClientIdentifier = 0x12,
-    ServerKeepAlive = 0x13,
-    AuthenticationMethod = 0x15,
-    AuthenticationData = 0x16,
-    RequestProblemInformation = 0x17,
-    WillDelayInterval = 0x18,
-    RequestResponseInformation = 0x19,
-    ResponseInformation = 0x1a,
-    ServerReference = 0x1c,
-    ReasonString = 0x1f,
-    ReceiveMaximum = 0x21,
-    TopicAliasMaximum = 0x22,
-    TopicAlias = 0x23,
-    MaximumQoS = 0x24,
-    RetainAvailable = 0x25,
-    UserProperty = 0x26,
-    MaximumPacketSize = 0x27,
-    WildcardSubscriptionAvailable = 0x28,
-    SubscriptionIdentifierAvailable = 0x29,
-    SharedSubscriptionAvailable = 0x2a,
-}
-
-impl Encoder for Property {
-    fn encode(&self, buffer: &mut BytesMut) {
-        buffer.put_u8(*self as u8);
-    }
-
-    fn encoded_size(&self) -> usize {
-        mem::size_of::<u8>()
-    }
-}
-
-impl Decoder for Property {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-        match buffer.get_u8() {
-            0x01 => Ok(Some(Property::PayloadFormatIndicator)),
-            0x02 => Ok(Some(Property::MessageExpiryInterval)),
-            0x03 => Ok(Some(Property::ContentType)),
-            0x08 => Ok(Some(Property::ResponseTopic)),
-            0x09 => Ok(Some(Property::CorrelationData)),
-            0x0b => Ok(Some(Property::SubscriptionIdentifier)),
-            0x11 => Ok(Some(Property::SessionExpiryInterval)),
-            0x12 => Ok(Some(Property::AssignedClientIdentifier)),
-            0x13 => Ok(Some(Property::ServerKeepAlive)),
-            0x15 => Ok(Some(Property::AuthenticationMethod)),
-            0x16 => Ok(Some(Property::AuthenticationData)),
-            0x17 => Ok(Some(Property::RequestProblemInformation)),
-            0x18 => Ok(Some(Property::WillDelayInterval)),
-            0x19 => Ok(Some(Property::RequestResponseInformation)),
-            0x1a => Ok(Some(Property::ResponseInformation)),
-            0x1c => Ok(Some(Property::ServerReference)),
-            0x1f => Ok(Some(Property::ReasonString)),
-            0x21 => Ok(Some(Property::ReceiveMaximum)),
-            0x22 => Ok(Some(Property::TopicAliasMaximum)),
-            0x23 => Ok(Some(Property::TopicAlias)),
-            0x24 => Ok(Some(Property::MaximumQoS)),
-            0x25 => Ok(Some(Property::RetainAvailable)),
-            0x26 => Ok(Some(Property::UserProperty)),
-            0x27 => Ok(Some(Property::MaximumPacketSize)),
-            0x28 => Ok(Some(Property::WildcardSubscriptionAvailable)),
-            0x29 => Ok(Some(Property::SubscriptionIdentifierAvailable)),
-            0x2a => Ok(Some(Property::SharedSubscriptionAvailable)),
-            _ => Err(ReasonCode::MalformedPacket.into()),
-        }
-    }
-}
-
-macro_rules! endecable_property {
-    ($t:ident {$($n:tt: $s:ty),*})  => {
+macro_rules! define_property {
+    ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
         #[derive(PartialEq)]
         #[derive(Debug)]
         pub struct $t {$($n: $s,)*}
 
         impl $t {
+            pub const $i: u32 = $a;
             pub fn new($($n: $s,)*) -> $t {
                 $t {
                     $($n,)*
@@ -102,7 +21,8 @@ macro_rules! endecable_property {
 
         impl Encoder for $t {
             fn encode(&self, buffer: &mut BytesMut) {
-                Property::$t.encode(buffer);
+                VariableByteInteger(Self::$i).encode(buffer);
+
                 $(
                     self.$n.encode(buffer);
                 )*
@@ -111,7 +31,7 @@ macro_rules! endecable_property {
             fn encoded_size(&self) -> usize {
                 let mut len = 0;
 
-                len += Property::$t.encoded_size();
+                len += VariableByteInteger(Self::$i).encoded_size();
 
                 $(
                     len += self.$n.encoded_size();
@@ -124,42 +44,257 @@ macro_rules! endecable_property {
         impl Decoder for $t {
             type Context = ();
 
-            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-                Ok(Some($t::new($(<$s>::decode(buffer, None)?.unwrap(),)*)))
+            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+                Ok($t::new($(<$s>::decode(buffer, None)?,)*))
             }
         }
     }
 }
 
-endecable_property!(PayloadFormatIndicator { value: u8 });
-endecable_property!(MessageExpiryInterval { value: u32 });
-endecable_property!(ContentType { value: String });
-endecable_property!(ResponseTopic { value: String });
-endecable_property!(CorrelationData { value: Bytes });
-endecable_property!(SubscriptionIdentifier {
+define_property!(PayloadFormatIndicator {
+    ID: 0x01,
+    value: u8
+});
+
+define_property!(MessageExpiryInterval {
+    ID: 0x02,
+    value: u32
+});
+
+define_property!(ContentType {
+    ID: 0x03,
+    value: String
+});
+
+define_property!(ResponseTopic {
+    ID: 0x08,
+    value: String
+});
+
+define_property!(CorrelationData {
+    ID: 0x09,
+    value: Bytes
+});
+
+define_property!(SubscriptionIdentifier {
+    ID: 0x0b,
     value: VariableByteInteger
 });
-endecable_property!(SessionExpiryInterval { value: u32 });
-endecable_property!(AssignedClientIdentifier { value: String });
-endecable_property!(ServerKeepAlive { value: u16 });
-endecable_property!(AuthenticationMethod { value: String });
-endecable_property!(AuthenticationData { value: Bytes });
-endecable_property!(RequestProblemInformation { value: u8 });
-endecable_property!(WillDelayInterval { value: u32 });
-endecable_property!(RequestResponseInformation { value: u8 });
-endecable_property!(ResponseInformation { value: String });
-endecable_property!(ServerReference { value: String });
-endecable_property!(ReasonString { value: String });
-endecable_property!(ReceiveMaximum { value: u16 });
-endecable_property!(TopicAliasMaximum { value: u16 });
-endecable_property!(TopicAlias { value: u16 });
-endecable_property!(MaximumQoS { value: u8 });
-endecable_property!(RetainAvailable { value: bool });
-endecable_property!(UserProperty {
+
+define_property!(SessionExpiryInterval {
+    ID: 0x11,
+    value: u32
+});
+
+define_property!(AssignedClientIdentifier {
+    ID: 0x12,
+    value: String
+});
+
+define_property!(ServerKeepAlive {
+    ID: 0x13,
+    value: u16
+});
+
+define_property!(AuthenticationMethod {
+    ID: 0x15,
+    value: String
+});
+
+define_property!(AuthenticationData {
+    ID: 0x16,
+    value: Bytes
+});
+
+define_property!(RequestProblemInformation {
+    ID: 0x17,
+    value: u8
+});
+
+define_property!(WillDelayInterval {
+    ID: 0x18,
+    value: u32
+});
+
+define_property!(RequestResponseInformation {
+    ID: 0x19,
+    value: u8
+});
+
+define_property!(ResponseInformation {
+    ID: 0x1a,
+    value: String
+});
+
+define_property!(ServerReference {
+    ID: 0x1c,
+    value: String
+});
+
+define_property!(ReasonString {
+    ID: 0x1f,
+    value: String
+});
+
+define_property!(ReceiveMaximum {
+    ID: 0x21,
+    value: u16
+});
+
+define_property!(TopicAliasMaximum {
+    ID: 0x22,
+    value: u16
+});
+
+define_property!(TopicAlias {
+    ID: 0x23,
+    value: u16
+});
+
+define_property!(MaximumQoS {
+    ID: 0x24,
+    value: u8
+});
+
+define_property!(RetainAvailable {
+    ID: 0x25,
+    value: bool
+});
+
+define_property!(UserProperty {
+    ID: 0x26,
     key: String,
     value: String
 });
-endecable_property!(MaximumPacketSize { value: u32 });
-endecable_property!(WildcardSubscriptionAvailable { value: bool });
-endecable_property!(SubscriptionIdentifierAvailable { value: bool });
-endecable_property!(SharedSubscriptionAvailable { value: bool });
+
+define_property!(MaximumPacketSize {
+    ID: 0x27,
+    value: u32
+});
+
+define_property!(WildcardSubscriptionAvailable {
+    ID: 0x28,
+    value: bool
+});
+
+define_property!(SubscriptionIdentifierAvailable {
+    ID: 0x29,
+    value: bool
+});
+
+define_property!(SharedSubscriptionAvailable {
+    ID: 0x2a,
+    value: bool
+});
+
+#[derive(PartialEq, Debug)]
+#[allow(clippy::enum_variant_names)] // Warns because of UserProperty
+pub enum Property {
+    PayloadFormatIndicator(PayloadFormatIndicator),
+    MessageExpiryInterval(MessageExpiryInterval),
+    ContentType(ContentType),
+    ResponseTopic(ResponseTopic),
+    CorrelationData(CorrelationData),
+    SubscriptionIdentifier(SubscriptionIdentifier),
+    SessionExpiryInterval(SessionExpiryInterval),
+    AssignedClientIdentifier(AssignedClientIdentifier),
+    ServerKeepAlive(ServerKeepAlive),
+    AuthenticationMethod(AuthenticationMethod),
+    AuthenticationData(AuthenticationData),
+    RequestProblemInformation(RequestProblemInformation),
+    WillDelayInterval(WillDelayInterval),
+    RequestResponseInformation(RequestResponseInformation),
+    ResponseInformation(ResponseInformation),
+    ServerReference(ServerReference),
+    ReasonString(ReasonString),
+    ReceiveMaximum(ReceiveMaximum),
+    TopicAliasMaximum(TopicAliasMaximum),
+    TopicAlias(TopicAlias),
+    MaximumQoS(MaximumQoS),
+    RetainAvailable(RetainAvailable),
+    UserProperty(UserProperty),
+    MaximumPacketSize(MaximumPacketSize),
+    WildcardSubscriptionAvailable(WildcardSubscriptionAvailable),
+    SubscriptionIdentifierAvailable(SubscriptionIdentifierAvailable),
+    SharedSubscriptionAvailable(SharedSubscriptionAvailable),
+}
+
+impl Decoder for Property {
+    type Context = ();
+
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        let id = VariableByteInteger::decode(buffer, None)?.0;
+        let property = match id {
+            PayloadFormatIndicator::ID => {
+                Property::PayloadFormatIndicator(PayloadFormatIndicator::decode(buffer, None)?)
+            }
+            MessageExpiryInterval::ID => {
+                Property::MessageExpiryInterval(MessageExpiryInterval::decode(buffer, None)?)
+            }
+            ContentType::ID => Property::ContentType(ContentType::decode(buffer, None)?),
+            ResponseTopic::ID => Property::ResponseTopic(ResponseTopic::decode(buffer, None)?),
+            CorrelationData::ID => {
+                Property::CorrelationData(CorrelationData::decode(buffer, None)?)
+            }
+            SubscriptionIdentifier::ID => {
+                Property::SubscriptionIdentifier(SubscriptionIdentifier::decode(buffer, None)?)
+            }
+            SessionExpiryInterval::ID => {
+                Property::SessionExpiryInterval(SessionExpiryInterval::decode(buffer, None)?)
+            }
+            AssignedClientIdentifier::ID => {
+                Property::AssignedClientIdentifier(AssignedClientIdentifier::decode(buffer, None)?)
+            }
+            ServerKeepAlive::ID => {
+                Property::ServerKeepAlive(ServerKeepAlive::decode(buffer, None)?)
+            }
+            AuthenticationMethod::ID => {
+                Property::AuthenticationMethod(AuthenticationMethod::decode(buffer, None)?)
+            }
+            AuthenticationData::ID => {
+                Property::AuthenticationData(AuthenticationData::decode(buffer, None)?)
+            }
+            RequestProblemInformation::ID => Property::RequestProblemInformation(
+                RequestProblemInformation::decode(buffer, None)?,
+            ),
+            WillDelayInterval::ID => {
+                Property::WillDelayInterval(WillDelayInterval::decode(buffer, None)?)
+            }
+            RequestResponseInformation::ID => Property::RequestResponseInformation(
+                RequestResponseInformation::decode(buffer, None)?,
+            ),
+            ResponseInformation::ID => {
+                Property::ResponseInformation(ResponseInformation::decode(buffer, None)?)
+            }
+            ServerReference::ID => {
+                Property::ServerReference(ServerReference::decode(buffer, None)?)
+            }
+            ReasonString::ID => Property::ReasonString(ReasonString::decode(buffer, None)?),
+            ReceiveMaximum::ID => Property::ReceiveMaximum(ReceiveMaximum::decode(buffer, None)?),
+            TopicAliasMaximum::ID => {
+                Property::TopicAliasMaximum(TopicAliasMaximum::decode(buffer, None)?)
+            }
+            TopicAlias::ID => Property::TopicAlias(TopicAlias::decode(buffer, None)?),
+            MaximumQoS::ID => Property::MaximumQoS(MaximumQoS::decode(buffer, None)?),
+            RetainAvailable::ID => {
+                Property::RetainAvailable(RetainAvailable::decode(buffer, None)?)
+            }
+            UserProperty::ID => Property::UserProperty(UserProperty::decode(buffer, None)?),
+            MaximumPacketSize::ID => {
+                Property::MaximumPacketSize(MaximumPacketSize::decode(buffer, None)?)
+            }
+            WildcardSubscriptionAvailable::ID => Property::WildcardSubscriptionAvailable(
+                WildcardSubscriptionAvailable::decode(buffer, None)?,
+            ),
+            SubscriptionIdentifierAvailable::ID => Property::SubscriptionIdentifierAvailable(
+                SubscriptionIdentifierAvailable::decode(buffer, None)?,
+            ),
+            SharedSubscriptionAvailable::ID => Property::SharedSubscriptionAvailable(
+                SharedSubscriptionAvailable::decode(buffer, None)?,
+            ),
+            _ => return Err(ReasonCode::MalformedPacket.into()),
+        };
+
+        Ok(property)
+    }
+}

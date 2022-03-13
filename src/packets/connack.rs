@@ -2,25 +2,9 @@ use std::mem;
 
 use bytes::{Buf, BufMut};
 
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::properties::AssignedClientIdentifier;
-use crate::properties::AuthenticationData;
-use crate::properties::AuthenticationMethod;
-use crate::properties::MaximumPacketSize;
-use crate::properties::MaximumQoS;
-use crate::properties::Property;
-use crate::properties::ReasonString;
-use crate::properties::ReceiveMaximum;
-use crate::properties::ResponseInformation;
-use crate::properties::RetainAvailable;
-use crate::properties::ServerKeepAlive;
-use crate::properties::ServerReference;
-use crate::properties::SessionExpiryInterval;
-use crate::properties::SharedSubscriptionAvailable;
-use crate::properties::SubscriptionIdentifierAvailable;
-use crate::properties::TopicAliasMaximum;
-use crate::properties::UserProperty;
-use crate::properties::WildcardSubscriptionAvailable;
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
+use crate::error::Error;
+use crate::properties::*;
 use crate::reason::ReasonCode;
 use crate::result::Result;
 
@@ -45,16 +29,16 @@ impl Encoder for ConnAckFlags {
 impl Decoder for ConnAckFlags {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         let encoded = buffer.get_u8();
 
         if (0b1111_1110 & encoded) != 0 {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        Ok(Some(ConnAckFlags {
+        Ok(ConnAckFlags {
             session_present: (0b0000_0001 & encoded) != 0,
-        }))
+        })
     }
 }
 
@@ -128,122 +112,57 @@ impl Encoder for ConnAckProperties {
 impl Decoder for ConnAckProperties {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        use Property::*;
+
+        let len = VariableByteInteger::decode(buffer, None)?;
+        let mut properties = ConnAckProperties::default();
+
         if len.0 == 0 {
-            return Ok(None);
+            return Ok(properties);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
+            return Err(Error::PacketIncomplete);
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
-        let mut connack_properties = ConnAckProperties::default();
 
-        loop {
-            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
-
-            match p {
-                Property::SessionExpiryInterval => {
-                    connack_properties.session_expiry_interval =
-                        SessionExpiryInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ReceiveMaximum => {
-                    connack_properties.receive_maximum =
-                        ReceiveMaximum::decode(&mut encoded_properties, None)?
-                }
-
-                Property::MaximumQoS => {
-                    connack_properties.maximum_qos =
-                        MaximumQoS::decode(&mut encoded_properties, None)?
-                }
-
-                Property::RetainAvailable => {
-                    connack_properties.retain_available =
-                        RetainAvailable::decode(&mut encoded_properties, None)?
-                }
-
-                Property::MaximumPacketSize => {
-                    connack_properties.maximum_packet_size =
-                        MaximumPacketSize::decode(&mut encoded_properties, None)?
-                }
-
-                Property::AssignedClientIdentifier => {
-                    connack_properties.assigned_client_id =
-                        AssignedClientIdentifier::decode(&mut encoded_properties, None)?
-                }
-
-                Property::TopicAliasMaximum => {
-                    connack_properties.topic_alias_max =
-                        TopicAliasMaximum::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ReasonString => {
-                    connack_properties.reason_string =
-                        ReasonString::decode(&mut encoded_properties, None)?
-                }
-
-                Property::UserProperty => {
-                    let user_property =
-                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
-
-                    if let Some(v) = &mut connack_properties.user_property {
-                        v.push(user_property);
+        while encoded_properties.has_remaining() {
+            match Property::decode(&mut encoded_properties, None)? {
+                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
+                ReceiveMaximum(v) => properties.receive_maximum = Some(v),
+                MaximumQoS(v) => properties.maximum_qos = Some(v),
+                RetainAvailable(v) => properties.retain_available = Some(v),
+                MaximumPacketSize(v) => properties.maximum_packet_size = Some(v),
+                AssignedClientIdentifier(v) => properties.assigned_client_id = Some(v),
+                TopicAliasMaximum(v) => properties.topic_alias_max = Some(v),
+                ReasonString(v) => properties.reason_string = Some(v),
+                UserProperty(v) => {
+                    if let Some(vec) = &mut properties.user_property {
+                        vec.push(v);
                     } else {
-                        let v = vec![user_property];
-                        connack_properties.user_property = Some(v);
+                        let vec = vec![v];
+                        properties.user_property = Some(vec);
                     }
                 }
-
-                Property::WildcardSubscriptionAvailable => {
-                    connack_properties.wildcard_subscription_available =
-                        WildcardSubscriptionAvailable::decode(&mut encoded_properties, None)?
+                WildcardSubscriptionAvailable(v) => {
+                    properties.wildcard_subscription_available = Some(v)
                 }
-
-                Property::SubscriptionIdentifierAvailable => {
-                    connack_properties.subscription_identifier_available =
-                        SubscriptionIdentifierAvailable::decode(&mut encoded_properties, None)?
+                SubscriptionIdentifierAvailable(v) => {
+                    properties.subscription_identifier_available = Some(v)
                 }
-
-                Property::SharedSubscriptionAvailable => {
-                    connack_properties.shared_subscription_available =
-                        SharedSubscriptionAvailable::decode(&mut encoded_properties, None)?
+                SharedSubscriptionAvailable(v) => {
+                    properties.shared_subscription_available = Some(v)
                 }
-
-                Property::ServerKeepAlive => {
-                    connack_properties.server_keepalive =
-                        ServerKeepAlive::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ResponseInformation => {
-                    connack_properties.response_information =
-                        ResponseInformation::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ServerReference => {
-                    connack_properties.server_reference =
-                        ServerReference::decode(&mut encoded_properties, None)?
-                }
-
-                Property::AuthenticationMethod => {
-                    connack_properties.authentication_method =
-                        AuthenticationMethod::decode(&mut encoded_properties, None)?
-                }
-
-                Property::AuthenticationData => {
-                    connack_properties.authentication_data =
-                        AuthenticationData::decode(&mut encoded_properties, None)?
-                }
-
+                ServerKeepAlive(v) => properties.server_keepalive = Some(v),
+                ResponseInformation(v) => properties.response_information = Some(v),
+                ServerReference(v) => properties.server_reference = Some(v),
+                AuthenticationMethod(v) => properties.authentication_method = Some(v),
+                AuthenticationData(v) => properties.authentication_data = Some(v),
                 _ => return Err(ReasonCode::MalformedPacket.into()),
-            }
-
-            if !encoded_properties.has_remaining() {
-                break;
             }
         }
 
-        Ok(Some(connack_properties))
+        Ok(properties)
     }
 }
 
@@ -279,19 +198,19 @@ impl Encoder for ConnAckPacket {
 impl Decoder for ConnAckPacket {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         buffer.advance(1); // Packet type
         let _ = VariableByteInteger::decode(buffer, None); //Remaining length
 
-        let flags = ConnAckFlags::decode(buffer, None)?.unwrap();
-        let reason_code = ReasonCode::decode(buffer, None)?.unwrap();
-        let properties = ConnAckProperties::decode(buffer, None)?;
+        let flags = ConnAckFlags::decode(buffer, None)?;
+        let reason_code = ReasonCode::decode(buffer, None)?;
+        let properties = Some(ConnAckProperties::decode(buffer, None)?);
 
-        Ok(Some(ConnAckPacket {
+        Ok(ConnAckPacket {
             flags,
             reason_code,
             properties,
-        }))
+        })
     }
 }
 
@@ -346,9 +265,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnAckPacket::decode(&mut bytes, None)
-            .expect("Unexpected error")
-            .unwrap();
+        let new_packet = ConnAckPacket::decode(&mut bytes, None).expect("Unexpected error");
 
         assert_eq!(packet, new_packet);
     }

@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
 use crate::result::Result;
 
 use super::control_packet_type::ControlPacketType;
@@ -24,8 +24,8 @@ impl Encoder for PingReqPacket {
 impl Decoder for PingReqPacket {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         buffer.advance(1);
-        Ok(Some(Self {}))
+        Ok(Self {})
     }
 }

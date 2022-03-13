@@ -3,7 +3,7 @@ use std::io::{Cursor, Seek, SeekFrom};
 use bytes::Buf;
 
 use crate::{
-    endec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
     packets::{
         auth::AuthPacket, connack::ConnAckPacket, connect::ConnectPacket,
@@ -49,10 +49,9 @@ impl ControlPacket {
 
         src.set_position(remaining_len_pos);
 
-        if let Some(remaining_len) = VariableByteInteger::decode(src, None)? {
-            if (len as usize - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
-                return Ok(());
-            }
+        let remaining_len = VariableByteInteger::decode(src, None)?;
+        if (len as usize - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
+            return Ok(());
         }
 
         Err(Error::PacketIncomplete)
@@ -65,46 +64,28 @@ impl ControlPacket {
         let packet_type: u8 = src.get_u8() >> 4;
 
         let packet = match packet_type {
-            ConnectPacket::PACKET_TYPE => {
-                ControlPacket::Connect(ConnectPacket::decode(src, None)?.unwrap())
-            }
-            ConnAckPacket::PACKET_TYPE => {
-                ControlPacket::ConnAck(ConnAckPacket::decode(src, None)?.unwrap())
-            }
-            PublishPacket::PACKET_TYPE => {
-                ControlPacket::Publish(PublishPacket::decode(src, None)?.unwrap())
-            }
-            PubAckPacket::PACKET_TYPE => {
-                ControlPacket::PubAck(PubAckPacket::decode(src, None)?.unwrap())
-            }
-            PubRecPacket::PACKET_TYPE => {
-                ControlPacket::PubRec(PubRecPacket::decode(src, None)?.unwrap())
-            }
-            PubRelPacket::PACKET_TYPE => {
-                ControlPacket::PubRel(PubRelPacket::decode(src, None)?.unwrap())
-            }
-            PubCompPacket::PACKET_TYPE => {
-                ControlPacket::PubComp(PubCompPacket::decode(src, None)?.unwrap())
-            }
+            ConnectPacket::PACKET_TYPE => ControlPacket::Connect(ConnectPacket::decode(src, None)?),
+            ConnAckPacket::PACKET_TYPE => ControlPacket::ConnAck(ConnAckPacket::decode(src, None)?),
+            PublishPacket::PACKET_TYPE => ControlPacket::Publish(PublishPacket::decode(src, None)?),
+            PubAckPacket::PACKET_TYPE => ControlPacket::PubAck(PubAckPacket::decode(src, None)?),
+            PubRecPacket::PACKET_TYPE => ControlPacket::PubRec(PubRecPacket::decode(src, None)?),
+            PubRelPacket::PACKET_TYPE => ControlPacket::PubRel(PubRelPacket::decode(src, None)?),
+            PubCompPacket::PACKET_TYPE => ControlPacket::PubComp(PubCompPacket::decode(src, None)?),
             SubscribePacket::PACKET_TYPE => {
-                ControlPacket::Subscribe(SubscribePacket::decode(src, None)?.unwrap())
+                ControlPacket::Subscribe(SubscribePacket::decode(src, None)?)
             }
-            SubAckPacket::PACKET_TYPE => {
-                ControlPacket::SubAck(SubAckPacket::decode(src, None)?.unwrap())
-            }
+            SubAckPacket::PACKET_TYPE => ControlPacket::SubAck(SubAckPacket::decode(src, None)?),
             UnsubscribePacket::PACKET_TYPE => {
-                ControlPacket::Unsubscribe(UnsubscribePacket::decode(src, None)?.unwrap())
+                ControlPacket::Unsubscribe(UnsubscribePacket::decode(src, None)?)
             }
-            PingReqPacket::PACKET_TYPE => {
-                ControlPacket::PingReq(PingReqPacket::decode(src, None)?.unwrap())
-            }
+            PingReqPacket::PACKET_TYPE => ControlPacket::PingReq(PingReqPacket::decode(src, None)?),
             PingRespPacket::PACKET_TYPE => {
-                ControlPacket::PingResp(PingRespPacket::decode(src, None)?.unwrap())
+                ControlPacket::PingResp(PingRespPacket::decode(src, None)?)
             }
             DisconnectPacket::PACKET_TYPE => {
-                ControlPacket::Disconnect(DisconnectPacket::decode(src, None)?.unwrap())
+                ControlPacket::Disconnect(DisconnectPacket::decode(src, None)?)
             }
-            AuthPacket::PACKET_TYPE => ControlPacket::Auth(AuthPacket::decode(src, None)?.unwrap()),
+            AuthPacket::PACKET_TYPE => ControlPacket::Auth(AuthPacket::decode(src, None)?),
             _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 

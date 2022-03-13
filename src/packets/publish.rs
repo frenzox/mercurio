@@ -1,15 +1,8 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::endec::{Decoder, Encoder, VariableByteInteger};
-use crate::properties::ContentType;
-use crate::properties::CorrelationData;
-use crate::properties::MessageExpiryInterval;
-use crate::properties::PayloadFormatIndicator;
-use crate::properties::Property;
-use crate::properties::ResponseTopic;
-use crate::properties::SubscriptionIdentifier;
-use crate::properties::TopicAlias;
-use crate::properties::UserProperty;
+use crate::codec::{Decoder, Encoder, VariableByteInteger};
+use crate::error::Error;
+use crate::properties::*;
 use crate::qos::QoS;
 use crate::reason::ReasonCode;
 use crate::result::Result;
@@ -58,77 +51,42 @@ impl Encoder for PublishProperties {
 impl Decoder for PublishProperties {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
-        let len = VariableByteInteger::decode(buffer, None)?.unwrap();
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+        use Property::*;
+
+        let len = VariableByteInteger::decode(buffer, None)?;
+        let mut properties = PublishProperties::default();
+
         if len.0 == 0 {
-            return Ok(None);
+            return Ok(properties);
         } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
+            return Err(Error::PacketIncomplete);
         }
 
         let mut encoded_properties = buffer.take(len.0 as usize);
-        let mut publish_properties = PublishProperties::default();
 
-        loop {
-            let p = Property::decode(&mut encoded_properties, None)?.unwrap();
-
-            match p {
-                Property::PayloadFormatIndicator => {
-                    publish_properties.payload_format_indicator =
-                        PayloadFormatIndicator::decode(&mut encoded_properties, None)?
-                }
-
-                Property::MessageExpiryInterval => {
-                    publish_properties.message_expiry_interval =
-                        MessageExpiryInterval::decode(&mut encoded_properties, None)?
-                }
-
-                Property::TopicAlias => {
-                    publish_properties.topic_alias =
-                        TopicAlias::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ResponseTopic => {
-                    publish_properties.response_topic =
-                        ResponseTopic::decode(&mut encoded_properties, None)?
-                }
-
-                Property::CorrelationData => {
-                    publish_properties.correlation_data =
-                        CorrelationData::decode(&mut encoded_properties, None)?
-                }
-
-                Property::UserProperty => {
-                    let user_property =
-                        UserProperty::decode(&mut encoded_properties, None)?.unwrap();
-
-                    if let Some(v) = &mut publish_properties.user_property {
-                        v.push(user_property);
+        while encoded_properties.has_remaining() {
+            match Property::decode(&mut encoded_properties, None)? {
+                PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
+                MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
+                TopicAlias(v) => properties.topic_alias = Some(v),
+                ResponseTopic(v) => properties.response_topic = Some(v),
+                CorrelationData(v) => properties.correlation_data = Some(v),
+                UserProperty(v) => {
+                    if let Some(vec) = &mut properties.user_property {
+                        vec.push(v);
                     } else {
-                        let v = vec![user_property];
-                        publish_properties.user_property = Some(v);
+                        let vec = vec![v];
+                        properties.user_property = Some(vec);
                     }
                 }
-
-                Property::SubscriptionIdentifier => {
-                    publish_properties.subscription_identifier =
-                        SubscriptionIdentifier::decode(&mut encoded_properties, None)?
-                }
-
-                Property::ContentType => {
-                    publish_properties.content_type =
-                        ContentType::decode(&mut encoded_properties, None)?
-                }
-
+                SubscriptionIdentifier(v) => properties.subscription_identifier = Some(v),
+                ContentType(v) => properties.content_type = Some(v),
                 _ => return Err(ReasonCode::MalformedPacket.into()),
-            }
-
-            if !encoded_properties.has_remaining() {
-                break;
             }
         }
 
-        Ok(Some(publish_properties))
+        Ok(properties)
     }
 }
 
@@ -185,18 +143,18 @@ impl Encoder for PublishPacket {
 impl Decoder for PublishPacket {
     type Context = ();
 
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Option<Self>> {
+    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         // Fixed header
         let fixed_header = buffer.get_u8();
         let dup = (fixed_header & 0b0000_1000) != 0;
         let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 1);
         let retain = (fixed_header & 0b0000_0001) != 0;
-        let remaining_len = VariableByteInteger::decode(buffer, None)?.unwrap().0 as usize;
+        let remaining_len = VariableByteInteger::decode(buffer, None)?.0 as usize;
 
         // Variable header
-        let topic_name = String::decode(buffer, None)?.unwrap();
-        let packet_id = u16::decode(buffer, None)?;
-        let properties = PublishProperties::decode(buffer, None)?;
+        let topic_name = String::decode(buffer, None)?;
+        let packet_id = Some(u16::decode(buffer, None)?);
+        let properties = Some(PublishProperties::decode(buffer, None)?);
 
         // Payload
         let payload_len = remaining_len
@@ -211,7 +169,7 @@ impl Decoder for PublishPacket {
 
         let payload = Some(buffer.copy_to_bytes(payload_len));
 
-        Ok(Some(PublishPacket {
+        Ok(PublishPacket {
             dup,
             qos_level,
             retain,
@@ -219,7 +177,7 @@ impl Decoder for PublishPacket {
             packet_id,
             properties,
             payload,
-        }))
+        })
     }
 }
 
@@ -257,9 +215,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PublishPacket::decode(&mut bytes, None)
-            .expect("Unexpected error")
-            .unwrap();
+        let new_packet = PublishPacket::decode(&mut bytes, None).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }
