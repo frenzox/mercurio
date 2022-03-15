@@ -88,10 +88,7 @@ impl Decoder for VariableByteInteger {
     type Context = ();
 
     fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
-        match decode_var_byte_integer(buffer) {
-            Ok(v) => Ok(v),
-            Err(e) => Err(e),
-        }
+        decode_var_byte_integer(buffer)
     }
 }
 
