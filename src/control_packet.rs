@@ -61,31 +61,24 @@ impl ControlPacket {
     where
         Self: Sized,
     {
+        use ControlPacket::*;
         let packet_type: u8 = src.get_u8() >> 4;
 
         let packet = match packet_type {
-            ConnectPacket::PACKET_TYPE => ControlPacket::Connect(ConnectPacket::decode(src, None)?),
-            ConnAckPacket::PACKET_TYPE => ControlPacket::ConnAck(ConnAckPacket::decode(src, None)?),
-            PublishPacket::PACKET_TYPE => ControlPacket::Publish(PublishPacket::decode(src, None)?),
-            PubAckPacket::PACKET_TYPE => ControlPacket::PubAck(PubAckPacket::decode(src, None)?),
-            PubRecPacket::PACKET_TYPE => ControlPacket::PubRec(PubRecPacket::decode(src, None)?),
-            PubRelPacket::PACKET_TYPE => ControlPacket::PubRel(PubRelPacket::decode(src, None)?),
-            PubCompPacket::PACKET_TYPE => ControlPacket::PubComp(PubCompPacket::decode(src, None)?),
-            SubscribePacket::PACKET_TYPE => {
-                ControlPacket::Subscribe(SubscribePacket::decode(src, None)?)
-            }
-            SubAckPacket::PACKET_TYPE => ControlPacket::SubAck(SubAckPacket::decode(src, None)?),
-            UnsubscribePacket::PACKET_TYPE => {
-                ControlPacket::Unsubscribe(UnsubscribePacket::decode(src, None)?)
-            }
-            PingReqPacket::PACKET_TYPE => ControlPacket::PingReq(PingReqPacket::decode(src, None)?),
-            PingRespPacket::PACKET_TYPE => {
-                ControlPacket::PingResp(PingRespPacket::decode(src, None)?)
-            }
-            DisconnectPacket::PACKET_TYPE => {
-                ControlPacket::Disconnect(DisconnectPacket::decode(src, None)?)
-            }
-            AuthPacket::PACKET_TYPE => ControlPacket::Auth(AuthPacket::decode(src, None)?),
+            ConnectPacket::PACKET_TYPE => Connect(ConnectPacket::decode(src, None)?),
+            ConnAckPacket::PACKET_TYPE => ConnAck(ConnAckPacket::decode(src, None)?),
+            PublishPacket::PACKET_TYPE => Publish(PublishPacket::decode(src, None)?),
+            PubAckPacket::PACKET_TYPE => PubAck(PubAckPacket::decode(src, None)?),
+            PubRecPacket::PACKET_TYPE => PubRec(PubRecPacket::decode(src, None)?),
+            PubRelPacket::PACKET_TYPE => PubRel(PubRelPacket::decode(src, None)?),
+            PubCompPacket::PACKET_TYPE => PubComp(PubCompPacket::decode(src, None)?),
+            SubscribePacket::PACKET_TYPE => Subscribe(SubscribePacket::decode(src, None)?),
+            SubAckPacket::PACKET_TYPE => SubAck(SubAckPacket::decode(src, None)?),
+            UnsubscribePacket::PACKET_TYPE => Unsubscribe(UnsubscribePacket::decode(src, None)?),
+            PingReqPacket::PACKET_TYPE => PingReq(PingReqPacket::decode(src, None)?),
+            PingRespPacket::PACKET_TYPE => PingResp(PingRespPacket::decode(src, None)?),
+            DisconnectPacket::PACKET_TYPE => Disconnect(DisconnectPacket::decode(src, None)?),
+            AuthPacket::PACKET_TYPE => Auth(AuthPacket::decode(src, None)?),
             _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 
