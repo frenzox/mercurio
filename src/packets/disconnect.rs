@@ -81,7 +81,7 @@ pub struct DisconnectPacket {
 }
 
 impl ControlPacketType for DisconnectPacket {
-    const PACKET_TYPE: u8 = 0x0d;
+    const PACKET_TYPE: u8 = 0x0e;
 }
 
 impl Encoder for DisconnectPacket {

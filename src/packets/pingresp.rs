@@ -9,7 +9,7 @@ use super::control_packet_type::ControlPacketType;
 pub struct PingRespPacket {}
 
 impl ControlPacketType for PingRespPacket {
-    const PACKET_TYPE: u8 = 0x0c;
+    const PACKET_TYPE: u8 = 0x0d;
 }
 
 impl Encoder for PingRespPacket {
