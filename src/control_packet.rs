@@ -1,6 +1,6 @@
 use std::io::{Cursor, Seek, SeekFrom};
 
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 
 use crate::{
     codec::{Decoder, Encoder, VariableByteInteger},
@@ -38,20 +38,21 @@ pub enum ControlPacket {
 }
 
 impl ControlPacket {
-    pub fn check(src: &mut Cursor<&[u8]>) -> Result<()>
+    pub fn check(src: &mut BytesMut) -> Result<()>
     where
         Self: Sized,
     {
+        let mut peeker = Cursor::new(&src[..]);
         let remaining_len_pos = 1;
 
-        let len = match src.seek(SeekFrom::End(0)) {
+        let len = match peeker.seek(SeekFrom::End(0)) {
             Ok(n) => n,
             Err(err) => return Err(err.into()),
         };
 
-        src.set_position(remaining_len_pos);
+        peeker.set_position(remaining_len_pos);
 
-        let remaining_len = VariableByteInteger::decode(src, None)?;
+        let remaining_len = VariableByteInteger::decode(&mut peeker, None)?;
         if (len as usize - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
             return Ok(());
         }
@@ -59,12 +60,13 @@ impl ControlPacket {
         Err(Error::PacketIncomplete)
     }
 
-    pub fn parse(src: &mut Cursor<&[u8]>) -> Result<ControlPacket>
+    pub fn parse(src: &mut BytesMut) -> Result<ControlPacket>
     where
         Self: Sized,
     {
         use ControlPacket::*;
-        let packet_type: u8 = src.get_u8() >> 4;
+        let mut peeker = Cursor::new(&src[..]);
+        let packet_type: u8 = peeker.get_u8() >> 4;
 
         let packet = match packet_type {
             ConnectPacket::PACKET_TYPE => Connect(ConnectPacket::decode(src, None)?),
