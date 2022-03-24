@@ -81,7 +81,7 @@ pub struct AuthPacket {
 }
 
 impl ControlPacketType for AuthPacket {
-    const PACKET_TYPE: u8 = 0x0e;
+    const PACKET_TYPE: u8 = 0x0f;
 }
 
 impl Encoder for AuthPacket {

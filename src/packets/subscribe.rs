@@ -216,7 +216,8 @@ impl Decoder for SubscribePacket {
 
     fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer, None)?; //Remaining length
+        let remaining_len = VariableByteInteger::decode(buffer, None)?.0 as usize; //Remaining length
+        let buffer_len = buffer.remaining();
 
         let packet_id = u16::decode(buffer, None)?;
         let properties = Some(SubscribeProperties::decode(buffer, None)?);
@@ -225,9 +226,10 @@ impl Decoder for SubscribePacket {
             return Err(ReasonCode::ProtocolError.into());
         }
 
+        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.has_remaining() {
+        while buffer.remaining() > next_packet {
             payload.push(SubscribePayload::decode(buffer, None)?);
         }
 

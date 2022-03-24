@@ -81,7 +81,7 @@ pub struct DisconnectPacket {
 }
 
 impl ControlPacketType for DisconnectPacket {
-    const PACKET_TYPE: u8 = 0x0d;
+    const PACKET_TYPE: u8 = 0x0e;
 }
 
 impl Encoder for DisconnectPacket {
@@ -108,9 +108,19 @@ impl Decoder for DisconnectPacket {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let _ = VariableByteInteger::decode(buffer, None); //Remaining length
-        let reason = ReasonCode::decode(buffer, None)?;
-        let properties = Some(DisconnectProperties::decode(buffer, None)?);
+        let min_len_reason = 1;
+        let min_len_properties = 2;
+
+        let remaining_len = VariableByteInteger::decode(buffer, None)?; //Remaining length
+        let reason = match remaining_len.0.cmp(&min_len_reason) {
+            std::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
+            _ => ReasonCode::decode(buffer, None)?,
+        };
+
+        let properties = match remaining_len.0.cmp(&min_len_properties) {
+            std::cmp::Ordering::Less => None,
+            _ => Some(DisconnectProperties::decode(buffer, None)?),
+        };
 
         Ok(DisconnectPacket { reason, properties })
     }

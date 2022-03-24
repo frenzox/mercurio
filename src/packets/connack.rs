@@ -12,7 +12,7 @@ use super::control_packet_type::ControlPacketType;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnAckFlags {
-    session_present: bool,
+    pub session_present: bool,
 }
 
 impl Encoder for ConnAckFlags {
@@ -168,9 +168,9 @@ impl Decoder for ConnAckProperties {
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnAckPacket {
-    flags: ConnAckFlags,
-    reason_code: ReasonCode,
-    properties: Option<ConnAckProperties>,
+    pub flags: ConnAckFlags,
+    pub reason_code: ReasonCode,
+    pub properties: Option<ConnAckProperties>,
 }
 
 impl Encoder for ConnAckPacket {

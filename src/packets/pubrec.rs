@@ -106,6 +106,7 @@ impl Decoder for PubRecPacket {
 
     fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
         buffer.advance(1);
+
         let _ = VariableByteInteger::decode(buffer, None);
         let packet_id = u16::decode(buffer, None)?;
         let reason = ReasonCode::decode(buffer, None)?;
