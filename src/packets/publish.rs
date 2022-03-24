@@ -153,7 +153,12 @@ impl Decoder for PublishPacket {
 
         // Variable header
         let topic_name = String::decode(buffer, None)?;
-        let packet_id = Some(u16::decode(buffer, None)?);
+        let packet_id = match qos_level {
+            QoS::AtMostOnce => None,
+            QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
+            _ => Some(u16::decode(buffer, None)?),
+        };
+
         let properties = Some(PublishProperties::decode(buffer, None)?);
 
         // Payload
@@ -163,7 +168,7 @@ impl Decoder for PublishPacket {
                 + properties.encoded_size()
                 + VariableByteInteger(properties.encoded_size() as u32).encoded_size());
 
-        if buffer.remaining() != payload_len {
+        if buffer.remaining() < payload_len {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
