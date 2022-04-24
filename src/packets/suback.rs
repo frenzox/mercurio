@@ -1,12 +1,11 @@
 use bytes::{Buf, BytesMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct SubAckProperties {
@@ -31,12 +30,10 @@ impl Encoder for SubAckProperties {
 }
 
 impl Decoder for SubAckProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = SubAckProperties::default();
 
         if len.0 == 0 {
@@ -48,7 +45,7 @@ impl Decoder for SubAckProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 ReasonString(v) => properties.reason_string = Some(v),
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
@@ -68,7 +65,7 @@ impl Decoder for SubAckProperties {
 
 #[derive(Debug, PartialEq)]
 pub struct SubAckPayload {
-    reason_code: ReasonCode,
+    pub(crate) reason_code: ReasonCode,
 }
 
 impl Encoder for SubAckPayload {
@@ -86,10 +83,8 @@ impl Encoder for SubAckPayload {
 }
 
 impl Decoder for SubAckPayload {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
-        let reason_code = ReasonCode::decode(buffer, None)?;
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let reason_code = ReasonCode::decode(buffer)?;
 
         Ok(SubAckPayload { reason_code })
     }
@@ -97,17 +92,19 @@ impl Decoder for SubAckPayload {
 
 #[derive(Debug, PartialEq)]
 pub struct SubAckPacket {
-    packet_id: u16,
-    properties: Option<SubAckProperties>,
-    payload: Vec<SubAckPayload>,
+    pub(crate) packet_id: u16,
+    pub(crate) properties: Option<SubAckProperties>,
+    pub(crate) payload: Vec<SubAckPayload>,
 }
+
+const PACKET_TYPE: u8 = 0x09;
 
 impl Encoder for SubAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
         let mut remaining_len = 0;
 
         // Fixed header
-        let fixed_header: u8 = Self::PACKET_TYPE << 4;
+        let fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header.encode(buffer);
 
         remaining_len += self.packet_id.encoded_size();
@@ -125,15 +122,13 @@ impl Encoder for SubAckPacket {
 }
 
 impl Decoder for SubAckPacket {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer, None)?.0 as usize; //Remaining length
+        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
         let buffer_len = buffer.remaining();
 
-        let packet_id = u16::decode(buffer, None)?;
-        let properties = Some(SubAckProperties::decode(buffer, None)?);
+        let packet_id = u16::decode(buffer)?;
+        let properties = Some(SubAckProperties::decode(buffer)?);
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError.into());
@@ -143,7 +138,7 @@ impl Decoder for SubAckPacket {
         let mut payload = Vec::new();
 
         while buffer.remaining() > next_packet {
-            payload.push(SubAckPayload::decode(buffer, None)?);
+            payload.push(SubAckPayload::decode(buffer)?);
         }
 
         Ok(SubAckPacket {
@@ -152,10 +147,6 @@ impl Decoder for SubAckPacket {
             payload,
         })
     }
-}
-
-impl ControlPacketType for SubAckPacket {
-    const PACKET_TYPE: u8 = 0x09;
 }
 
 #[cfg(test)]
@@ -183,7 +174,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = SubAckPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = SubAckPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

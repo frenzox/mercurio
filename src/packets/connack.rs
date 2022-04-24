@@ -2,13 +2,12 @@ use std::mem;
 
 use bytes::{Buf, BufMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnAckFlags {
@@ -27,9 +26,7 @@ impl Encoder for ConnAckFlags {
 }
 
 impl Decoder for ConnAckFlags {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let encoded = buffer.get_u8();
 
         if (0b1111_1110 & encoded) != 0 {
@@ -110,12 +107,10 @@ impl Encoder for ConnAckProperties {
 }
 
 impl Decoder for ConnAckProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = ConnAckProperties::default();
 
         if len.0 == 0 {
@@ -127,7 +122,7 @@ impl Decoder for ConnAckProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
                 ReceiveMaximum(v) => properties.receive_maximum = Some(v),
                 MaximumQoS(v) => properties.maximum_qos = Some(v),
@@ -173,12 +168,14 @@ pub struct ConnAckPacket {
     pub properties: Option<ConnAckProperties>,
 }
 
+const PACKET_TYPE: u8 = 0x02;
+
 impl Encoder for ConnAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8(Self::PACKET_TYPE << 4);
+        buffer.put_u8(PACKET_TYPE << 4);
         remaining_len += self.flags.encoded_size();
         remaining_len += self.reason_code.encoded_size();
         remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
@@ -196,15 +193,13 @@ impl Encoder for ConnAckPacket {
 }
 
 impl Decoder for ConnAckPacket {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer, None); //Remaining length
+        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
 
-        let flags = ConnAckFlags::decode(buffer, None)?;
-        let reason_code = ReasonCode::decode(buffer, None)?;
-        let properties = Some(ConnAckProperties::decode(buffer, None)?);
+        let flags = ConnAckFlags::decode(buffer)?;
+        let reason_code = ReasonCode::decode(buffer)?;
+        let properties = Some(ConnAckProperties::decode(buffer)?);
 
         Ok(ConnAckPacket {
             flags,
@@ -212,10 +207,6 @@ impl Decoder for ConnAckPacket {
             properties,
         })
     }
-}
-
-impl ControlPacketType for ConnAckPacket {
-    const PACKET_TYPE: u8 = 0x02;
 }
 
 #[cfg(test)]
@@ -265,7 +256,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnAckPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = ConnAckPacket::decode(&mut bytes).expect("Unexpected error");
 
         assert_eq!(packet, new_packet);
     }

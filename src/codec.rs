@@ -2,12 +2,10 @@ use std::mem;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{error::Error, reason::ReasonCode, result::Result};
+use crate::{error::Error, reason::ReasonCode};
 
 pub trait Decoder {
-    type Context;
-
-    fn decode<T>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Self>
+    fn decode<T>(buffer: &mut T) -> crate::Result<Self>
     where
         Self: Sized,
         T: Buf;
@@ -39,7 +37,7 @@ fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
     }
 }
 
-fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<VariableByteInteger> {
+fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByteInteger> {
     let mut multiplier = 1;
     let mut value: u32 = 0;
 
@@ -65,7 +63,7 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> Result<VariableByteIntege
     Ok(VariableByteInteger(value))
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Default)]
 pub struct VariableByteInteger(pub u32);
 
 impl Encoder for VariableByteInteger {
@@ -85,9 +83,7 @@ impl Encoder for VariableByteInteger {
 }
 
 impl Decoder for VariableByteInteger {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         decode_var_byte_integer(buffer)
     }
 }
@@ -104,9 +100,7 @@ impl Encoder for String {
 }
 
 impl Decoder for String {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if buffer.remaining() < 2 {
             return Err(Error::PacketIncomplete);
         }
@@ -143,9 +137,7 @@ impl Encoder for u8 {
 }
 
 impl Decoder for u8 {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if !buffer.has_remaining() {
             return Err(Error::PacketIncomplete);
         }
@@ -161,9 +153,7 @@ impl Encoder for u16 {
 }
 
 impl Decoder for u16 {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if buffer.remaining() < 2 {
             return Err(Error::PacketIncomplete);
         }
@@ -179,9 +169,7 @@ impl Encoder for u32 {
 }
 
 impl Decoder for u32 {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if buffer.remaining() < 4 {
             return Err(Error::PacketIncomplete);
         }
@@ -197,9 +185,7 @@ impl Encoder for bool {
 }
 
 impl Decoder for bool {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if buffer.remaining() < 1 {
             return Err(Error::PacketIncomplete);
         }
@@ -220,9 +206,7 @@ impl Encoder for Bytes {
 }
 
 impl Decoder for Bytes {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if buffer.remaining() < 2 {
             return Err(Error::PacketIncomplete);
         }
@@ -278,18 +262,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::codec::*;
-    use crate::error::Error;
+    use crate::{codec::*, error::Error};
 
     #[test]
-    fn test_codec_encode_decode() -> Result<()> {
+    fn test_codec_encode_decode() -> crate::Result<()> {
         let value: u16 = 325;
         let mut encoded = BytesMut::new();
 
         VariableByteInteger(value as u32).encode(&mut encoded);
         assert_eq!(encoded, Bytes::from(vec![0xc5, 0x02]));
 
-        let decoded = VariableByteInteger::decode(&mut encoded, None)?;
+        let decoded = VariableByteInteger::decode(&mut encoded)?;
         assert_eq!(decoded.0 as u16, value);
 
         Ok(())
@@ -299,7 +282,7 @@ mod tests {
     fn test_decoder_malformed_integer() {
         let mut encoded = Bytes::from(vec![0xc5, 0xc5, 0xc5, 0xc5, 0x02]);
 
-        match VariableByteInteger::decode(&mut encoded, None) {
+        match VariableByteInteger::decode(&mut encoded) {
             Err(Error::MQTTReasonCode(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
             _ => unreachable!(),
         };

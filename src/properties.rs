@@ -1,13 +1,13 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::reason::ReasonCode;
-use crate::result::Result;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    reason::ReasonCode,
+};
 
 macro_rules! def_prop {
     ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
-        #[derive(PartialEq)]
-        #[derive(Debug)]
+        #[derive(Debug, Default, PartialEq)]
         pub struct $t {$($n: $s,)*}
 
         impl $t {
@@ -42,10 +42,8 @@ macro_rules! def_prop {
         }
 
         impl Decoder for $t {
-            type Context = ();
-
-            fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
-                Ok($t::new($(<$s>::decode(buffer, None)?,)*))
+            fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+                Ok($t::new($(<$s>::decode(buffer)?,)*))
             }
         }
     }
@@ -221,12 +219,12 @@ pub enum Property {
 
 macro_rules! dec_prop {
     ($name:ident, $buf: tt) => {
-        Property::$name($name::decode($buf, None)?)
+        Property::$name($name::decode($buf)?)
     };
 }
 
 #[inline(always)]
-fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> Result<Property> {
+fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
     let property = match id {
         PayloadFormatIndicator::ID => dec_prop!(PayloadFormatIndicator, buffer),
         MessageExpiryInterval::ID => dec_prop!(MessageExpiryInterval, buffer),
@@ -262,10 +260,8 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> Result<Property> {
 }
 
 impl Decoder for Property {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
-        let id = VariableByteInteger::decode(buffer, None)?.0;
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let id = VariableByteInteger::decode(buffer)?.0;
 
         decode_with_id(id, buffer)
     }
