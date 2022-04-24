@@ -1,12 +1,11 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PubRecProperties {
@@ -31,12 +30,10 @@ impl Encoder for PubRecProperties {
 }
 
 impl Decoder for PubRecProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = PubRecProperties::default();
 
         if len.0 == 0 {
@@ -48,7 +45,7 @@ impl Decoder for PubRecProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 ReasonString(v) => properties.reason_string = Some(v),
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
@@ -73,15 +70,13 @@ pub struct PubRecPacket {
     properties: Option<PubRecProperties>,
 }
 
-impl ControlPacketType for PubRecPacket {
-    const PACKET_TYPE: u8 = 0x05;
-}
+const PACKET_TYPE: u8 = 0x05;
 
 impl Encoder for PubRecPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
-        buffer.put_u8(Self::PACKET_TYPE << 4);
+        buffer.put_u8(PACKET_TYPE << 4);
 
         remaining_len += self.packet_id.encoded_size();
         remaining_len += self.reason.encoded_size();
@@ -102,15 +97,13 @@ impl Encoder for PubRecPacket {
 }
 
 impl Decoder for PubRecPacket {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1);
 
-        let _ = VariableByteInteger::decode(buffer, None);
-        let packet_id = u16::decode(buffer, None)?;
-        let reason = ReasonCode::decode(buffer, None)?;
-        let properties = Some(PubRecProperties::decode(buffer, None)?);
+        let _ = VariableByteInteger::decode(buffer)?;
+        let packet_id = u16::decode(buffer)?;
+        let reason = ReasonCode::decode(buffer)?;
+        let properties = Some(PubRecProperties::decode(buffer)?);
 
         Ok(PubRecPacket {
             packet_id,
@@ -146,7 +139,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PubRecPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = PubRecPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

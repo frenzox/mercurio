@@ -2,14 +2,13 @@ use std::mem;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::qos::QoS;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    qos::QoS,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct ConnectFlags {
@@ -55,9 +54,7 @@ impl Encoder for ConnectFlags {
 }
 
 impl Decoder for ConnectFlags {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         if !buffer.has_remaining() {
             return Err(Error::PacketIncomplete);
         }
@@ -132,12 +129,10 @@ impl Encoder for ConnectProperties {
 }
 
 impl Decoder for ConnectProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = ConnectProperties::default();
 
         if len.0 == 0 {
@@ -149,7 +144,7 @@ impl Decoder for ConnectProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
                 AuthenticationMethod(v) => properties.authentication_method = Some(v),
                 AuthenticationData(v) => properties.authentication_data = Some(v),
@@ -211,12 +206,10 @@ impl Encoder for WillProperties {
 }
 
 impl Decoder for WillProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = WillProperties::default();
 
         if len.0 == 0 {
@@ -228,7 +221,7 @@ impl Decoder for WillProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 WillDelayInterval(v) => properties.will_delay_interval = Some(v),
                 PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
                 MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
@@ -296,27 +289,11 @@ impl Encoder for ConnectPayload {
 }
 
 impl Decoder for ConnectPayload {
-    type Context = ConnectFlags;
-
-    fn decode<T: Buf>(buffer: &mut T, context: Option<&Self::Context>) -> Result<Self> {
-        let mut payload = ConnectPayload {
-            client_id: String::decode(buffer, None)?,
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let payload = ConnectPayload {
+            client_id: String::decode(buffer)?,
             ..Default::default()
         };
-
-        if context.unwrap().will_flag {
-            payload.will_properties = Some(WillProperties::decode(buffer, None)?);
-            payload.will_topic = Some(String::decode(buffer, None)?);
-            payload.will_payload = Some(Bytes::decode(buffer, None)?);
-        }
-
-        if context.unwrap().user_name {
-            payload.user_name = Some(String::decode(buffer, None)?);
-        }
-
-        if context.unwrap().password {
-            payload.password = Some(Bytes::decode(buffer, None)?);
-        }
 
         Ok(payload)
     }
@@ -324,10 +301,10 @@ impl Decoder for ConnectPayload {
 
 #[derive(PartialEq, Debug)]
 pub struct ConnectPacket {
-    flags: ConnectFlags,
-    keepalive: u16,
-    properties: Option<ConnectProperties>,
-    payload: ConnectPayload,
+    pub flags: ConnectFlags,
+    pub keepalive: u16,
+    pub properties: Option<ConnectProperties>,
+    pub payload: ConnectPayload,
 }
 
 impl ConnectPacket {
@@ -335,16 +312,14 @@ impl ConnectPacket {
     const PROTOCOL_VERSION: u8 = 5;
 }
 
-impl ControlPacketType for ConnectPacket {
-    const PACKET_TYPE: u8 = 0x01;
-}
+const PACKET_TYPE: u8 = 0x01;
 
 impl Encoder for ConnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
         // Fixed header
-        buffer.put_u8(Self::PACKET_TYPE << 4);
+        buffer.put_u8(PACKET_TYPE << 4);
         remaining_len += Self::PROTOCOL_NAME.encoded_size();
         remaining_len += Self::PROTOCOL_VERSION.encoded_size();
         remaining_len += self.flags.encoded_size();
@@ -368,25 +343,38 @@ impl Encoder for ConnectPacket {
 }
 
 impl Decoder for ConnectPacket {
-    type Context = ();
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer, None); //Remaining length
+        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
 
-        let protocol_name = String::decode(buffer, None)?;
+        let protocol_name = String::decode(buffer)?;
         if protocol_name != Self::PROTOCOL_NAME {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let protocol_version = u8::decode(buffer, None)?;
+        let protocol_version = u8::decode(buffer)?;
         if protocol_version != 5 {
             return Err(ReasonCode::UnsupportedProtocolVersion.into());
         }
 
-        let flags = ConnectFlags::decode(buffer, None)?;
-        let keepalive = u16::decode(buffer, None)?;
-        let properties = Some(ConnectProperties::decode(buffer, None)?);
-        let payload = ConnectPayload::decode(buffer, Some(&flags))?;
+        let flags = ConnectFlags::decode(buffer)?;
+        let keepalive = u16::decode(buffer)?;
+        let properties = Some(ConnectProperties::decode(buffer)?);
+        let mut payload = ConnectPayload::decode(buffer)?;
+
+        if flags.will_flag {
+            payload.will_properties = Some(WillProperties::decode(buffer)?);
+            payload.will_topic = Some(String::decode(buffer)?);
+            payload.will_payload = Some(Bytes::decode(buffer)?);
+        }
+
+        if flags.user_name {
+            payload.user_name = Some(String::decode(buffer)?);
+        }
+
+        if flags.password {
+            payload.password = Some(Bytes::decode(buffer)?);
+        }
 
         Ok(ConnectPacket {
             flags,
@@ -404,9 +392,8 @@ mod tests {
     #[test]
     fn test_connect_packet_encoding() {
         let expected = vec![
-            0x10, 0x10, 0x00, 0x04, 0x4d, 0x51, //
-            0x54, 0x54, 0x05, 0x02, 0x00, 0x3c, //
-            0x03, 0x21, 0x00, 0x14, 0x00, 0x00,
+            0x10, 0x10, 0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x05, 0x02, 0x00, 0x3c, 0x03, 0x21,
+            0x00, 0x14, 0x00, 0x00,
         ];
 
         let flags = ConnectFlags {
@@ -438,7 +425,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -496,7 +483,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

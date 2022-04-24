@@ -1,13 +1,12 @@
 use bytes::{Buf, Bytes, BytesMut};
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::qos::QoS;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    qos::QoS,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PublishProperties {
@@ -49,12 +48,10 @@ impl Encoder for PublishProperties {
 }
 
 impl Decoder for PublishProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = PublishProperties::default();
 
         if len.0 == 0 {
@@ -66,7 +63,7 @@ impl Decoder for PublishProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
                 MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
                 TopicAlias(v) => properties.topic_alias = Some(v),
@@ -92,25 +89,23 @@ impl Decoder for PublishProperties {
 
 #[derive(Default, Debug, PartialEq)]
 pub struct PublishPacket {
-    dup: bool,
-    qos_level: QoS,
-    retain: bool,
-    topic_name: String,
-    packet_id: Option<u16>,
-    properties: Option<PublishProperties>,
-    payload: Option<Bytes>,
+    pub(crate) dup: bool,
+    pub(crate) qos_level: QoS,
+    pub(crate) retain: bool,
+    pub(crate) topic_name: String,
+    pub(crate) packet_id: Option<u16>,
+    pub(crate) properties: Option<PublishProperties>,
+    pub(crate) payload: Option<Bytes>,
 }
 
-impl ControlPacketType for PublishPacket {
-    const PACKET_TYPE: u8 = 0x03;
-}
+const PACKET_TYPE: u8 = 0x03;
 
 impl Encoder for PublishPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
         // Fixed header
-        let mut fixed_header: u8 = Self::PACKET_TYPE << 4;
+        let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= (self.dup as u8) << 3;
         fixed_header |= (self.qos_level as u8) << 1;
         fixed_header |= self.retain as u8;
@@ -141,25 +136,23 @@ impl Encoder for PublishPacket {
 }
 
 impl Decoder for PublishPacket {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // Fixed header
         let fixed_header = buffer.get_u8();
         let dup = (fixed_header & 0b0000_1000) != 0;
         let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 1);
         let retain = (fixed_header & 0b0000_0001) != 0;
-        let remaining_len = VariableByteInteger::decode(buffer, None)?.0 as usize;
+        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
 
         // Variable header
-        let topic_name = String::decode(buffer, None)?;
+        let topic_name = String::decode(buffer)?;
         let packet_id = match qos_level {
             QoS::AtMostOnce => None,
             QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
-            _ => Some(u16::decode(buffer, None)?),
+            _ => Some(u16::decode(buffer)?),
         };
 
-        let properties = Some(PublishProperties::decode(buffer, None)?);
+        let properties = Some(PublishProperties::decode(buffer)?);
 
         // Payload
         let payload_len = remaining_len
@@ -220,7 +213,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PublishPacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = PublishPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

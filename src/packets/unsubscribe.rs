@@ -1,12 +1,11 @@
 use bytes::Buf;
 
-use crate::codec::{Decoder, Encoder, VariableByteInteger};
-use crate::error::Error;
-use crate::properties::*;
-use crate::reason::ReasonCode;
-use crate::result::Result;
-
-use super::control_packet_type::ControlPacketType;
+use crate::{
+    codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
+    properties::*,
+    reason::ReasonCode,
+};
 
 #[derive(Default, Debug, PartialEq)]
 pub struct UnsubscribeProperties {
@@ -28,12 +27,10 @@ impl Encoder for UnsubscribeProperties {
 }
 
 impl Decoder for UnsubscribeProperties {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer, None)?;
+        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = UnsubscribeProperties::default();
 
         if len.0 == 0 {
@@ -45,7 +42,7 @@ impl Decoder for UnsubscribeProperties {
         let mut encoded_properties = buffer.take(len.0 as usize);
 
         while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties, None)? {
+            match Property::decode(&mut encoded_properties)? {
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
@@ -82,10 +79,8 @@ impl Encoder for UnsubscribePayload {
 }
 
 impl Decoder for UnsubscribePayload {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
-        let topic_filter = String::decode(buffer, None)?;
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let topic_filter = String::decode(buffer)?;
 
         Ok(UnsubscribePayload { topic_filter })
     }
@@ -98,12 +93,14 @@ pub struct UnsubscribePacket {
     payload: Vec<UnsubscribePayload>,
 }
 
+const PACKET_TYPE: u8 = 0x0a;
+
 impl Encoder for UnsubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
         let mut remaining_len = 0;
 
         // Fixed header
-        let mut fixed_header: u8 = Self::PACKET_TYPE << 4;
+        let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
@@ -122,15 +119,13 @@ impl Encoder for UnsubscribePacket {
 }
 
 impl Decoder for UnsubscribePacket {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _context: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer, None)?.0 as usize; //Remaining length
+        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
         let buffer_len = buffer.remaining();
 
-        let packet_id = u16::decode(buffer, None)?;
-        let properties = Some(UnsubscribeProperties::decode(buffer, None)?);
+        let packet_id = u16::decode(buffer)?;
+        let properties = Some(UnsubscribeProperties::decode(buffer)?);
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError.into());
@@ -140,7 +135,7 @@ impl Decoder for UnsubscribePacket {
         let mut payload = Vec::new();
 
         while buffer.remaining() > next_packet {
-            payload.push(UnsubscribePayload::decode(buffer, None)?);
+            payload.push(UnsubscribePayload::decode(buffer)?);
         }
 
         Ok(UnsubscribePacket {
@@ -149,10 +144,6 @@ impl Decoder for UnsubscribePacket {
             payload,
         })
     }
-}
-
-impl ControlPacketType for UnsubscribePacket {
-    const PACKET_TYPE: u8 = 0x0a;
 }
 
 #[cfg(test)]
@@ -183,7 +174,7 @@ mod tests {
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = UnsubscribePacket::decode(&mut bytes, None).expect("Unexpected error");
+        let new_packet = UnsubscribePacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

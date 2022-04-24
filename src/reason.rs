@@ -3,7 +3,6 @@ use std::{error, fmt};
 use bytes::Buf;
 
 use crate::codec::{Decoder, Encoder};
-use crate::result::Result;
 
 #[derive(Debug, PartialEq)]
 pub enum ReasonCode {
@@ -119,10 +118,9 @@ impl Encoder for ReasonCode {
 }
 
 impl Decoder for ReasonCode {
-    type Context = ();
-
-    fn decode<T: Buf>(buffer: &mut T, _: Option<&Self::Context>) -> Result<Self> {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use ReasonCode::*;
+
         let reason = match buffer.get_u8() {
             0x00 => Success,
             0x01 => GrantedQoS1,
