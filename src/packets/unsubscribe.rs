@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
     user_property: Option<Vec<UserProperty>>,
 }
@@ -59,7 +59,7 @@ impl Decoder for UnsubscribeProperties {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct UnsubscribePayload {
     topic_filter: String,
 }
@@ -86,7 +86,7 @@ impl Decoder for UnsubscribePayload {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct UnsubscribePacket {
     packet_id: u16,
     properties: Option<UnsubscribeProperties>,

@@ -8,7 +8,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct PublishProperties {
     payload_format_indicator: Option<PayloadFormatIndicator>,
     message_expiry_interval: Option<MessageExpiryInterval>,
@@ -87,7 +87,7 @@ impl Decoder for PublishProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct PublishPacket {
     pub(crate) dup: bool,
     pub(crate) qos_level: QoS,

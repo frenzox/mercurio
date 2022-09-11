@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, PartialEq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
     session_expiry_interval: Option<SessionExpiryInterval>,
     reason_string: Option<ReasonString>,
@@ -71,7 +71,7 @@ impl Decoder for DisconnectProperties {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
     pub(crate) reason: ReasonCode,
     pub(crate) properties: Option<DisconnectProperties>,

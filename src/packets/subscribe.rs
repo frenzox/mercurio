@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct SubscribeProperties {
     subscription_id: Option<SubscriptionIdentifier>,
     user_property: Option<Vec<UserProperty>>,
@@ -63,7 +63,7 @@ impl Decoder for SubscribeProperties {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RetainHandling {
     SendRetained = 0x00,
@@ -83,7 +83,7 @@ impl From<u8> for RetainHandling {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubscriptionOptions {
     qos: QoS,
     no_local: bool,
@@ -140,7 +140,7 @@ impl Decoder for SubscriptionOptions {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubscribePayload {
     pub(crate) topic_filter: String,
     pub(crate) subs_opt: SubscriptionOptions,
@@ -174,7 +174,7 @@ impl Decoder for SubscribePayload {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubscribePacket {
     pub(crate) packet_id: u16,
     pub(crate) properties: Option<SubscribeProperties>,

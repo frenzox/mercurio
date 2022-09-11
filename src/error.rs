@@ -1,20 +1,15 @@
+use thiserror::Error;
+
 use crate::reason::ReasonCode;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
+    #[error("Packet is not complete")]
     PacketIncomplete,
-    Io(std::io::Error),
-    MQTTReasonCode(ReasonCode),
-}
 
-impl From<ReasonCode> for Error {
-    fn from(err: ReasonCode) -> Self {
-        Error::MQTTReasonCode(err)
-    }
-}
+    #[error("I/O Error: {0}")]
+    Io(#[from] std::io::Error),
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io(err)
-    }
+    #[error("MQTT Error: {0}")]
+    MQTTReasonCode(#[from] ReasonCode),
 }

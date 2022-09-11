@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
     reason_string: Option<ReasonString>,
     user_property: Option<Vec<UserProperty>>,
@@ -63,7 +63,7 @@ impl Decoder for SubAckProperties {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubAckPayload {
     pub(crate) reason_code: ReasonCode,
 }
@@ -90,7 +90,7 @@ impl Decoder for SubAckPayload {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SubAckPacket {
     pub(crate) packet_id: u16,
     pub(crate) properties: Option<SubAckProperties>,

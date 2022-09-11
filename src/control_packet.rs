@@ -19,7 +19,7 @@ use crate::{
 };
 
 #[repr(u8)]
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum ControlPacket {
     Connect(ConnectPacket),
     ConnAck(ConnAckPacket),

@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, PartialEq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct AuthProperties {
     auth_method: Option<AuthenticationMethod>,
     auth_data: Option<AuthenticationData>,
@@ -71,7 +71,7 @@ impl Decoder for AuthProperties {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct AuthPacket {
     reason: ReasonCode,
     properties: AuthProperties,

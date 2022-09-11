@@ -2,7 +2,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::codec::{Decoder, Encoder, VariableByteInteger};
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct PingReqPacket {}
 
 const PACKET_TYPE: u8 = 0x0c;

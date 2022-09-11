@@ -7,7 +7,7 @@ use crate::{
 
 macro_rules! def_prop {
     ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
-        #[derive(Debug, Default, PartialEq)]
+        #[derive(Debug, Default, PartialEq, Eq)]
         pub struct $t {$($n: $s,)*}
 
         impl $t {
@@ -185,7 +185,7 @@ def_prop!(SharedSubscriptionAvailable {
     value: bool
 });
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 #[allow(clippy::enum_variant_names)] // Warns because of UserProperty
 pub enum Property {
     PayloadFormatIndicator(PayloadFormatIndicator),
