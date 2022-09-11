@@ -1,55 +1,144 @@
-use std::{error, fmt};
-
 use bytes::Buf;
+use thiserror::Error;
 
 use crate::codec::{Decoder, Encoder};
 
-#[derive(Debug, PartialEq)]
+#[derive(Error, Debug, PartialEq, Default)]
 pub enum ReasonCode {
+    #[default]
+    #[error("Success")]
     Success,
+
+    #[error("NormalDisconnection")]
     NormalDisconnection,
+
+    #[error("Granted QoS 0")]
     GrantedQoS0,
+
+    #[error("Granted QoS 1")]
     GrantedQoS1,
+
+    #[error("Granted QoS 2")]
     GrantedQoS2,
+
+    #[error("Disconnect with Will Message")]
     DisconnectWithWillMessage,
+
+    #[error("No matching subscribers")]
     NoMatchingSubscribers,
+
+    #[error("No subscription existed")]
     NoSubscriptionExisted,
+
+    #[error("Continue authentication")]
     ContinueAuthentication,
+
+    #[error("Re-authenticate")]
     ReAuthenticate,
+
+    #[error("Unspecified error")]
     UnspecifiedError,
+
+    #[error("Malformed packet")]
     MalformedPacket,
+
+    #[error("Protocol error")]
     ProtocolError,
+
+    #[error("Implementation specific error")]
     ImplementationSpecificError,
+
+    #[error("Unsupported protocol version")]
     UnsupportedProtocolVersion,
+
+    #[error("Client identifier not valid")]
     ClientIdentifierNotValid,
+
+    #[error("Bad User Name or Password")]
     BadUserNameOrPassword,
+
+    #[error("Not authorized")]
     NotAuthorized,
+
+    #[error("Server unavailable")]
     ServerUnavailable,
+
+    #[error("Server busy")]
     ServerBusy,
+
+    #[error("Banned")]
     Banned,
+
+    #[error("Server shutting down")]
     ServerShuttingDown,
+
+    #[error("Bad authentication method")]
     BadAuthenticationMethod,
+
+    #[error("Keep Alive timeout")]
     KeepAliveTimeout,
+
+    #[error("Session taken over")]
     SessionTakenOver,
+
+    #[error("Topic filter invalid")]
     TopicFilterInvalid,
+
+    #[error("Topic name invalid")]
     TopicNameInvalid,
+
+    #[error("Packet identifier in use")]
     PacketIdentifierInUse,
+
+    #[error("Packet identifier not found")]
     PacketIdentifierNotFound,
+
+    #[error("Receive maximum exceeded")]
     ReceiveMaximumExceeded,
+
+    #[error("Topic alias invalid")]
     TopicAliasInvalid,
+
+    #[error("Packet too large")]
     PacketTooLarge,
+
+    #[error("Message rate too high")]
     MessageRateTooHigh,
+
+    #[error("Quota exceeded")]
     QuotaExceeded,
+
+    #[error("Administrative action")]
     AdministrativeAction,
+
+    #[error("Payload format invalid")]
     PayloadFormatInvalid,
+
+    #[error("Retain not supported")]
     RetainNotSupported,
+
+    #[error("QoS not supported")]
     QoSNotSupported,
+
+    #[error("User another server")]
     UseAnotherServer,
+
+    #[error("Server moved")]
     ServerMoved,
+
+    #[error("Shared subscriptions not supported")]
     SharedSubscriptionsNotSupported,
+
+    #[error("Connection rate exceeded")]
     ConnectionRateExceeded,
+
+    #[error("Maximum connect time")]
     MaximumConnectTime,
+
+    #[error("Subscription indentifiers not supported")]
     SubscriptionIdentifiersNotSupported,
+
+    #[error("Wildcard subscriptions not supported")]
     WildcardSubscriptionsNotSupported,
 }
 
@@ -169,72 +258,5 @@ impl Decoder for ReasonCode {
         };
 
         Ok(reason)
-    }
-}
-
-impl Default for ReasonCode {
-    fn default() -> Self {
-        ReasonCode::Success
-    }
-}
-
-impl error::Error for ReasonCode {}
-impl fmt::Display for ReasonCode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use ReasonCode::*;
-
-        match *self {
-            Success => write!(f, "Succcess"),
-            NormalDisconnection => write!(f, "Normal disconnection"),
-            GrantedQoS0 => write!(f, "Granted QoS 0"),
-            GrantedQoS1 => write!(f, "Granted QoS 1"),
-            GrantedQoS2 => write!(f, "Granted QoS 2"),
-            DisconnectWithWillMessage => write!(f, "Disconnect with Will Message"),
-            NoMatchingSubscribers => write!(f, "No matching subscribers"),
-            NoSubscriptionExisted => write!(f, "No subscriptions existed"),
-            ContinueAuthentication => write!(f, "Continue authentication"),
-            ReAuthenticate => write!(f, "Re-authenticate"),
-            UnspecifiedError => write!(f, "Unspecified error"),
-            MalformedPacket => write!(f, "Malformed packet"),
-            ProtocolError => writeln!(f, "Protocol error"),
-            ImplementationSpecificError => write!(f, "Implementation specific error"),
-            UnsupportedProtocolVersion => write!(f, "Unsupported protocol version"),
-            ClientIdentifierNotValid => write!(f, "Client identifier not valid"),
-            BadUserNameOrPassword => write!(f, "Bad User Name or Password"),
-            NotAuthorized => write!(f, "Not authorized"),
-            ServerUnavailable => write!(f, "Server unavailable"),
-            ServerBusy => write!(f, "Server busy"),
-            Banned => write!(f, "Banned"),
-            ServerShuttingDown => write!(f, "Server shutting down"),
-            BadAuthenticationMethod => write!(f, "Bad authentication method"),
-            KeepAliveTimeout => write!(f, "Keep Alive timeout"),
-            SessionTakenOver => write!(f, "Session taken over"),
-            TopicFilterInvalid => write!(f, "Topic filter invalid"),
-            TopicNameInvalid => write!(f, "Topic name invalid"),
-            PacketIdentifierInUse => write!(f, "Packet identifier in use"),
-            PacketIdentifierNotFound => write!(f, "Packet identifier not found"),
-            ReceiveMaximumExceeded => write!(f, "Receive maximum exceeded"),
-            TopicAliasInvalid => write!(f, "Topic alias invalid"),
-            PacketTooLarge => write!(f, "Packet too large"),
-            MessageRateTooHigh => write!(f, "Message rate too high"),
-            QuotaExceeded => write!(f, "Quota exceeded"),
-            AdministrativeAction => write!(f, "Administrative action"),
-            PayloadFormatInvalid => write!(f, "Payload format invalid"),
-            RetainNotSupported => write!(f, "Retain not supported"),
-            QoSNotSupported => write!(f, "QoS not supported"),
-            UseAnotherServer => write!(f, "User another server"),
-            ServerMoved => write!(f, "Server moved"),
-            SharedSubscriptionsNotSupported => {
-                write!(f, "Shared subscriptions not supported")
-            }
-            ConnectionRateExceeded => write!(f, "Connection rate exceeded"),
-            MaximumConnectTime => write!(f, "Maximum connect time"),
-            SubscriptionIdentifiersNotSupported => {
-                write!(f, "Subscription indentifiers not supported")
-            }
-            WildcardSubscriptionsNotSupported => {
-                write!(f, "Wildcard subscriptions not supported")
-            }
-        }
     }
 }
