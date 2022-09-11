@@ -10,7 +10,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnectFlags {
     pub user_name: bool,
     pub password: bool,
@@ -85,7 +85,7 @@ impl Decoder for ConnectFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnectProperties {
     pub session_expiry_interval: Option<SessionExpiryInterval>,
     pub receive_maximum: Option<ReceiveMaximum>,
@@ -168,7 +168,7 @@ impl Decoder for ConnectProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct WillProperties {
     pub will_delay_interval: Option<WillDelayInterval>,
     pub payload_format_indicator: Option<PayloadFormatIndicator>,
@@ -245,7 +245,7 @@ impl Decoder for WillProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, Eq, PartialEq)]
 pub struct ConnectPayload {
     pub client_id: String,
     pub will_properties: Option<WillProperties>,
@@ -299,7 +299,7 @@ impl Decoder for ConnectPayload {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct ConnectPacket {
     pub flags: ConnectFlags,
     pub keepalive: u16,

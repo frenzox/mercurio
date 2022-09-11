@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::codec::{Decoder, Encoder};
 
-#[derive(Error, Debug, PartialEq, Default)]
+#[derive(Error, Debug, PartialEq, Eq, Default)]
 pub enum ReasonCode {
     #[default]
     #[error("Success")]

@@ -9,7 +9,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
     pub session_present: bool,
 }
@@ -39,7 +39,7 @@ impl Decoder for ConnAckFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnAckProperties {
     pub session_expiry_interval: Option<SessionExpiryInterval>,
     pub receive_maximum: Option<ReceiveMaximum>,
@@ -161,7 +161,7 @@ impl Decoder for ConnAckProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
     pub flags: ConnAckFlags,
     pub reason_code: ReasonCode,

@@ -7,7 +7,7 @@ use crate::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubCompProperties {
     reason_string: Option<ReasonString>,
     user_property: Option<Vec<UserProperty>>,
@@ -63,7 +63,7 @@ impl Decoder for PubCompProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubCompPacket {
     packet_id: u16,
     reason: ReasonCode,
