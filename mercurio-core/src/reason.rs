@@ -120,7 +120,7 @@ pub enum ReasonCode {
     #[error("QoS not supported")]
     QoSNotSupported,
 
-    #[error("User another server")]
+    #[error("Use another server")]
     UseAnotherServer,
 
     #[error("Server moved")]
