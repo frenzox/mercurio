@@ -1,6 +1,7 @@
 #[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum QoS {
+    #[default]
     AtMostOnce = 0,
     AtLeastOnce = 1,
     ExactlyOnce = 2,
@@ -15,12 +16,6 @@ impl From<u8> for QoS {
             0x02 => QoS::ExactlyOnce,
             _ => QoS::Invalid,
         }
-    }
-}
-
-impl Default for QoS {
-    fn default() -> Self {
-        QoS::AtMostOnce
     }
 }
 
