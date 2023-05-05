@@ -8,7 +8,7 @@ use tracing::info;
 type Messages = Pin<Box<dyn Stream<Item = Message> + Send>>;
 
 use mercurio_core::{
-    message::Message, properties::AssignedClientIdentifier, reason::ReasonCode, Result,
+    message::Message, properties::AssignedClientIdentifier, qos::QoS, reason::ReasonCode, Result,
 };
 use mercurio_packets::{
     connack::{ConnAckPacket, ConnAckProperties},
@@ -112,7 +112,7 @@ impl Session {
         &mut self,
         packet: ControlPacket,
         broker: &Broker,
-    ) -> Result<ControlPacket> {
+    ) -> Result<Option<ControlPacket>> {
         match packet {
             ControlPacket::Connect(_) => Err(ReasonCode::ProtocolError.into()),
             ControlPacket::ConnAck(_) => Err(ReasonCode::ProtocolError.into()),
@@ -129,7 +129,11 @@ impl Session {
 
                 broker.publish(&topic, message)?;
 
-                Ok(ControlPacket::PubAck(PubAckPacket::default()))
+                if p.qos_level == QoS::AtMostOnce {
+                    return Ok(None);
+                }
+
+                Ok(ControlPacket::PubAck(PubAckPacket::default()).into())
             }
             ControlPacket::PubAck(_) => todo!(),
             ControlPacket::PubRec(_) => todo!(),
@@ -165,14 +169,14 @@ impl Session {
                         .insert(sub.topic_filter.to_string(), rx);
                 }
 
-                Ok(ControlPacket::SubAck(ack))
+                Ok(ControlPacket::SubAck(ack).into())
             }
             ControlPacket::SubAck(_) => todo!(),
             ControlPacket::Unsubscribe(_) => todo!(),
             ControlPacket::UnsubAck(_) => todo!(),
-            ControlPacket::PingReq(_) => Ok(ControlPacket::PingResp(PingRespPacket {})),
+            ControlPacket::PingReq(_) => Ok(ControlPacket::PingResp(PingRespPacket {}).into()),
             ControlPacket::PingResp(_) => todo!(),
-            ControlPacket::Disconnect(p) => Ok(ControlPacket::Disconnect(p)),
+            ControlPacket::Disconnect(p) => Ok(ControlPacket::Disconnect(p).into()),
             ControlPacket::Auth(_) => todo!(),
         }
     }

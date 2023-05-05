@@ -121,13 +121,15 @@ impl Handler {
                         Some(packet) => packet,
                     };
 
-                    let ack = session
+                    let maybe_res = session
                         .process_incoming(
                             packet,
                             &self.broker,
                         ).await?;
 
-                    self.connection.write_packet(ack).await?;
+                    if let Some(res) = maybe_res {
+                        self.connection.write_packet(res).await?;
+                    }
                 }
 
                 // Try to send outgoing packet
