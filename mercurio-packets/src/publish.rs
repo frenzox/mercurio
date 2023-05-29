@@ -8,7 +8,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct PublishProperties {
     payload_format_indicator: Option<PayloadFormatIndicator>,
     message_expiry_interval: Option<MessageExpiryInterval>,
@@ -87,7 +87,7 @@ impl Decoder for PublishProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct PublishPacket {
     pub dup: bool,
     pub qos_level: QoS,

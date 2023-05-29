@@ -65,9 +65,9 @@ impl Decoder for PubRecProperties {
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubRecPacket {
-    packet_id: u16,
-    reason: ReasonCode,
-    properties: Option<PubRecProperties>,
+    pub packet_id: u16,
+    pub reason: ReasonCode,
+    pub properties: Option<PubRecProperties>,
 }
 
 const PACKET_TYPE: u8 = 0x05;
@@ -79,13 +79,21 @@ impl Encoder for PubRecPacket {
         buffer.put_u8(PACKET_TYPE << 4);
 
         remaining_len += self.packet_id.encoded_size();
-        remaining_len += self.reason.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
+        if self.properties.is_some() || self.reason != ReasonCode::Success {
+            remaining_len += self.reason.encoded_size();
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+        }
 
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
+
+        if remaining_len == 2 {
+            return;
+        }
+
         self.reason.encode(buffer);
         VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
@@ -100,8 +108,17 @@ impl Decoder for PubRecPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1);
 
-        let _ = VariableByteInteger::decode(buffer)?;
+        let remaining_len = VariableByteInteger::decode(buffer)?;
         let packet_id = u16::decode(buffer)?;
+
+        if remaining_len.0 == 2 {
+            return Ok(PubRecPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            });
+        }
+
         let reason = ReasonCode::decode(buffer)?;
         let properties = Some(PubRecProperties::decode(buffer)?);
 

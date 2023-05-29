@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 use mercurio_core::Result;
 use mercurio_packets::connect::ConnectPacket;
@@ -21,7 +21,6 @@ pub(crate) struct SessionManager {
 
 struct Shared {
     state: Mutex<State>,
-    background_task: Notify,
 }
 
 struct State {
@@ -46,7 +45,6 @@ impl SessionManager {
             state: Mutex::new(State {
                 sessions: HashMap::new(),
             }),
-            background_task: Notify::new(),
         });
 
         SessionManager { shared }
