@@ -3,11 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rand::{self, prelude::SliceRandom};
 use tokio::sync::broadcast;
 
 use crate::topic_tree::TopicTree;
 use mercurio_core::{message::Message, Result};
+
+const CHANNEL_SIZE: usize = 5;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Broker {
@@ -24,13 +25,6 @@ struct State {
     subscriptions: TopicTree<Message>,
     shared_subscriptions: HashMap<String, HashMap<String, Vec<broadcast::Sender<Message>>>>,
 }
-
-fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    let mut rng = rand::thread_rng();
-    vec.choose(&mut rng)
-}
-
-const CHANNEL_SIZE: usize = 5;
 
 impl Broker {
     pub(crate) fn new() -> Broker {

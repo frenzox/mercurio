@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod broker;
 pub mod connection;
 pub mod server;

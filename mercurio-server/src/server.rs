@@ -57,6 +57,7 @@ impl Listener {
     async fn run(&mut self) -> Result<()> {
         loop {
             let socket = self.accept().await?;
+
             info!("Got a connection: {:#?}", socket.peer_addr());
 
             let mut handler = Handler {
@@ -128,12 +129,15 @@ impl Handler {
                         ).await?;
 
                     if let Some(res) = maybe_res {
+                        tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
                         self.connection.write_packet(res).await?;
                     }
                 }
 
                 // Try to send outgoing packet
                 Some(packet) = session.process_outgoing() => {
+                    tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", packet, session.get_client_id().await);
+
                     self.connection.write_packet(packet).await?;
                 }
 

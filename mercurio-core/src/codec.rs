@@ -63,7 +63,7 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
     Ok(VariableByteInteger(value))
 }
 
-#[derive(PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default, Clone)]
 pub struct VariableByteInteger(pub u32);
 
 impl Encoder for VariableByteInteger {

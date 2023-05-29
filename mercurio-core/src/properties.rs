@@ -7,8 +7,8 @@ use crate::{
 
 macro_rules! def_prop {
     ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
-        #[derive(Debug, Default, PartialEq, Eq)]
-        pub struct $t {$($n: $s,)*}
+        #[derive(Debug, Default, PartialEq, Eq, Clone)]
+        pub struct $t {$(pub $n: $s,)*}
 
         impl $t {
             pub const $i: u32 = $a;

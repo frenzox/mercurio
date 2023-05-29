@@ -11,18 +11,16 @@ use tracing::error;
 struct TopicNode<T: Clone> {
     channel: broadcast::Sender<T>,
     children: HashMap<String, TopicNode<T>>,
-    n_subs: u32,
     level: usize,
 }
 
 impl<T: Clone> TopicNode<T> {
     pub fn new(level: usize) -> TopicNode<T> {
-        let (sender, _) = broadcast::channel(5); //TODO: What size should this actually be?
+        let (sender, _) = broadcast::channel(5); // TODO: What size should this actually be?
 
         TopicNode {
             channel: sender,
             children: HashMap::new(),
-            n_subs: 0,
             level,
         }
     }

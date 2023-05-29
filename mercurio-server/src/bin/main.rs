@@ -14,6 +14,7 @@ async fn main() -> mercurio_core::Result<()> {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
     let listener = TcpListener::bind("127.0.0.1:1883").await?;
     server::run(listener, signal::ctrl_c()).await;
 
