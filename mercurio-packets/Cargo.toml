@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 bytes = "1.0"
-thiserror = "1.0.34"
+thiserror = "1.0.38"
 
 mercurio-core = { path = "../mercurio-core" }
