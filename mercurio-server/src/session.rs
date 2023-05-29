@@ -43,8 +43,6 @@ struct State {
     subscriptions: StreamMap<String, Messages>,
     unacknowledged_messages: Vec<PublishPacket>,
     pubrecs: Vec<PubRecPacket>,
-    tx_pending_messages: Vec<Message>,
-    expiry: Option<tokio::time::Instant>,
 }
 
 impl SessionDropGuard {
@@ -61,19 +59,6 @@ impl SessionDropGuard {
 
 impl Session {
     pub fn new(connect_packet: ConnectPacket) -> Self {
-        let expiry = connect_packet
-            .properties
-            .as_ref()
-            .map(|p| {
-                p.session_expiry_interval
-                    .as_ref()
-                    .map(|session_expiry_interval| {
-                        tokio::time::Instant::now()
-                            + std::time::Duration::from_secs(session_expiry_interval.value.into())
-                    })
-            })
-            .flatten();
-
         Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -81,8 +66,6 @@ impl Session {
                     subscriptions: StreamMap::new(),
                     unacknowledged_messages: Vec::new(),
                     pubrecs: Vec::new(),
-                    tx_pending_messages: Vec::new(),
-                    expiry,
                 }),
             }),
         }
