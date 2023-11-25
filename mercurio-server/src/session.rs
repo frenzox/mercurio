@@ -286,7 +286,7 @@ impl Session {
             ControlPacket::Auth(_) => todo!(),
 
             // Some packets are not supposed to be received by the server.
-            // Namely: ConnAck, Unsubscribe, UnsubAck, PingResp
+            // Namely: ConnAck, UnsubAck, PingResp
             // The Connect packet is handled before the session is created.
             _ => Err(ReasonCode::ProtocolError.into()),
         }
