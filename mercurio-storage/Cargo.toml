@@ -5,11 +5,17 @@ edition = "2021"
 description = "Storage abstraction layer for Mercurio MQTT broker"
 license = "MIT"
 
+[features]
+default = []
+sqlite = ["dep:rusqlite", "dep:tokio"]
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core" }
 async-trait = "0.1"
 bytes = "1"
 thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
