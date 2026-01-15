@@ -234,12 +234,19 @@ impl Session {
         };
 
         for sub in &packet.payload {
-            let mut rx = broker.subscribe(&sub.topic_filter);
+            let (mut rx, retained_messages) = broker.subscribe(&sub.topic_filter);
             ack.payload.push(SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS0,
             });
 
-            let rx = Box::pin(async_stream::stream! {
+            // Create a stream that first yields retained messages, then live messages
+            let stream = Box::pin(async_stream::stream! {
+                // First deliver any retained messages
+                for msg in retained_messages {
+                    yield msg;
+                }
+
+                // Then continue with live messages
                 loop {
                     match rx.recv().await {
                         Ok(msg) => yield msg,
@@ -252,7 +259,7 @@ impl Session {
 
             session
                 .subscriptions
-                .insert(sub.topic_filter.to_string(), rx);
+                .insert(sub.topic_filter.to_string(), stream);
         }
 
         Ok(Some(ControlPacket::SubAck(ack)))
