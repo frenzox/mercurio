@@ -20,6 +20,8 @@ use mercurio_packets::{
     pubrec::PubRecPacket,
     pubrel::PubRelPacket,
     suback::{SubAckPacket, SubAckPayload},
+    unsuback::{UnsubAckPacket, UnsubAckPayload},
+    unsubscribe::UnsubscribePacket,
     ControlPacket,
 };
 
@@ -256,6 +258,32 @@ impl Session {
         Ok(Some(ControlPacket::SubAck(ack)))
     }
 
+    async fn handle_unsubscribe(
+        &mut self,
+        packet: UnsubscribePacket,
+    ) -> Result<Option<ControlPacket>> {
+        let mut session = self.shared.state.lock().await;
+        let mut ack = UnsubAckPacket {
+            packet_id: packet.packet_id,
+            properties: None,
+            payload: Vec::with_capacity(packet.payload.len()),
+        };
+
+        for unsub in &packet.payload {
+            // Remove the subscription from the StreamMap
+            // Returns Some if the subscription existed, None otherwise
+            let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
+                ReasonCode::Success
+            } else {
+                ReasonCode::NoSubscriptionExisted
+            };
+
+            ack.payload.push(UnsubAckPayload { reason_code });
+        }
+
+        Ok(Some(ControlPacket::UnsubAck(ack)))
+    }
+
     pub(crate) async fn process_incoming(
         &mut self,
         packet: ControlPacket,
@@ -268,7 +296,7 @@ impl Session {
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
             ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker).await,
-            ControlPacket::Unsubscribe(_) => todo!(),
+            ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
             ControlPacket::Auth(_) => todo!(),

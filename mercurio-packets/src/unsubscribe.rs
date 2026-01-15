@@ -61,7 +61,7 @@ impl Decoder for UnsubscribeProperties {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubscribePayload {
-    topic_filter: String,
+    pub topic_filter: String,
 }
 
 impl Encoder for UnsubscribePayload {
@@ -88,9 +88,9 @@ impl Decoder for UnsubscribePayload {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubscribePacket {
-    packet_id: u16,
-    properties: Option<UnsubscribeProperties>,
-    payload: Vec<UnsubscribePayload>,
+    pub packet_id: u16,
+    pub properties: Option<UnsubscribeProperties>,
+    pub payload: Vec<UnsubscribePayload>,
 }
 
 const PACKET_TYPE: u8 = 0x0a;

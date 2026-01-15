@@ -65,7 +65,7 @@ impl Decoder for UnsubAckProperties {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubAckPayload {
-    reason_code: ReasonCode,
+    pub reason_code: ReasonCode,
 }
 
 impl Encoder for UnsubAckPayload {
@@ -92,9 +92,9 @@ impl Decoder for UnsubAckPayload {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubAckPacket {
-    packet_id: u16,
-    properties: Option<UnsubAckProperties>,
-    payload: Vec<UnsubAckPayload>,
+    pub packet_id: u16,
+    pub properties: Option<UnsubAckProperties>,
+    pub payload: Vec<UnsubAckPayload>,
 }
 
 const PACKET_TYPE: u8 = 0x0b;
