@@ -83,7 +83,13 @@ impl From<u8> for RetainHandling {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl Default for RetainHandling {
+    fn default() -> Self {
+        Self::SendRetained
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionOptions {
     qos: QoS,
     no_local: bool,

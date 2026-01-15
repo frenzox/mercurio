@@ -343,3 +343,148 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mercurio_packets::{
+        connect::{ConnectFlags, ConnectPayload},
+        subscribe::{SubscribePayload, SubscriptionOptions},
+        unsubscribe::UnsubscribePayload,
+    };
+
+    fn create_test_session() -> Session {
+        let connect_packet = ConnectPacket {
+            flags: ConnectFlags::default(),
+            keepalive: 60,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "test-client".to_string(),
+                will_properties: None,
+                will_topic: None,
+                will_payload: None,
+                user_name: None,
+                password: None,
+            },
+        };
+        Session::new(connect_packet)
+    }
+
+    fn default_subscription_options() -> SubscriptionOptions {
+        SubscriptionOptions::default()
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_nonexistent_topic() {
+        let mut session = create_test_session();
+
+        let packet = UnsubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: "nonexistent/topic".to_string(),
+            }],
+        };
+
+        let result = session.handle_unsubscribe(packet).await.unwrap();
+
+        match result {
+            Some(ControlPacket::UnsubAck(ack)) => {
+                assert_eq!(ack.packet_id, 1);
+                assert_eq!(ack.payload.len(), 1);
+                assert_eq!(ack.payload[0].reason_code, ReasonCode::NoSubscriptionExisted);
+            }
+            _ => panic!("Expected UnsubAck packet"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_existing_topic() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new();
+
+        // First subscribe to a topic
+        let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![SubscribePayload {
+                topic_filter: "test/topic".to_string(),
+                subs_opt: default_subscription_options(),
+            }],
+        };
+        session.handle_subscribe(subscribe_packet, &broker).await.unwrap();
+
+        // Now unsubscribe
+        let unsub_packet = UnsubscribePacket {
+            packet_id: 2,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: "test/topic".to_string(),
+            }],
+        };
+
+        let result = session.handle_unsubscribe(unsub_packet).await.unwrap();
+
+        match result {
+            Some(ControlPacket::UnsubAck(ack)) => {
+                assert_eq!(ack.packet_id, 2);
+                assert_eq!(ack.payload.len(), 1);
+                assert_eq!(ack.payload[0].reason_code, ReasonCode::Success);
+            }
+            _ => panic!("Expected UnsubAck packet"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_multiple_topics() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new();
+
+        // Subscribe to two topics
+        let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![
+                SubscribePayload {
+                    topic_filter: "topic/one".to_string(),
+                    subs_opt: default_subscription_options(),
+                },
+                SubscribePayload {
+                    topic_filter: "topic/two".to_string(),
+                    subs_opt: default_subscription_options(),
+                },
+            ],
+        };
+        session.handle_subscribe(subscribe_packet, &broker).await.unwrap();
+
+        // Unsubscribe from one existing, one non-existing
+        let unsub_packet = UnsubscribePacket {
+            packet_id: 3,
+            properties: None,
+            payload: vec![
+                UnsubscribePayload {
+                    topic_filter: "topic/one".to_string(),
+                },
+                UnsubscribePayload {
+                    topic_filter: "topic/nonexistent".to_string(),
+                },
+                UnsubscribePayload {
+                    topic_filter: "topic/two".to_string(),
+                },
+            ],
+        };
+
+        let result = session.handle_unsubscribe(unsub_packet).await.unwrap();
+
+        match result {
+            Some(ControlPacket::UnsubAck(ack)) => {
+                assert_eq!(ack.packet_id, 3);
+                assert_eq!(ack.payload.len(), 3);
+                assert_eq!(ack.payload[0].reason_code, ReasonCode::Success);
+                assert_eq!(ack.payload[1].reason_code, ReasonCode::NoSubscriptionExisted);
+                assert_eq!(ack.payload[2].reason_code, ReasonCode::Success);
+            }
+            _ => panic!("Expected UnsubAck packet"),
+        }
+    }
+}
