@@ -225,7 +225,9 @@ where
     T: Encoder,
 {
     fn encode(&self, buffer: &mut BytesMut) {
-        if let Some(v) = self { v.encode(buffer) }
+        if let Some(v) = self {
+            v.encode(buffer)
+        }
     }
 
     fn encoded_size(&self) -> usize {
