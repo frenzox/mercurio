@@ -392,7 +392,10 @@ mod tests {
             Some(ControlPacket::UnsubAck(ack)) => {
                 assert_eq!(ack.packet_id, 1);
                 assert_eq!(ack.payload.len(), 1);
-                assert_eq!(ack.payload[0].reason_code, ReasonCode::NoSubscriptionExisted);
+                assert_eq!(
+                    ack.payload[0].reason_code,
+                    ReasonCode::NoSubscriptionExisted
+                );
             }
             _ => panic!("Expected UnsubAck packet"),
         }
@@ -412,7 +415,10 @@ mod tests {
                 subs_opt: default_subscription_options(),
             }],
         };
-        session.handle_subscribe(subscribe_packet, &broker).await.unwrap();
+        session
+            .handle_subscribe(subscribe_packet, &broker)
+            .await
+            .unwrap();
 
         // Now unsubscribe
         let unsub_packet = UnsubscribePacket {
@@ -455,7 +461,10 @@ mod tests {
                 },
             ],
         };
-        session.handle_subscribe(subscribe_packet, &broker).await.unwrap();
+        session
+            .handle_subscribe(subscribe_packet, &broker)
+            .await
+            .unwrap();
 
         // Unsubscribe from one existing, one non-existing
         let unsub_packet = UnsubscribePacket {
@@ -481,7 +490,10 @@ mod tests {
                 assert_eq!(ack.packet_id, 3);
                 assert_eq!(ack.payload.len(), 3);
                 assert_eq!(ack.payload[0].reason_code, ReasonCode::Success);
-                assert_eq!(ack.payload[1].reason_code, ReasonCode::NoSubscriptionExisted);
+                assert_eq!(
+                    ack.payload[1].reason_code,
+                    ReasonCode::NoSubscriptionExisted
+                );
                 assert_eq!(ack.payload[2].reason_code, ReasonCode::Success);
             }
             _ => panic!("Expected UnsubAck packet"),
