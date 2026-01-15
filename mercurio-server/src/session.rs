@@ -17,6 +17,7 @@ use mercurio_core::{
     Result,
 };
 use mercurio_packets::{
+    auth::{AuthPacket, AuthProperties},
     connack::{ConnAckPacket, ConnAckProperties},
     connect::ConnectPacket,
     pingresp::PingRespPacket,
@@ -31,7 +32,11 @@ use mercurio_packets::{
     ControlPacket,
 };
 
-use crate::{broker::Broker, connection::Connection};
+use crate::{
+    auth::{AuthManager, AuthResult},
+    broker::Broker,
+    connection::Connection,
+};
 
 /// Will message to be published on abnormal client disconnect.
 #[derive(Debug, Clone)]
@@ -85,6 +90,8 @@ struct State {
     pubrecs: HashMap<u16, PubRecPacket>,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
+    /// Current authentication method name for ongoing re-authentication
+    auth_method: Option<String>,
 }
 
 impl SessionDropGuard {
@@ -113,6 +120,7 @@ impl Session {
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
                     will_message,
+                    auth_method: None,
                 }),
             }),
         }
@@ -356,10 +364,118 @@ impl Session {
         Ok(Some(ControlPacket::UnsubAck(ack)))
     }
 
+    async fn handle_auth(
+        &mut self,
+        packet: AuthPacket,
+        auth_manager: Option<&AuthManager>,
+    ) -> Result<Option<ControlPacket>> {
+        let Some(auth_manager) = auth_manager else {
+            // No auth manager configured - enhanced auth not supported
+            return Err(ReasonCode::BadAuthenticationMethod.into());
+        };
+
+        let mut session = self.shared.state.lock().await;
+
+        // Get auth method from packet properties
+        let method_name = packet
+            .properties
+            .auth_method
+            .as_ref()
+            .map(|m| m.value.as_str());
+
+        // Get auth data from packet properties
+        let auth_data = packet.properties.auth_data.as_ref().map(|d| &d.value);
+
+        match packet.reason {
+            ReasonCode::ReAuthenticate => {
+                // Client wants to re-authenticate
+                let Some(method_name) = method_name else {
+                    return Err(ReasonCode::ProtocolError.into());
+                };
+
+                if !auth_manager.supports_method(method_name) {
+                    return Err(ReasonCode::BadAuthenticationMethod.into());
+                }
+
+                // Start re-authentication
+                session.auth_method = Some(method_name.to_string());
+
+                match auth_manager.start_auth(method_name, auth_data) {
+                    AuthResult::Success => {
+                        session.auth_method = None;
+                        Ok(Some(ControlPacket::Auth(AuthPacket {
+                            reason: ReasonCode::Success,
+                            properties: AuthProperties::default(),
+                        })))
+                    }
+                    AuthResult::Continue(challenge) => {
+                        use mercurio_core::properties::{AuthenticationData, AuthenticationMethod};
+                        Ok(Some(ControlPacket::Auth(AuthPacket {
+                            reason: ReasonCode::ContinueAuthentication,
+                            properties: AuthProperties {
+                                auth_method: Some(AuthenticationMethod {
+                                    value: method_name.to_string(),
+                                }),
+                                auth_data: Some(AuthenticationData { value: challenge }),
+                                reason_string: None,
+                                user_property: None,
+                            },
+                        })))
+                    }
+                    AuthResult::Failed(reason) => Err(reason.into()),
+                }
+            }
+            ReasonCode::ContinueAuthentication => {
+                // Client is continuing an ongoing authentication
+                let Some(ref current_method) = session.auth_method else {
+                    // No authentication in progress
+                    return Err(ReasonCode::ProtocolError.into());
+                };
+
+                let Some(auth_data) = auth_data else {
+                    return Err(ReasonCode::ProtocolError.into());
+                };
+
+                match auth_manager.continue_auth(current_method, auth_data) {
+                    AuthResult::Success => {
+                        session.auth_method = None;
+                        Ok(Some(ControlPacket::Auth(AuthPacket {
+                            reason: ReasonCode::Success,
+                            properties: AuthProperties::default(),
+                        })))
+                    }
+                    AuthResult::Continue(challenge) => {
+                        use mercurio_core::properties::{AuthenticationData, AuthenticationMethod};
+                        Ok(Some(ControlPacket::Auth(AuthPacket {
+                            reason: ReasonCode::ContinueAuthentication,
+                            properties: AuthProperties {
+                                auth_method: Some(AuthenticationMethod {
+                                    value: current_method.clone(),
+                                }),
+                                auth_data: Some(AuthenticationData { value: challenge }),
+                                reason_string: None,
+                                user_property: None,
+                            },
+                        })))
+                    }
+                    AuthResult::Failed(reason) => {
+                        session.auth_method = None;
+                        Err(reason.into())
+                    }
+                }
+            }
+            _ => {
+                // Unexpected reason code
+                Err(ReasonCode::ProtocolError.into())
+            }
+        }
+    }
+
     pub(crate) async fn process_incoming(
         &mut self,
         packet: ControlPacket,
         broker: &Broker,
+        auth_manager: Option<&AuthManager>,
     ) -> Result<Option<ControlPacket>> {
         match packet {
             ControlPacket::Publish(packet) => self.handle_publish(packet, broker).await,
@@ -371,7 +487,7 @@ impl Session {
             ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
-            ControlPacket::Auth(_) => todo!(),
+            ControlPacket::Auth(packet) => self.handle_auth(packet, auth_manager).await,
 
             // Some packets are not supposed to be received by the server.
             // Namely: ConnAck, UnsubAck, PingResp

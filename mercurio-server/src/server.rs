@@ -147,6 +147,7 @@ impl Handler {
                         .process_incoming(
                             packet,
                             &self.broker,
+                            None, // TODO: Add auth_manager when configurable auth is implemented
                         ).await?;
 
                     if let Some(res) = maybe_res {
