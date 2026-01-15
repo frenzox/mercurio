@@ -19,10 +19,10 @@ pub(crate) struct Broker<S: RetainedMessageStore> {
 }
 
 impl<S: RetainedMessageStore> Broker<S> {
-    pub(crate) fn new(storage: S) -> Broker<S> {
+    pub(crate) fn new(storage: Arc<S>) -> Broker<S> {
         Broker {
             subscriptions: TopicTree::new(),
-            storage: Arc::new(storage),
+            storage,
         }
     }
 
@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retained_message_stored() {
-        let broker = Broker::new(MemoryStore::new());
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
         let msg = create_test_message("test/topic", "hello", true);
 
         broker.publish("test/topic", msg).await.unwrap();
@@ -107,7 +107,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retained_message_not_stored_without_flag() {
-        let broker = Broker::new(MemoryStore::new());
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
         let msg = create_test_message("test/topic", "hello", false);
 
         broker.publish("test/topic", msg).await.unwrap();
@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retained_message_cleared_with_empty_payload() {
-        let broker = Broker::new(MemoryStore::new());
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
 
         // First, store a retained message
         let msg = create_test_message("test/topic", "hello", true);
@@ -146,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retained_message_replaced() {
-        let broker = Broker::new(MemoryStore::new());
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
 
         // Store first message
         let msg1 = create_test_message("test/topic", "first", true);
@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retained_message_wildcard_subscription() {
-        let broker = Broker::new(MemoryStore::new());
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
 
         // Store retained messages on multiple topics
         broker
