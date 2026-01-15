@@ -1,45 +1,32 @@
-use std::sync::{Arc, Mutex};
-
 use tokio::sync::broadcast;
 
 use crate::topic_tree::TopicTree;
 use mercurio_core::{message::Message, Result};
 
+/// Message broker that handles pub/sub routing.
+///
+/// The broker maintains a topic tree for efficient message routing with wildcard support.
+/// It is thread-safe and can be cloned cheaply (uses Arc internally).
 #[derive(Debug, Clone)]
 pub(crate) struct Broker {
-    shared: Arc<Shared>,
-}
-
-#[derive(Debug)]
-struct Shared {
-    state: Mutex<State>,
-}
-
-#[derive(Debug)]
-struct State {
     subscriptions: TopicTree<Message>,
 }
 
 impl Broker {
     pub(crate) fn new() -> Broker {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                subscriptions: TopicTree::new(),
-            }),
-        });
-
-        Broker { shared }
+        Broker {
+            subscriptions: TopicTree::new(),
+        }
     }
 
-    pub(crate) fn subscribe(&self, topic: String) -> broadcast::Receiver<Message> {
-        let mut state = self.shared.state.lock().unwrap();
-        state.subscriptions.subscribe(topic)
+    /// Subscribe to a topic filter. Returns a receiver for matching messages.
+    pub(crate) fn subscribe(&self, topic: &str) -> broadcast::Receiver<Message> {
+        self.subscriptions.subscribe(topic)
     }
 
+    /// Publish a message to a topic. Delivers to all matching subscribers.
     pub(crate) fn publish(&self, topic: &str, message: Message) -> Result<()> {
-        let mut state = self.shared.state.lock().unwrap();
-        state.subscriptions.publish(topic, message);
-
+        self.subscriptions.publish(topic, message);
         Ok(())
     }
 }
