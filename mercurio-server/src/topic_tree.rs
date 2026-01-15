@@ -1,41 +1,26 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    sync::{Arc, RwLock},
 };
 
+use smallvec::SmallVec;
 use tokio::sync::broadcast;
-use tracing::error;
 
 #[derive(Debug)]
 struct TopicNode<T: Clone> {
     channel: broadcast::Sender<T>,
     children: HashMap<String, TopicNode<T>>,
-    level: usize,
 }
 
 impl<T: Clone> TopicNode<T> {
-    pub fn new(level: usize) -> TopicNode<T> {
-        let (sender, _) = broadcast::channel(5); // TODO: What size should this actually be?
+    fn new() -> TopicNode<T> {
+        // TODO: Make channel capacity configurable
+        let (sender, _) = broadcast::channel(16);
 
         TopicNode {
             channel: sender,
             children: HashMap::new(),
-            level,
         }
-    }
-}
-
-impl<T: Clone> Hash for TopicNode<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let children_ptr: *const HashMap<String, TopicNode<T>> = &self.children;
-        children_ptr.hash(state);
-    }
-}
-impl<T: Clone> Eq for TopicNode<T> {}
-impl<T: Clone> PartialEq for TopicNode<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.children.eq(&other.children)
     }
 }
 
@@ -46,7 +31,7 @@ pub(crate) struct TopicTree<T: Clone> {
 
 #[derive(Debug)]
 struct Shared<T: Clone> {
-    state: Mutex<State<T>>,
+    state: RwLock<State<T>>,
 }
 
 #[derive(Debug)]
@@ -54,81 +39,87 @@ struct State<T: Clone> {
     root: TopicNode<T>,
 }
 
+impl<T: Clone> Clone for TopicTree<T> {
+    fn clone(&self) -> Self {
+        TopicTree {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
 impl<T: Clone> TopicTree<T> {
     pub fn new() -> TopicTree<T> {
         TopicTree {
             shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    root: TopicNode::new(usize::MAX),
+                state: RwLock::new(State {
+                    root: TopicNode::new(),
                 }),
             }),
         }
     }
 
-    pub fn subscribe(&mut self, topic: String) -> broadcast::Receiver<T> {
-        let levels = topic.split('/');
-        let root = &mut self.shared.state.lock().unwrap().root;
-        let mut next = root;
+    /// Subscribe to a topic filter. Returns a receiver for messages matching the filter.
+    ///
+    /// This method acquires a write lock as it may create new nodes in the tree.
+    pub fn subscribe(&self, topic: &str) -> broadcast::Receiver<T> {
+        let mut state = self.shared.state.write().unwrap();
+        let mut node = &mut state.root;
 
-        for (idx, level) in levels.enumerate() {
-            next = next
+        for level in topic.split('/') {
+            node = node
                 .children
                 .entry(level.to_string())
-                .or_insert_with(|| TopicNode::new(idx));
+                .or_insert_with(TopicNode::new);
         }
 
-        next.channel.subscribe()
+        node.channel.subscribe()
     }
 
-    pub fn publish(&mut self, topic: &str, value: T) {
-        // TODO: Validate topic name
-        let mut visited = HashSet::<&TopicNode<T>>::new();
-        let mut stack = VecDeque::<&TopicNode<T>>::new();
+    /// Publish a message to a topic.
+    ///
+    /// This method only acquires a read lock since it doesn't modify the tree structure.
+    /// Messages are sent to all subscribers whose topic filters match the topic.
+    pub fn publish(&self, topic: &str, value: T) {
+        let state = self.shared.state.read().unwrap();
 
-        let root = &self.shared.state.lock().unwrap().root;
-        let levels: Vec<&str> = topic.split('/').collect();
+        // Use SmallVec to avoid heap allocation for typical topic depths (< 8 levels)
+        // Stack holds (node reference, current depth in topic)
+        let mut stack: SmallVec<[(&TopicNode<T>, usize); 8]> = SmallVec::new();
 
-        stack.push_front(root);
+        // Collect topic levels into SmallVec (avoids heap for < 8 levels)
+        let levels: SmallVec<[&str; 8]> = topic.split('/').collect();
+        let target_depth = levels.len();
 
-        while !stack.is_empty() {
-            let node = stack.pop_front().unwrap(); // Safe to unwrap, otherwise we
-                                                   // wouldn't get into the loop
-            if node.level == levels.len() - 1 {
-                // We reached the last level, send message to subscribers
-                if let Err(e) = node.channel.send(value.clone()) {
-                    error!("Error publishing value {}", e);
+        stack.push((&state.root, 0));
+
+        while let Some((node, depth)) = stack.pop() {
+            if depth == target_depth {
+                // Reached the target depth - send to subscribers at this node
+                let _ = node.channel.send(value.clone());
+
+                // Also send to multi-level wildcard (#) subscribers at the next level
+                if let Some(wildcard) = node.children.get("#") {
+                    let _ = wildcard.channel.send(value.clone());
                 }
-
-                // Check if there is a children multi-level wildcard sub in the next level,
-                // if so send to them too
-                if let Some(next) = node.children.get("#") {
-                    if let Err(e) = next.channel.send(value) {
-                        error!("Error publishing value {}", e);
-                    }
-                }
-
-                break;
+                continue;
             }
 
-            // DFS alike
-            if let Some(next) = node.children.get(levels[node.level.overflowing_add(1).0]) {
-                if !visited.contains(next) {
-                    visited.insert(next);
-                    stack.push_front(next);
-                }
+            let level = levels[depth];
+            let next_depth = depth + 1;
+
+            // Check for exact match
+            if let Some(child) = node.children.get(level) {
+                stack.push((child, next_depth));
             }
 
-            if let Some(next) = node.children.get("+") {
-                if !visited.contains(next) {
-                    visited.insert(next);
-                    stack.push_front(next);
-                }
+            // Check for single-level wildcard (+)
+            if let Some(child) = node.children.get("+") {
+                stack.push((child, next_depth));
             }
 
-            if let Some(next) = node.children.get("#") {
-                if let Err(e) = next.channel.send(value.clone()) {
-                    error!("Error publishing value {}", e);
-                }
+            // Multi-level wildcard (#) matches the remainder of the topic
+            if let Some(child) = node.children.get("#") {
+                let _ = child.channel.send(value.clone());
             }
         }
     }
@@ -144,9 +135,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pubsub_normal_topics() {
-        let mut tree = TopicTree::<String>::new();
-        let mut subscriber = tree.subscribe("a/b/c".to_string());
-        let mut subscriber2 = tree.subscribe("/a/b/c".to_string());
+        let tree = TopicTree::<String>::new();
+        let mut subscriber = tree.subscribe("a/b/c");
+        let mut subscriber2 = tree.subscribe("/a/b/c");
 
         tree.publish("a/b/c", "test_message".to_string());
         tree.publish("/a/b/c", "test_message2".to_string());
@@ -178,9 +169,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pubsub_multi_level_wildcard() {
-        let mut tree = TopicTree::<String>::new();
+        let tree = TopicTree::<String>::new();
 
-        let mut subscriber = tree.subscribe("sport/tennis/player1/#".into());
+        let mut subscriber = tree.subscribe("sport/tennis/player1/#");
         tree.publish("sport/tennis/player1", "test_message".into());
 
         tree.publish("sport/tennis/player1/ranking", "test_message_1".into());
@@ -214,7 +205,7 @@ mod tests {
             "test_message_2".to_string()
         );
 
-        let mut subscriber = tree.subscribe("sport/#".to_string());
+        let mut subscriber = tree.subscribe("sport/#");
         tree.publish("sport", "test_message_3".into());
 
         assert_eq!(
@@ -228,9 +219,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pubsub_single_level_wildcard() {
-        let mut tree = TopicTree::<String>::new();
-        let mut subscriber = tree.subscribe("sport/tennis/+".into());
-        let mut subscriber2 = tree.subscribe("sport/tennis/+/ranking".into());
+        let tree = TopicTree::<String>::new();
+        let mut subscriber = tree.subscribe("sport/tennis/+");
+        let mut subscriber2 = tree.subscribe("sport/tennis/+/ranking");
         tree.publish("sport/tennis/player1", "test_message".into());
         tree.publish("sport/tennis/player1/ranking", "test_message".into());
         tree.publish("sport/tennis", "test_message".into());
