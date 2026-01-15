@@ -250,13 +250,22 @@ mod tests {
 
         // Store retained messages on multiple topics
         broker
-            .publish("sensors/temp/room1", create_test_message("sensors/temp/room1", "22", true))
+            .publish(
+                "sensors/temp/room1",
+                create_test_message("sensors/temp/room1", "22", true),
+            )
             .unwrap();
         broker
-            .publish("sensors/temp/room2", create_test_message("sensors/temp/room2", "24", true))
+            .publish(
+                "sensors/temp/room2",
+                create_test_message("sensors/temp/room2", "24", true),
+            )
             .unwrap();
         broker
-            .publish("sensors/humidity/room1", create_test_message("sensors/humidity/room1", "50", true))
+            .publish(
+                "sensors/humidity/room1",
+                create_test_message("sensors/humidity/room1", "50", true),
+            )
             .unwrap();
 
         // Subscribe with single-level wildcard
