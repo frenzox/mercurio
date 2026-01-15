@@ -37,6 +37,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
 };
+use mercurio_storage::RetainedMessageStore;
 
 /// Will message to be published on abnormal client disconnect.
 #[derive(Debug, Clone)]
@@ -184,10 +185,10 @@ impl Session {
         Ok(())
     }
 
-    async fn handle_publish(
+    async fn handle_publish<S: RetainedMessageStore>(
         &mut self,
         packet: PublishPacket,
-        broker: &Broker,
+        broker: &Broker<S>,
     ) -> Result<Option<ControlPacket>> {
         // Validate topic name (no wildcards, no null chars, etc.)
         if validate_publish_topic(&packet.topic_name).is_err() {
@@ -238,7 +239,7 @@ impl Session {
             payload: packet.payload,
         };
 
-        broker.publish(&topic, message)?;
+        broker.publish(&topic, message).await?;
 
         response
     }
@@ -285,10 +286,10 @@ impl Session {
         })))
     }
 
-    async fn handle_subscribe(
+    async fn handle_subscribe<S: RetainedMessageStore>(
         &mut self,
         packet: mercurio_packets::subscribe::SubscribePacket,
-        broker: &Broker,
+        broker: &Broker<S>,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         // Pre-allocate payload vec based on subscription count
@@ -307,7 +308,7 @@ impl Session {
                 continue;
             }
 
-            let (mut rx, retained_messages) = broker.subscribe(&sub.topic_filter);
+            let (mut rx, retained_messages) = broker.subscribe(&sub.topic_filter).await?;
             ack.payload.push(SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS0,
             });
@@ -471,10 +472,10 @@ impl Session {
         }
     }
 
-    pub(crate) async fn process_incoming(
+    pub(crate) async fn process_incoming<S: RetainedMessageStore>(
         &mut self,
         packet: ControlPacket,
-        broker: &Broker,
+        broker: &Broker<S>,
         auth_manager: Option<&AuthManager>,
     ) -> Result<Option<ControlPacket>> {
         match packet {
@@ -540,6 +541,7 @@ mod tests {
         subscribe::{SubscribePayload, SubscriptionOptions},
         unsubscribe::UnsubscribePayload,
     };
+    use mercurio_storage::memory::MemoryStore;
 
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
@@ -628,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe_existing_topic() {
         let mut session = create_test_session();
-        let broker = crate::broker::Broker::new();
+        let broker = crate::broker::Broker::new(MemoryStore::new());
 
         // First subscribe to a topic
         let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {
@@ -668,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe_multiple_topics() {
         let mut session = create_test_session();
-        let broker = crate::broker::Broker::new();
+        let broker = crate::broker::Broker::new(MemoryStore::new());
 
         // Subscribe to two topics
         let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {

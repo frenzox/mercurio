@@ -21,3 +21,4 @@ uuid = { version = "1.2.2", features = ["v4"] }
 
 mercurio-core = { path = "../mercurio-core" }
 mercurio-packets = { path = "../mercurio-packets" }
+mercurio-storage = { path = "../mercurio-storage" }

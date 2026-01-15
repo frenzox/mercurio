@@ -235,6 +235,7 @@ dependencies = [
  "bytes",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-storage",
  "rand",
  "smallvec",
  "thiserror 1.0.69",
