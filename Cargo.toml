@@ -1,6 +1,10 @@
 [workspace]
+resolver = "2"
 members = [
     "mercurio-core",
     "mercurio-packets",
     "mercurio-server",
 ]
+
+[profile.release]
+debug = true  # Enable debug symbols for profiling

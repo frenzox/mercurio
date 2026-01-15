@@ -108,10 +108,7 @@ impl ControlPacket {
         let mut peeker = Cursor::new(&src[..]);
         let remaining_len_pos = 1;
 
-        let len = match peeker.seek(SeekFrom::End(0)) {
-            Ok(n) => n,
-            Err(err) => return Err(err.into()),
-        };
+        let len = peeker.seek(SeekFrom::End(0))?;
 
         peeker.set_position(remaining_len_pos);
 

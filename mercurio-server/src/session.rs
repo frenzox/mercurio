@@ -1,4 +1,4 @@
-use std::{pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::{broadcast, Mutex};
 use tokio_stream::{Stream, StreamExt, StreamMap};
@@ -40,9 +40,13 @@ struct Shared {
 
 struct State {
     pub connect_packet: ConnectPacket,
+    /// Cached client ID to avoid lock acquisition for logging
+    client_id: String,
     subscriptions: StreamMap<String, Messages>,
-    unacknowledged_messages: Vec<PublishPacket>,
-    pubrecs: Vec<PubRecPacket>,
+    /// Maps packet_id -> PublishPacket for O(1) lookup/removal
+    unacknowledged_messages: HashMap<u16, PublishPacket>,
+    /// Maps packet_id -> PubRecPacket for O(1) lookup/removal
+    pubrecs: HashMap<u16, PubRecPacket>,
 }
 
 impl SessionDropGuard {
@@ -59,13 +63,16 @@ impl SessionDropGuard {
 
 impl Session {
     pub fn new(connect_packet: ConnectPacket) -> Self {
+        let client_id = connect_packet.payload.client_id.clone();
         Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     connect_packet,
+                    client_id,
                     subscriptions: StreamMap::new(),
-                    unacknowledged_messages: Vec::new(),
-                    pubrecs: Vec::new(),
+                    // Pre-allocate with reasonable capacity for typical usage
+                    unacknowledged_messages: HashMap::with_capacity(16),
+                    pubrecs: HashMap::with_capacity(16),
                 }),
             }),
         }
@@ -73,41 +80,42 @@ impl Session {
 
     pub(crate) async fn set_connect_packet(&mut self, connect_packet: ConnectPacket) {
         let mut session = self.shared.state.lock().await;
+        session.client_id = connect_packet.payload.client_id.clone();
         session.connect_packet = connect_packet;
     }
 
+    /// Returns a clone of the client ID. For logging, prefer using the cached version.
     pub(crate) async fn get_client_id(&self) -> String {
         let session = self.shared.state.lock().await;
-        session.connect_packet.payload.client_id.clone()
+        session.client_id.clone()
     }
 
     pub async fn begin(&mut self, connection: &mut Connection, resume: bool) -> Result<()> {
         let mut ack = ConnAckPacket::default();
         ack.flags.session_present = resume;
 
-        {
+        let client_id = {
             let mut session = self.shared.state.lock().await;
 
             if session.connect_packet.payload.client_id.is_empty() {
                 let uuid = Uuid::new_v4();
-                session.connect_packet.payload.client_id = uuid.hyphenated().to_string();
+                let generated_id = uuid.hyphenated().to_string();
+                session.connect_packet.payload.client_id = generated_id.clone();
+                session.client_id = generated_id.clone();
                 ack.properties = Some(ConnAckProperties {
-                    assigned_client_id: Some(AssignedClientIdentifier::new(
-                        session.connect_packet.payload.client_id.clone(),
-                    )),
+                    assigned_client_id: Some(AssignedClientIdentifier::new(generated_id)),
                     ..Default::default()
                 });
             }
 
-            info!(
-                "Client with id `{}` {} a session",
-                session.connect_packet.payload.client_id,
-                match resume {
-                    true => "resumed",
-                    false => "started",
-                }
-            );
-        }
+            session.client_id.clone()
+        };
+
+        info!(
+            "Client with id `{}` {} a session",
+            client_id,
+            if resume { "resumed" } else { "started" }
+        );
 
         connection.write_packet(ControlPacket::ConnAck(ack)).await?;
 
@@ -119,116 +127,95 @@ impl Session {
         packet: PublishPacket,
         broker: &Broker,
     ) -> Result<Option<ControlPacket>> {
-        match packet.qos_level {
+        let response = match packet.qos_level {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
                 if let Some(packet_id) = packet.packet_id {
-                    Ok(ControlPacket::PubAck(PubAckPacket {
+                    Ok(Some(ControlPacket::PubAck(PubAckPacket {
                         packet_id,
                         reason: ReasonCode::Success,
                         properties: None,
-                    })
-                    .into())
+                    })))
                 } else {
                     Err(ReasonCode::ProtocolError.into())
                 }
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = packet.packet_id {
+                    // Store for QoS 2 flow - use packet_id as key for O(1) lookup
                     let mut session = self.shared.state.lock().await;
-                    session.unacknowledged_messages.push(packet.clone());
-                    Ok(ControlPacket::PubRec(PubRecPacket {
+                    session
+                        .unacknowledged_messages
+                        .insert(packet_id, packet.clone());
+
+                    Ok(Some(ControlPacket::PubRec(PubRecPacket {
                         packet_id,
                         reason: ReasonCode::Success,
                         properties: None,
-                    })
-                    .into())
+                    })))
                 } else {
                     Err(ReasonCode::ProtocolError.into())
                 }
             }
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
-        }
-        .and_then(|res| {
-            let topic = packet.topic_name.clone();
-            let message = Message {
-                packet_id: packet.packet_id,
-                topic: packet.topic_name,
-                dup: packet.dup,
-                retain: packet.retain,
-                qos: packet.qos_level,
-                payload: packet.payload,
-            };
+        };
 
-            broker.publish(&topic, message)?;
+        // Publish to broker - convert topic to Arc<str> for cheap cloning to subscribers
+        let topic: Arc<str> = packet.topic_name.into();
+        let message = Message {
+            packet_id: packet.packet_id,
+            topic: Arc::clone(&topic),
+            dup: packet.dup,
+            retain: packet.retain,
+            qos: packet.qos_level,
+            payload: packet.payload,
+        };
 
-            Ok(res)
-        })
+        broker.publish(&topic, message)?;
+
+        response
     }
 
     async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        if let Some(index) = session
-            .unacknowledged_messages
-            .iter()
-            .position(|p| p.packet_id == Some(packet.packet_id))
-        {
-            session.unacknowledged_messages.remove(index);
-        }
-
+        // O(1) removal instead of O(n) search + remove
+        session.unacknowledged_messages.remove(&packet.packet_id);
         Ok(None)
     }
 
     async fn handle_pubrec(&mut self, packet: PubRecPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        if let Some(index) = session
-            .unacknowledged_messages
-            .iter()
-            .position(|p| p.packet_id == Some(packet.packet_id))
-        {
-            session.unacknowledged_messages.remove(index);
-        }
+        // O(1) removal
+        session.unacknowledged_messages.remove(&packet.packet_id);
 
         let packet_id = packet.packet_id;
-        session.pubrecs.push(packet);
+        // O(1) insertion
+        session.pubrecs.insert(packet_id, packet);
 
-        Ok(ControlPacket::PubRel(PubRelPacket {
+        Ok(Some(ControlPacket::PubRel(PubRelPacket {
             packet_id,
             reason: ReasonCode::Success,
             properties: None,
-        })
-        .into())
+        })))
     }
 
     async fn handle_pubcomp(&mut self, packet: PubCompPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        if let Some(index) = session
-            .pubrecs
-            .iter()
-            .position(|p| p.packet_id == packet.packet_id)
-        {
-            session.pubrecs.remove(index);
-        }
-
+        // O(1) removal
+        session.pubrecs.remove(&packet.packet_id);
         Ok(None)
     }
 
     async fn handle_pubrel(&mut self, packet: PubRelPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        if let Some(index) = session
-            .pubrecs
-            .iter()
-            .position(|p| p.packet_id == packet.packet_id)
-        {
-            session.pubrecs.remove(index);
-        }
+        // O(1) removal
+        session.pubrecs.remove(&packet.packet_id);
 
-        Ok(ControlPacket::PubComp(PubCompPacket {
+        Ok(Some(ControlPacket::PubComp(PubCompPacket {
             packet_id: packet.packet_id,
             reason: ReasonCode::Success,
             properties: None,
-        })
-        .into())
+        })))
     }
 
     async fn handle_subscribe(
@@ -237,14 +224,15 @@ impl Session {
         broker: &Broker,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
+        // Pre-allocate payload vec based on subscription count
         let mut ack = SubAckPacket {
             packet_id: packet.packet_id,
             properties: None,
-            payload: Vec::new(),
+            payload: Vec::with_capacity(packet.payload.len()),
         };
 
         for sub in &packet.payload {
-            let mut rx = broker.subscribe(sub.topic_filter.to_string());
+            let mut rx = broker.subscribe(&sub.topic_filter);
             ack.payload.push(SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS0,
             });
@@ -265,7 +253,7 @@ impl Session {
                 .insert(sub.topic_filter.to_string(), rx);
         }
 
-        Ok(ControlPacket::SubAck(ack).into())
+        Ok(Some(ControlPacket::SubAck(ack)))
     }
 
     pub(crate) async fn process_incoming(
@@ -281,8 +269,8 @@ impl Session {
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
             ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker).await,
             ControlPacket::Unsubscribe(_) => todo!(),
-            ControlPacket::PingReq(_) => Ok(ControlPacket::PingResp(PingRespPacket {}).into()),
-            ControlPacket::Disconnect(packet) => Ok(ControlPacket::Disconnect(packet).into()),
+            ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
+            ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
             ControlPacket::Auth(_) => todo!(),
 
             // Some packets are not supposed to be received by the server.
@@ -307,13 +295,19 @@ impl Session {
                     payload: message.payload,
                 };
 
-                match message.qos {
-                    mercurio_core::qos::QoS::AtMostOnce => {}
-                    mercurio_core::qos::QoS::AtLeastOnce | mercurio_core::qos::QoS::ExactlyOnce => {
-                        session.unacknowledged_messages.push(publish.clone());
+                // Track for acknowledgment if QoS > 0
+                if let Some(packet_id) = publish.packet_id {
+                    match message.qos {
+                        QoS::AtMostOnce => {}
+                        QoS::AtLeastOnce | QoS::ExactlyOnce => {
+                            // O(1) insertion
+                            session
+                                .unacknowledged_messages
+                                .insert(packet_id, publish.clone());
+                        }
+                        QoS::Invalid => unreachable!(),
                     }
-                    mercurio_core::qos::QoS::Invalid => unreachable!(),
-                };
+                }
 
                 Some(ControlPacket::Publish(publish))
             }
