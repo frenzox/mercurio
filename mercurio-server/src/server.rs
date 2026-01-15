@@ -9,6 +9,7 @@ use tracing::{error, info};
 
 use mercurio_core::{message::Message, Result};
 use mercurio_packets::{connect::ConnectPacket, ControlPacket};
+use mercurio_storage::memory::MemoryStore;
 
 use crate::{
     broker::Broker,
@@ -20,13 +21,13 @@ use crate::{
 
 struct Listener {
     listener: TcpListener,
-    broker: Broker,
+    broker: Broker<MemoryStore>,
     session_manager_holder: SessionManagerDropGuard,
     notify_shutdown: broadcast::Sender<()>,
 }
 
 struct Handler {
-    broker: Broker,
+    broker: Broker<MemoryStore>,
     session_manager: SessionManager,
     connection: Connection,
     shutdown: Shutdown,
@@ -37,7 +38,7 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
 
     let mut server = Listener {
         listener,
-        broker: Broker::new(),
+        broker: Broker::new(MemoryStore::new()),
         session_manager_holder: SessionManagerDropGuard::new(),
         notify_shutdown,
     };
@@ -190,7 +191,7 @@ impl Handler {
             payload: Some(will.payload),
         };
 
-        if let Err(e) = self.broker.publish(&topic, message) {
+        if let Err(e) = self.broker.publish(&topic, message).await {
             error!("Failed to publish will message: {}", e);
         }
     }

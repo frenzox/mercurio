@@ -12,4 +12,7 @@ pub enum Error {
 
     #[error("MQTT Error: {0}")]
     MQTTReasonCode(#[from] ReasonCode),
+
+    #[error("Storage error: {0}")]
+    Storage(String),
 }
