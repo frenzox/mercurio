@@ -65,7 +65,9 @@ impl Decoder for SubscribeProperties {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum RetainHandling {
+    #[default]
     SendRetained = 0x00,
     SendRetainedIfNonExisting = 0x01,
     DoNotSendRetained = 0x02,
@@ -80,12 +82,6 @@ impl From<u8> for RetainHandling {
             0x02 => Self::DoNotSendRetained,
             _ => Self::Invalid,
         }
-    }
-}
-
-impl Default for RetainHandling {
-    fn default() -> Self {
-        Self::SendRetained
     }
 }
 
