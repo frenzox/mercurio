@@ -9,7 +9,12 @@ use uuid::Uuid;
 type Messages = Pin<Box<dyn Stream<Item = Message> + Send>>;
 
 use mercurio_core::{
-    message::Message, properties::AssignedClientIdentifier, qos::QoS, reason::ReasonCode, Result,
+    message::Message,
+    properties::AssignedClientIdentifier,
+    qos::QoS,
+    reason::ReasonCode,
+    topic::{validate_publish_topic, validate_subscribe_filter},
+    Result,
 };
 use mercurio_packets::{
     connack::{ConnAckPacket, ConnAckProperties},
@@ -176,6 +181,11 @@ impl Session {
         packet: PublishPacket,
         broker: &Broker,
     ) -> Result<Option<ControlPacket>> {
+        // Validate topic name (no wildcards, no null chars, etc.)
+        if validate_publish_topic(&packet.topic_name).is_err() {
+            return Err(ReasonCode::TopicNameInvalid.into());
+        }
+
         let response = match packet.qos_level {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
@@ -281,6 +291,14 @@ impl Session {
         };
 
         for sub in &packet.payload {
+            // Validate topic filter before subscribing
+            if validate_subscribe_filter(&sub.topic_filter).is_err() {
+                ack.payload.push(SubAckPayload {
+                    reason_code: ReasonCode::TopicFilterInvalid,
+                });
+                continue;
+            }
+
             let (mut rx, retained_messages) = broker.subscribe(&sub.topic_filter);
             ack.payload.push(SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS0,
