@@ -1,5 +1,6 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
+use bytes::Bytes;
 use tokio::sync::{broadcast, Mutex};
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tracing::info;
@@ -27,6 +28,34 @@ use mercurio_packets::{
 
 use crate::{broker::Broker, connection::Connection};
 
+/// Will message to be published on abnormal client disconnect.
+#[derive(Debug, Clone)]
+pub struct WillMessage {
+    pub topic: String,
+    pub payload: Bytes,
+    pub qos: QoS,
+    pub retain: bool,
+}
+
+impl WillMessage {
+    /// Extract will message from a ConnectPacket if will_flag is set.
+    fn from_connect_packet(packet: &ConnectPacket) -> Option<Self> {
+        if !packet.flags.will_flag {
+            return None;
+        }
+
+        let topic = packet.payload.will_topic.as_ref()?;
+        let payload = packet.payload.will_payload.clone().unwrap_or_default();
+
+        Some(WillMessage {
+            topic: topic.clone(),
+            payload,
+            qos: packet.flags.will_qos,
+            retain: packet.flags.will_retain,
+        })
+    }
+}
+
 pub struct SessionDropGuard {
     session: Session,
 }
@@ -49,6 +78,8 @@ struct State {
     unacknowledged_messages: HashMap<u16, PublishPacket>,
     /// Maps packet_id -> PubRecPacket for O(1) lookup/removal
     pubrecs: HashMap<u16, PubRecPacket>,
+    /// Will message to be published on abnormal disconnect
+    will_message: Option<WillMessage>,
 }
 
 impl SessionDropGuard {
@@ -66,6 +97,7 @@ impl SessionDropGuard {
 impl Session {
     pub fn new(connect_packet: ConnectPacket) -> Self {
         let client_id = connect_packet.payload.client_id.clone();
+        let will_message = WillMessage::from_connect_packet(&connect_packet);
         Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -75,6 +107,7 @@ impl Session {
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
+                    will_message,
                 }),
             }),
         }
@@ -83,7 +116,21 @@ impl Session {
     pub(crate) async fn set_connect_packet(&mut self, connect_packet: ConnectPacket) {
         let mut session = self.shared.state.lock().await;
         session.client_id = connect_packet.payload.client_id.clone();
+        session.will_message = WillMessage::from_connect_packet(&connect_packet);
         session.connect_packet = connect_packet;
+    }
+
+    /// Clear the will message. Called on normal DISCONNECT.
+    pub(crate) async fn clear_will(&self) {
+        let mut session = self.shared.state.lock().await;
+        session.will_message = None;
+    }
+
+    /// Take the will message for publishing. Called on abnormal disconnect.
+    /// Returns None if no will was set or it was already cleared.
+    pub(crate) async fn take_will(&self) -> Option<WillMessage> {
+        let mut session = self.shared.state.lock().await;
+        session.will_message.take()
     }
 
     /// Returns a clone of the client ID. For logging, prefer using the cached version.
@@ -381,6 +428,42 @@ mod tests {
         SubscriptionOptions::default()
     }
 
+    fn create_connect_packet_with_will() -> ConnectPacket {
+        ConnectPacket {
+            flags: ConnectFlags {
+                will_flag: true,
+                will_qos: QoS::AtLeastOnce,
+                will_retain: true,
+                clean_start: true,
+                ..Default::default()
+            },
+            keepalive: 60,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "test-client".to_string(),
+                will_topic: Some("will/topic".to_string()),
+                will_payload: Some(Bytes::from("goodbye")),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn create_connect_packet_without_will() -> ConnectPacket {
+        ConnectPacket {
+            flags: ConnectFlags {
+                will_flag: false,
+                clean_start: true,
+                ..Default::default()
+            },
+            keepalive: 60,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "test-client".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
     #[tokio::test]
     async fn test_unsubscribe_nonexistent_topic() {
         let mut session = create_test_session();
@@ -505,5 +588,97 @@ mod tests {
             }
             _ => panic!("Expected UnsubAck packet"),
         }
+    }
+
+    #[test]
+    fn test_will_message_from_connect_packet() {
+        let packet = create_connect_packet_with_will();
+        let will = WillMessage::from_connect_packet(&packet);
+
+        assert!(will.is_some());
+        let will = will.unwrap();
+        assert_eq!(will.topic, "will/topic");
+        assert_eq!(will.payload.as_ref(), b"goodbye");
+        assert_eq!(will.qos, QoS::AtLeastOnce);
+        assert!(will.retain);
+    }
+
+    #[test]
+    fn test_will_message_from_connect_packet_no_will() {
+        let packet = create_connect_packet_without_will();
+        let will = WillMessage::from_connect_packet(&packet);
+
+        assert!(will.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_stores_will() {
+        let packet = create_connect_packet_with_will();
+        let session = Session::new(packet);
+
+        let will = session.take_will().await;
+        assert!(will.is_some());
+        let will = will.unwrap();
+        assert_eq!(will.topic, "will/topic");
+    }
+
+    #[tokio::test]
+    async fn test_session_no_will_when_not_set() {
+        let packet = create_connect_packet_without_will();
+        let session = Session::new(packet);
+
+        let will = session.take_will().await;
+        assert!(will.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_will() {
+        let packet = create_connect_packet_with_will();
+        let session = Session::new(packet);
+
+        // Will should exist initially
+        {
+            let state = session.shared.state.lock().await;
+            assert!(state.will_message.is_some());
+        }
+
+        // Clear the will
+        session.clear_will().await;
+
+        // Will should be None after clearing
+        let will = session.take_will().await;
+        assert!(will.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_take_will_removes_will() {
+        let packet = create_connect_packet_with_will();
+        let session = Session::new(packet);
+
+        // First take should return the will
+        let will1 = session.take_will().await;
+        assert!(will1.is_some());
+
+        // Second take should return None
+        let will2 = session.take_will().await;
+        assert!(will2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_connect_packet_updates_will() {
+        let packet_no_will = create_connect_packet_without_will();
+        let mut session = Session::new(packet_no_will);
+
+        // No will initially
+        assert!(session.take_will().await.is_none());
+
+        // Update with packet that has will
+        let packet_with_will = create_connect_packet_with_will();
+        session.set_connect_packet(packet_with_will).await;
+
+        // Now will should exist
+        let will = session.take_will().await;
+        assert!(will.is_some());
+        assert_eq!(will.unwrap().topic, "will/topic");
     }
 }

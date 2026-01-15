@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -7,12 +7,13 @@ use tokio::{
 };
 use tracing::{error, info};
 
-use mercurio_core::Result;
+use mercurio_core::{message::Message, Result};
 use mercurio_packets::{connect::ConnectPacket, ControlPacket};
 
 use crate::{
     broker::Broker,
     connection::Connection,
+    session::Session,
     session_manager::{SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
 };
@@ -106,17 +107,37 @@ impl Listener {
 
 impl Handler {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
-        let mut session = self
+        let session = self
             .session_manager
             .start_session(&mut self.connection, connect_packet)
             .await?;
+
+        let result = self.handle_connection(&session).await;
+
+        // Publish will message on abnormal disconnect
+        // (clean disconnect clears the will, so take_will returns None)
+        if let Some(will) = session.take_will().await {
+            self.publish_will(will, &session).await;
+        }
+
+        result
+    }
+
+    async fn handle_connection(&mut self, session: &Session) -> Result<()> {
+        let mut session = session.clone();
 
         while !self.shutdown.is_shutdown() {
             tokio::select! {
                 // Try to read and process new incoming packet
                 maybe_packet = self.connection.read_packet() => {
                     let packet = match maybe_packet? {
-                        None | Some(ControlPacket::Disconnect(_)) => {
+                        None => {
+                            // Connection closed without DISCONNECT - abnormal
+                            return Ok(());
+                        }
+                        Some(ControlPacket::Disconnect(_)) => {
+                            // Clean disconnect - clear the will
+                            session.clear_will().await;
                             return Ok(());
                         }
                         Some(packet) => packet,
@@ -149,5 +170,27 @@ impl Handler {
         }
 
         Ok(())
+    }
+
+    async fn publish_will(&self, will: crate::session::WillMessage, session: &Session) {
+        let client_id = session.get_client_id().await;
+        info!(
+            "Publishing will message for client `{}` on topic `{}`",
+            client_id, will.topic
+        );
+
+        let topic: Arc<str> = Arc::from(will.topic.as_str());
+        let message = Message {
+            packet_id: None, // Will messages don't have packet IDs
+            topic: Arc::clone(&topic),
+            dup: false,
+            qos: will.qos,
+            retain: will.retain,
+            payload: Some(will.payload),
+        };
+
+        if let Err(e) = self.broker.publish(&topic, message) {
+            error!("Failed to publish will message: {}", e);
+        }
     }
 }
