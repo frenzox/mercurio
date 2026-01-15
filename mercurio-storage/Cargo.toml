@@ -1,0 +1,15 @@
+[package]
+name = "mercurio-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Storage abstraction layer for Mercurio MQTT broker"
+license = "MIT"
+
+[dependencies]
+mercurio-core = { path = "../mercurio-core" }
+async-trait = "0.1"
+bytes = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
