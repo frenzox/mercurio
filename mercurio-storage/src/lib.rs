@@ -5,6 +5,9 @@
 
 pub mod memory;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use mercurio_core::{message::Message, qos::QoS};
@@ -24,6 +27,10 @@ pub enum StorageError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[cfg(feature = "sqlite")]
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] rusqlite::Error),
 }
 
 /// Result type for storage operations.
