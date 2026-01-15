@@ -4,6 +4,7 @@ members = [
     "mercurio-core",
     "mercurio-packets",
     "mercurio-server",
+    "mercurio-storage",
 ]
 
 [profile.release]
