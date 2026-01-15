@@ -22,13 +22,13 @@ use crate::{
 struct Listener {
     listener: TcpListener,
     broker: Broker<MemoryStore>,
-    session_manager_holder: SessionManagerDropGuard,
+    session_manager_holder: SessionManagerDropGuard<MemoryStore>,
     notify_shutdown: broadcast::Sender<()>,
 }
 
 struct Handler {
     broker: Broker<MemoryStore>,
-    session_manager: SessionManager,
+    session_manager: SessionManager<MemoryStore>,
     connection: Connection,
     shutdown: Shutdown,
 }
@@ -36,10 +36,13 @@ struct Handler {
 pub async fn run(listener: TcpListener, shutdown: impl Future) {
     let (notify_shutdown, _) = broadcast::channel(1);
 
+    // Create shared storage instance for both broker and session manager
+    let storage = Arc::new(MemoryStore::new());
+
     let mut server = Listener {
         listener,
-        broker: Broker::new(MemoryStore::new()),
-        session_manager_holder: SessionManagerDropGuard::new(),
+        broker: Broker::new(Arc::clone(&storage)),
+        session_manager_holder: SessionManagerDropGuard::new(storage),
         notify_shutdown,
     };
 
@@ -108,10 +111,19 @@ impl Listener {
 
 impl Handler {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
-        let session = self
+        let start_result = self
             .session_manager
             .start_session(&mut self.connection, connect_packet)
             .await?;
+
+        let mut session = start_result.session;
+
+        // Restore subscriptions if resuming a persisted session
+        if !start_result.subscriptions_to_restore.is_empty() {
+            session
+                .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker)
+                .await?;
+        }
 
         let result = self.handle_connection(&session).await;
 
@@ -144,12 +156,27 @@ impl Handler {
                         Some(packet) => packet,
                     };
 
+                    let is_subscription_change = matches!(
+                        packet,
+                        ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
+                    );
+
                     let maybe_res = session
                         .process_incoming(
                             packet,
                             &self.broker,
                             None, // TODO: Add auth_manager when configurable auth is implemented
                         ).await?;
+
+                    // Persist subscriptions after subscribe/unsubscribe operations
+                    if is_subscription_change {
+                        let client_id = session.get_client_id().await;
+                        let subscriptions = session.get_subscription_filters().await;
+                        let _ = self
+                            .session_manager
+                            .save_subscriptions(&client_id, subscriptions)
+                            .await;
+                    }
 
                     if let Some(res) = maybe_res {
                         tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);

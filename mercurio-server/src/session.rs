@@ -153,6 +153,46 @@ impl Session {
         session.client_id.clone()
     }
 
+    /// Returns a list of all subscription topic filters for this session.
+    pub(crate) async fn get_subscription_filters(&self) -> Vec<String> {
+        let session = self.shared.state.lock().await;
+        session.subscriptions.keys().cloned().collect()
+    }
+
+    /// Restore subscriptions by re-subscribing to the broker.
+    /// Called when resuming a persisted session.
+    pub(crate) async fn restore_subscriptions<S: RetainedMessageStore>(
+        &mut self,
+        topic_filters: Vec<String>,
+        broker: &Broker<S>,
+    ) -> Result<()> {
+        let mut session = self.shared.state.lock().await;
+
+        for topic_filter in topic_filters {
+            let (mut rx, retained_messages) = broker.subscribe(&topic_filter).await?;
+
+            let stream = Box::pin(async_stream::stream! {
+                // First deliver any retained messages
+                for msg in retained_messages {
+                    yield msg;
+                }
+
+                // Then continue with live messages
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => yield msg,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            session.subscriptions.insert(topic_filter, stream);
+        }
+
+        Ok(())
+    }
+
     pub async fn begin(&mut self, connection: &mut Connection, resume: bool) -> Result<()> {
         let mut ack = ConnAckPacket::default();
         ack.flags.session_present = resume;
@@ -630,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe_existing_topic() {
         let mut session = create_test_session();
-        let broker = crate::broker::Broker::new(MemoryStore::new());
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         // First subscribe to a topic
         let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {
@@ -670,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe_multiple_topics() {
         let mut session = create_test_session();
-        let broker = crate::broker::Broker::new(MemoryStore::new());
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         // Subscribe to two topics
         let subscribe_packet = mercurio_packets::subscribe::SubscribePacket {
