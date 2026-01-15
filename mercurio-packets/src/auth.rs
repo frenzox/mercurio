@@ -7,12 +7,12 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-#[derive(Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
-    auth_method: Option<AuthenticationMethod>,
-    auth_data: Option<AuthenticationData>,
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
+    pub auth_method: Option<AuthenticationMethod>,
+    pub auth_data: Option<AuthenticationData>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for AuthProperties {
@@ -71,10 +71,10 @@ impl Decoder for AuthProperties {
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug, Clone)]
 pub struct AuthPacket {
-    reason: ReasonCode,
-    properties: AuthProperties,
+    pub reason: ReasonCode,
+    pub properties: AuthProperties,
 }
 
 const PACKET_TYPE: u8 = 0x0f;

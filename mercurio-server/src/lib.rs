@@ -1,3 +1,4 @@
+pub mod auth;
 mod broker;
 pub mod connection;
 pub mod server;
