@@ -7,9 +7,9 @@ use tokio::{
 };
 use tracing::{error, info};
 
-use mercurio_core::{message::Message, Result};
-use mercurio_packets::{connect::ConnectPacket, ControlPacket};
-use mercurio_storage::memory::MemoryStore;
+use mercurio_core::{message::Message, qos::QoS, Result};
+use mercurio_packets::{connect::ConnectPacket, publish::PublishPacket, ControlPacket};
+use mercurio_storage::{memory::MemoryStore, InflightMessage};
 
 use crate::{
     broker::Broker,
@@ -130,6 +130,26 @@ impl Handler {
             session.set_will(will).await;
         }
 
+        // Retry inflight messages (QoS 1/2 awaiting acknowledgment)
+        for inflight in start_result.inflight_to_retry {
+            let publish = PublishPacket {
+                dup: true, // Mark as duplicate since this is a retry
+                qos_level: inflight.qos,
+                retain: false,
+                topic_name: inflight.topic,
+                packet_id: Some(inflight.packet_id),
+                properties: None,
+                payload: inflight.payload,
+            };
+            if let Err(e) = self
+                .connection
+                .write_packet(ControlPacket::Publish(publish))
+                .await
+            {
+                error!("Failed to retry inflight message: {}", e);
+            }
+        }
+
         let result = self.handle_connection(&session).await;
 
         // Publish will message on abnormal disconnect
@@ -171,6 +191,13 @@ impl Handler {
                         ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
                     );
 
+                    // Check if this is an ack that completes an inflight message
+                    let inflight_completed = match &packet {
+                        ControlPacket::PubAck(ack) => Some(ack.packet_id),
+                        ControlPacket::PubComp(comp) => Some(comp.packet_id),
+                        _ => None,
+                    };
+
                     let maybe_res = session
                         .process_incoming(
                             packet,
@@ -188,6 +215,15 @@ impl Handler {
                             .await;
                     }
 
+                    // Remove inflight message after acknowledgment
+                    if let Some(packet_id) = inflight_completed {
+                        let client_id = session.get_client_id().await;
+                        let _ = self
+                            .session_manager
+                            .remove_inflight(&client_id, packet_id)
+                            .await;
+                    }
+
                     if let Some(res) = maybe_res {
                         tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
                         self.connection.write_packet(res).await?;
@@ -197,6 +233,26 @@ impl Handler {
                 // Try to send outgoing packet
                 Some(packet) = session.process_outgoing() => {
                     tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", packet, session.get_client_id().await);
+
+                    // Store inflight for QoS 1/2 messages
+                    if let ControlPacket::Publish(ref publish) = packet {
+                        if let Some(packet_id) = publish.packet_id {
+                            if matches!(publish.qos_level, QoS::AtLeastOnce | QoS::ExactlyOnce) {
+                                let client_id = session.get_client_id().await;
+                                let inflight = InflightMessage {
+                                    packet_id,
+                                    topic: publish.topic_name.clone(),
+                                    payload: publish.payload.clone(),
+                                    qos: publish.qos_level,
+                                    dup: publish.dup,
+                                };
+                                let _ = self
+                                    .session_manager
+                                    .store_inflight(&client_id, packet_id, &inflight)
+                                    .await;
+                            }
+                        }
+                    }
 
                     self.connection.write_packet(packet).await?;
                 }
