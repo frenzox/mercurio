@@ -3,9 +3,9 @@ use std::{future::Future, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
-    time::{self, Duration},
+    time::{self, Duration, Instant},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use mercurio_core::{message::Message, qos::QoS, Result};
 use mercurio_packets::{connect::ConnectPacket, publish::PublishPacket, ControlPacket};
@@ -111,6 +111,8 @@ impl Listener {
 
 impl Handler {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
+        let keepalive = connect_packet.keepalive;
+
         let start_result = self
             .session_manager
             .start_session(&mut self.connection, connect_packet)
@@ -150,7 +152,7 @@ impl Handler {
             }
         }
 
-        let result = self.handle_connection(&session).await;
+        let result = self.handle_connection(&session, keepalive).await;
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
@@ -164,8 +166,19 @@ impl Handler {
         result
     }
 
-    async fn handle_connection(&mut self, session: &Session) -> Result<()> {
+    async fn handle_connection(&mut self, session: &Session, keepalive: u16) -> Result<()> {
         let mut session = session.clone();
+
+        // Calculate keep-alive timeout: 1.5x keepalive seconds per MQTT spec
+        // A keepalive of 0 means disabled (use a very long timeout)
+        let timeout_duration = if keepalive == 0 {
+            Duration::from_secs(u64::MAX / 2) // Effectively disabled
+        } else {
+            Duration::from_secs((keepalive as u64 * 3) / 2)
+        };
+
+        let deadline = time::sleep(timeout_duration);
+        tokio::pin!(deadline);
 
         while !self.shutdown.is_shutdown() {
             tokio::select! {
@@ -228,6 +241,9 @@ impl Handler {
                         tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
                         self.connection.write_packet(res).await?;
                     }
+
+                    // Reset keep-alive deadline after receiving any packet
+                    deadline.as_mut().reset(Instant::now() + timeout_duration);
                 }
 
                 // Try to send outgoing packet
@@ -255,6 +271,18 @@ impl Handler {
                     }
 
                     self.connection.write_packet(packet).await?;
+                }
+
+                // Keep-alive timeout expired - disconnect client
+                _ = &mut deadline => {
+                    let client_id = session.get_client_id().await;
+                    warn!(
+                        "Keep-alive timeout for client `{}` ({}s with no packets)",
+                        client_id, timeout_duration.as_secs()
+                    );
+                    // Return normally to trigger abnormal disconnect handling
+                    // (will message will be published)
+                    return Ok(());
                 }
 
                 // Exit in case a signal is received
