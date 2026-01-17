@@ -234,15 +234,25 @@ impl Session {
         let client_id = {
             let mut session = self.shared.state.lock().await;
 
+            // Set protocol version from the CONNECT packet
+            ack.protocol_version = session.connect_packet.protocol_version;
+
             if session.connect_packet.payload.client_id.is_empty() {
                 let uuid = Uuid::new_v4();
                 let generated_id = uuid.hyphenated().to_string();
                 session.connect_packet.payload.client_id = generated_id.clone();
                 session.client_id = generated_id.clone();
-                ack.properties = Some(ConnAckProperties {
-                    assigned_client_id: Some(AssignedClientIdentifier::new(generated_id)),
-                    ..Default::default()
-                });
+                // Assigned client ID is only supported in MQTT 5.0
+                if session
+                    .connect_packet
+                    .protocol_version
+                    .supports_properties()
+                {
+                    ack.properties = Some(ConnAckProperties {
+                        assigned_client_id: Some(AssignedClientIdentifier::new(generated_id)),
+                        ..Default::default()
+                    });
+                }
             }
 
             session.client_id.clone()
@@ -368,6 +378,7 @@ impl Session {
         let mut session = self.shared.state.lock().await;
         // Pre-allocate payload vec based on subscription count
         let mut ack = SubAckPacket {
+            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -419,6 +430,7 @@ impl Session {
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
+            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -610,6 +622,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mercurio_core::protocol::ProtocolVersion;
     use mercurio_packets::{
         connect::{ConnectFlags, ConnectPayload},
         subscribe::{SubscribePayload, SubscriptionOptions},
@@ -619,6 +632,7 @@ mod tests {
 
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags::default(),
             keepalive: 60,
             properties: None,
@@ -640,6 +654,7 @@ mod tests {
 
     fn create_connect_packet_with_will() -> ConnectPacket {
         ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 will_flag: true,
                 will_qos: QoS::AtLeastOnce,
@@ -660,6 +675,7 @@ mod tests {
 
     fn create_connect_packet_without_will() -> ConnectPacket {
         ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 will_flag: false,
                 clean_start: true,

@@ -6,6 +6,7 @@ use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
@@ -161,8 +162,49 @@ impl Decoder for ConnAckProperties {
     }
 }
 
+/// MQTT 3.x return codes for CONNACK.
+/// These are different from MQTT 5.0 reason codes.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ConnAckReturnCode {
+    #[default]
+    Accepted = 0x00,
+    UnacceptableProtocolVersion = 0x01,
+    IdentifierRejected = 0x02,
+    ServerUnavailable = 0x03,
+    BadUsernameOrPassword = 0x04,
+    NotAuthorized = 0x05,
+}
+
+impl Encoder for ConnAckReturnCode {
+    fn encode(&self, buffer: &mut bytes::BytesMut) {
+        buffer.put_u8(*self as u8);
+    }
+
+    fn encoded_size(&self) -> usize {
+        1
+    }
+}
+
+impl From<ReasonCode> for ConnAckReturnCode {
+    fn from(reason: ReasonCode) -> Self {
+        match reason {
+            ReasonCode::Success => ConnAckReturnCode::Accepted,
+            ReasonCode::UnsupportedProtocolVersion => {
+                ConnAckReturnCode::UnacceptableProtocolVersion
+            }
+            ReasonCode::ClientIdentifierNotValid => ConnAckReturnCode::IdentifierRejected,
+            ReasonCode::ServerUnavailable => ConnAckReturnCode::ServerUnavailable,
+            ReasonCode::BadUserNameOrPassword => ConnAckReturnCode::BadUsernameOrPassword,
+            ReasonCode::NotAuthorized => ConnAckReturnCode::NotAuthorized,
+            _ => ConnAckReturnCode::ServerUnavailable, // Default fallback for unmapped codes
+        }
+    }
+}
+
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
+    pub protocol_version: ProtocolVersion,
     pub flags: ConnAckFlags,
     pub reason_code: ReasonCode,
     pub properties: Option<ConnAckProperties>,
@@ -177,34 +219,81 @@ impl Encoder for ConnAckPacket {
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
         remaining_len += self.flags.encoded_size();
-        remaining_len += self.reason_code.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
+
+        if self.protocol_version.supports_properties() {
+            // MQTT 5.0: reason code + properties
+            remaining_len += self.reason_code.encoded_size();
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+        } else {
+            // MQTT 3.x: return code only, no properties
+            remaining_len += 1; // Return code byte
+        }
+
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         // Variable header
         self.flags.encode(buffer);
-        self.reason_code.encode(buffer);
 
-        // Properties
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+        if self.protocol_version.supports_properties() {
+            // MQTT 5.0
+            self.reason_code.encode(buffer);
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
+        } else {
+            // MQTT 3.x: encode return code (mapped from reason code)
+            let return_code: ConnAckReturnCode = self.reason_code.into();
+            return_code.encode(buffer);
+        }
     }
 }
 
 impl Decoder for ConnAckPacket {
+    /// Decodes a CONNACK packet assuming MQTT 5.0 format.
+    /// For MQTT 3.x decoding, use `decode_v3` instead.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
+        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
 
         let flags = ConnAckFlags::decode(buffer)?;
         let reason_code = ReasonCode::decode(buffer)?;
         let properties = Some(ConnAckProperties::decode(buffer)?);
 
         Ok(ConnAckPacket {
+            protocol_version: ProtocolVersion::V5,
             flags,
             reason_code,
             properties,
+        })
+    }
+}
+
+impl ConnAckPacket {
+    /// Decodes a CONNACK packet in MQTT 3.x format.
+    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        buffer.advance(1); // Packet type
+        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+
+        let flags = ConnAckFlags::decode(buffer)?;
+        let return_code = buffer.get_u8();
+
+        // Map MQTT 3.x return code to reason code
+        let reason_code = match return_code {
+            0x00 => ReasonCode::Success,
+            0x01 => ReasonCode::UnsupportedProtocolVersion,
+            0x02 => ReasonCode::ClientIdentifierNotValid,
+            0x03 => ReasonCode::ServerUnavailable,
+            0x04 => ReasonCode::BadUserNameOrPassword,
+            0x05 => ReasonCode::NotAuthorized,
+            _ => ReasonCode::UnspecifiedError,
+        };
+
+        Ok(ConnAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1, // Default to 3.1.1 for v3 decoding
+            flags,
+            reason_code,
+            properties: None,
         })
     }
 }
@@ -244,6 +333,7 @@ mod tests {
         };
 
         let packet = ConnAckPacket {
+            protocol_version: ProtocolVersion::V5,
             flags,
             reason_code,
             properties: properties.into(),
@@ -259,5 +349,56 @@ mod tests {
         let new_packet = ConnAckPacket::decode(&mut bytes).expect("Unexpected error");
 
         assert_eq!(packet, new_packet);
+    }
+
+    #[test]
+    fn test_connack_packet_v3_1_1_encode() {
+        // MQTT 3.1.1 CONNACK: just flags (session_present) + return code
+        // No properties, no reason codes - simpler format
+        let expected = vec![
+            0x20, // Packet type: CONNACK
+            0x02, // Remaining length: 2
+            0x00, // Flags: session_present = false
+            0x00, // Return code: 0 = Connection Accepted
+        ];
+
+        let packet = ConnAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            flags: ConnAckFlags {
+                session_present: false,
+            },
+            reason_code: ReasonCode::Success,
+            properties: None,
+        };
+
+        let mut encoded = BytesMut::new();
+        packet.encode(&mut encoded);
+
+        assert_eq!(encoded.to_vec(), expected);
+    }
+
+    #[test]
+    fn test_connack_packet_v3_1_1_not_authorized() {
+        // MQTT 3.1.1 CONNACK with "not authorized" error
+        let expected = vec![
+            0x20, // Packet type: CONNACK
+            0x02, // Remaining length: 2
+            0x00, // Flags: session_present = false
+            0x05, // Return code: 5 = Not Authorized
+        ];
+
+        let packet = ConnAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            flags: ConnAckFlags {
+                session_present: false,
+            },
+            reason_code: ReasonCode::NotAuthorized,
+            properties: None,
+        };
+
+        let mut encoded = BytesMut::new();
+        packet.encode(&mut encoded);
+
+        assert_eq!(encoded.to_vec(), expected);
     }
 }

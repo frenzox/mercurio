@@ -6,6 +6,7 @@ use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
     properties::*,
+    protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
 };
@@ -255,8 +256,69 @@ pub struct ConnectPayload {
     pub password: Option<Bytes>,
 }
 
+impl ConnectPayload {
+    /// Encode payload with version-specific handling.
+    pub fn encode_for_version(
+        &self,
+        buffer: &mut BytesMut,
+        version: ProtocolVersion,
+        flags: &ConnectFlags,
+    ) {
+        self.client_id.encode(buffer);
+
+        // Will properties only for MQTT 5.0
+        if flags.will_flag {
+            if version.supports_properties() && self.will_properties.encoded_size() > 0 {
+                VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
+                self.will_properties.encode(buffer);
+            }
+            self.will_topic.encode(buffer);
+            self.will_payload.encode(buffer);
+        }
+
+        if flags.user_name {
+            self.user_name.encode(buffer);
+        }
+        if flags.password {
+            self.password.encode(buffer);
+        }
+    }
+
+    /// Calculate encoded size with version-specific handling.
+    pub fn encoded_size_for_version(
+        &self,
+        version: ProtocolVersion,
+        flags: &ConnectFlags,
+    ) -> usize {
+        let mut len = 0;
+
+        len += self.client_id.encoded_size();
+
+        if flags.will_flag {
+            // Will properties only for MQTT 5.0
+            if version.supports_properties() && self.will_properties.encoded_size() > 0 {
+                len +=
+                    VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
+                len += self.will_properties.encoded_size();
+            }
+            len += self.will_topic.encoded_size();
+            len += self.will_payload.encoded_size();
+        }
+
+        if flags.user_name {
+            len += self.user_name.encoded_size();
+        }
+        if flags.password {
+            len += self.password.encoded_size();
+        }
+
+        len
+    }
+}
+
 impl Encoder for ConnectPayload {
     fn encode(&self, buffer: &mut BytesMut) {
+        // Default encoding assumes MQTT 5.0 with all optional fields
         self.client_id.encode(buffer);
 
         if self.will_properties.encoded_size() > 0 {
@@ -301,69 +363,88 @@ impl Decoder for ConnectPayload {
 
 #[derive(Eq, PartialEq, Debug)]
 pub struct ConnectPacket {
+    pub protocol_version: ProtocolVersion,
     pub flags: ConnectFlags,
     pub keepalive: u16,
     pub properties: Option<ConnectProperties>,
     pub payload: ConnectPayload,
 }
 
-impl ConnectPacket {
-    const PROTOCOL_NAME: &'static str = "MQTT";
-    const PROTOCOL_VERSION: u8 = 5;
-}
-
 const PACKET_TYPE: u8 = 0x01;
 
 impl Encoder for ConnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
+        let protocol_name = self.protocol_version.protocol_name();
+        let protocol_level = self.protocol_version.protocol_level();
+
         let mut remaining_len = 0;
 
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += Self::PROTOCOL_NAME.encoded_size();
-        remaining_len += Self::PROTOCOL_VERSION.encoded_size();
+        remaining_len += protocol_name.encoded_size();
+        remaining_len += protocol_level.encoded_size();
         remaining_len += self.flags.encoded_size();
         remaining_len += self.keepalive.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
-        remaining_len += self.payload.encoded_size();
+
+        // Properties only for MQTT 5.0
+        if self.protocol_version.supports_properties() {
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+        }
+
+        remaining_len += self
+            .payload
+            .encoded_size_for_version(self.protocol_version, &self.flags);
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         // Variable header
-        Self::PROTOCOL_NAME.encode(buffer);
-        Self::PROTOCOL_VERSION.encode(buffer);
+        protocol_name.encode(buffer);
+        protocol_level.encode(buffer);
         self.flags.encode(buffer);
         self.keepalive.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+
+        // Properties only for MQTT 5.0
+        if self.protocol_version.supports_properties() {
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
+        }
 
         // Payload
-        self.payload.encode(buffer);
+        self.payload
+            .encode_for_version(buffer, self.protocol_version, &self.flags);
     }
 }
 
 impl Decoder for ConnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
+        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
 
+        // Parse protocol name and level to determine version
         let protocol_name = String::decode(buffer)?;
-        if protocol_name != Self::PROTOCOL_NAME {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
+        let protocol_level = u8::decode(buffer)?;
 
-        let protocol_version = u8::decode(buffer)?;
-        if protocol_version != 5 {
-            return Err(ReasonCode::UnsupportedProtocolVersion.into());
-        }
+        let protocol_version = ProtocolVersion::from_name_and_level(&protocol_name, protocol_level)
+            .ok_or(ReasonCode::UnsupportedProtocolVersion)?;
 
         let flags = ConnectFlags::decode(buffer)?;
         let keepalive = u16::decode(buffer)?;
-        let properties = Some(ConnectProperties::decode(buffer)?);
+
+        // Properties only exist in MQTT 5.0
+        let properties = if protocol_version.supports_properties() {
+            Some(ConnectProperties::decode(buffer)?)
+        } else {
+            None
+        };
+
         let mut payload = ConnectPayload::decode(buffer)?;
 
         if flags.will_flag {
-            payload.will_properties = Some(WillProperties::decode(buffer)?);
+            // Will properties only exist in MQTT 5.0
+            if protocol_version.supports_properties() {
+                payload.will_properties = Some(WillProperties::decode(buffer)?);
+            }
             payload.will_topic = Some(String::decode(buffer)?);
             payload.will_payload = Some(Bytes::decode(buffer)?);
         }
@@ -377,6 +458,7 @@ impl Decoder for ConnectPacket {
         }
 
         Ok(ConnectPacket {
+            protocol_version,
             flags,
             keepalive,
             properties,
@@ -412,6 +494,7 @@ mod tests {
 
         let payload = ConnectPayload::default();
         let packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
             flags,
             keepalive: 60,
             properties: properties.into(),
@@ -470,6 +553,7 @@ mod tests {
         };
 
         let packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
             flags,
             keepalive: 60,
             properties: properties.into(),
@@ -485,5 +569,66 @@ mod tests {
 
         let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
+    }
+
+    #[test]
+    fn test_connect_packet_v3_1_1_encode_decode() {
+        // MQTT 3.1.1 CONNECT packet: no properties
+        // Protocol: MQTT (2+4=6 bytes), Level: 1 byte, Flags: 1 byte, Keepalive: 2 bytes, Client ID: 2 bytes = 12 total
+        let expected = vec![
+            0x10, // Packet type: CONNECT
+            0x0c, // Remaining length: 12
+            0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, // Protocol name: "MQTT"
+            0x04, // Protocol level: 4 (MQTT 3.1.1)
+            0x02, // Flags: clean_start
+            0x00, 0x3c, // Keepalive: 60
+            0x00, 0x00, // Client ID: empty
+        ];
+
+        let flags = ConnectFlags {
+            clean_start: true,
+            ..Default::default()
+        };
+
+        let payload = ConnectPayload::default();
+        let packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            flags,
+            keepalive: 60,
+            properties: None, // No properties for 3.1.1
+            payload,
+        };
+
+        let mut encoded = BytesMut::new();
+        packet.encode(&mut encoded);
+
+        assert_eq!(encoded.to_vec(), expected);
+
+        let mut bytes = Bytes::from(expected);
+        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        assert_eq!(packet, new_packet);
+    }
+
+    #[test]
+    fn test_connect_packet_v3_1_decode() {
+        // MQTT 3.1 CONNECT packet: Protocol "MQIsdp", Level 3
+        // Protocol: MQIsdp (2+6=8 bytes), Level: 1 byte, Flags: 1 byte, Keepalive: 2 bytes, Client ID: 2 bytes = 14 total
+        let input = vec![
+            0x10, // Packet type: CONNECT
+            0x0e, // Remaining length: 14
+            0x00, 0x06, 0x4d, 0x51, 0x49, 0x73, 0x64, 0x70, // Protocol name: "MQIsdp"
+            0x03, // Protocol level: 3 (MQTT 3.1)
+            0x02, // Flags: clean_start
+            0x00, 0x3c, // Keepalive: 60
+            0x00, 0x00, // Client ID: empty
+        ];
+
+        let mut bytes = Bytes::from(input);
+        let packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+
+        assert_eq!(packet.protocol_version, ProtocolVersion::V3_1);
+        assert!(packet.flags.clean_start);
+        assert_eq!(packet.keepalive, 60);
+        assert!(packet.properties.is_none());
     }
 }

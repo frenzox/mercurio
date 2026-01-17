@@ -2,6 +2,7 @@ pub mod codec;
 pub mod error;
 pub mod message;
 pub mod properties;
+pub mod protocol;
 pub mod qos;
 pub mod reason;
 pub mod topic;
