@@ -5,23 +5,23 @@ use tracing::info;
 
 use mercurio_core::Result;
 use mercurio_packets::connect::ConnectPacket;
-use mercurio_storage::{SessionState, SessionStore};
+use mercurio_storage::{SessionState, SessionStore, StoredWillMessage, WillStore};
 
 use crate::{
     connection::Connection,
-    session::{Session, SessionDropGuard},
+    session::{Session, SessionDropGuard, WillMessage},
 };
 
-pub(crate) struct SessionManagerDropGuard<S: SessionStore> {
+pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore> {
     session_manager: SessionManager<S>,
 }
 
-pub(crate) struct SessionManager<S: SessionStore> {
+pub(crate) struct SessionManager<S: SessionStore + WillStore> {
     shared: Arc<Shared>,
     storage: Arc<S>,
 }
 
-impl<S: SessionStore> Clone for SessionManager<S> {
+impl<S: SessionStore + WillStore> Clone for SessionManager<S> {
     fn clone(&self) -> Self {
         SessionManager {
             shared: Arc::clone(&self.shared),
@@ -38,7 +38,7 @@ struct State {
     sessions: HashMap<String, SessionDropGuard>,
 }
 
-impl<S: SessionStore> SessionManagerDropGuard<S> {
+impl<S: SessionStore + WillStore> SessionManagerDropGuard<S> {
     pub(crate) fn new(storage: Arc<S>) -> SessionManagerDropGuard<S> {
         SessionManagerDropGuard {
             session_manager: SessionManager::new(storage),
@@ -50,14 +50,16 @@ impl<S: SessionStore> SessionManagerDropGuard<S> {
     }
 }
 
-/// Result of starting a session, includes subscriptions to restore if resuming.
+/// Result of starting a session, includes subscriptions and will to restore if resuming.
 pub(crate) struct SessionStartResult {
     pub session: Session,
     /// Topic filters to restore (re-subscribe to broker) if resuming a persisted session.
     pub subscriptions_to_restore: Vec<String>,
+    /// Will message restored from storage (if resuming and will was persisted).
+    pub will_to_restore: Option<WillMessage>,
 }
 
-impl<S: SessionStore> SessionManager<S> {
+impl<S: SessionStore + WillStore> SessionManager<S> {
     pub(crate) fn new(storage: Arc<S>) -> SessionManager<S> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -77,11 +79,13 @@ impl<S: SessionStore> SessionManager<S> {
         let mut manager = self.shared.state.lock().await;
         let mut resume = false;
         let mut subscriptions_to_restore = Vec::new();
+        let mut will_to_restore = None;
 
         if connect_packet.flags.clean_start {
             // Clean start: remove any existing session (in-memory and storage)
             manager.sessions.remove(client_id);
             let _ = self.storage.delete_session(client_id).await;
+            let _ = self.storage.delete_will(client_id).await;
         } else {
             // Try to resume existing session
             // First check in-memory sessions
@@ -97,6 +101,12 @@ impl<S: SessionStore> SessionManager<S> {
                     );
                     subscriptions_to_restore = stored_session.subscriptions;
                     resume = true;
+
+                    // Also restore will message if present
+                    if let Ok(Some(stored_will)) = self.storage.get_will(client_id).await {
+                        info!("Restoring will message for client `{}`", client_id);
+                        will_to_restore = Some(stored_will.into());
+                    }
                 }
             }
         }
@@ -115,20 +125,26 @@ impl<S: SessionStore> SessionManager<S> {
 
         session.begin(connection, resume).await?;
 
-        // Save session state to storage (with empty subscriptions initially)
+        let client_id = session.get_client_id().await;
+
+        // Save session state to storage
         let session_state = SessionState {
-            client_id: session.get_client_id().await,
+            client_id: client_id.clone(),
             subscriptions: subscriptions_to_restore.clone(),
             clean_start: false,
         };
-        let _ = self
-            .storage
-            .save_session(&session_state.client_id, &session_state)
-            .await;
+        let _ = self.storage.save_session(&client_id, &session_state).await;
+
+        // Store will message if present in the new CONNECT packet
+        if let Some(will) = session.get_will().await {
+            let stored_will: StoredWillMessage = will.into();
+            let _ = self.storage.store_will(&client_id, &stored_will).await;
+        }
 
         Ok(SessionStartResult {
             session,
             subscriptions_to_restore,
+            will_to_restore,
         })
     }
 
@@ -145,6 +161,15 @@ impl<S: SessionStore> SessionManager<S> {
         };
         self.storage
             .save_session(client_id, &session_state)
+            .await
+            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+    }
+
+    /// Delete persisted will message for a client.
+    /// Called when will is cleared (clean disconnect) or published (abnormal disconnect).
+    pub(crate) async fn delete_will(&self, client_id: &str) -> Result<()> {
+        self.storage
+            .delete_will(client_id)
             .await
             .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
     }
