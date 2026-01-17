@@ -125,12 +125,20 @@ impl Handler {
                 .await?;
         }
 
+        // Restore will message if resuming a persisted session
+        if let Some(will) = start_result.will_to_restore {
+            session.set_will(will).await;
+        }
+
         let result = self.handle_connection(&session).await;
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
         if let Some(will) = session.take_will().await {
             self.publish_will(will, &session).await;
+            // Delete persisted will after publishing
+            let client_id = session.get_client_id().await;
+            let _ = self.session_manager.delete_will(&client_id).await;
         }
 
         result
@@ -149,8 +157,10 @@ impl Handler {
                             return Ok(());
                         }
                         Some(ControlPacket::Disconnect(_)) => {
-                            // Clean disconnect - clear the will
+                            // Clean disconnect - clear the will (in-memory and storage)
                             session.clear_will().await;
+                            let client_id = session.get_client_id().await;
+                            let _ = self.session_manager.delete_will(&client_id).await;
                             return Ok(());
                         }
                         Some(packet) => packet,

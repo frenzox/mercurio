@@ -37,7 +37,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
 };
-use mercurio_storage::RetainedMessageStore;
+use mercurio_storage::{RetainedMessageStore, StoredWillMessage};
 
 /// Will message to be published on abnormal client disconnect.
 #[derive(Debug, Clone)]
@@ -64,6 +64,28 @@ impl WillMessage {
             qos: packet.flags.will_qos,
             retain: packet.flags.will_retain,
         })
+    }
+}
+
+impl From<WillMessage> for StoredWillMessage {
+    fn from(will: WillMessage) -> Self {
+        StoredWillMessage {
+            topic: will.topic,
+            payload: will.payload,
+            qos: will.qos,
+            retain: will.retain,
+        }
+    }
+}
+
+impl From<StoredWillMessage> for WillMessage {
+    fn from(stored: StoredWillMessage) -> Self {
+        WillMessage {
+            topic: stored.topic,
+            payload: stored.payload,
+            qos: stored.qos,
+            retain: stored.retain,
+        }
     }
 }
 
@@ -145,6 +167,18 @@ impl Session {
     pub(crate) async fn take_will(&self) -> Option<WillMessage> {
         let mut session = self.shared.state.lock().await;
         session.will_message.take()
+    }
+
+    /// Get a clone of the will message without removing it.
+    pub(crate) async fn get_will(&self) -> Option<WillMessage> {
+        let session = self.shared.state.lock().await;
+        session.will_message.clone()
+    }
+
+    /// Set the will message. Called when restoring from storage.
+    pub(crate) async fn set_will(&self, will: WillMessage) {
+        let mut session = self.shared.state.lock().await;
+        session.will_message = Some(will);
     }
 
     /// Returns a clone of the client ID. For logging, prefer using the cached version.
