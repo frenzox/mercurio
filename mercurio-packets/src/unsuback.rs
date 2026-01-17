@@ -4,6 +4,7 @@ use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
@@ -92,6 +93,7 @@ impl Decoder for UnsubAckPayload {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubAckPacket {
+    pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
     pub properties: Option<UnsubAckProperties>,
     pub payload: Vec<UnsubAckPayload>,
@@ -108,23 +110,34 @@ impl Encoder for UnsubAckPacket {
         fixed_header.encode(buffer);
 
         remaining_len += self.packet_id.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
-        remaining_len += self.payload.encoded_size();
+
+        // Properties and payload reason codes only for MQTT 5.0
+        // MQTT 3.x UNSUBACK is just packet_id (2 bytes)
+        if self.protocol_version.supports_properties() {
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+            remaining_len += self.payload.encoded_size();
+        }
 
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
-        self.payload.encode(buffer);
+
+        // Properties and payload reason codes only for MQTT 5.0
+        if self.protocol_version.supports_properties() {
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
+            self.payload.encode(buffer);
+        }
     }
 }
 
 impl Decoder for UnsubAckPacket {
+    /// Decodes an UNSUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
+        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; // Remaining length
         let buffer_len = buffer.remaining();
 
         let packet_id = u16::decode(buffer)?;
@@ -142,6 +155,7 @@ impl Decoder for UnsubAckPacket {
         }
 
         Ok(UnsubAckPacket {
+            protocol_version: ProtocolVersion::V5,
             packet_id,
             properties,
             payload,
@@ -160,6 +174,7 @@ mod tests {
         let expected = vec![0xb0, 0x04, 0x00, 0x01, 0x00, 0x01];
 
         let packet = UnsubAckPacket {
+            protocol_version: ProtocolVersion::V5,
             packet_id: 1,
             properties: UnsubAckProperties::default().into(),
             payload: vec![UnsubAckPayload {
