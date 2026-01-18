@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "mercurio-client",
     "mercurio-core",
     "mercurio-packets",
     "mercurio-server",

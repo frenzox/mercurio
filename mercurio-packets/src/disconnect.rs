@@ -73,8 +73,8 @@ impl Decoder for DisconnectProperties {
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
-    pub(crate) reason: ReasonCode,
-    pub(crate) properties: Option<DisconnectProperties>,
+    pub reason: ReasonCode,
+    pub properties: Option<DisconnectProperties>,
 }
 
 const PACKET_TYPE: u8 = 0x0e;

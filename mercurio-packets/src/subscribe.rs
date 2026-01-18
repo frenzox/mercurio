@@ -87,10 +87,10 @@ impl From<u8> for RetainHandling {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SubscriptionOptions {
-    qos: QoS,
-    no_local: bool,
-    retain_as_pub: bool,
-    retain_handling: RetainHandling,
+    pub qos: QoS,
+    pub no_local: bool,
+    pub retain_as_pub: bool,
+    pub retain_handling: RetainHandling,
 }
 
 impl Encoder for SubscriptionOptions {

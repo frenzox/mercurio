@@ -163,6 +163,25 @@ impl Decoder for UnsubAckPacket {
     }
 }
 
+impl UnsubAckPacket {
+    /// Decodes an UNSUBACK packet in MQTT 3.x format.
+    /// MQTT 3.x UNSUBACK: just packet_id (no properties, no payload)
+    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        buffer.advance(1); // Packet type
+        let _ = VariableByteInteger::decode(buffer)?; // Remaining length (should be 2)
+
+        let packet_id = u16::decode(buffer)?;
+
+        // MQTT 3.x UNSUBACK has no properties and no payload
+        Ok(UnsubAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            packet_id,
+            properties: None,
+            payload: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
