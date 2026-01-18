@@ -1,0 +1,19 @@
+[package]
+name = "mercurio-client"
+version = "0.1.0"
+edition = "2021"
+description = "MQTT client library for the Mercurio MQTT implementation"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mercurio-core = { path = "../mercurio-core" }
+mercurio-packets = { path = "../mercurio-packets" }
+
+bytes = "1"
+tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

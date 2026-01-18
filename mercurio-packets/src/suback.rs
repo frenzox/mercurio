@@ -164,6 +164,42 @@ impl Decoder for SubAckPacket {
     }
 }
 
+impl SubAckPacket {
+    /// Decodes a SUBACK packet in MQTT 3.x format.
+    /// MQTT 3.x SUBACK: packet_id + return codes (no properties)
+    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        buffer.advance(1); // Packet type
+        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+        let buffer_len = buffer.remaining();
+
+        let packet_id = u16::decode(buffer)?;
+
+        // No properties in MQTT 3.x
+        // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure
+        let next_packet = buffer_len - remaining_len;
+        let mut payload = Vec::new();
+
+        while buffer.remaining() > next_packet {
+            let return_code = buffer.get_u8();
+            let reason_code = match return_code {
+                0x00 => ReasonCode::GrantedQoS0,
+                0x01 => ReasonCode::GrantedQoS1,
+                0x02 => ReasonCode::GrantedQoS2,
+                0x80 => ReasonCode::UnspecifiedError,
+                _ => ReasonCode::UnspecifiedError,
+            };
+            payload.push(SubAckPayload { reason_code });
+        }
+
+        Ok(SubAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            packet_id,
+            properties: None,
+            payload,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};

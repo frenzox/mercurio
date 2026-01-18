@@ -24,6 +24,7 @@ use bytes::{Buf, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
 };
@@ -121,6 +122,16 @@ impl ControlPacket {
     }
 
     pub fn parse(src: &mut BytesMut) -> crate::Result<ControlPacket> {
+        // Default to MQTT 5.0 parsing
+        Self::parse_with_version(src, ProtocolVersion::V5)
+    }
+
+    /// Parse a control packet with version-specific decoding.
+    /// Use this when the protocol version is known (e.g., after CONNECT).
+    pub fn parse_with_version(
+        src: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> crate::Result<ControlPacket> {
         use ControlPacket::*;
 
         let mut peeker = Cursor::new(&src[..]);
@@ -128,20 +139,38 @@ impl ControlPacket {
 
         let packet = match packet_type.try_into()? {
             PacketType::Connect => Connect(ConnectPacket::decode(src)?),
-            PacketType::ConnAck => ConnAck(ConnAckPacket::decode(src)?),
+            PacketType::ConnAck => {
+                if version.supports_properties() {
+                    ConnAck(ConnAckPacket::decode(src)?)
+                } else {
+                    ConnAck(ConnAckPacket::decode_v3(src)?)
+                }
+            }
             PacketType::Publish => Publish(PublishPacket::decode(src)?),
             PacketType::PubAck => PubAck(PubAckPacket::decode(src)?),
             PacketType::PubRec => PubRec(PubRecPacket::decode(src)?),
             PacketType::PubRel => PubRel(PubRelPacket::decode(src)?),
             PacketType::PubComp => PubComp(PubCompPacket::decode(src)?),
             PacketType::Subscribe => Subscribe(SubscribePacket::decode(src)?),
-            PacketType::SubAck => SubAck(SubAckPacket::decode(src)?),
+            PacketType::SubAck => {
+                if version.supports_properties() {
+                    SubAck(SubAckPacket::decode(src)?)
+                } else {
+                    SubAck(SubAckPacket::decode_v3(src)?)
+                }
+            }
             PacketType::Unsubscribe => Unsubscribe(UnsubscribePacket::decode(src)?),
+            PacketType::UnsubAck => {
+                if version.supports_properties() {
+                    UnsubAck(UnsubAckPacket::decode(src)?)
+                } else {
+                    UnsubAck(UnsubAckPacket::decode_v3(src)?)
+                }
+            }
             PacketType::PingReq => PingReq(PingReqPacket::decode(src)?),
             PacketType::PingResp => PingResp(PingRespPacket::decode(src)?),
             PacketType::Disconnect => Disconnect(DisconnectPacket::decode(src)?),
             PacketType::Auth => Auth(AuthPacket::decode(src)?),
-            _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 
         Ok(packet)
