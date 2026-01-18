@@ -1,0 +1,21 @@
+[package]
+name = "mercuriod"
+version = "0.1.0"
+edition = "2021"
+description = "Mercurio MQTT broker daemon"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "mercuriod"
+path = "src/main.rs"
+
+[dependencies]
+mercurio-core = { path = "../mercurio-core" }
+mercurio-server = { path = "../mercurio-server" }
+
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

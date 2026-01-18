@@ -2,10 +2,8 @@
 name = "mercurio-server"
 version = "0.1.0"
 edition = "2021"
-
-[[bin]]
-name = "mercurio-server"
-path = "src/bin/main.rs"
+description = "MQTT broker library for the Mercurio implementation"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-stream = "0.3"

@@ -1,51 +1,50 @@
-# Mercurio CLI Tools
+# Mercurio
 
-Command-line tools for publishing and subscribing to MQTT topics.
+MQTT command-line client for publishing and subscribing to topics.
 
 ## Installation
 
 ```bash
-cargo install --path mercurio-cli
+cargo install --path mercurio
 ```
 
 Or build from the workspace root:
 
 ```bash
-cargo build --release --package mercurio-cli
+cargo build --release --package mercurio
 ```
 
-Binaries will be available at `target/release/mercurio-pub` and `target/release/mercurio-sub`.
-
-## mercurio-pub
-
-Publish messages to an MQTT broker.
-
-### Usage
+## Usage
 
 ```bash
-mercurio-pub [OPTIONS] --topic <TOPIC>
+mercurio <COMMAND> [OPTIONS]
 ```
 
-### Examples
+### Commands
+
+- `pub` - Publish a message to a topic
+- `sub` - Subscribe to topics and print messages
+
+## Publishing Messages
 
 ```bash
 # Publish a simple message
-mercurio-pub -t test/topic -m "Hello, MQTT!"
+mercurio pub -t test/topic -m "Hello, MQTT!"
 
 # Publish with QoS 1 and retain flag
-mercurio-pub -t sensor/temperature -m "23.5" -q 1 -r
+mercurio pub -t sensor/temperature -m "23.5" -q 1 -r
 
 # Read message from stdin
-echo "Hello from stdin" | mercurio-pub -t test/topic
+echo "Hello from stdin" | mercurio pub -t test/topic
 
 # Publish to a remote broker with authentication
-mercurio-pub -h broker.example.com -u myuser -P mypass -t test/topic -m "Hello"
+mercurio pub -h broker.example.com -u myuser -P mypass -t test/topic -m "Hello"
 
 # Use MQTT 3.1.1 protocol
-mercurio-pub -V 311 -t test/topic -m "Hello"
+mercurio pub -V 311 -t test/topic -m "Hello"
 ```
 
-### Options
+### Publish Options
 
 | Option | Description |
 |--------|-------------|
@@ -54,39 +53,29 @@ mercurio-pub -V 311 -t test/topic -m "Hello"
 | `-q, --qos <QOS>` | QoS level: 0, 1, or 2 (default: 0) |
 | `-r, --retain` | Retain the message on the broker |
 
-## mercurio-sub
-
-Subscribe to topics and print received messages.
-
-### Usage
-
-```bash
-mercurio-sub [OPTIONS] --topic <TOPIC>
-```
-
-### Examples
+## Subscribing to Topics
 
 ```bash
 # Subscribe to a single topic
-mercurio-sub -t test/topic
+mercurio sub -t test/topic
 
 # Subscribe to multiple topics
-mercurio-sub -t "sensor/#" -t "device/+/status"
+mercurio sub -t "sensor/#" -t "device/+/status"
 
 # Print topic name with each message
-mercurio-sub -t "sensor/#" -T
+mercurio sub -t "sensor/#" -T
 
 # Subscribe with QoS 1
-mercurio-sub -t test/topic -q 1
+mercurio sub -t test/topic -q 1
 
 # Connect to a remote broker
-mercurio-sub -h broker.example.com -p 1883 -t test/topic
+mercurio sub -h broker.example.com -p 1883 -t test/topic
 
 # With authentication
-mercurio-sub -h broker.example.com -u myuser -P mypass -t test/topic
+mercurio sub -h broker.example.com -u myuser -P mypass -t test/topic
 ```
 
-### Options
+### Subscribe Options
 
 | Option | Description |
 |--------|-------------|
@@ -96,7 +85,7 @@ mercurio-sub -h broker.example.com -u myuser -P mypass -t test/topic
 
 ## Common Options
 
-Both tools share these connection options:
+Both commands share these connection options:
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -122,30 +111,30 @@ The `-V` flag accepts:
 
 Terminal 1:
 ```bash
-mercurio-sub -t test/hello
+mercurio sub -t test/hello
 ```
 
 Terminal 2:
 ```bash
-mercurio-pub -t test/hello -m "Hello, World!"
+mercurio pub -t test/hello -m "Hello, World!"
 ```
 
 ### Wildcard subscriptions
 
 ```bash
 # Single-level wildcard (+)
-mercurio-sub -t "sensor/+/temperature"
+mercurio sub -t "sensor/+/temperature"
 
 # Multi-level wildcard (#)
-mercurio-sub -t "home/#"
+mercurio sub -t "home/#"
 ```
 
 ### Piping data
 
 ```bash
 # Publish file contents
-cat data.json | mercurio-pub -t data/upload
+cat data.json | mercurio pub -t data/upload
 
 # Publish command output
-date | mercurio-pub -t system/time
+date | mercurio pub -t system/time
 ```

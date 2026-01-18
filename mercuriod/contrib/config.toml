@@ -1,0 +1,23 @@
+# Mercurio MQTT Broker Configuration
+
+[server]
+# Host address to bind to
+# Use 0.0.0.0 to listen on all interfaces
+host = "127.0.0.1"
+
+# Port to listen on (default MQTT port is 1883)
+port = 1883
+
+# Maximum number of concurrent connections
+max_connections = 10000
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+[auth]
+# Enable authentication
+enabled = false
+
+# Allow anonymous connections (when auth is enabled)
+allow_anonymous = true
