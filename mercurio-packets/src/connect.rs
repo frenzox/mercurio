@@ -271,7 +271,8 @@ impl ConnectPayload {
 
         // Will properties only for MQTT 5.0
         if flags.will_flag {
-            if version.supports_properties() && self.will_properties.encoded_size() > 0 {
+            if version.supports_properties() {
+                // Will properties length must be encoded even if 0
                 VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
                 self.will_properties.encode(buffer);
             }
@@ -299,7 +300,8 @@ impl ConnectPayload {
 
         if flags.will_flag {
             // Will properties only for MQTT 5.0
-            if version.supports_properties() && self.will_properties.encoded_size() > 0 {
+            if version.supports_properties() {
+                // Will properties length must be encoded even if 0
                 len +=
                     VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
                 len += self.will_properties.encoded_size();
