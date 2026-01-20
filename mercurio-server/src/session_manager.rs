@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Mutex,
+};
 use tracing::info;
 
 use mercurio_core::Result;
@@ -74,11 +77,14 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
         SessionManager { shared, storage }
     }
 
-    pub(crate) async fn start_session(
+    pub(crate) async fn start_session<Stream>(
         &mut self,
-        connection: &mut Connection,
+        connection: &mut Connection<Stream>,
         connect_packet: ConnectPacket,
-    ) -> Result<SessionStartResult> {
+    ) -> Result<SessionStartResult>
+    where
+        Stream: AsyncRead + AsyncWrite + Unpin,
+    {
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
         let mut resume = false;

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use mercurio_server::tls::TlsConfig;
 use tokio::{net::TcpListener, signal};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -65,7 +66,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
-    mercurio_server::server::run(listener, signal::ctrl_c()).await;
+    // Build TLS configuration if enabled
+    let tls_config = if config.server.tls.enabled {
+        let cert_path = config.server.tls.cert_path.ok_or_else(|| {
+            "TLS enabled but cert_path not specified in configuration"
+        })?;
+        let key_path = config.server.tls.key_path.ok_or_else(|| {
+            "TLS enabled but key_path not specified in configuration"
+        })?;
+
+        let mut tls = TlsConfig::new(cert_path, key_path);
+        if let Some(ca_path) = config.server.tls.ca_path {
+            tls = tls.with_client_auth(ca_path);
+        }
+
+        info!("TLS enabled");
+        Some(tls)
+    } else {
+        None
+    };
+
+    mercurio_server::server::run_with_tls(listener, tls_config, signal::ctrl_c()).await;
 
     info!("Mercurio MQTT broker stopped");
 

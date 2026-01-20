@@ -1,11 +1,13 @@
 use std::{future::Future, sync::Arc};
 
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     sync::broadcast,
     time::{self, Duration, Instant},
 };
-use tracing::{error, info, warn};
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, error, info, warn};
 
 use mercurio_core::{message::Message, qos::QoS, Result};
 use mercurio_packets::{connect::ConnectPacket, publish::PublishPacket, ControlPacket};
@@ -17,6 +19,7 @@ use crate::{
     session::Session,
     session_manager::{SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
+    tls::TlsConfig,
 };
 
 struct Listener {
@@ -24,26 +27,59 @@ struct Listener {
     broker: Broker<MemoryStore>,
     session_manager_holder: SessionManagerDropGuard<MemoryStore>,
     notify_shutdown: broadcast::Sender<()>,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
-struct Handler {
+struct Handler<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     broker: Broker<MemoryStore>,
     session_manager: SessionManager<MemoryStore>,
-    connection: Connection,
+    connection: Connection<S>,
     shutdown: Shutdown,
 }
 
+/// Run the MQTT broker with plain TCP connections.
 pub async fn run(listener: TcpListener, shutdown: impl Future) {
+    run_with_tls(listener, None, shutdown).await
+}
+
+/// Run the MQTT broker with optional TLS support.
+pub async fn run_with_tls(
+    listener: TcpListener,
+    tls_config: Option<TlsConfig>,
+    shutdown: impl Future,
+) {
     let (notify_shutdown, _) = broadcast::channel(1);
 
     // Create shared storage instance for both broker and session manager
     let storage = Arc::new(MemoryStore::new());
+
+    // Build TLS acceptor if configured
+    let tls_acceptor = match tls_config {
+        Some(config) => match config.build_acceptor() {
+            Ok(acceptor) => {
+                info!("TLS enabled");
+                Some(acceptor)
+            }
+            Err(e) => {
+                error!("Failed to configure TLS: {}", e);
+                return;
+            }
+        },
+        None => {
+            debug!("TLS not configured, using plain TCP");
+            None
+        }
+    };
 
     let mut server = Listener {
         listener,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage),
         notify_shutdown,
+        tls_acceptor,
     };
 
     tokio::select! {
@@ -62,30 +98,64 @@ impl Listener {
     async fn run(&mut self) -> Result<()> {
         loop {
             let socket = self.accept().await?;
+            let peer_addr = socket.peer_addr().ok();
 
-            info!("Got a connection: {:#?}", socket.peer_addr());
+            info!("Got a connection: {:?}", peer_addr);
 
-            let mut handler = Handler {
-                broker: self.broker.clone(),
-                session_manager: self.session_manager_holder.session_manager(),
-                connection: Connection::new(socket),
-                shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
-            };
+            let broker = self.broker.clone();
+            let session_manager = self.session_manager_holder.session_manager();
+            let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
 
-            tokio::spawn(async move {
-                match handler.connection.read_packet().await {
-                    // [MQTT-3.1.0-1]
-                    // After a Network Connection is established by a Client
-                    // to a Server, the first packet sent from the Client to
-                    // the Server MUST be a CONNECT packet.
-                    Ok(Some(ControlPacket::Connect(p))) => {
-                        if let Err(err) = handler.run(p).await {
-                            error!(cause = ?err, "Connection error");
+            if let Some(ref tls_acceptor) = self.tls_acceptor {
+                // TLS connection
+                let acceptor = tls_acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(socket).await {
+                        Ok(tls_stream) => {
+                            debug!("TLS handshake completed for {:?}", peer_addr);
+                            let mut handler = Handler {
+                                broker,
+                                session_manager,
+                                connection: Connection::new_tls(tls_stream),
+                                shutdown,
+                            };
+                            Self::handle_connection(&mut handler).await;
+                        }
+                        Err(e) => {
+                            error!("TLS handshake failed for {:?}: {}", peer_addr, e);
                         }
                     }
-                    _ => error!("ConnectPacket expectation not met"),
+                });
+            } else {
+                // Plain TCP connection
+                tokio::spawn(async move {
+                    let mut handler = Handler {
+                        broker,
+                        session_manager,
+                        connection: Connection::new(socket),
+                        shutdown,
+                    };
+                    Self::handle_connection(&mut handler).await;
+                });
+            }
+        }
+    }
+
+    async fn handle_connection<S>(handler: &mut Handler<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        match handler.connection.read_packet().await {
+            // [MQTT-3.1.0-1]
+            // After a Network Connection is established by a Client
+            // to a Server, the first packet sent from the Client to
+            // the Server MUST be a CONNECT packet.
+            Ok(Some(ControlPacket::Connect(p))) => {
+                if let Err(err) = handler.run(p).await {
+                    error!(cause = ?err, "Connection error");
                 }
-            });
+            }
+            _ => error!("ConnectPacket expectation not met"),
         }
     }
 
@@ -109,7 +179,10 @@ impl Listener {
     }
 }
 
-impl Handler {
+impl<S> Handler<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
         let keepalive = connect_packet.keepalive;
 

@@ -42,6 +42,10 @@ pub struct ServerConfig {
     /// Maximum number of concurrent connections
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// TLS configuration
+    #[serde(default)]
+    pub tls: TlsServerConfig,
 }
 
 impl Default for ServerConfig {
@@ -50,8 +54,27 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             max_connections: default_max_connections(),
+            tls: TlsServerConfig::default(),
         }
     }
+}
+
+/// TLS configuration for the server.
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct TlsServerConfig {
+    /// Enable TLS
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to certificate file (PEM format)
+    pub cert_path: Option<String>,
+
+    /// Path to private key file (PEM format)
+    pub key_path: Option<String>,
+
+    /// Optional path to CA certificate for client authentication (mTLS)
+    pub ca_path: Option<String>,
 }
 
 fn default_host() -> String {

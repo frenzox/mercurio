@@ -17,6 +17,9 @@ rand = "0.8"
 thiserror = "1.0.38"
 tokio = { version = "1.24", features = ["full"] }
 tokio-stream = { version = "0.1.11", features = ["time", "sync"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.2.2", features = ["v4"] }

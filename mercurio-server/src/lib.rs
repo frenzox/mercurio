@@ -1,8 +1,10 @@
 pub mod auth;
 mod broker;
 pub mod connection;
+pub mod error;
 pub mod server;
 mod session;
 pub mod session_manager;
 mod shutdown;
+pub mod tls;
 mod topic_tree;
