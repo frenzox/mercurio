@@ -395,7 +395,6 @@ name = "mercurio-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -404,7 +403,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "mercurio-core",
- "thiserror 1.0.69",
 ]
 
 [[package]]

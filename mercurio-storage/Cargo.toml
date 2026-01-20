@@ -6,11 +6,12 @@ description = "Storage abstraction layer for Mercurio MQTT broker"
 license = "MIT"
 
 [features]
-default = []
+default = ["std"]
+std = ["mercurio-core/std"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
 
 [dependencies]
-mercurio-core = { path = "../mercurio-core" }
+mercurio-core = { path = "../mercurio-core", default-features = false }
 async-trait = "0.1"
 bytes = "1"
 thiserror = "2"

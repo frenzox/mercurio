@@ -1,4 +1,7 @@
-use std::mem;
+use core::mem;
+
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec, vec::Vec};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 

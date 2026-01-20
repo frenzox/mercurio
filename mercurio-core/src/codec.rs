@@ -1,4 +1,9 @@
-use std::mem;
+//! Encoding and decoding traits for MQTT packets.
+
+use core::mem;
+
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 

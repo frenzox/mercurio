@@ -1,3 +1,7 @@
+//! MQTT protocol version handling.
+
+use core::fmt;
+
 /// MQTT protocol version.
 ///
 /// Represents the different versions of the MQTT protocol that can be
@@ -68,8 +72,8 @@ impl From<u8> for ProtocolVersion {
     }
 }
 
-impl std::fmt::Display for ProtocolVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProtocolVersion::V3_1 => write!(f, "MQTT 3.1"),
             ProtocolVersion::V3_1_1 => write!(f, "MQTT 3.1.1"),

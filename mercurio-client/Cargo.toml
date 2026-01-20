@@ -5,9 +5,13 @@ edition = "2021"
 description = "MQTT client library for the Mercurio MQTT implementation"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["std"]
+std = ["mercurio-core/std", "mercurio-packets/std"]
+
 [dependencies]
-mercurio-core = { path = "../mercurio-core" }
-mercurio-packets = { path = "../mercurio-packets" }
+mercurio-core = { path = "../mercurio-core", default-features = false }
+mercurio-packets = { path = "../mercurio-packets", default-features = false }
 
 bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
