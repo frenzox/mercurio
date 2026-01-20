@@ -1,7 +1,10 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
-use tokio::sync::{broadcast, Mutex};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::{broadcast, Mutex},
+};
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tracing::info;
 use uuid::Uuid;
@@ -227,7 +230,10 @@ impl Session {
         Ok(())
     }
 
-    pub async fn begin(&mut self, connection: &mut Connection, resume: bool) -> Result<()> {
+    pub async fn begin<S>(&mut self, connection: &mut Connection<S>, resume: bool) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut ack = ConnAckPacket::default();
         ack.flags.session_present = resume;
 
