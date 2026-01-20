@@ -1,3 +1,13 @@
+//! MQTT packet encoding and decoding for all MQTT versions.
+//!
+//! This crate provides packet types for MQTT 3.1, 3.1.1, and 5.0 and is
+//! `no_std` compatible when the `std` feature is disabled.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 pub mod auth;
 pub mod connack;
 pub mod connect;
@@ -14,12 +24,9 @@ pub mod subscribe;
 pub mod unsuback;
 pub mod unsubscribe;
 
-use std::{
-    convert::{TryFrom, TryInto},
-    io::{Cursor, Seek, SeekFrom},
-};
+use core::convert::{TryFrom, TryInto};
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
@@ -78,7 +85,7 @@ pub enum PacketType {
 impl TryFrom<u8> for PacketType {
     type Error = ReasonCode;
 
-    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: u8) -> core::result::Result<Self, Self::Error> {
         use PacketType::*;
 
         let res = match value {
@@ -105,16 +112,24 @@ impl TryFrom<u8> for PacketType {
 }
 
 impl ControlPacket {
+    /// Check if the buffer contains a complete MQTT packet.
+    ///
+    /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
+    /// if more data is needed.
     pub fn check(src: &mut BytesMut) -> crate::Result<()> {
-        let mut peeker = Cursor::new(&src[..]);
-        let remaining_len_pos = 1;
+        let len = src.len();
 
-        let len = peeker.seek(SeekFrom::End(0))?;
+        // Need at least 2 bytes (1 byte fixed header + 1 byte remaining length)
+        if len < 2 {
+            return Err(Error::PacketIncomplete);
+        }
 
-        peeker.set_position(remaining_len_pos);
+        // Read remaining length from position 1 (skip fixed header byte)
+        let mut remaining_bytes = &src[1..];
+        let remaining_len = VariableByteInteger::decode(&mut remaining_bytes)?;
 
-        let remaining_len = VariableByteInteger::decode(&mut peeker)?;
-        if (len as usize - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
+        // Check if we have enough data: fixed header (1) + remaining length size + payload
+        if (len - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
             return Ok(());
         }
 
@@ -134,8 +149,11 @@ impl ControlPacket {
     ) -> crate::Result<ControlPacket> {
         use ControlPacket::*;
 
-        let mut peeker = Cursor::new(&src[..]);
-        let packet_type: u8 = peeker.get_u8() >> 4;
+        // Peek at the first byte to get packet type (don't consume)
+        if src.is_empty() {
+            return Err(Error::PacketIncomplete);
+        }
+        let packet_type: u8 = src[0] >> 4;
 
         let packet = match packet_type.try_into()? {
             PacketType::Connect => Connect(ConnectPacket::decode(src)?),

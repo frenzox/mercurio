@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec, vec::Vec};
+
 use bytes::Buf;
 
 use mercurio_core::{

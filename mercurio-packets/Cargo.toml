@@ -2,11 +2,14 @@
 name = "mercurio-packets"
 version = "0.1.0"
 edition = "2021"
+description = "MQTT packet encoding and decoding for the Mercurio MQTT implementation"
+license = "MIT OR Apache-2.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["std"]
+std = ["mercurio-core/std"]
 
 [dependencies]
-bytes = "1.0"
-thiserror = "1.0.38"
+bytes = { version = "1.0", default-features = false }
 
-mercurio-core = { path = "../mercurio-core" }
+mercurio-core = { path = "../mercurio-core", default-features = false }

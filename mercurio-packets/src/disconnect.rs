@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
@@ -106,12 +109,12 @@ impl Decoder for DisconnectPacket {
 
         let remaining_len = VariableByteInteger::decode(buffer)?; //Remaining length
         let reason = match remaining_len.0.cmp(&min_len_reason) {
-            std::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
+            core::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
             _ => ReasonCode::decode(buffer)?,
         };
 
         let properties = match remaining_len.0.cmp(&min_len_properties) {
-            std::cmp::Ordering::Less => None,
+            core::cmp::Ordering::Less => None,
             _ => Some(DisconnectProperties::decode(buffer)?),
         };
 

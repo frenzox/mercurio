@@ -1,3 +1,8 @@
+//! MQTT 5.0 properties encoding and decoding.
+
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{

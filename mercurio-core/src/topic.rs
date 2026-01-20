@@ -3,6 +3,11 @@
 //! This module provides validation for MQTT topic names and topic filters
 //! according to the MQTT specification.
 
+use core::fmt;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 /// Maximum topic name/filter length in bytes (UTF-8 encoded).
 pub const MAX_TOPIC_LENGTH: usize = 65535;
 
@@ -23,8 +28,8 @@ pub enum TopicValidationError {
     InvalidMultiLevelWildcard,
 }
 
-impl std::fmt::Display for TopicValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for TopicValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TopicValidationError::Empty => write!(f, "topic name cannot be empty"),
             TopicValidationError::TooLong => {
@@ -59,6 +64,7 @@ impl std::fmt::Display for TopicValidationError {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for TopicValidationError {}
 
 /// Validate a topic name for publishing.

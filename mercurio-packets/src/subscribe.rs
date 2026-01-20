@@ -1,3 +1,8 @@
+use core::mem;
+
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec, vec::Vec};
+
 use bytes::{Buf, BufMut};
 
 use mercurio_core::{
@@ -111,7 +116,7 @@ impl Encoder for SubscriptionOptions {
     }
 
     fn encoded_size(&self) -> usize {
-        std::mem::size_of::<u8>()
+        mem::size_of::<u8>()
     }
 }
 

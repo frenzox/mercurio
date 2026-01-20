@@ -1,146 +1,117 @@
+//! MQTT reason codes as defined in the MQTT specification.
+
 use bytes::Buf;
-use thiserror::Error;
+use core::fmt;
 
 use crate::codec::{Decoder, Encoder};
 
-#[derive(Error, Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// MQTT reason code used in various packets to indicate success or failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasonCode {
     #[default]
-    #[error("Success")]
     Success,
-
-    #[error("NormalDisconnection")]
     NormalDisconnection,
-
-    #[error("Granted QoS 0")]
     GrantedQoS0,
-
-    #[error("Granted QoS 1")]
     GrantedQoS1,
-
-    #[error("Granted QoS 2")]
     GrantedQoS2,
-
-    #[error("Disconnect with Will Message")]
     DisconnectWithWillMessage,
-
-    #[error("No matching subscribers")]
     NoMatchingSubscribers,
-
-    #[error("No subscription existed")]
     NoSubscriptionExisted,
-
-    #[error("Continue authentication")]
     ContinueAuthentication,
-
-    #[error("Re-authenticate")]
     ReAuthenticate,
-
-    #[error("Unspecified error")]
     UnspecifiedError,
-
-    #[error("Malformed packet")]
     MalformedPacket,
-
-    #[error("Protocol error")]
     ProtocolError,
-
-    #[error("Implementation specific error")]
     ImplementationSpecificError,
-
-    #[error("Unsupported protocol version")]
     UnsupportedProtocolVersion,
-
-    #[error("Client identifier not valid")]
     ClientIdentifierNotValid,
-
-    #[error("Bad User Name or Password")]
     BadUserNameOrPassword,
-
-    #[error("Not authorized")]
     NotAuthorized,
-
-    #[error("Server unavailable")]
     ServerUnavailable,
-
-    #[error("Server busy")]
     ServerBusy,
-
-    #[error("Banned")]
     Banned,
-
-    #[error("Server shutting down")]
     ServerShuttingDown,
-
-    #[error("Bad authentication method")]
     BadAuthenticationMethod,
-
-    #[error("Keep Alive timeout")]
     KeepAliveTimeout,
-
-    #[error("Session taken over")]
     SessionTakenOver,
-
-    #[error("Topic filter invalid")]
     TopicFilterInvalid,
-
-    #[error("Topic name invalid")]
     TopicNameInvalid,
-
-    #[error("Packet identifier in use")]
     PacketIdentifierInUse,
-
-    #[error("Packet identifier not found")]
     PacketIdentifierNotFound,
-
-    #[error("Receive maximum exceeded")]
     ReceiveMaximumExceeded,
-
-    #[error("Topic alias invalid")]
     TopicAliasInvalid,
-
-    #[error("Packet too large")]
     PacketTooLarge,
-
-    #[error("Message rate too high")]
     MessageRateTooHigh,
-
-    #[error("Quota exceeded")]
     QuotaExceeded,
-
-    #[error("Administrative action")]
     AdministrativeAction,
-
-    #[error("Payload format invalid")]
     PayloadFormatInvalid,
-
-    #[error("Retain not supported")]
     RetainNotSupported,
-
-    #[error("QoS not supported")]
     QoSNotSupported,
-
-    #[error("Use another server")]
     UseAnotherServer,
-
-    #[error("Server moved")]
     ServerMoved,
-
-    #[error("Shared subscriptions not supported")]
     SharedSubscriptionsNotSupported,
-
-    #[error("Connection rate exceeded")]
     ConnectionRateExceeded,
-
-    #[error("Maximum connect time")]
     MaximumConnectTime,
-
-    #[error("Subscription indentifiers not supported")]
     SubscriptionIdentifiersNotSupported,
-
-    #[error("Wildcard subscriptions not supported")]
     WildcardSubscriptionsNotSupported,
 }
+
+impl fmt::Display for ReasonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ReasonCode::*;
+        let msg = match self {
+            Success => "Success",
+            NormalDisconnection => "Normal disconnection",
+            GrantedQoS0 => "Granted QoS 0",
+            GrantedQoS1 => "Granted QoS 1",
+            GrantedQoS2 => "Granted QoS 2",
+            DisconnectWithWillMessage => "Disconnect with will message",
+            NoMatchingSubscribers => "No matching subscribers",
+            NoSubscriptionExisted => "No subscription existed",
+            ContinueAuthentication => "Continue authentication",
+            ReAuthenticate => "Re-authenticate",
+            UnspecifiedError => "Unspecified error",
+            MalformedPacket => "Malformed packet",
+            ProtocolError => "Protocol error",
+            ImplementationSpecificError => "Implementation specific error",
+            UnsupportedProtocolVersion => "Unsupported protocol version",
+            ClientIdentifierNotValid => "Client identifier not valid",
+            BadUserNameOrPassword => "Bad user name or password",
+            NotAuthorized => "Not authorized",
+            ServerUnavailable => "Server unavailable",
+            ServerBusy => "Server busy",
+            Banned => "Banned",
+            ServerShuttingDown => "Server shutting down",
+            BadAuthenticationMethod => "Bad authentication method",
+            KeepAliveTimeout => "Keep alive timeout",
+            SessionTakenOver => "Session taken over",
+            TopicFilterInvalid => "Topic filter invalid",
+            TopicNameInvalid => "Topic name invalid",
+            PacketIdentifierInUse => "Packet identifier in use",
+            PacketIdentifierNotFound => "Packet identifier not found",
+            ReceiveMaximumExceeded => "Receive maximum exceeded",
+            TopicAliasInvalid => "Topic alias invalid",
+            PacketTooLarge => "Packet too large",
+            MessageRateTooHigh => "Message rate too high",
+            QuotaExceeded => "Quota exceeded",
+            AdministrativeAction => "Administrative action",
+            PayloadFormatInvalid => "Payload format invalid",
+            RetainNotSupported => "Retain not supported",
+            QoSNotSupported => "QoS not supported",
+            UseAnotherServer => "Use another server",
+            ServerMoved => "Server moved",
+            SharedSubscriptionsNotSupported => "Shared subscriptions not supported",
+            ConnectionRateExceeded => "Connection rate exceeded",
+            MaximumConnectTime => "Maximum connect time",
+            SubscriptionIdentifiersNotSupported => "Subscription identifiers not supported",
+            WildcardSubscriptionsNotSupported => "Wildcard subscriptions not supported",
+        };
+        write!(f, "{}", msg)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReasonCode {}
 
 impl ReasonCode {
     pub fn get_code(&self) -> u8 {
