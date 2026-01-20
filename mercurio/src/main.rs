@@ -4,7 +4,7 @@ use std::io::{self, Read};
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use mercurio_client::{Event, MqttClient};
+use mercurio_client::{Event, MqttClient, Will};
 use mercurio_core::qos::QoS;
 use tokio::signal;
 
@@ -59,6 +59,22 @@ enum Commands {
         /// Print topic name before each message
         #[arg(short = 'T', long)]
         print_topic: bool,
+
+        /// Will message topic (sent by broker if client disconnects unexpectedly)
+        #[arg(long)]
+        will_topic: Option<String>,
+
+        /// Will message payload
+        #[arg(long)]
+        will_message: Option<String>,
+
+        /// Will message QoS level (0, 1, or 2)
+        #[arg(long, default_value = "0")]
+        will_qos: u8,
+
+        /// Retain the will message on the broker
+        #[arg(long)]
+        will_retain: bool,
     },
 }
 
@@ -82,9 +98,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             topic,
             qos,
             print_topic,
+            will_topic,
+            will_message,
+            will_qos,
+            will_retain,
         } => {
             init_logging(connection.verbose);
-            run_subscribe(connection, topic, qos, print_topic).await?;
+            run_subscribe(
+                connection,
+                topic,
+                qos,
+                print_topic,
+                will_topic,
+                will_message,
+                will_qos,
+                will_retain,
+            )
+            .await?;
         }
     }
 
@@ -137,12 +167,29 @@ async fn run_subscribe(
     topics: Vec<String>,
     qos_level: u8,
     print_topic: bool,
+    will_topic: Option<String>,
+    will_message: Option<String>,
+    will_qos: u8,
+    will_retain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Parse QoS
     let qos = parse_qos(qos_level)?;
 
     // Connect to broker
-    let options = connection.to_connect_options();
+    let mut options = connection.to_connect_options();
+
+    // Configure will message if topic is provided
+    if let Some(topic) = will_topic {
+        let payload = will_message.unwrap_or_default();
+        let will = Will {
+            topic,
+            payload: Bytes::from(payload),
+            qos: parse_qos(will_qos)?,
+            retain: will_retain,
+        };
+        options = options.will(will);
+    }
+
     let client = MqttClient::connect(options).await?;
 
     // Subscribe to topics

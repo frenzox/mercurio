@@ -8,7 +8,7 @@ use mercurio_core::protocol::ProtocolVersion;
 #[derive(Args, Debug, Clone)]
 pub struct ConnectionArgs {
     /// MQTT broker hostname
-    #[arg(short = 'h', long, default_value = "localhost")]
+    #[arg(short = 'H', long, default_value = "localhost")]
     pub host: String,
 
     /// MQTT broker port
