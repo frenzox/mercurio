@@ -1,17 +1,13 @@
 [package]
-name = "mercurio-cli"
+name = "mercurio"
 version = "0.1.0"
 edition = "2021"
-description = "MQTT command-line tools for publishing and subscribing"
+description = "MQTT command-line client for publishing and subscribing"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "mercurio-pub"
-path = "src/bin/mercurio-pub.rs"
-
-[[bin]]
-name = "mercurio-sub"
-path = "src/bin/mercurio-sub.rs"
+name = "mercurio"
+path = "src/main.rs"
 
 [dependencies]
 mercurio-client = { path = "../mercurio-client" }

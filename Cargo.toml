@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "mercurio-cli",
+    "mercurio",
     "mercurio-client",
     "mercurio-core",
     "mercurio-packets",
     "mercurio-server",
     "mercurio-storage",
+    "mercuriod",
 ]
 
 [profile.release]
