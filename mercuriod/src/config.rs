@@ -120,6 +120,9 @@ pub struct AuthConfig {
     /// Allow anonymous connections
     #[serde(default = "default_allow_anonymous")]
     pub allow_anonymous: bool,
+
+    /// Path to password file (format: username:password per line)
+    pub password_file: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -127,6 +130,7 @@ impl Default for AuthConfig {
         Self {
             enabled: false,
             allow_anonymous: default_allow_anonymous(),
+            password_file: None,
         }
     }
 }

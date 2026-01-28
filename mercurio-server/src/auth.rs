@@ -109,6 +109,41 @@ impl AuthMethod for PlainAuth {
     }
 }
 
+/// Trait for validating username/password credentials from CONNECT packets.
+///
+/// This is separate from the MQTT 5.0 Enhanced Authentication (AUTH packets).
+/// It validates the simple username/password fields in the CONNECT packet.
+pub trait CredentialValidator: Send + Sync {
+    /// Validate a username/password pair.
+    /// Returns true if the credentials are valid.
+    fn validate(&self, username: &str, password: &[u8]) -> bool;
+}
+
+/// Simple in-memory credential validator using a username -> password map.
+pub struct SimpleCredentialValidator {
+    credentials: HashMap<String, String>,
+}
+
+impl SimpleCredentialValidator {
+    /// Create a new validator with the given credentials.
+    pub fn new(credentials: HashMap<String, String>) -> Self {
+        Self { credentials }
+    }
+}
+
+impl CredentialValidator for SimpleCredentialValidator {
+    fn validate(&self, username: &str, password: &[u8]) -> bool {
+        let password_str = match std::str::from_utf8(password) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        self.credentials
+            .get(username)
+            .map(|stored| stored == password_str)
+            .unwrap_or(false)
+    }
+}
+
 /// Manages authentication methods and ongoing authentication sessions.
 pub struct AuthManager {
     /// Available authentication methods by name.
@@ -262,5 +297,32 @@ mod tests {
             AuthResult::Success => {}
             other => panic!("Expected Success, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_credential_validator_success() {
+        let mut creds = HashMap::new();
+        creds.insert("user".to_string(), "pass".to_string());
+        let validator = SimpleCredentialValidator::new(creds);
+
+        assert!(validator.validate("user", b"pass"));
+    }
+
+    #[test]
+    fn test_credential_validator_wrong_password() {
+        let mut creds = HashMap::new();
+        creds.insert("user".to_string(), "pass".to_string());
+        let validator = SimpleCredentialValidator::new(creds);
+
+        assert!(!validator.validate("user", b"wrong"));
+    }
+
+    #[test]
+    fn test_credential_validator_unknown_user() {
+        let mut creds = HashMap::new();
+        creds.insert("user".to_string(), "pass".to_string());
+        let validator = SimpleCredentialValidator::new(creds);
+
+        assert!(!validator.validate("unknown", b"pass"));
     }
 }
