@@ -2,22 +2,26 @@ use bytes::BytesMut;
 use mercurio_core::{codec::Encoder, protocol::ProtocolVersion};
 use mercurio_packets::ControlPacket;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
+use tokio_rustls::client::TlsStream;
 
 use crate::error::{ClientError, Result};
 
-/// A TCP connection to an MQTT broker with packet framing.
-pub struct Connection {
-    stream: TcpStream,
+/// A connection to an MQTT broker with packet framing.
+/// Generic over the stream type to support both plain TCP and TLS.
+pub struct Connection<S = TcpStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream: S,
     read_buffer: BytesMut,
     protocol_version: ProtocolVersion,
 }
 
-impl Connection {
-    /// Create a new connection from a TCP stream.
-    /// Defaults to MQTT 5.0 protocol version.
+impl Connection<TcpStream> {
+    /// Create a new plain TCP connection.
     pub fn new(stream: TcpStream) -> Self {
         Self {
             stream,
@@ -25,7 +29,23 @@ impl Connection {
             protocol_version: ProtocolVersion::V5,
         }
     }
+}
 
+impl Connection<TlsStream<TcpStream>> {
+    /// Create a new TLS-encrypted connection.
+    pub fn new_tls(stream: TlsStream<TcpStream>) -> Self {
+        Self {
+            stream,
+            read_buffer: BytesMut::with_capacity(4096),
+            protocol_version: ProtocolVersion::V5,
+        }
+    }
+}
+
+impl<S> Connection<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     /// Set the protocol version for version-aware packet parsing.
     pub fn set_protocol_version(&mut self, version: ProtocolVersion) {
         self.protocol_version = version;

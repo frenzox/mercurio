@@ -68,12 +68,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build TLS configuration if enabled
     let tls_config = if config.server.tls.enabled {
-        let cert_path = config.server.tls.cert_path.ok_or_else(|| {
-            "TLS enabled but cert_path not specified in configuration"
-        })?;
-        let key_path = config.server.tls.key_path.ok_or_else(|| {
-            "TLS enabled but key_path not specified in configuration"
-        })?;
+        let cert_path = config
+            .server
+            .tls
+            .cert_path
+            .ok_or_else(|| "TLS enabled but cert_path not specified in configuration")?;
+        let key_path = config
+            .server
+            .tls
+            .key_path
+            .ok_or_else(|| "TLS enabled but key_path not specified in configuration")?;
 
         let mut tls = TlsConfig::new(cert_path, key_path);
         if let Some(ca_path) = config.server.tls.ca_path {

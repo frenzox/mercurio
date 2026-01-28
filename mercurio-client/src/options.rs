@@ -31,6 +31,18 @@ impl Will {
     }
 }
 
+/// TLS configuration for client connections.
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Enable TLS for the connection.
+    pub enabled: bool,
+    /// Path to custom CA certificate file (PEM format).
+    /// If not set, system root certificates are used.
+    pub ca_path: Option<String>,
+    /// Skip server certificate verification (insecure, for testing only).
+    pub danger_skip_verify: bool,
+}
+
 /// Options for connecting to an MQTT broker.
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
@@ -44,6 +56,7 @@ pub struct ConnectOptions {
     pub(crate) will: Option<Will>,
     pub(crate) protocol_version: ProtocolVersion,
     pub(crate) connect_timeout_secs: u64,
+    pub(crate) tls: TlsOptions,
 }
 
 impl ConnectOptions {
@@ -60,7 +73,26 @@ impl ConnectOptions {
             will: None,
             protocol_version: ProtocolVersion::V5,
             connect_timeout_secs: 30,
+            tls: TlsOptions::default(),
         }
+    }
+
+    /// Enable TLS for the connection.
+    pub fn tls(mut self, enabled: bool) -> Self {
+        self.tls.enabled = enabled;
+        self
+    }
+
+    /// Set custom CA certificate file path for TLS verification.
+    pub fn ca_path(mut self, path: impl Into<String>) -> Self {
+        self.tls.ca_path = Some(path.into());
+        self
+    }
+
+    /// Skip TLS certificate verification (insecure, for testing only).
+    pub fn danger_skip_tls_verify(mut self, skip: bool) -> Self {
+        self.tls.danger_skip_verify = skip;
+        self
     }
 
     /// Set the client ID. If not set, the broker will assign one.

@@ -36,6 +36,9 @@ pub enum ClientError {
 
     #[error("Send error")]
     SendError,
+
+    #[error("TLS error: {0}")]
+    Tls(String),
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;

@@ -139,8 +139,8 @@ mod tests {
 
     #[test]
     fn test_tls_config_with_client_auth() {
-        let config =
-            TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem").with_client_auth("/path/to/ca.pem");
+        let config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem")
+            .with_client_auth("/path/to/ca.pem");
         assert!(config.ca_path.is_some());
         assert_eq!(config.ca_path.unwrap(), "/path/to/ca.pem");
     }
