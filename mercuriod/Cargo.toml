@@ -13,7 +13,9 @@ path = "src/main.rs"
 mercurio-core = { path = "../mercurio-core" }
 mercurio-server = { path = "../mercurio-server" }
 
+argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
