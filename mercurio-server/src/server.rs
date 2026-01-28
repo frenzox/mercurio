@@ -9,11 +9,12 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use mercurio_core::{message::Message, qos::QoS, Result};
+use mercurio_core::{message::Message, qos::QoS, reason::ReasonCode, Result};
 use mercurio_packets::{connect::ConnectPacket, publish::PublishPacket, ControlPacket};
 use mercurio_storage::{memory::MemoryStore, InflightMessage};
 
 use crate::{
+    auth::{AuthManager, CredentialValidator},
     broker::Broker,
     connection::Connection,
     session::Session,
@@ -22,12 +23,33 @@ use crate::{
     tls::TlsConfig,
 };
 
+/// Authentication configuration for the server.
+pub struct AuthConfig {
+    /// Whether authentication is required.
+    pub require_auth: bool,
+    /// Optional credential validator for CONNECT username/password.
+    pub credential_validator: Option<Arc<dyn CredentialValidator>>,
+    /// Optional auth manager for MQTT 5.0 enhanced authentication.
+    pub auth_manager: Option<Arc<AuthManager>>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            require_auth: false,
+            credential_validator: None,
+            auth_manager: None,
+        }
+    }
+}
+
 struct Listener {
     listener: TcpListener,
     broker: Broker<MemoryStore>,
     session_manager_holder: SessionManagerDropGuard<MemoryStore>,
     notify_shutdown: broadcast::Sender<()>,
     tls_acceptor: Option<TlsAcceptor>,
+    auth_config: Arc<AuthConfig>,
 }
 
 struct Handler<S>
@@ -38,17 +60,19 @@ where
     session_manager: SessionManager<MemoryStore>,
     connection: Connection<S>,
     shutdown: Shutdown,
+    auth_config: Arc<AuthConfig>,
 }
 
 /// Run the MQTT broker with plain TCP connections.
 pub async fn run(listener: TcpListener, shutdown: impl Future) {
-    run_with_tls(listener, None, shutdown).await
+    run_with_tls(listener, None, AuthConfig::default(), shutdown).await
 }
 
-/// Run the MQTT broker with optional TLS support.
+/// Run the MQTT broker with optional TLS support and authentication.
 pub async fn run_with_tls(
     listener: TcpListener,
     tls_config: Option<TlsConfig>,
+    auth_config: AuthConfig,
     shutdown: impl Future,
 ) {
     let (notify_shutdown, _) = broadcast::channel(1);
@@ -74,12 +98,15 @@ pub async fn run_with_tls(
         }
     };
 
+    let auth_config = Arc::new(auth_config);
+
     let mut server = Listener {
         listener,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage),
         notify_shutdown,
         tls_acceptor,
+        auth_config,
     };
 
     tokio::select! {
@@ -105,6 +132,7 @@ impl Listener {
             let broker = self.broker.clone();
             let session_manager = self.session_manager_holder.session_manager();
             let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
+            let auth_config = Arc::clone(&self.auth_config);
 
             if let Some(ref tls_acceptor) = self.tls_acceptor {
                 // TLS connection
@@ -118,6 +146,7 @@ impl Listener {
                                 session_manager,
                                 connection: Connection::new_tls(tls_stream),
                                 shutdown,
+                                auth_config,
                             };
                             Self::handle_connection(&mut handler).await;
                         }
@@ -134,6 +163,7 @@ impl Listener {
                         session_manager,
                         connection: Connection::new(socket),
                         shutdown,
+                        auth_config,
                     };
                     Self::handle_connection(&mut handler).await;
                 });
@@ -184,6 +214,46 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
+        // Validate credentials if authentication is configured
+        if self.auth_config.require_auth {
+            let authenticated = match (&connect_packet.payload.user_name, &connect_packet.payload.password) {
+                (Some(username), Some(password)) => {
+                    if let Some(ref validator) = self.auth_config.credential_validator {
+                        let valid = validator.validate(username, password);
+                        if !valid {
+                            warn!("Authentication failed for user `{}`", username);
+                        }
+                        valid
+                    } else {
+                        // Auth required but no validator configured — reject
+                        false
+                    }
+                }
+                _ => {
+                    warn!("Authentication required but no credentials provided");
+                    false
+                }
+            };
+
+            if !authenticated {
+                use mercurio_packets::connack::{ConnAckFlags, ConnAckPacket};
+
+                let connack = ConnAckPacket {
+                    protocol_version: connect_packet.protocol_version,
+                    flags: ConnAckFlags {
+                        session_present: false,
+                    },
+                    reason_code: ReasonCode::BadUserNameOrPassword,
+                    properties: None,
+                };
+                let _ = self
+                    .connection
+                    .write_packet(ControlPacket::ConnAck(connack))
+                    .await;
+                return Ok(());
+            }
+        }
+
         let keepalive = connect_packet.keepalive;
 
         let start_result = self
@@ -288,7 +358,7 @@ where
                         .process_incoming(
                             packet,
                             &self.broker,
-                            None, // TODO: Add auth_manager when configurable auth is implemented
+                            self.auth_config.auth_manager.as_deref(),
                         ).await?;
 
                     // Persist subscriptions after subscribe/unsubscribe operations

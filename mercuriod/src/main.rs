@@ -1,8 +1,12 @@
 //! Mercuriod - MQTT broker daemon
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
+use mercurio_server::auth::SimpleCredentialValidator;
+use mercurio_server::server::AuthConfig as ServerAuthConfig;
 use mercurio_server::tls::TlsConfig;
 use tokio::{net::TcpListener, signal};
 use tracing::info;
@@ -90,9 +94,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    mercurio_server::server::run_with_tls(listener, tls_config, signal::ctrl_c()).await;
+    // Build authentication configuration
+    let auth_config = if config.auth.enabled {
+        let credential_validator = if let Some(ref password_file) = config.auth.password_file {
+            let credentials = load_password_file(password_file)?;
+            info!(
+                "Loaded {} credentials from password file",
+                credentials.len()
+            );
+            Some(Arc::new(SimpleCredentialValidator::new(credentials))
+                as Arc<dyn mercurio_server::auth::CredentialValidator>)
+        } else {
+            None
+        };
+
+        info!("Authentication enabled");
+        ServerAuthConfig {
+            require_auth: true,
+            credential_validator,
+            auth_manager: None,
+        }
+    } else {
+        ServerAuthConfig::default()
+    };
+
+    mercurio_server::server::run_with_tls(listener, tls_config, auth_config, signal::ctrl_c())
+        .await;
 
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// Load a password file with format: `username:password` per line.
+/// Lines starting with `#` and empty lines are ignored.
+fn load_password_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read password file `{}`: {}", path, e))?;
+
+    let mut credentials = HashMap::new();
+    for (line_num, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((username, password)) = line.split_once(':') else {
+            return Err(format!(
+                "Invalid format in password file `{}` at line {}: expected `username:password`",
+                path,
+                line_num + 1
+            )
+            .into());
+        };
+        credentials.insert(username.to_string(), password.to_string());
+    }
+
+    Ok(credentials)
 }
