@@ -216,7 +216,10 @@ where
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
         // Validate credentials if authentication is configured
         if self.auth_config.require_auth {
-            let authenticated = match (&connect_packet.payload.user_name, &connect_packet.payload.password) {
+            let authenticated = match (
+                &connect_packet.payload.user_name,
+                &connect_packet.payload.password,
+            ) {
                 (Some(username), Some(password)) => {
                     if let Some(ref validator) = self.auth_config.credential_validator {
                         let valid = validator.validate(username, password);

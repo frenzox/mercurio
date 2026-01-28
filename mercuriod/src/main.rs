@@ -241,7 +241,10 @@ fn write_password_file(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = std::fs::File::create(path)?;
     writeln!(file, "# Mercurio password file")?;
-    writeln!(file, "# Managed by `mercuriod passwd`. Do not edit manually.")?;
+    writeln!(
+        file,
+        "# Managed by `mercuriod passwd`. Do not edit manually."
+    )?;
     for (username, hash) in entries {
         writeln!(file, "{}:{}", username, hash)?;
     }
