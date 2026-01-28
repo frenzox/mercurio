@@ -16,6 +16,10 @@ mercurio-packets = { path = "../mercurio-packets", default-features = false }
 bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 tracing = "0.1"
 thiserror = "1"
 

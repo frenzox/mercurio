@@ -12,6 +12,7 @@ use mercurio_packets::publish::PublishPacket;
 use mercurio_packets::subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions};
 use mercurio_packets::unsubscribe::{UnsubscribePacket, UnsubscribePayload};
 use mercurio_packets::ControlPacket;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, timeout};
@@ -21,6 +22,7 @@ use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::event::{DisconnectReason, Event, SubscribeResult};
 use crate::options::ConnectOptions;
+use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
 enum Command {
@@ -67,13 +69,72 @@ impl MqttClient {
         .map_err(|_| ClientError::Timeout)?
         .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
-        let mut connection = Connection::new(stream);
+        // Create channels for communication
+        let (command_tx, command_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(256);
 
-        // Set the protocol version for version-aware packet parsing
-        connection.set_protocol_version(options.protocol_version);
+        if options.tls.enabled {
+            // TLS connection
+            info!("Establishing TLS connection");
+            let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
 
+            let tls_stream = timeout(
+                Duration::from_secs(options.connect_timeout_secs),
+                connector.connect(server_name, stream),
+            )
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
+
+            let mut connection = Connection::new_tls(tls_stream);
+            connection.set_protocol_version(options.protocol_version);
+
+            let (client_id, keep_alive) = Self::perform_connect(&mut connection, &options).await?;
+
+            tokio::spawn(async move {
+                if let Err(e) = Self::event_loop(connection, command_rx, event_tx, keep_alive).await
+                {
+                    error!("Client event loop error: {}", e);
+                }
+            });
+
+            Ok(MqttClient {
+                command_tx,
+                event_rx: Mutex::new(event_rx),
+                client_id,
+            })
+        } else {
+            // Plain TCP connection
+            let mut connection = Connection::new(stream);
+            connection.set_protocol_version(options.protocol_version);
+
+            let (client_id, keep_alive) = Self::perform_connect(&mut connection, &options).await?;
+
+            tokio::spawn(async move {
+                if let Err(e) = Self::event_loop(connection, command_rx, event_tx, keep_alive).await
+                {
+                    error!("Client event loop error: {}", e);
+                }
+            });
+
+            Ok(MqttClient {
+                command_tx,
+                event_rx: Mutex::new(event_rx),
+                client_id,
+            })
+        }
+    }
+
+    /// Perform the MQTT CONNECT handshake.
+    async fn perform_connect<S>(
+        connection: &mut Connection<S>,
+        options: &ConnectOptions,
+    ) -> Result<(String, u16)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         // Build CONNECT packet
-        let connect_packet = Self::build_connect_packet(&options);
+        let connect_packet = Self::build_connect_packet(options);
         connection
             .write_packet(ControlPacket::Connect(connect_packet))
             .await?;
@@ -109,23 +170,7 @@ impl MqttClient {
             client_id, session_present
         );
 
-        // Create channels for communication
-        let (command_tx, command_rx) = mpsc::channel(32);
-        let (event_tx, event_rx) = mpsc::channel(256);
-
-        // Spawn the client event loop
-        let keep_alive = options.keep_alive;
-        tokio::spawn(async move {
-            if let Err(e) = Self::event_loop(connection, command_rx, event_tx, keep_alive).await {
-                error!("Client event loop error: {}", e);
-            }
-        });
-
-        Ok(MqttClient {
-            command_tx,
-            event_rx: Mutex::new(event_rx),
-            client_id,
-        })
+        Ok((client_id, options.keep_alive))
     }
 
     /// Build a CONNECT packet from options.
@@ -162,12 +207,15 @@ impl MqttClient {
     }
 
     /// The main event loop that handles incoming packets and outgoing commands.
-    async fn event_loop(
-        mut connection: Connection,
+    async fn event_loop<S>(
+        mut connection: Connection<S>,
         mut command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
         keep_alive: u16,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let packet_id_counter = Arc::new(AtomicU16::new(1));
 
         // Keep-alive interval (send PINGREQ at half the keep-alive time)
@@ -272,11 +320,14 @@ impl MqttClient {
     }
 
     /// Handle an incoming packet from the broker.
-    async fn handle_incoming_packet(
+    async fn handle_incoming_packet<S>(
         packet: ControlPacket,
-        connection: &mut Connection,
+        connection: &mut Connection<S>,
         event_tx: &mpsc::Sender<Event>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         match packet {
             ControlPacket::Publish(publish) => {
                 debug!("Received PUBLISH on topic: {}", publish.topic_name);
@@ -330,14 +381,17 @@ impl MqttClient {
     }
 
     /// Handle a publish command.
-    async fn handle_publish(
-        connection: &mut Connection,
+    async fn handle_publish<S>(
+        connection: &mut Connection<S>,
         packet_id_counter: &AtomicU16,
         topic: String,
         payload: Bytes,
         qos: QoS,
         retain: bool,
-    ) -> Result<Option<u16>> {
+    ) -> Result<Option<u16>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let packet_id = if qos != QoS::AtMostOnce {
             Some(packet_id_counter.fetch_add(1, Ordering::SeqCst))
         } else {
@@ -363,11 +417,14 @@ impl MqttClient {
     }
 
     /// Handle a subscribe command.
-    async fn handle_subscribe(
-        connection: &mut Connection,
+    async fn handle_subscribe<S>(
+        connection: &mut Connection<S>,
         packet_id_counter: &AtomicU16,
         topics: Vec<(String, QoS)>,
-    ) -> Result<Vec<SubscribeResult>> {
+    ) -> Result<Vec<SubscribeResult>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let packet_id = packet_id_counter.fetch_add(1, Ordering::SeqCst);
 
         let payload: Vec<SubscribePayload> = topics
@@ -404,11 +461,14 @@ impl MqttClient {
     }
 
     /// Handle an unsubscribe command.
-    async fn handle_unsubscribe(
-        connection: &mut Connection,
+    async fn handle_unsubscribe<S>(
+        connection: &mut Connection<S>,
         packet_id_counter: &AtomicU16,
         topics: Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let packet_id = packet_id_counter.fetch_add(1, Ordering::SeqCst);
 
         let payload: Vec<UnsubscribePayload> = topics
@@ -433,7 +493,10 @@ impl MqttClient {
     }
 
     /// Handle a disconnect command.
-    async fn handle_disconnect(connection: &mut Connection) -> Result<()> {
+    async fn handle_disconnect<S>(connection: &mut Connection<S>) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let disconnect = DisconnectPacket {
             reason: ReasonCode::NormalDisconnection,
             properties: None,

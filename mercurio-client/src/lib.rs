@@ -37,6 +37,7 @@ mod connection;
 mod error;
 mod event;
 mod options;
+mod tls;
 
 pub use client::MqttClient;
 pub use error::{ClientError, Result};

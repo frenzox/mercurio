@@ -35,6 +35,18 @@ pub struct ConnectionArgs {
     #[arg(short = 'V', long, default_value = "5")]
     pub protocol_version: String,
 
+    /// Enable TLS for the connection
+    #[arg(long)]
+    pub tls: bool,
+
+    /// Path to CA certificate file (PEM format) for TLS verification
+    #[arg(long)]
+    pub cafile: Option<String>,
+
+    /// Skip TLS certificate verification (insecure, for testing only)
+    #[arg(long)]
+    pub insecure: bool,
+
     /// Enable verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
@@ -57,6 +69,18 @@ impl ConnectionArgs {
 
         if let Some(ref pass) = self.password {
             opts = opts.password(pass.as_bytes().to_vec());
+        }
+
+        if self.tls {
+            opts = opts.tls(true);
+        }
+
+        if let Some(ref ca) = self.cafile {
+            opts = opts.ca_path(ca);
+        }
+
+        if self.insecure {
+            opts = opts.danger_skip_tls_verify(true);
         }
 
         opts
