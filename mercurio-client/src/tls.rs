@@ -1,10 +1,8 @@
 //! TLS support for the MQTT client.
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
@@ -52,12 +50,9 @@ pub fn build_tls_connector(
 
 /// Load certificates from a PEM file.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, ClientError> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| ClientError::Tls(format!("Failed to open cert file '{}': {}", path, e)))?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ClientError::Tls(format!("Failed to parse certs from '{}': {}", path, e)))?;
+    let certs = CertificateDer::pem_file_iter(path)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| ClientError::Tls(format!("Failed to read certs from '{}': {}", path, e)))?;
 
     if certs.is_empty() {
         return Err(ClientError::Tls(format!(
