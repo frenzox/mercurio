@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use mercurio_core::{
     error::Error,
     message::Message,
-    properties::{AuthenticationData, AuthenticationMethod, ReasonString},
+    properties::{AuthenticationData, AuthenticationMethod, ReasonString, ServerReference},
     protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
@@ -107,6 +107,19 @@ pub struct ConnectPolicy {
     /// `%c` replaced by their client id: a topic prefix they may use for the
     /// responses of request/response exchanges.
     pub response_information: Option<String>,
+    /// Send every client to another server instead of serving it.
+    pub redirect: Option<Redirect>,
+}
+
+/// Where clients are sent instead of being served.
+#[derive(Debug, Clone)]
+pub struct Redirect {
+    /// The server clients should use, in the form MQTT 5 clients expect,
+    /// such as `host:port`
+    pub server_reference: String,
+    /// Whether the move is permanent (Server Moved) or temporary (Use Another
+    /// Server)
+    pub permanent: bool,
 }
 
 struct Listener<St: MqttStore + 'static> {
@@ -416,6 +429,10 @@ where
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
 
+        if let Some(redirect) = self.policy.redirect.clone() {
+            return self.redirect(&connect_packet, &redirect).await;
+        }
+
         let authentication_method = connect_packet
             .properties
             .as_ref()
@@ -670,6 +687,47 @@ where
             let data = auth.properties.auth_data.map(|d| d.value);
             result = exchange.step(data.as_ref());
         }
+    }
+
+    /// Refuses the connection, pointing MQTT 5 clients to another server.
+    /// MQTT 3.x has no way to name one, so its clients learn only that this
+    /// server is unavailable.
+    async fn redirect(
+        &mut self,
+        connect_packet: &ConnectPacket,
+        redirect: &Redirect,
+    ) -> Result<()> {
+        let connack = if connect_packet.protocol_version.supports_properties() {
+            ConnAckPacket {
+                protocol_version: connect_packet.protocol_version,
+                flags: ConnAckFlags {
+                    session_present: false,
+                },
+                reason_code: if redirect.permanent {
+                    ReasonCode::ServerMoved
+                } else {
+                    ReasonCode::UseAnotherServer
+                },
+                properties: Some(ConnAckProperties {
+                    server_reference: Some(ServerReference::new(redirect.server_reference.clone())),
+                    ..Default::default()
+                }),
+            }
+        } else {
+            ConnAckPacket {
+                protocol_version: connect_packet.protocol_version,
+                flags: ConnAckFlags {
+                    session_present: false,
+                },
+                reason_code: ReasonCode::ServerUnavailable,
+                properties: None,
+            }
+        };
+        let _ = self
+            .connection
+            .write_packet(ControlPacket::ConnAck(connack))
+            .await;
+        Ok(())
     }
 
     async fn reject_connect(

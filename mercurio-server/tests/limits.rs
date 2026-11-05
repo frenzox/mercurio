@@ -126,6 +126,7 @@ async fn response_information_is_given_to_clients_that_ask() {
     let config = ServerConfig {
         policy: mercurio_server::server::ConnectPolicy {
             response_information: Some("responses/%c".into()),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -153,4 +154,43 @@ async fn response_information_is_given_to_clients_that_ask() {
     // Clients that don't ask don't get it
     let (_, connack) = connect(addr, b'n').await;
     assert!(!connack.contains(&0x1a));
+}
+
+#[tokio::test]
+async fn clients_are_redirected_when_configured() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ServerConfig {
+        policy: mercurio_server::server::ConnectPolicy {
+            redirect: Some(mercurio_server::server::Redirect {
+                server_reference: "other:1883".into(),
+                permanent: true,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // MQTT 5: Server Moved, with Server Reference (0x1c) "other:1883"
+    let (_, connack) = connect(addr, b'c').await;
+    assert_eq!(connack[3], 0x9d);
+    let expected = [&[0x1c, 0x00, 0x0a][..], b"other:1883"].concat();
+    assert!(connack.windows(expected.len()).any(|w| w == expected));
+
+    // MQTT 3.1.1: Server unavailable
+    let mut v3 = TcpStream::connect(addr).await.unwrap();
+    v3.write_all(&[
+        0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x01, b'v',
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        common::read_connack(&mut v3).await,
+        [0x20, 0x02, 0x00, 0x03]
+    );
 }

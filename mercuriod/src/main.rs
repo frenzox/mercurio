@@ -9,7 +9,9 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
-use mercurio_server::server::{AuthConfig as ServerAuthConfig, ConnectPolicy, ServerConfig};
+use mercurio_server::server::{
+    AuthConfig as ServerAuthConfig, ConnectPolicy, Redirect, ServerConfig,
+};
 use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
@@ -117,6 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limits = config.server.limits();
     let policy = ConnectPolicy {
         response_information: config.server.response_information.clone(),
+        redirect: config.server.redirect.clone().map(|r| Redirect {
+            server_reference: r.server_reference,
+            permanent: r.permanent,
+        }),
     };
 
     let tls_config = if config.server.tls.enabled {
