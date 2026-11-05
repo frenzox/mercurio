@@ -163,7 +163,11 @@ async fn topics_follow_the_acl() {
     // Granted QoS 0
     assert_eq!(reader.subscribe("public/#").await.get_code(), 0x00);
 
-    assert_eq!(alice.publish("alice/notes").await, ReasonCode::Success);
+    // Accepted; nobody happens to be subscribed
+    assert_eq!(
+        alice.publish("alice/notes").await,
+        ReasonCode::NoMatchingSubscribers
+    );
     assert_eq!(
         reader.publish("public/news").await,
         ReasonCode::NotAuthorized

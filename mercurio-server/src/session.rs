@@ -515,8 +515,31 @@ impl Session {
                     "Client `{}` may not publish to `{}`",
                     identity.client_id, packet.topic_name
                 );
-                return self.refuse_publish(&packet).await;
+                return self
+                    .refuse_publish(&packet, ReasonCode::NotAuthorized)
+                    .await;
             }
+        }
+
+        // A payload declared as UTF-8 text has to be valid UTF-8; QoS 0 has
+        // no acknowledgement to say so, so it costs the connection
+        let declares_text = packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.payload_format_indicator.as_ref())
+            .is_some_and(|f| f.value == 1);
+        if declares_text
+            && packet
+                .payload
+                .as_ref()
+                .is_some_and(|p| std::str::from_utf8(p).is_err())
+        {
+            if packet.qos_level == QoS::AtMostOnce {
+                return Err(ReasonCode::PayloadFormatInvalid.into());
+            }
+            return self
+                .refuse_publish(&packet, ReasonCode::PayloadFormatInvalid)
+                .await;
         }
 
         let response = match packet.qos_level {
@@ -581,9 +604,34 @@ impl Session {
             subscription_identifier: None,
         };
 
-        broker
+        let subscribers = broker
             .publish_from(&topic, message, Some(self.shared.subscriber_id))
             .await?;
+
+        // MQTT 5 publishers learn when nobody received the message
+        let reports_reasons = self
+            .shared
+            .state
+            .lock()
+            .await
+            .connect_packet
+            .protocol_version
+            .supports_reason_codes();
+        if subscribers == 0 && reports_reasons {
+            return response.map(|ack| {
+                ack.map(|ack| match ack {
+                    ControlPacket::PubAck(mut puback) => {
+                        puback.reason = ReasonCode::NoMatchingSubscribers;
+                        ControlPacket::PubAck(puback)
+                    }
+                    ControlPacket::PubRec(mut pubrec) => {
+                        pubrec.reason = ReasonCode::NoMatchingSubscribers;
+                        ControlPacket::PubRec(pubrec)
+                    }
+                    other => other,
+                })
+            });
+        }
 
         response
     }
@@ -591,14 +639,18 @@ impl Session {
     /// Acknowledges a PUBLISH the client was not allowed to make without
     /// forwarding it. MQTT 3.x has no way to report the refusal, so those
     /// clients get a normal acknowledgement.
-    async fn refuse_publish(&self, packet: &PublishPacket) -> Result<Option<ControlPacket>> {
+    async fn refuse_publish(
+        &self,
+        packet: &PublishPacket,
+        reason: ReasonCode,
+    ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let reports_reasons = session
             .connect_packet
             .protocol_version
             .supports_reason_codes();
         let reason = if reports_reasons {
-            ReasonCode::NotAuthorized
+            reason
         } else {
             ReasonCode::Success
         };
@@ -2219,6 +2271,78 @@ mod tests {
             .unacknowledged_messages
             .values()
             .all(|(_, p)| !p.topic_name.is_empty()));
+    }
+
+    fn qos1_publish(topic: &str, payload: &'static [u8], text: bool) -> ControlPacket {
+        ControlPacket::Publish(PublishPacket {
+            qos_level: QoS::AtLeastOnce,
+            topic_name: topic.into(),
+            packet_id: Some(1),
+            properties: Some(PublishProperties {
+                payload_format_indicator: text
+                    .then(|| mercurio_core::properties::PayloadFormatIndicator::new(1)),
+                ..Default::default()
+            }),
+            payload: Some(Bytes::from_static(payload)),
+            ..Default::default()
+        })
+    }
+
+    async fn puback_reason(
+        session: &mut Session,
+        broker: &crate::broker::Broker<MemoryStore>,
+        packet: ControlPacket,
+    ) -> ReasonCode {
+        match session
+            .process_incoming(packet, broker, None, None)
+            .await
+            .unwrap()
+        {
+            Some(ControlPacket::PubAck(puback)) => puback.reason,
+            other => panic!("Expected PUBACK, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_acknowledgement_reasons() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        subscriber
+            .handle_subscribe(subscribe_packet("watched", QoS::AtLeastOnce), &broker, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            puback_reason(
+                &mut publisher,
+                &broker,
+                qos1_publish("watched", b"hi", true)
+            )
+            .await,
+            ReasonCode::Success
+        );
+        assert_eq!(
+            puback_reason(
+                &mut publisher,
+                &broker,
+                qos1_publish("ignored", b"hi", false)
+            )
+            .await,
+            ReasonCode::NoMatchingSubscribers
+        );
+        // Declared as text, but not valid UTF-8, so not forwarded
+        assert_eq!(
+            puback_reason(
+                &mut publisher,
+                &broker,
+                qos1_publish("watched", b"\xff", true)
+            )
+            .await,
+            ReasonCode::PayloadFormatInvalid
+        );
+        next_publish(&mut subscriber).await;
+        assert!(nothing_queued(&subscriber).await);
     }
 
     #[tokio::test]

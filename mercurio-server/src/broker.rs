@@ -61,16 +61,17 @@ impl<S: RetainedMessageStore> Broker<S> {
     /// Publish a message to a topic. Delivers to all matching subscribers.
     /// If the retain flag is set, stores or clears the retained message for this topic.
     pub(crate) async fn publish(&self, topic: &str, message: Message) -> Result<()> {
-        self.publish_from(topic, message, None).await
+        self.publish_from(topic, message, None).await.map(|_| ())
     }
 
     /// Publishes a message on behalf of the session `origin`, if any.
+    /// Returns how many subscriptions matched it.
     pub(crate) async fn publish_from(
         &self,
         topic: &str,
         message: Message,
         origin: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         // Handle retained message storage
         if message.retain {
             if message.payload.as_ref().is_none_or(|p| p.is_empty()) {
@@ -90,10 +91,11 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        for subscriber in self.subscriptions.matching(topic) {
+        let subscribers = self.subscriptions.matching(topic);
+        for subscriber in &subscribers {
             subscriber.deliver(message.clone(), origin);
         }
-        Ok(())
+        Ok(subscribers.len())
     }
 }
 
