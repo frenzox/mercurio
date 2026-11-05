@@ -33,7 +33,7 @@ async fn connect() -> (TcpStream, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn connack_advertises_maximum_packet_size() {
+async fn connack_advertises_capabilities() {
     let (_, connack) = connect().await;
 
     let mut buffer = BytesMut::from(&connack[..]);
@@ -49,6 +49,14 @@ async fn connack_advertises_maximum_packet_size() {
         properties.topic_alias_max.unwrap().value,
         Limits::default().topic_alias_maximum
     );
+    assert_eq!(
+        properties.receive_maximum.unwrap().value,
+        Limits::default().receive_maximum
+    );
+    assert!(properties.retain_available.unwrap().value);
+    assert!(properties.wildcard_subscription_available.unwrap().value);
+    assert!(properties.subscription_identifier_available.unwrap().value);
+    assert!(properties.shared_subscription_available.unwrap().value);
 }
 
 #[tokio::test]
