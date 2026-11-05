@@ -133,7 +133,20 @@ impl Encoder for SubAckPacket {
             self.properties.encode(buffer);
         }
 
-        self.payload.encode(buffer);
+        if self.protocol_version.supports_reason_codes() {
+            self.payload.encode(buffer);
+        } else {
+            // MQTT 3.x only has the granted QoS return codes and 0x80 for failure
+            for p in &self.payload {
+                let return_code: u8 = match p.reason_code {
+                    ReasonCode::GrantedQoS0 => 0x00,
+                    ReasonCode::GrantedQoS1 => 0x01,
+                    ReasonCode::GrantedQoS2 => 0x02,
+                    _ => 0x80,
+                };
+                return_code.encode(buffer);
+            }
+        }
     }
 }
 
@@ -205,6 +218,27 @@ impl SubAckPacket {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_v3_encode_maps_failures_to_0x80() {
+        let packet = SubAckPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            packet_id: 1,
+            properties: None,
+            payload: vec![
+                SubAckPayload {
+                    reason_code: ReasonCode::GrantedQoS1,
+                },
+                SubAckPayload {
+                    reason_code: ReasonCode::TopicFilterInvalid,
+                },
+            ],
+        };
+
+        let mut buffer = BytesMut::new();
+        packet.encode(&mut buffer);
+        assert_eq!(&buffer[..], &[0x90, 0x04, 0x00, 0x01, 0x01, 0x80]);
+    }
+
     use bytes::{Bytes, BytesMut};
 
     use crate::suback::*;
