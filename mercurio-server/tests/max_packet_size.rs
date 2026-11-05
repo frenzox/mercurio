@@ -42,8 +42,13 @@ async fn connack_advertises_maximum_packet_size() {
     else {
         panic!("Expected ConnAck");
     };
-    let maximum = connack.properties.unwrap().maximum_packet_size.unwrap();
+    let properties = connack.properties.unwrap();
+    let maximum = properties.maximum_packet_size.unwrap();
     assert_eq!(maximum.value as usize, Limits::default().max_packet_size);
+    assert_eq!(
+        properties.topic_alias_max.unwrap().value,
+        Limits::default().topic_alias_maximum
+    );
 }
 
 #[tokio::test]
