@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
-
-use crate::topic_tree::TopicTree;
+use crate::{queue::Subscriber, topic_tree::TopicTree};
 use mercurio_core::{message::Message, Result};
 use mercurio_storage::RetainedMessageStore;
 
@@ -13,7 +11,7 @@ use mercurio_storage::RetainedMessageStore;
 /// It is thread-safe and can be cloned cheaply (uses Arc internally).
 #[derive(Clone)]
 pub(crate) struct Broker<S: RetainedMessageStore> {
-    subscriptions: TopicTree<Message>,
+    subscriptions: TopicTree<Subscriber>,
     /// Storage backend for retained messages
     storage: Arc<S>,
 }
@@ -26,19 +24,30 @@ impl<S: RetainedMessageStore> Broker<S> {
         }
     }
 
-    /// Subscribe to a topic filter. Returns a receiver for matching messages
-    /// and any retained messages that match the filter.
+    /// Subscribes `id` to a topic filter, replacing any previous subscription
+    /// of `id` to the same filter. Returns the retained messages matching it.
     pub(crate) async fn subscribe(
         &self,
-        topic: &str,
-    ) -> Result<(broadcast::Receiver<Message>, Vec<Message>)> {
-        let receiver = self.subscriptions.subscribe(topic);
-        let retained_messages = self
-            .storage
-            .get_retained(topic)
+        filter: &str,
+        id: u64,
+        subscriber: Subscriber,
+    ) -> Result<Vec<Message>> {
+        self.subscriptions.subscribe(filter, id, subscriber);
+        self.storage
+            .get_retained(filter)
             .await
-            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))?;
-        Ok((receiver, retained_messages))
+            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+    }
+
+    /// Removes the subscription of `id` to a topic filter. Returns whether it
+    /// existed.
+    pub(crate) fn unsubscribe(&self, filter: &str, id: u64) -> bool {
+        self.subscriptions.unsubscribe(filter, id)
+    }
+
+    /// Handle to the subscriptions, for removing them without a broker.
+    pub(crate) fn topics(&self) -> TopicTree<Subscriber> {
+        self.subscriptions.clone()
     }
 
     /// Publish a message to a topic. Delivers to all matching subscribers.
@@ -63,8 +72,13 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        // Deliver to current subscribers
-        self.subscriptions.publish(topic, message);
+        // Forwarded messages carry RETAIN only when sent because of a new
+        // subscription [MQTT-3.3.1-9]
+        let mut message = message;
+        message.retain = false;
+        for subscriber in self.subscriptions.matching(topic) {
+            subscriber.deliver(message.clone());
+        }
         Ok(())
     }
 }
@@ -76,6 +90,13 @@ mod tests {
     use mercurio_core::qos::QoS;
     use mercurio_storage::memory::MemoryStore;
     use std::sync::Arc;
+
+    fn subscriber() -> Subscriber {
+        Subscriber {
+            queue: Default::default(),
+            granted_qos: QoS::AtMostOnce,
+        }
+    }
 
     fn create_test_message(topic: &str, payload: &str, retain: bool) -> Message {
         Message {
@@ -96,7 +117,10 @@ mod tests {
         broker.publish("test/topic", msg).await.unwrap();
 
         // Subscribe and check retained message is returned
-        let (_, retained) = broker.subscribe("test/topic").await.unwrap();
+        let retained = broker
+            .subscribe("test/topic", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(
             retained[0].payload.as_ref().unwrap().as_ref(),
@@ -112,7 +136,10 @@ mod tests {
 
         broker.publish("test/topic", msg).await.unwrap();
 
-        let (_, retained) = broker.subscribe("test/topic").await.unwrap();
+        let retained = broker
+            .subscribe("test/topic", 0, subscriber())
+            .await
+            .unwrap();
         assert!(retained.is_empty());
     }
 
@@ -125,7 +152,10 @@ mod tests {
         broker.publish("test/topic", msg).await.unwrap();
 
         // Verify it's stored
-        let (_, retained) = broker.subscribe("test/topic").await.unwrap();
+        let retained = broker
+            .subscribe("test/topic", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 1);
 
         // Clear with empty payload
@@ -140,7 +170,10 @@ mod tests {
         broker.publish("test/topic", clear_msg).await.unwrap();
 
         // Verify it's cleared
-        let (_, retained) = broker.subscribe("test/topic").await.unwrap();
+        let retained = broker
+            .subscribe("test/topic", 0, subscriber())
+            .await
+            .unwrap();
         assert!(retained.is_empty());
     }
 
@@ -157,7 +190,10 @@ mod tests {
         broker.publish("test/topic", msg2).await.unwrap();
 
         // Verify only latest is returned
-        let (_, retained) = broker.subscribe("test/topic").await.unwrap();
+        let retained = broker
+            .subscribe("test/topic", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(
             retained[0].payload.as_ref().unwrap().as_ref(),
@@ -193,15 +229,24 @@ mod tests {
             .unwrap();
 
         // Subscribe with single-level wildcard
-        let (_, retained) = broker.subscribe("sensors/temp/+").await.unwrap();
+        let retained = broker
+            .subscribe("sensors/temp/+", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 2);
 
         // Subscribe with multi-level wildcard
-        let (_, retained) = broker.subscribe("sensors/#").await.unwrap();
+        let retained = broker
+            .subscribe("sensors/#", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 3);
 
         // Exact match
-        let (_, retained) = broker.subscribe("sensors/temp/room1").await.unwrap();
+        let retained = broker
+            .subscribe("sensors/temp/room1", 0, subscriber())
+            .await
+            .unwrap();
         assert_eq!(retained.len(), 1);
     }
 }
