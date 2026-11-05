@@ -354,11 +354,16 @@ where
             .and_then(|p| p.authentication_method.as_ref())
             .map(|m| m.value.clone());
 
+        // The user name access control can rely on: only one that was
+        // verified, by enhanced authentication or the password check
+        let mut verified_user = None;
+
         // MQTT 5 enhanced authentication replaces the user name and password
         // check when the client asks for it
         if let Some(method) = authentication_method {
-            if !self.authenticate_enhanced(&connect_packet, &method).await? {
-                return Ok(());
+            match self.authenticate_enhanced(&connect_packet, &method).await? {
+                Some(username) => verified_user = username,
+                None => return Ok(()),
             }
         } else if self.auth_config.require_auth {
             let authenticated = match (
@@ -389,6 +394,7 @@ where
                     .reject_connect(&connect_packet, ReasonCode::BadUserNameOrPassword)
                     .await;
             }
+            verified_user = connect_packet.payload.user_name.clone();
         }
 
         // A will is published on the client's behalf, so it needs the same
@@ -399,7 +405,7 @@ where
         ) {
             let identity = ClientIdentity {
                 client_id: connect_packet.payload.client_id.clone(),
-                username: connect_packet.payload.user_name.clone(),
+                username: verified_user.clone(),
             };
             if !authorizer.authorize(&identity, will_topic, Access::Write) {
                 return self
@@ -443,6 +449,8 @@ where
         let start_result = self.session_manager.start_session(connect_packet).await?;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
+
+        session.set_verified_user(verified_user).await;
 
         let result = async {
             session
@@ -529,37 +537,38 @@ where
     }
 
     /// Runs the AUTH exchange of MQTT 5 enhanced authentication during
-    /// CONNECT. Returns false, having refused the connection, if it fails.
+    /// CONNECT. Returns the user name the method verified, if any, or None
+    /// having refused the connection.
     async fn authenticate_enhanced(
         &mut self,
         connect_packet: &ConnectPacket,
         method: &str,
-    ) -> Result<bool> {
-        let Some(manager) = self.auth_config.auth_manager.clone() else {
+    ) -> Result<Option<Option<String>>> {
+        let exchange = self
+            .auth_config
+            .auth_manager
+            .as_ref()
+            .and_then(|manager| manager.begin(method));
+        let Some(mut exchange) = exchange else {
             self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
                 .await?;
-            return Ok(false);
+            return Ok(None);
         };
-        if !manager.supports_method(method) {
-            self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
-                .await?;
-            return Ok(false);
-        }
 
         let initial_data = connect_packet
             .properties
             .as_ref()
             .and_then(|p| p.authentication_data.as_ref())
             .map(|d| &d.value);
-        let mut result = manager.start_auth(method, initial_data);
+        let mut result = exchange.step(initial_data);
 
         loop {
             let challenge = match result {
-                AuthResult::Success => return Ok(true),
+                AuthResult::Success { username } => return Ok(Some(username)),
                 AuthResult::Failed(reason) => {
                     warn!("Enhanced authentication with `{}` failed", method);
                     self.reject_connect(connect_packet, reason).await?;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 AuthResult::Continue(challenge) => challenge,
             };
@@ -585,7 +594,7 @@ where
             let Some(ControlPacket::Auth(auth)) = response else {
                 self.reject_connect(connect_packet, ReasonCode::ProtocolError)
                     .await?;
-                return Ok(false);
+                return Ok(None);
             };
             let same_method = auth
                 .properties
@@ -595,15 +604,11 @@ where
             if auth.reason != ReasonCode::ContinueAuthentication || !same_method {
                 self.reject_connect(connect_packet, ReasonCode::ProtocolError)
                     .await?;
-                return Ok(false);
+                return Ok(None);
             }
 
-            let data = auth
-                .properties
-                .auth_data
-                .map(|d| d.value)
-                .unwrap_or_default();
-            result = manager.continue_auth(method, &data);
+            let data = auth.properties.auth_data.map(|d| d.value);
+            result = exchange.step(data.as_ref());
         }
     }
 
@@ -643,8 +648,6 @@ where
 
         let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
-
-        let identity = session.identity().await;
 
         while !self.shutdown.is_shutdown() {
             // Re-evaluated after every packet, so acknowledgements reopen it
@@ -756,6 +759,8 @@ where
                     // Checked per message: a permitted subscription can still
                     // match topics the client may not read
                     if let Some(authorizer) = &self.auth_config.authorizer {
+                        // Re-read each time: re-authentication can change the user
+                        let identity = session.identity().await;
                         if !authorizer.authorize(&identity, &message.topic, Access::Read) {
                             continue;
                         }

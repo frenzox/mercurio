@@ -18,9 +18,10 @@ use mercurio_core::{
     codec::{Encoder, VariableByteInteger},
     message::{unix_millis, Message, MessageProperties},
     properties::{
-        AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, ReceiveMaximum,
-        RetainAvailable, SharedSubscriptionAvailable, SubscriptionIdentifier,
-        SubscriptionIdentifierAvailable, TopicAliasMaximum, WildcardSubscriptionAvailable,
+        AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
+        MessageExpiryInterval, ReceiveMaximum, RetainAvailable, SharedSubscriptionAvailable,
+        SubscriptionIdentifier, SubscriptionIdentifierAvailable, TopicAliasMaximum,
+        WildcardSubscriptionAvailable,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -46,7 +47,7 @@ use mercurio_packets::{
 
 use crate::{
     acl::{Access, Authorizer, ClientIdentity},
-    auth::{AuthManager, AuthResult},
+    auth::{AuthExchange, AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
     queue::{MessageQueue, QueueLimits, Subscriber},
@@ -215,8 +216,10 @@ struct State {
     receive_maximum: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
-    /// Current authentication method name for ongoing re-authentication
-    auth_method: Option<String>,
+    /// Re-authentication in progress, if any
+    auth_exchange: Option<Box<dyn AuthExchange>>,
+    /// User name verified by authentication, the one access control trusts
+    verified_user: Option<String>,
 }
 
 impl SessionDropGuard {
@@ -258,7 +261,8 @@ impl Session {
                     topic_alias_maximum: 0,
                     receive_maximum: u16::MAX,
                     will_message,
-                    auth_method: None,
+                    auth_exchange: None,
+                    verified_user: None,
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -576,8 +580,13 @@ impl Session {
         let session = self.shared.state.lock().await;
         ClientIdentity {
             client_id: session.client_id.clone(),
-            username: session.connect_packet.payload.user_name.clone(),
+            username: session.verified_user.clone(),
         }
+    }
+
+    /// Records the user name authentication verified for this connection.
+    pub(crate) async fn set_verified_user(&self, username: Option<String>) {
+        self.shared.state.lock().await.verified_user = username;
     }
 
     async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {
@@ -682,7 +691,7 @@ impl Session {
             if let Some(authorizer) = authorizer {
                 let identity = ClientIdentity {
                     client_id: session.client_id.clone(),
-                    username: session.connect_packet.payload.user_name.clone(),
+                    username: session.verified_user.clone(),
                 };
                 if !authorizer.authorize(&identity, &sub.topic_filter, Access::Read) {
                     warn!(
@@ -783,109 +792,59 @@ impl Session {
 
         let mut session = self.shared.state.lock().await;
 
-        // Get auth method from packet properties
-        let method_name = packet
+        // Every AUTH must name the method the connection was authenticated
+        // with [MQTT-4.12.1-1]
+        let connect_method = session
+            .connect_packet
             .properties
-            .auth_method
             .as_ref()
-            .map(|m| m.value.as_str());
+            .and_then(|p| p.authentication_method.as_ref())
+            .map(|m| m.value.clone());
+        let method_name = packet.properties.auth_method.as_ref().map(|m| &m.value);
+        let Some(method) = connect_method.filter(|m| Some(m) == method_name) else {
+            return Err(ReasonCode::ProtocolError.into());
+        };
+        let data = packet.properties.auth_data.map(|d| d.value);
 
-        // Get auth data from packet properties
-        let auth_data = packet.properties.auth_data.as_ref().map(|d| &d.value);
-
-        match packet.reason {
+        let result = match packet.reason {
             ReasonCode::ReAuthenticate => {
-                // Client wants to re-authenticate
-                let Some(method_name) = method_name else {
-                    return Err(ReasonCode::ProtocolError.into());
-                };
-
-                // Re-authentication must use the method the connection was
-                // authenticated with [MQTT-4.12.1-1]
-                let connect_method = session
-                    .connect_packet
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.authentication_method.as_ref())
-                    .map(|m| m.value.as_str());
-                if connect_method != Some(method_name) {
-                    return Err(ReasonCode::ProtocolError.into());
-                }
-
-                if !auth_manager.supports_method(method_name) {
+                let Some(mut exchange) = auth_manager.begin(&method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
-                }
-
-                // Start re-authentication
-                session.auth_method = Some(method_name.to_string());
-
-                match auth_manager.start_auth(method_name, auth_data) {
-                    AuthResult::Success => {
-                        session.auth_method = None;
-                        Ok(Some(ControlPacket::Auth(AuthPacket {
-                            reason: ReasonCode::Success,
-                            properties: AuthProperties::default(),
-                        })))
-                    }
-                    AuthResult::Continue(challenge) => {
-                        use mercurio_core::properties::{AuthenticationData, AuthenticationMethod};
-                        Ok(Some(ControlPacket::Auth(AuthPacket {
-                            reason: ReasonCode::ContinueAuthentication,
-                            properties: AuthProperties {
-                                auth_method: Some(AuthenticationMethod {
-                                    value: method_name.to_string(),
-                                }),
-                                auth_data: Some(AuthenticationData { value: challenge }),
-                                reason_string: None,
-                                user_property: None,
-                            },
-                        })))
-                    }
-                    AuthResult::Failed(reason) => Err(reason.into()),
-                }
+                };
+                let result = exchange.step(data.as_ref());
+                session.auth_exchange = Some(exchange);
+                result
             }
             ReasonCode::ContinueAuthentication => {
-                // Client is continuing an ongoing authentication
-                let Some(ref current_method) = session.auth_method else {
-                    // No authentication in progress
+                // Only valid while a re-authentication is in progress
+                let Some(exchange) = session.auth_exchange.as_mut() else {
                     return Err(ReasonCode::ProtocolError.into());
                 };
-
-                let Some(auth_data) = auth_data else {
-                    return Err(ReasonCode::ProtocolError.into());
-                };
-
-                match auth_manager.continue_auth(current_method, auth_data) {
-                    AuthResult::Success => {
-                        session.auth_method = None;
-                        Ok(Some(ControlPacket::Auth(AuthPacket {
-                            reason: ReasonCode::Success,
-                            properties: AuthProperties::default(),
-                        })))
-                    }
-                    AuthResult::Continue(challenge) => {
-                        use mercurio_core::properties::{AuthenticationData, AuthenticationMethod};
-                        Ok(Some(ControlPacket::Auth(AuthPacket {
-                            reason: ReasonCode::ContinueAuthentication,
-                            properties: AuthProperties {
-                                auth_method: Some(AuthenticationMethod {
-                                    value: current_method.clone(),
-                                }),
-                                auth_data: Some(AuthenticationData { value: challenge }),
-                                reason_string: None,
-                                user_property: None,
-                            },
-                        })))
-                    }
-                    AuthResult::Failed(reason) => {
-                        session.auth_method = None;
-                        Err(reason.into())
-                    }
-                }
+                exchange.step(data.as_ref())
             }
-            _ => {
-                // Unexpected reason code
-                Err(ReasonCode::ProtocolError.into())
+            _ => return Err(ReasonCode::ProtocolError.into()),
+        };
+
+        match result {
+            AuthResult::Success { username } => {
+                session.auth_exchange = None;
+                session.verified_user = username;
+                Ok(Some(ControlPacket::Auth(AuthPacket {
+                    reason: ReasonCode::Success,
+                    properties: AuthProperties::default(),
+                })))
+            }
+            AuthResult::Continue(challenge) => Ok(Some(ControlPacket::Auth(AuthPacket {
+                reason: ReasonCode::ContinueAuthentication,
+                properties: AuthProperties {
+                    auth_method: Some(AuthenticationMethod::new(method)),
+                    auth_data: Some(AuthenticationData::new(challenge)),
+                    ..Default::default()
+                },
+            }))),
+            AuthResult::Failed(reason) => {
+                session.auth_exchange = None;
+                Err(reason.into())
             }
         }
     }
