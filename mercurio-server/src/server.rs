@@ -32,6 +32,7 @@ use crate::{
 };
 
 /// Authentication configuration for the server.
+#[derive(Default)]
 pub struct AuthConfig {
     /// Whether authentication is required.
     pub require_auth: bool,
@@ -41,14 +42,29 @@ pub struct AuthConfig {
     pub auth_manager: Option<Arc<AuthManager>>,
 }
 
-impl Default for AuthConfig {
+/// Tunable limits of the broker.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// How long a new connection may take to complete the TLS handshake and
+    /// send CONNECT before it is closed.
+    pub connect_timeout: Duration,
+}
+
+impl Default for Limits {
     fn default() -> Self {
         Self {
-            require_auth: false,
-            credential_validator: None,
-            auth_manager: None,
+            connect_timeout: Duration::from_secs(10),
         }
     }
+}
+
+/// Broker configuration.
+#[derive(Default)]
+pub struct ServerConfig {
+    /// Serve TLS instead of plain TCP when set.
+    pub tls: Option<TlsConfig>,
+    pub auth: AuthConfig,
+    pub limits: Limits,
 }
 
 struct Listener {
@@ -58,6 +74,7 @@ struct Listener {
     notify_shutdown: broadcast::Sender<()>,
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
+    limits: Limits,
 }
 
 struct Handler<S>
@@ -69,20 +86,22 @@ where
     connection: Connection<S>,
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
+    limits: Limits,
 }
 
 /// Run the MQTT broker with plain TCP connections.
 pub async fn run(listener: TcpListener, shutdown: impl Future) {
-    run_with_tls(listener, None, AuthConfig::default(), shutdown).await
+    run_with_config(listener, ServerConfig::default(), shutdown).await
 }
 
-/// Run the MQTT broker with optional TLS support and authentication.
-pub async fn run_with_tls(
-    listener: TcpListener,
-    tls_config: Option<TlsConfig>,
-    auth_config: AuthConfig,
-    shutdown: impl Future,
-) {
+/// Run the MQTT broker with the given configuration.
+pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdown: impl Future) {
+    let ServerConfig {
+        tls: tls_config,
+        auth: auth_config,
+        limits,
+    } = config;
+
     let (notify_shutdown, _) = broadcast::channel(1);
 
     // Create shared storage instance for both broker and session manager
@@ -115,6 +134,7 @@ pub async fn run_with_tls(
         notify_shutdown,
         tls_acceptor,
         auth_config,
+        limits,
     };
 
     tokio::select! {
@@ -137,13 +157,14 @@ impl Listener {
             let session_manager = self.session_manager_holder.session_manager();
             let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
             let auth_config = Arc::clone(&self.auth_config);
+            let limits = self.limits;
 
             if let Some(ref tls_acceptor) = self.tls_acceptor {
                 // TLS connection
                 let acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    match acceptor.accept(socket).await {
-                        Ok(tls_stream) => {
+                    match time::timeout(limits.connect_timeout, acceptor.accept(socket)).await {
+                        Ok(Ok(tls_stream)) => {
                             debug!("TLS handshake completed for {:?}", peer_addr);
                             let mut handler = Handler {
                                 broker,
@@ -151,11 +172,15 @@ impl Listener {
                                 connection: Connection::new_tls(tls_stream),
                                 shutdown,
                                 auth_config,
+                                limits,
                             };
                             Self::handle_connection(&mut handler).await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             error!("TLS handshake failed for {:?}: {}", peer_addr, e);
+                        }
+                        Err(_) => {
+                            warn!("TLS handshake timed out for {:?}", peer_addr);
                         }
                     }
                 });
@@ -168,6 +193,7 @@ impl Listener {
                         connection: Connection::new(socket),
                         shutdown,
                         auth_config,
+                        limits,
                     };
                     Self::handle_connection(&mut handler).await;
                 });
@@ -179,16 +205,23 @@ impl Listener {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        match handler.connection.read_packet().await {
+        let first_packet = time::timeout(
+            handler.limits.connect_timeout,
+            handler.connection.read_packet(),
+        )
+        .await;
+
+        match first_packet {
             // [MQTT-3.1.0-1]
             // After a Network Connection is established by a Client
             // to a Server, the first packet sent from the Client to
             // the Server MUST be a CONNECT packet.
-            Ok(Some(ControlPacket::Connect(p))) => {
+            Ok(Ok(Some(ControlPacket::Connect(p)))) => {
                 if let Err(err) = handler.run(p).await {
                     error!(cause = ?err, "Connection error");
                 }
             }
+            Err(_) => warn!("No CONNECT received in time, closing connection"),
             _ => error!("ConnectPacket expectation not met"),
         }
     }
