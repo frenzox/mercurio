@@ -12,10 +12,10 @@ use mercurio_core::{
 
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
-    session_expiry_interval: Option<SessionExpiryInterval>,
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
-    server_reference: Option<ServerReference>,
+    pub session_expiry_interval: Option<SessionExpiryInterval>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
+    pub server_reference: Option<ServerReference>,
 }
 
 impl Encoder for DisconnectProperties {
@@ -86,13 +86,29 @@ impl Encoder for DisconnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         let mut remaining_len = 0;
 
+        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
+
         buffer.put_u8(PACKET_TYPE << 4);
         remaining_len += self.reason.encoded_size();
-        remaining_len += self.properties.encoded_size();
+        if self.properties.is_some() {
+            remaining_len += properties_len.encoded_size() + self.properties.encoded_size();
+        }
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.reason.encode(buffer);
-        self.properties.encode(buffer);
+        if self.properties.is_some() {
+            properties_len.encode(buffer);
+            self.properties.encode(buffer);
+        }
+    }
+}
+
+impl DisconnectPacket {
+    /// Encodes a DISCONNECT packet in MQTT 3.x format, which has no
+    /// variable header.
+    pub fn encode_v3(&self, buffer: &mut BytesMut) {
+        buffer.put_u8(PACKET_TYPE << 4);
+        buffer.put_u8(0);
     }
 }
 
@@ -119,5 +135,38 @@ impl Decoder for DisconnectPacket {
         };
 
         Ok(DisconnectPacket { reason, properties })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_round_trip_with_properties() {
+        let packet = DisconnectPacket {
+            reason: ReasonCode::DisconnectWithWillMessage,
+            properties: Some(DisconnectProperties {
+                session_expiry_interval: Some(SessionExpiryInterval { value: 30 }),
+                ..Default::default()
+            }),
+        };
+
+        let mut buffer = BytesMut::new();
+        packet.encode(&mut buffer);
+        assert_eq!(DisconnectPacket::decode(&mut buffer).unwrap(), packet);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_encode_v3_has_no_variable_header() {
+        let packet = DisconnectPacket {
+            reason: ReasonCode::NormalDisconnection,
+            properties: None,
+        };
+
+        let mut buffer = BytesMut::new();
+        packet.encode_v3(&mut buffer);
+        assert_eq!(&buffer[..], &[0xe0, 0x00]);
     }
 }
