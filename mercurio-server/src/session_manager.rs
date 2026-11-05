@@ -7,7 +7,7 @@ use tokio::{
 use tracing::info;
 use uuid::Uuid;
 
-use mercurio_core::Result;
+use mercurio_core::{message::unix_millis, Result};
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_storage::{
     InflightMessage, InflightStore, SessionState, SessionStore, StoredSubscription,
@@ -134,6 +134,8 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             connect_packet.payload.client_id = Uuid::new_v4().hyphenated().to_string();
         }
 
+        let expiry_interval = session_expiry(&connect_packet).map(|e| e.as_secs() as u32);
+
         let lease = self
             .acquire_client_id(&connect_packet.payload.client_id)
             .await;
@@ -217,6 +219,8 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             client_id: client_id.clone(),
             subscriptions,
             clean_start: false,
+            expiry_interval,
+            expires_at: None,
         };
         let _ = self.storage.save_session(&client_id, &session_state).await;
 
@@ -298,11 +302,48 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         }
 
         if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(expiry).await;
-                manager.end_session(&client_id, generation).await;
-            });
+            // Recorded so a restarted broker still expires the session
+            if let Ok(Some(mut state)) = self.storage.load_session(&client_id).await {
+                state.expiry_interval = Some(expiry.as_secs() as u32);
+                state.expires_at = Some(unix_millis() + expiry.as_millis() as u64);
+                let _ = self.storage.save_session(&client_id, &state).await;
+            }
+            self.schedule_end(client_id, generation, expiry);
+        }
+    }
+
+    /// Ends the session of `client_id` after `delay`, unless a connection
+    /// newer than `generation` uses it in the meantime.
+    fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            manager.end_session(&client_id, generation).await;
+        });
+    }
+
+    /// Schedules the expiry of sessions persisted by a previous run, and
+    /// discards those that expired while the broker was down.
+    pub(crate) async fn restore_expiry(&self) {
+        let Ok(client_ids) = self.storage.list_sessions().await else {
+            return;
+        };
+        let now = unix_millis();
+
+        for client_id in client_ids {
+            let Ok(Some(state)) = self.storage.load_session(&client_id).await else {
+                continue;
+            };
+            // Sessions connected when the broker stopped count as
+            // disconnected from now on
+            let deadline = state
+                .expires_at
+                .or_else(|| state.expiry_interval.map(|i| now + u64::from(i) * 1000));
+            if let Some(deadline) = deadline {
+                // Generation 0 predates every connection of this run
+                let delay = Duration::from_millis(deadline.saturating_sub(now));
+                self.schedule_end(client_id, 0, delay);
+            }
         }
     }
 
@@ -310,11 +351,15 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     /// `generation` has used it since.
     async fn end_session(&self, client_id: &str, generation: u64) {
         let mut manager = self.shared.state.lock().await;
-        if manager
+        let connected_since = manager
             .connections
             .get(client_id)
-            .is_some_and(|slot| slot.generation != generation)
-        {
+            .is_some_and(|slot| slot.generation != generation);
+        let resumed_since = match manager.sessions.get(client_id) {
+            Some(session) => session.session().generation().await != generation,
+            None => false,
+        };
+        if connected_since || resumed_since {
             return;
         }
 
@@ -345,11 +390,17 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         client_id: &str,
         subscriptions: Vec<StoredSubscription>,
     ) -> Result<()> {
-        let session_state = SessionState {
-            client_id: client_id.to_string(),
-            subscriptions,
-            clean_start: false,
+        let mut session_state = match self.storage.load_session(client_id).await {
+            Ok(Some(state)) => state,
+            _ => SessionState {
+                client_id: client_id.to_string(),
+                subscriptions: Vec::new(),
+                clean_start: false,
+                expiry_interval: None,
+                expires_at: None,
+            },
         };
+        session_state.subscriptions = subscriptions;
         self.storage
             .save_session(client_id, &session_state)
             .await
@@ -392,6 +443,22 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             .await
             .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
     }
+}
+
+/// How long a session outlives its connection; `None` means forever.
+pub(crate) fn session_expiry(connect_packet: &ConnectPacket) -> Option<Duration> {
+    if !connect_packet.protocol_version.supports_properties() {
+        // MQTT 3.x: a clean session ends with the connection, others persist
+        return connect_packet.flags.clean_start.then_some(Duration::ZERO);
+    }
+
+    let interval = connect_packet
+        .properties
+        .as_ref()
+        .and_then(|p| p.session_expiry_interval.as_ref())
+        .map_or(0, |p| p.value);
+
+    (interval != u32::MAX).then(|| Duration::from_secs(interval.into()))
 }
 
 #[cfg(test)]
@@ -539,6 +606,8 @@ mod tests {
                     client_id: "c".to_string(),
                     subscriptions: vec![],
                     clean_start: false,
+                    expiry_interval: None,
+                    expires_at: None,
                 },
             )
             .await
@@ -589,6 +658,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restore_expiry_discards_sessions_expired_while_down() {
+        let storage = create_test_storage();
+        for (client_id, expires_at) in [("expired", Some(1)), ("forever", None)] {
+            storage
+                .save_session(
+                    client_id,
+                    &SessionState {
+                        client_id: client_id.to_string(),
+                        subscriptions: vec![],
+                        clean_start: false,
+                        expiry_interval: expires_at.map(|_| 60),
+                        expires_at,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+        manager.restore_expiry().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(storage.load_session("expired").await.unwrap().is_none());
+        assert!(storage.load_session("forever").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn test_store_and_remove_inflight() {
         let storage = create_test_storage();
         let manager: SessionManager<MemoryStore> = SessionManager::new(storage);
@@ -635,6 +731,8 @@ mod tests {
             client_id: "client1".to_string(),
             subscriptions: vec![StoredSubscription::new("topic/a", QoS::AtLeastOnce)],
             clean_start: false,
+            expiry_interval: None,
+            expires_at: None,
         };
         storage
             .save_session("client1", &session_state)
@@ -695,6 +793,8 @@ mod tests {
             client_id: "client1".to_string(),
             subscriptions: vec![],
             clean_start: false,
+            expiry_interval: None,
+            expires_at: None,
         };
         storage
             .save_session("client1", &session_state)

@@ -9,11 +9,19 @@ use mercurio_storage::RetainedMessageStore;
 /// The broker maintains a topic tree for efficient message routing with wildcard support.
 /// It uses a pluggable storage backend for retained messages.
 /// It is thread-safe and can be cloned cheaply (uses Arc internally).
-#[derive(Clone)]
 pub(crate) struct Broker<S: RetainedMessageStore> {
     subscriptions: TopicTree<Subscriber>,
     /// Storage backend for retained messages
     storage: Arc<S>,
+}
+
+impl<S: RetainedMessageStore> Clone for Broker<S> {
+    fn clone(&self) -> Self {
+        Broker {
+            subscriptions: self.subscriptions.clone(),
+            storage: Arc::clone(&self.storage),
+        }
+    }
 }
 
 impl<S: RetainedMessageStore> Broker<S> {

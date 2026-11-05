@@ -45,6 +45,11 @@ pub struct SessionState {
     pub client_id: String,
     pub subscriptions: Vec<StoredSubscription>,
     pub clean_start: bool,
+    /// Seconds the session outlives its connection; None means forever
+    pub expiry_interval: Option<u32>,
+    /// Unix time in milliseconds when the session expires, once its
+    /// connection has ended
+    pub expires_at: Option<u64>,
 }
 
 /// A subscription, the QoS granted for it and its MQTT 5 options.

@@ -24,7 +24,7 @@ use mercurio_packets::{
     disconnect::DisconnectPacket,
     ControlPacket,
 };
-use mercurio_storage::memory::MemoryStore;
+use mercurio_storage::{memory::MemoryStore, MqttStore};
 
 use crate::{
     auth::{AuthManager, AuthResult, CredentialValidator},
@@ -32,7 +32,7 @@ use crate::{
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
     queue::QueueLimits,
     session::{Session, WillMessage},
-    session_manager::{ConnectionLease, SessionManager, SessionManagerDropGuard},
+    session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     tls::TlsConfig,
 };
@@ -91,10 +91,10 @@ pub struct ServerConfig {
     pub limits: Limits,
 }
 
-struct Listener {
+struct Listener<St: MqttStore + 'static> {
     listener: TcpListener,
-    broker: Broker<MemoryStore>,
-    session_manager_holder: SessionManagerDropGuard<MemoryStore>,
+    broker: Broker<St>,
+    session_manager_holder: SessionManagerDropGuard<St>,
     notify_shutdown: broadcast::Sender<()>,
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
@@ -103,12 +103,13 @@ struct Listener {
     connection_slots: Option<Arc<Semaphore>>,
 }
 
-struct Handler<S>
+struct Handler<St, S>
 where
+    St: MqttStore + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    broker: Broker<MemoryStore>,
-    session_manager: SessionManager<MemoryStore>,
+    broker: Broker<St>,
+    session_manager: SessionManager<St>,
     connection: Connection<S>,
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
@@ -120,8 +121,20 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
     run_with_config(listener, ServerConfig::default(), shutdown).await
 }
 
-/// Run the MQTT broker with the given configuration.
+/// Run the MQTT broker with the given configuration, keeping its state in
+/// memory.
 pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdown: impl Future) {
+    run_with_storage(listener, config, Arc::new(MemoryStore::new()), shutdown).await
+}
+
+/// Run the MQTT broker with the given configuration, keeping sessions,
+/// retained messages, wills and in-flight messages in `storage`.
+pub async fn run_with_storage<St: MqttStore + 'static>(
+    listener: TcpListener,
+    config: ServerConfig,
+    storage: Arc<St>,
+    shutdown: impl Future,
+) {
     let ServerConfig {
         tls: tls_config,
         auth: auth_config,
@@ -129,9 +142,6 @@ pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdo
     } = config;
 
     let (notify_shutdown, _) = broadcast::channel(1);
-
-    // Create shared storage instance for both broker and session manager
-    let storage = Arc::new(MemoryStore::new());
 
     // Build TLS acceptor if configured
     let tls_acceptor = match tls_config {
@@ -166,6 +176,12 @@ pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdo
         limits,
     };
 
+    server
+        .session_manager_holder
+        .session_manager()
+        .restore_expiry()
+        .await;
+
     tokio::select! {
         _ = server.run() => {}
         _ = shutdown => {
@@ -174,7 +190,7 @@ pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdo
     }
 }
 
-impl Listener {
+impl<St: MqttStore + 'static> Listener<St> {
     async fn run(&mut self) {
         loop {
             let socket = self.accept().await;
@@ -244,7 +260,7 @@ impl Listener {
         }
     }
 
-    async fn handle_connection<S>(handler: &mut Handler<S>)
+    async fn handle_connection<S>(handler: &mut Handler<St, S>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -312,24 +328,9 @@ impl Listener {
     }
 }
 
-/// How long a session outlives its connection; `None` means forever.
-fn session_expiry(connect_packet: &ConnectPacket) -> Option<Duration> {
-    if !connect_packet.protocol_version.supports_properties() {
-        // MQTT 3.x: a clean session ends with the connection, others persist
-        return connect_packet.flags.clean_start.then_some(Duration::ZERO);
-    }
-
-    let interval = connect_packet
-        .properties
-        .as_ref()
-        .and_then(|p| p.session_expiry_interval.as_ref())
-        .map_or(0, |p| p.value);
-
-    (interval != u32::MAX).then(|| Duration::from_secs(interval.into()))
-}
-
-impl<S> Handler<S>
+impl<St, S> Handler<St, S>
 where
+    St: MqttStore + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
@@ -784,7 +785,7 @@ where
     }
 }
 
-async fn publish_will(broker: &Broker<MemoryStore>, will: WillMessage, client_id: &str) {
+async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, client_id: &str) {
     info!(
         "Publishing will message for client `{}` on topic `{}`",
         client_id, will.topic

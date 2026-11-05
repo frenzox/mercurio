@@ -260,6 +260,8 @@ mod tests {
                 StoredSubscription::new("topic/b", QoS::AtLeastOnce),
             ],
             clean_start: false,
+            expiry_interval: None,
+            expires_at: None,
         };
 
         // Save and load
