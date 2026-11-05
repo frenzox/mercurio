@@ -579,6 +579,7 @@ mod tests {
                 }),
                 &broker,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -617,6 +618,7 @@ mod tests {
                     }],
                 }),
                 &broker,
+                None,
                 None,
             )
             .await

@@ -210,6 +210,10 @@ pub struct AuthConfig {
 
     /// Path to password file (format: username:password per line)
     pub password_file: Option<String>,
+
+    /// Path to a mosquitto-style ACL file restricting which topics each
+    /// client may publish and subscribe to
+    pub acl_file: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -218,6 +222,7 @@ impl Default for AuthConfig {
             enabled: false,
             allow_anonymous: default_allow_anonymous(),
             password_file: None,
+            acl_file: None,
         }
     }
 }

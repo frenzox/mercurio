@@ -8,6 +8,7 @@ use std::sync::Arc;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
+use mercurio_server::acl::{AclFile, Authorizer};
 use mercurio_server::server::{AuthConfig as ServerAuthConfig, ServerConfig};
 use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
@@ -138,6 +139,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let authorizer = match &config.auth.acl_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read ACL file {}: {}", path, e))?;
+            let acl = AclFile::parse(&contents)
+                .map_err(|e| format!("Invalid ACL file {}: {}", path, e))?;
+            info!("Loaded topic access control from {}", path);
+            Some(Arc::new(acl) as Arc<dyn Authorizer>)
+        }
+        None => None,
+    };
+
     // Build authentication configuration
     let auth_config = if config.auth.enabled {
         let credential_validator = if let Some(ref password_file) = config.auth.password_file {
@@ -158,9 +171,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_anonymous: config.auth.allow_anonymous,
             credential_validator,
             auth_manager: None,
+            authorizer,
         }
     } else {
-        ServerAuthConfig::default()
+        ServerAuthConfig {
+            authorizer,
+            ..Default::default()
+        }
     };
 
     let server_config = ServerConfig {

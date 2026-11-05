@@ -21,6 +21,7 @@ async fn start_broker(allow_anonymous: bool) -> SocketAddr {
             allow_anonymous,
             credential_validator: Some(Arc::new(SimpleCredentialValidator::new(credentials))),
             auth_manager: None,
+            authorizer: None,
         },
         ..Default::default()
     };

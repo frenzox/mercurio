@@ -81,6 +81,12 @@ enabled = false
 
 # Allow anonymous connections (when auth is enabled)
 allow_anonymous = true
+
+# Restrict the topics each client may publish and subscribe to, using
+# mosquitto's acl_file format. Anything not granted is denied. Rules for
+# named users rely on the user name being verified, so enable
+# authentication along with them.
+# acl_file = "/etc/mercurio/acl"
 ```
 
 ## Running

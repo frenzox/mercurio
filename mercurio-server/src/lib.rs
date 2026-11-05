@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod auth;
 mod broker;
 pub mod connection;

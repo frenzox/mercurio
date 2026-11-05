@@ -27,6 +27,7 @@ use mercurio_packets::{
 use mercurio_storage::{memory::MemoryStore, MqttStore};
 
 use crate::{
+    acl::{Access, Authorizer, ClientIdentity},
     auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
@@ -49,6 +50,9 @@ pub struct AuthConfig {
     pub credential_validator: Option<Arc<dyn CredentialValidator>>,
     /// Optional auth manager for MQTT 5.0 enhanced authentication.
     pub auth_manager: Option<Arc<AuthManager>>,
+    /// Decides which topics each client may publish and subscribe to; all
+    /// of them when unset.
+    pub authorizer: Option<Arc<dyn Authorizer>>,
 }
 
 /// Tunable limits of the broker.
@@ -387,6 +391,23 @@ where
             }
         }
 
+        // A will is published on the client's behalf, so it needs the same
+        // permission as a PUBLISH
+        if let (Some(authorizer), Some(will_topic)) = (
+            &self.auth_config.authorizer,
+            &connect_packet.payload.will_topic,
+        ) {
+            let identity = ClientIdentity {
+                client_id: connect_packet.payload.client_id.clone(),
+                username: connect_packet.payload.user_name.clone(),
+            };
+            if !authorizer.authorize(&identity, will_topic, Access::Write) {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+        }
+
         // Zero is not a valid Receive Maximum or Maximum Packet Size
         if let Some(properties) = &connect_packet.properties {
             if properties
@@ -623,6 +644,8 @@ where
         let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
 
+        let identity = session.identity().await;
+
         while !self.shutdown.is_shutdown() {
             // Re-evaluated after every packet, so acknowledgements reopen it
             let window_open = session.can_send_more().await;
@@ -683,6 +706,7 @@ where
                             packet,
                             &self.broker,
                             self.auth_config.auth_manager.as_deref(),
+                            self.auth_config.authorizer.as_deref(),
                         ).await?;
 
                     // Persist subscriptions after subscribe/unsubscribe operations
@@ -730,6 +754,13 @@ where
                 // ponytail: QoS 0 messages wait behind a full window too, which
                 // keeps ordering; split the queue if they should overtake
                 message = session.next_outgoing(), if window_open => {
+                    // Checked per message: a permitted subscription can still
+                    // match topics the client may not read
+                    if let Some(authorizer) = &self.auth_config.authorizer {
+                        if !authorizer.authorize(&identity, &message.topic, Access::Read) {
+                            continue;
+                        }
+                    }
                     let Some(outgoing) = session.prepare_publish(message).await else {
                         continue;
                     };

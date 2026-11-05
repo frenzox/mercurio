@@ -45,6 +45,7 @@ use mercurio_packets::{
 };
 
 use crate::{
+    acl::{Access, Authorizer, ClientIdentity},
     auth::{AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
@@ -414,6 +415,7 @@ impl Session {
         &mut self,
         mut packet: PublishPacket,
         broker: &Broker<S>,
+        authorizer: Option<&dyn Authorizer>,
     ) -> Result<Option<ControlPacket>> {
         let topic_alias = packet
             .properties
@@ -450,6 +452,17 @@ impl Session {
             .is_some_and(|p| p.subscription_identifier.is_some())
         {
             return Err(ReasonCode::ProtocolError.into());
+        }
+
+        if let Some(authorizer) = authorizer {
+            let identity = self.identity().await;
+            if !authorizer.authorize(&identity, &packet.topic_name, Access::Write) {
+                warn!(
+                    "Client `{}` may not publish to `{}`",
+                    identity.client_id, packet.topic_name
+                );
+                return self.refuse_publish(&packet).await;
+            }
         }
 
         let response = match packet.qos_level {
@@ -521,6 +534,52 @@ impl Session {
         response
     }
 
+    /// Acknowledges a PUBLISH the client was not allowed to make without
+    /// forwarding it. MQTT 3.x has no way to report the refusal, so those
+    /// clients get a normal acknowledgement.
+    async fn refuse_publish(&self, packet: &PublishPacket) -> Result<Option<ControlPacket>> {
+        let mut session = self.shared.state.lock().await;
+        let reports_reasons = session
+            .connect_packet
+            .protocol_version
+            .supports_reason_codes();
+        let reason = if reports_reasons {
+            ReasonCode::NotAuthorized
+        } else {
+            ReasonCode::Success
+        };
+
+        match (packet.qos_level, packet.packet_id) {
+            (QoS::AtMostOnce, _) => Ok(None),
+            (QoS::AtLeastOnce, Some(packet_id)) => Ok(Some(ControlPacket::PubAck(PubAckPacket {
+                packet_id,
+                reason,
+                properties: None,
+            }))),
+            (QoS::ExactlyOnce, Some(packet_id)) => {
+                // A successful PUBREC still expects the PUBREL exchange
+                if !reports_reasons {
+                    session.incoming_qos2.insert(packet_id);
+                }
+                Ok(Some(ControlPacket::PubRec(PubRecPacket {
+                    packet_id,
+                    reason,
+                    properties: None,
+                })))
+            }
+            _ => Err(ReasonCode::ProtocolError.into()),
+        }
+    }
+
+    /// Who the client of this session is, for access control.
+    pub(crate) async fn identity(&self) -> ClientIdentity {
+        let session = self.shared.state.lock().await;
+        ClientIdentity {
+            client_id: session.client_id.clone(),
+            username: session.connect_packet.payload.user_name.clone(),
+        }
+    }
+
     async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         // O(1) removal instead of O(n) search + remove
@@ -582,6 +641,7 @@ impl Session {
         &mut self,
         packet: mercurio_packets::subscribe::SubscribePacket,
         broker: &Broker<S>,
+        authorizer: Option<&dyn Authorizer>,
     ) -> Result<Option<ControlPacket>> {
         let subscription_identifier = packet
             .properties
@@ -617,6 +677,23 @@ impl Session {
                     reason_code: ReasonCode::TopicFilterInvalid,
                 });
                 continue;
+            }
+
+            if let Some(authorizer) = authorizer {
+                let identity = ClientIdentity {
+                    client_id: session.client_id.clone(),
+                    username: session.connect_packet.payload.user_name.clone(),
+                };
+                if !authorizer.authorize(&identity, &sub.topic_filter, Access::Read) {
+                    warn!(
+                        "Client `{}` may not subscribe to `{}`",
+                        identity.client_id, sub.topic_filter
+                    );
+                    ack.payload.push(SubAckPayload {
+                        reason_code: ReasonCode::NotAuthorized,
+                    });
+                    continue;
+                }
             }
 
             let granted_qos = sub.subs_opt.qos;
@@ -818,14 +895,17 @@ impl Session {
         packet: ControlPacket,
         broker: &Broker<S>,
         auth_manager: Option<&AuthManager>,
+        authorizer: Option<&dyn Authorizer>,
     ) -> Result<Option<ControlPacket>> {
         match packet {
-            ControlPacket::Publish(packet) => self.handle_publish(packet, broker).await,
+            ControlPacket::Publish(packet) => self.handle_publish(packet, broker, authorizer).await,
             ControlPacket::PubAck(packet) => self.handle_puback(packet).await,
             ControlPacket::PubRec(packet) => self.handle_pubrec(packet).await,
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
-            ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker).await,
+            ControlPacket::Subscribe(packet) => {
+                self.handle_subscribe(packet, broker, authorizer).await
+            }
             ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet, broker).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
@@ -1181,7 +1261,7 @@ mod tests {
             }],
         };
         session
-            .handle_subscribe(subscribe_packet, &broker)
+            .handle_subscribe(subscribe_packet, &broker, None)
             .await
             .unwrap();
 
@@ -1230,7 +1310,7 @@ mod tests {
             ],
         };
         session
-            .handle_subscribe(subscribe_packet, &broker)
+            .handle_subscribe(subscribe_packet, &broker, None)
             .await
             .unwrap();
 
@@ -1316,7 +1396,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("a/+", QoS::AtMostOnce), &broker)
+            .handle_subscribe(subscribe_packet("a/+", QoS::AtMostOnce), &broker, None)
             .await
             .unwrap();
         broker
@@ -1333,7 +1413,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let ack = session
-            .handle_subscribe(subscribe_packet("q/0", QoS::AtMostOnce), &broker)
+            .handle_subscribe(subscribe_packet("q/0", QoS::AtMostOnce), &broker, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1342,7 +1422,7 @@ mod tests {
         ));
 
         let ack = session
-            .handle_subscribe(subscribe_packet("q/1", QoS::AtLeastOnce), &broker)
+            .handle_subscribe(subscribe_packet("q/1", QoS::AtLeastOnce), &broker, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1377,7 +1457,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("p", QoS::ExactlyOnce), &broker)
+            .handle_subscribe(subscribe_packet("p", QoS::ExactlyOnce), &broker, None)
             .await
             .unwrap();
 
@@ -1431,13 +1511,13 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         subscriber
-            .handle_subscribe(subscribe_packet("t", QoS::ExactlyOnce), &broker)
+            .handle_subscribe(subscribe_packet("t", QoS::ExactlyOnce), &broker, None)
             .await
             .unwrap();
 
         for dup in [false, true] {
             let response = publisher
-                .process_incoming(qos2_publish("t", 5, dup), &broker, None)
+                .process_incoming(qos2_publish("t", 5, dup), &broker, None, None)
                 .await
                 .unwrap();
             assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
@@ -1460,11 +1540,12 @@ mod tests {
                 }),
                 &broker,
                 None,
+                None,
             )
             .await
             .unwrap();
         publisher
-            .process_incoming(qos2_publish("t", 5, false), &broker, None)
+            .process_incoming(qos2_publish("t", 5, false), &broker, None, None)
             .await
             .unwrap();
         next_publish(&mut subscriber).await;
@@ -1477,14 +1558,14 @@ mod tests {
         let packet_id = send_qos2_to(&mut session, &broker).await;
 
         let pubrel = session
-            .process_incoming(pubrec(packet_id, ReasonCode::Success), &broker, None)
+            .process_incoming(pubrec(packet_id, ReasonCode::Success), &broker, None, None)
             .await
             .unwrap();
         assert!(
             matches!(pubrel, Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::Success)
         );
         session
-            .process_incoming(pubrel_packet(packet_id), &broker, None)
+            .process_incoming(pubrel_packet(packet_id), &broker, None, None)
             .await
             .unwrap();
 
@@ -1503,7 +1584,7 @@ mod tests {
         broker: &crate::broker::Broker<MemoryStore>,
     ) -> u16 {
         session
-            .handle_subscribe(subscribe_packet("q2", QoS::ExactlyOnce), broker)
+            .handle_subscribe(subscribe_packet("q2", QoS::ExactlyOnce), broker, None)
             .await
             .unwrap();
         broker
@@ -1535,7 +1616,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let pubcomp = session
-            .process_incoming(pubrel_packet(77), &broker, None)
+            .process_incoming(pubrel_packet(77), &broker, None, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1544,7 +1625,7 @@ mod tests {
         ));
 
         let pubrel = session
-            .process_incoming(pubrec(78, ReasonCode::Success), &broker, None)
+            .process_incoming(pubrec(78, ReasonCode::Success), &broker, None, None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1565,6 +1646,7 @@ mod tests {
                 pubrec(packet_id, ReasonCode::UnspecifiedError),
                 &broker,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1581,7 +1663,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("s", QoS::AtLeastOnce), &broker)
+            .handle_subscribe(subscribe_packet("s", QoS::AtLeastOnce), &broker, None)
             .await
             .unwrap();
 
@@ -1658,7 +1740,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("n", options), &broker)
+            .handle_subscribe(subscribe_with("n", options), &broker, None)
             .await
             .unwrap();
 
@@ -1668,7 +1750,7 @@ mod tests {
             ..Default::default()
         });
         session
-            .process_incoming(publish, &broker, None)
+            .process_incoming(publish, &broker, None, None)
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -1679,7 +1761,7 @@ mod tests {
             ..Default::default()
         });
         other
-            .process_incoming(publish, &broker, None)
+            .process_incoming(publish, &broker, None, None)
             .await
             .unwrap();
         next_publish(&mut session).await;
@@ -1695,7 +1777,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("r", options), &broker)
+            .handle_subscribe(subscribe_with("r", options), &broker, None)
             .await
             .unwrap();
         broker
@@ -1720,7 +1802,7 @@ mod tests {
         };
         let mut session = create_test_session();
         session
-            .handle_subscribe(subscribe_with("h", if_new), &broker)
+            .handle_subscribe(subscribe_with("h", if_new), &broker, None)
             .await
             .unwrap();
         assert!(next_publish(&mut session).await.retain);
@@ -1729,7 +1811,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("h", if_new), &broker)
+            .handle_subscribe(subscribe_with("h", if_new), &broker, None)
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -1740,7 +1822,7 @@ mod tests {
         };
         let mut session = create_test_session();
         session
-            .handle_subscribe(subscribe_with("h", never), &broker)
+            .handle_subscribe(subscribe_with("h", never), &broker, None)
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -1765,7 +1847,7 @@ mod tests {
 
         for (filter, identifier) in [("s/+", 7), ("s/#", 9)] {
             session
-                .handle_subscribe(subscribe_with_identifier(filter, identifier), &broker)
+                .handle_subscribe(subscribe_with_identifier(filter, identifier), &broker, None)
                 .await
                 .unwrap();
         }
@@ -1789,7 +1871,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let zero = session
-            .handle_subscribe(subscribe_with_identifier("z", 0), &broker)
+            .handle_subscribe(subscribe_with_identifier("z", 0), &broker, None)
             .await;
         assert!(matches!(
             zero,
@@ -1807,7 +1889,9 @@ mod tests {
             ..Default::default()
         });
         assert!(matches!(
-            session.process_incoming(from_client, &broker, None).await,
+            session
+                .process_incoming(from_client, &broker, None, None)
+                .await,
             Err(mercurio_core::error::Error::MQTTReasonCode(
                 ReasonCode::ProtocolError
             ))
@@ -1833,13 +1917,13 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
         publisher.shared.state.lock().await.topic_alias_maximum = 5;
         subscriber
-            .handle_subscribe(subscribe_packet("a/b", QoS::AtMostOnce), &broker)
+            .handle_subscribe(subscribe_packet("a/b", QoS::AtMostOnce), &broker, None)
             .await
             .unwrap();
 
         for topic in ["a/b", ""] {
             publisher
-                .process_incoming(aliased_publish(topic, 1), &broker, None)
+                .process_incoming(aliased_publish(topic, 1), &broker, None, None)
                 .await
                 .unwrap();
             let publish = next_publish(&mut subscriber).await;
@@ -1854,7 +1938,7 @@ mod tests {
             ("", 2, ReasonCode::ProtocolError),
         ] {
             let result = publisher
-                .process_incoming(aliased_publish(topic, alias), &broker, None)
+                .process_incoming(aliased_publish(topic, alias), &broker, None, None)
                 .await;
             assert!(
                 matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
@@ -1902,7 +1986,11 @@ mod tests {
         let mut members = [create_test_session(), create_test_session()];
         for member in &mut members {
             member
-                .handle_subscribe(subscribe_packet("$share/g/w", QoS::AtMostOnce), &broker)
+                .handle_subscribe(
+                    subscribe_packet("$share/g/w", QoS::AtMostOnce),
+                    &broker,
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(nothing_queued(member).await);
@@ -1932,7 +2020,7 @@ mod tests {
             ..Default::default()
         };
         let result = session
-            .handle_subscribe(subscribe_with("$share/g/w", options), &broker)
+            .handle_subscribe(subscribe_with("$share/g/w", options), &broker, None)
             .await;
         assert!(matches!(
             result,
@@ -1952,7 +2040,7 @@ mod tests {
             .await
             .unwrap();
         session
-            .handle_subscribe(subscribe_packet("r/1", QoS::AtMostOnce), &broker)
+            .handle_subscribe(subscribe_packet("r/1", QoS::AtMostOnce), &broker, None)
             .await
             .unwrap();
         assert!(next_publish(&mut session).await.retain);
