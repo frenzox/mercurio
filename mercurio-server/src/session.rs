@@ -43,7 +43,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
 };
-use mercurio_storage::{RetainedMessageStore, StoredWillMessage};
+use mercurio_storage::{RetainedMessageStore, StoredSubscription, StoredWillMessage};
 
 /// Will message to be published on abnormal client disconnect.
 #[derive(Debug, Clone)]
@@ -151,6 +151,8 @@ struct State {
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     subscriptions: StreamMap<String, Messages>,
+    /// QoS granted for each entry of `subscriptions`
+    granted_qos: HashMap<String, QoS>,
     /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
     unacknowledged_messages: HashMap<u16, PublishPacket>,
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id
@@ -187,6 +189,7 @@ impl Session {
                     connect_packet,
                     client_id,
                     subscriptions: StreamMap::new(),
+                    granted_qos: HashMap::new(),
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
@@ -237,27 +240,33 @@ impl Session {
         session.client_id.clone()
     }
 
-    /// Returns a list of all subscription topic filters for this session.
-    pub(crate) async fn get_subscription_filters(&self) -> Vec<String> {
+    /// Returns the subscriptions of this session with their granted QoS.
+    pub(crate) async fn get_subscriptions(&self) -> Vec<StoredSubscription> {
         let session = self.shared.state.lock().await;
-        session.subscriptions.keys().cloned().collect()
+        session
+            .granted_qos
+            .iter()
+            .map(|(topic_filter, qos)| StoredSubscription {
+                topic_filter: topic_filter.clone(),
+                qos: *qos,
+            })
+            .collect()
     }
 
     /// Restore subscriptions by re-subscribing to the broker.
     /// Called when resuming a persisted session.
     pub(crate) async fn restore_subscriptions<S: RetainedMessageStore>(
         &mut self,
-        topic_filters: Vec<String>,
+        subscriptions: Vec<StoredSubscription>,
         broker: &Broker<S>,
     ) -> Result<()> {
         let mut session = self.shared.state.lock().await;
 
-        for topic_filter in topic_filters {
+        for StoredSubscription { topic_filter, qos } in subscriptions {
             let (rx, retained_messages) = broker.subscribe(&topic_filter).await?;
-            // ponytail: granted QoS isn't persisted yet, so restored subscriptions
-            // deliver at the publisher's QoS; store it alongside the filter to fix
-            let stream = subscription_stream(rx, retained_messages, QoS::ExactlyOnce);
-            session.subscriptions.insert(topic_filter, stream);
+            let stream = subscription_stream(rx, retained_messages, qos);
+            session.subscriptions.insert(topic_filter.clone(), stream);
+            session.granted_qos.insert(topic_filter, qos);
         }
 
         Ok(())
@@ -457,6 +466,9 @@ impl Session {
                 sub.topic_filter.to_string(),
                 subscription_stream(rx, retained_messages, granted_qos),
             );
+            session
+                .granted_qos
+                .insert(sub.topic_filter.to_string(), granted_qos);
         }
 
         Ok(Some(ControlPacket::SubAck(ack)))
@@ -477,6 +489,7 @@ impl Session {
         for unsub in &packet.payload {
             // Remove the subscription from the StreamMap
             // Returns Some if the subscription existed, None otherwise
+            session.granted_qos.remove(&unsub.topic_filter);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
                 ReasonCode::Success
             } else {
@@ -1103,6 +1116,48 @@ mod tests {
             .unwrap();
 
         assert!(session.shared.state.lock().await.pubrecs.contains_key(&9));
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions_record_granted_qos() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        session
+            .handle_subscribe(subscribe_packet("s", QoS::AtLeastOnce), &broker)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.get_subscriptions().await,
+            vec![StoredSubscription {
+                topic_filter: "s".to_string(),
+                qos: QoS::AtLeastOnce,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restored_subscription_keeps_granted_qos() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        session
+            .restore_subscriptions(
+                vec![StoredSubscription {
+                    topic_filter: "r".to_string(),
+                    qos: QoS::AtMostOnce,
+                }],
+                &broker,
+            )
+            .await
+            .unwrap();
+        broker
+            .publish("r", message("r", QoS::ExactlyOnce, Some(3), false))
+            .await
+            .unwrap();
+
+        assert_eq!(next_publish(&mut session).await.qos_level, QoS::AtMostOnce);
     }
 
     #[tokio::test]

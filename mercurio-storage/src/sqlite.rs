@@ -15,7 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     InflightMessage, InflightStore, Result, RetainedMessageStore, SessionState, SessionStore,
-    StorageError, StoredWillMessage, WillStore,
+    StorageError, StoredSubscription, StoredWillMessage, WillStore,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -134,11 +134,34 @@ fn int_to_qos(val: i32) -> QoS {
     }
 }
 
+/// Stores each subscription as its QoS digit followed by the topic filter,
+/// separated by NUL: the only character a topic filter cannot contain.
+fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> String {
+    subscriptions
+        .iter()
+        .map(|s| format!("{}{}", s.qos as u8, s.topic_filter))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
+    encoded
+        .split('\0')
+        .filter_map(|s| {
+            let (qos, topic_filter) = s.split_at_checked(1)?;
+            Some(StoredSubscription {
+                topic_filter: topic_filter.to_string(),
+                qos: qos.parse::<u8>().ok()?.into(),
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl SessionStore for SqliteStore {
     async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
         let client_id = client_id.to_string();
-        let subscriptions = session.subscriptions.join(",");
+        let subscriptions = encode_subscriptions(&session.subscriptions);
         let clean_start = session.clean_start;
 
         self.blocking(move |conn| {
@@ -169,11 +192,7 @@ impl SessionStore for SqliteStore {
 
             Ok(result.map(|(subs, clean_start)| SessionState {
                 client_id,
-                subscriptions: if subs.is_empty() {
-                    vec![]
-                } else {
-                    subs.split(',').map(|s| s.to_string()).collect()
-                },
+                subscriptions: decode_subscriptions(&subs),
                 clean_start,
             }))
         })
@@ -499,15 +518,24 @@ mod tests {
 
         let session = SessionState {
             client_id: "client1".to_string(),
-            subscriptions: vec!["topic/a".to_string(), "topic/b".to_string()],
+            subscriptions: vec![
+                // Commas are valid in topic filters
+                StoredSubscription {
+                    topic_filter: "topic/a,b".to_string(),
+                    qos: QoS::AtLeastOnce,
+                },
+                StoredSubscription {
+                    topic_filter: "topic/+".to_string(),
+                    qos: QoS::ExactlyOnce,
+                },
+            ],
             clean_start: false,
         };
 
         // Save and load
         store.save_session("client1", &session).await.unwrap();
         let loaded = store.load_session("client1").await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().subscriptions.len(), 2);
+        assert_eq!(loaded.unwrap().subscriptions, session.subscriptions);
 
         // List sessions
         let sessions = store.list_sessions().await.unwrap();
@@ -626,7 +654,10 @@ mod tests {
             let store = SqliteStore::new(&db_path).unwrap();
             let session = SessionState {
                 client_id: "persistent_client".to_string(),
-                subscriptions: vec!["topic/test".to_string()],
+                subscriptions: vec![StoredSubscription {
+                    topic_filter: "topic/test".to_string(),
+                    qos: QoS::AtMostOnce,
+                }],
                 clean_start: false,
             };
             store

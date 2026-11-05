@@ -10,7 +10,8 @@ use uuid::Uuid;
 use mercurio_core::Result;
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_storage::{
-    InflightMessage, InflightStore, SessionState, SessionStore, StoredWillMessage, WillStore,
+    InflightMessage, InflightStore, SessionState, SessionStore, StoredSubscription,
+    StoredWillMessage, WillStore,
 };
 
 use crate::session::{Session, SessionDropGuard, WillMessage};
@@ -83,7 +84,7 @@ pub(crate) struct SessionStartResult {
     /// Whether the server generated the client id
     pub assigned_client_id: bool,
     /// Topic filters to restore (re-subscribe to broker) if resuming a persisted session.
-    pub subscriptions_to_restore: Vec<String>,
+    pub subscriptions_to_restore: Vec<StoredSubscription>,
     /// Will message restored from storage (if resuming and will was persisted).
     pub will_to_restore: Option<WillMessage>,
     /// Must be held until the connection has finished, will message included.
@@ -184,7 +185,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
-        let mut subscriptions = session.get_subscription_filters().await;
+        let mut subscriptions = session.get_subscriptions().await;
         subscriptions.extend(subscriptions_to_restore.iter().cloned());
         let session_state = SessionState {
             client_id: client_id.clone(),
@@ -314,7 +315,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     pub(crate) async fn save_subscriptions(
         &self,
         client_id: &str,
-        subscriptions: Vec<String>,
+        subscriptions: Vec<StoredSubscription>,
     ) -> Result<()> {
         let session_state = SessionState {
             client_id: client_id.to_string(),
@@ -442,7 +443,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .save_subscriptions("c", session.get_subscription_filters().await)
+            .save_subscriptions("c", session.get_subscriptions().await)
             .await
             .unwrap();
         manager.end_connection(started.lease, None).await;
@@ -451,7 +452,13 @@ mod tests {
         assert!(resumed.resume);
 
         let stored = storage.load_session("c").await.unwrap().unwrap();
-        assert_eq!(stored.subscriptions, vec!["a".to_string()]);
+        assert_eq!(
+            stored.subscriptions,
+            vec![StoredSubscription {
+                topic_filter: "a".to_string(),
+                qos: QoS::AtMostOnce,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -495,7 +502,10 @@ mod tests {
         // First, store a session and inflight messages
         let session_state = SessionState {
             client_id: "client1".to_string(),
-            subscriptions: vec!["topic/a".to_string()],
+            subscriptions: vec![StoredSubscription {
+                topic_filter: "topic/a".to_string(),
+                qos: QoS::AtLeastOnce,
+            }],
             clean_start: false,
         };
         storage
