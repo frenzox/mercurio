@@ -267,7 +267,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
@@ -362,7 +362,7 @@ mod tests {
             sequence: 7,
             released: false,
             properties: Default::default(),
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();

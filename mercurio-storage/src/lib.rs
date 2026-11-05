@@ -104,7 +104,7 @@ pub struct InflightMessage {
     /// what remains to be sent
     pub released: bool,
     pub properties: MessageProperties,
-    pub subscription_identifier: Option<u32>,
+    pub subscription_identifiers: Vec<u32>,
 }
 
 /// Trait for session persistence.
