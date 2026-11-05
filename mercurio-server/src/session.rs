@@ -956,8 +956,8 @@ impl Session {
 
     /// Waits for the next message to send to the client. Cancel safe, and
     /// doesn't hold the session state while waiting.
-    pub(crate) async fn next_outgoing(&self) -> Message {
-        self.shared.queue.pop().await
+    pub(crate) async fn next_outgoing(&self, window_open: bool) -> Message {
+        self.shared.queue.pop(!window_open).await
     }
 
     /// Turns a queued message into the PUBLISH to send, tracking it until
@@ -1383,7 +1383,7 @@ mod tests {
     }
 
     async fn next_publish(session: &mut Session) -> PublishPacket {
-        let message = session.next_outgoing().await;
+        let message = session.next_outgoing(true).await;
         match session.prepare_publish(message).await.map(|o| o.packet) {
             Some(ControlPacket::Publish(p)) => p,
             other => panic!("Expected Publish packet, got {:?}", other),
@@ -1525,7 +1525,7 @@ mod tests {
 
         next_publish(&mut subscriber).await;
         assert!(
-            timeout(Duration::from_millis(50), subscriber.next_outgoing())
+            timeout(Duration::from_millis(50), subscriber.next_outgoing(true))
                 .await
                 .is_err()
         );
@@ -1724,7 +1724,7 @@ mod tests {
     }
 
     async fn nothing_queued(session: &Session) -> bool {
-        timeout(Duration::from_millis(50), session.next_outgoing())
+        timeout(Duration::from_millis(50), session.next_outgoing(true))
             .await
             .is_err()
     }

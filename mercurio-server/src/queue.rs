@@ -73,12 +73,24 @@ impl MessageQueue {
         self.notify.notify_one();
     }
 
-    /// Waits for the next message. Cancel safe: a message is only removed
-    /// from the queue when it is returned.
-    pub(crate) async fn pop(&self) -> Message {
+    /// Waits for the next message, or with `qos0_only` for the next QoS 0
+    /// one, which may overtake QoS 1 and 2 messages: ordering is only
+    /// guaranteed within a QoS level [MQTT-4.6.0-6]. Cancel safe: a message
+    /// is only removed from the queue when it is returned.
+    pub(crate) async fn pop(&self, qos0_only: bool) -> Message {
         loop {
-            if let Some(message) = self.messages.lock().unwrap().pop_front() {
-                return message;
+            {
+                let mut messages = self.messages.lock().unwrap();
+                let position = if qos0_only {
+                    messages.iter().position(|m| m.qos == QoS::AtMostOnce)
+                } else if messages.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                if let Some(message) = position.and_then(|p| messages.remove(p)) {
+                    return message;
+                }
             }
             self.notify.notified().await;
         }
@@ -176,12 +188,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_qos0_can_overtake_held_back_messages() {
+        let queue = MessageQueue::default();
+        queue.push(message(QoS::AtLeastOnce));
+        queue.push(message(QoS::AtMostOnce));
+
+        assert_eq!(queue.pop(true).await.qos, QoS::AtMostOnce);
+        assert!(timeout(Duration::from_millis(20), queue.pop(true))
+            .await
+            .is_err());
+        assert_eq!(queue.pop(false).await.qos, QoS::AtLeastOnce);
+    }
+
+    #[tokio::test]
     async fn test_pop_waits_for_push() {
         let queue = Arc::new(MessageQueue::default());
 
         let waiter = tokio::spawn({
             let queue = Arc::clone(&queue);
-            async move { queue.pop().await }
+            async move { queue.pop(false).await }
         });
         tokio::task::yield_now().await;
         queue.push(message(QoS::AtLeastOnce));
