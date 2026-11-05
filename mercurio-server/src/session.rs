@@ -400,16 +400,26 @@ impl Session {
 
     async fn handle_pubrec(&mut self, packet: PubRecPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        // O(1) removal
-        session.unacknowledged_messages.remove(&packet.packet_id);
-
         let packet_id = packet.packet_id;
-        // O(1) insertion
-        session.pubrecs.insert(packet_id, packet);
+        let known = session.unacknowledged_messages.remove(&packet_id).is_some()
+            || session.pubrecs.contains_key(&packet_id);
+
+        // A failure reason ends the exchange: the client won't take the message
+        if packet.reason.get_code() >= 0x80 {
+            session.pubrecs.remove(&packet_id);
+            return Ok(None);
+        }
+
+        let reason = if known {
+            session.pubrecs.insert(packet_id, packet);
+            ReasonCode::Success
+        } else {
+            session.unknown_packet_id_reason()
+        };
 
         Ok(Some(ControlPacket::PubRel(PubRelPacket {
             packet_id,
-            reason: ReasonCode::Success,
+            reason,
             properties: None,
         })))
     }
@@ -423,11 +433,15 @@ impl Session {
 
     async fn handle_pubrel(&mut self, packet: PubRelPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        session.incoming_qos2.remove(&packet.packet_id);
+        let reason = if session.incoming_qos2.remove(&packet.packet_id) {
+            ReasonCode::Success
+        } else {
+            session.unknown_packet_id_reason()
+        };
 
         Ok(Some(ControlPacket::PubComp(PubCompPacket {
             packet_id: packet.packet_id,
-            reason: ReasonCode::Success,
+            reason,
             properties: None,
         })))
     }
@@ -712,6 +726,16 @@ impl Session {
 }
 
 impl State {
+    /// Reason for acknowledging a packet id with no exchange in progress.
+    /// MQTT 3.x acknowledgements carry no reason, so it's always success.
+    fn unknown_packet_id_reason(&self) -> ReasonCode {
+        if self.connect_packet.protocol_version.supports_reason_codes() {
+            ReasonCode::PacketIdentifierNotFound
+        } else {
+            ReasonCode::Success
+        }
+    }
+
     /// Allocates the next packet identifier not currently in flight.
     /// Identifiers are per session, so they can't be copied from the publisher.
     fn next_packet_id(&mut self) -> Option<u16> {
@@ -1131,33 +1155,105 @@ mod tests {
     async fn test_incoming_pubrel_leaves_outgoing_qos2_state_alone() {
         let mut session = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        let packet_id = send_qos2_to(&mut session, &broker).await;
 
+        let pubrel = session
+            .process_incoming(pubrec(packet_id, ReasonCode::Success), &broker, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(pubrel, Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::Success)
+        );
         session
+            .process_incoming(pubrel_packet(packet_id), &broker, None)
+            .await
+            .unwrap();
+
+        assert!(session
+            .shared
+            .state
+            .lock()
+            .await
+            .pubrecs
+            .contains_key(&packet_id));
+    }
+
+    /// Delivers one QoS 2 message to `session`, returning its packet id.
+    async fn send_qos2_to(
+        session: &mut Session,
+        broker: &crate::broker::Broker<MemoryStore>,
+    ) -> u16 {
+        session
+            .handle_subscribe(subscribe_packet("q2", QoS::ExactlyOnce), broker)
+            .await
+            .unwrap();
+        broker
+            .publish("q2", message("q2", QoS::ExactlyOnce, Some(1), false))
+            .await
+            .unwrap();
+        next_publish(session).await.packet_id.unwrap()
+    }
+
+    fn pubrec(packet_id: u16, reason: ReasonCode) -> ControlPacket {
+        ControlPacket::PubRec(PubRecPacket {
+            packet_id,
+            reason,
+            properties: None,
+        })
+    }
+
+    fn pubrel_packet(packet_id: u16) -> ControlPacket {
+        ControlPacket::PubRel(PubRelPacket {
+            packet_id,
+            reason: ReasonCode::Success,
+            properties: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_unknown_packet_ids_are_reported() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let pubcomp = session
+            .process_incoming(pubrel_packet(77), &broker, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pubcomp,
+            Some(ControlPacket::PubComp(ref p)) if p.reason == ReasonCode::PacketIdentifierNotFound
+        ));
+
+        let pubrel = session
+            .process_incoming(pubrec(78, ReasonCode::Success), &broker, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pubrel,
+            Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::PacketIdentifierNotFound
+        ));
+        assert!(session.shared.state.lock().await.pubrecs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_pubrec_ends_the_exchange() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        let packet_id = send_qos2_to(&mut session, &broker).await;
+
+        let response = session
             .process_incoming(
-                ControlPacket::PubRec(PubRecPacket {
-                    packet_id: 9,
-                    reason: ReasonCode::Success,
-                    properties: None,
-                }),
+                pubrec(packet_id, ReasonCode::UnspecifiedError),
                 &broker,
                 None,
             )
             .await
             .unwrap();
-        session
-            .process_incoming(
-                ControlPacket::PubRel(PubRelPacket {
-                    packet_id: 9,
-                    reason: ReasonCode::Success,
-                    properties: None,
-                }),
-                &broker,
-                None,
-            )
-            .await
-            .unwrap();
 
-        assert!(session.shared.state.lock().await.pubrecs.contains_key(&9));
+        assert!(response.is_none());
+        let state = session.shared.state.lock().await;
+        assert!(state.pubrecs.is_empty());
+        assert!(state.unacknowledged_messages.is_empty());
     }
 
     #[tokio::test]
