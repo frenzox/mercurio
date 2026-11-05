@@ -11,7 +11,6 @@ use tokio::{
 };
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 type Messages = Pin<Box<dyn Stream<Item = Message> + Send>>;
 
@@ -264,7 +263,12 @@ impl Session {
         Ok(())
     }
 
-    pub async fn begin<S>(&mut self, connection: &mut Connection<S>, resume: bool) -> Result<()>
+    pub async fn begin<S>(
+        &mut self,
+        connection: &mut Connection<S>,
+        resume: bool,
+        assigned_client_id: bool,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -272,27 +276,24 @@ impl Session {
         ack.flags.session_present = resume;
 
         let client_id = {
-            let mut session = self.shared.state.lock().await;
+            let session = self.shared.state.lock().await;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
 
-            if session.connect_packet.payload.client_id.is_empty() {
-                let uuid = Uuid::new_v4();
-                let generated_id = uuid.hyphenated().to_string();
-                session.connect_packet.payload.client_id = generated_id.clone();
-                session.client_id = generated_id.clone();
-                // Assigned client ID is only supported in MQTT 5.0
-                if session
+            // Assigned client ID is only supported in MQTT 5.0
+            if assigned_client_id
+                && session
                     .connect_packet
                     .protocol_version
                     .supports_properties()
-                {
-                    ack.properties = Some(ConnAckProperties {
-                        assigned_client_id: Some(AssignedClientIdentifier::new(generated_id)),
-                        ..Default::default()
-                    });
-                }
+            {
+                ack.properties = Some(ConnAckProperties {
+                    assigned_client_id: Some(AssignedClientIdentifier::new(
+                        session.client_id.clone(),
+                    )),
+                    ..Default::default()
+                });
             }
 
             session.client_id.clone()

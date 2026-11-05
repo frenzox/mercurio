@@ -5,6 +5,7 @@ use tokio::{
     sync::Mutex,
 };
 use tracing::info;
+use uuid::Uuid;
 
 use mercurio_core::Result;
 use mercurio_packets::connect::ConnectPacket;
@@ -80,11 +81,18 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
     pub(crate) async fn start_session<Stream>(
         &mut self,
         connection: &mut Connection<Stream>,
-        connect_packet: ConnectPacket,
+        mut connect_packet: ConnectPacket,
     ) -> Result<SessionStartResult>
     where
         Stream: AsyncRead + AsyncWrite + Unpin,
     {
+        // Clients without an identifier each get a unique one, so they never
+        // share a session entry
+        let assigned_client_id = connect_packet.payload.client_id.is_empty();
+        if assigned_client_id {
+            connect_packet.payload.client_id = Uuid::new_v4().hyphenated().to_string();
+        }
+
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
         let mut resume = false;
@@ -147,7 +155,9 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
             }
         };
 
-        session.begin(connection, resume).await?;
+        session
+            .begin(connection, resume, assigned_client_id)
+            .await?;
 
         let client_id = session.get_client_id().await;
 
