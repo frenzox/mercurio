@@ -787,6 +787,13 @@ impl Session {
         };
 
         for unsub in &packet.payload {
+            if validate_subscribe_filter(&unsub.topic_filter).is_err() {
+                ack.payload.push(UnsubAckPayload {
+                    reason_code: ReasonCode::TopicFilterInvalid,
+                });
+                continue;
+            }
+
             broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
                 ReasonCode::Success
@@ -2053,6 +2060,26 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe_reports_invalid_filters() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let packet = UnsubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: "a/#/b".into(),
+            }],
+        };
+        let Some(ControlPacket::UnsubAck(ack)) =
+            session.handle_unsubscribe(packet, &broker).await.unwrap()
+        else {
+            panic!("Expected UNSUBACK");
+        };
+        assert_eq!(ack.payload[0].reason_code, ReasonCode::TopicFilterInvalid);
     }
 
     #[tokio::test]
