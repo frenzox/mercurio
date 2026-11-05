@@ -67,11 +67,11 @@ impl Decoder for PublishProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
-                MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
-                TopicAlias(v) => properties.topic_alias = Some(v),
-                ResponseTopic(v) => properties.response_topic = Some(v),
-                CorrelationData(v) => properties.correlation_data = Some(v),
+                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
+                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
+                TopicAlias(v) => set_once(&mut properties.topic_alias, v)?,
+                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
+                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
@@ -81,7 +81,7 @@ impl Decoder for PublishProperties {
                     }
                 }
                 SubscriptionIdentifier(v) => properties.subscription_identifier = Some(v),
-                ContentType(v) => properties.content_type = Some(v),
+                ContentType(v) => set_once(&mut properties.content_type, v)?,
                 _ => return Err(ReasonCode::MalformedPacket.into()),
             }
         }

@@ -55,9 +55,9 @@ impl Decoder for AuthProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                AuthenticationMethod(v) => properties.auth_method = Some(v),
-                AuthenticationData(v) => properties.auth_data = Some(v),
-                ReasonString(v) => properties.reason_string = Some(v),
+                AuthenticationMethod(v) => set_once(&mut properties.auth_method, v)?,
+                AuthenticationData(v) => set_once(&mut properties.auth_data, v)?,
+                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);

@@ -55,8 +55,8 @@ impl Decoder for DisconnectProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
-                ReasonString(v) => properties.reason_string = Some(v),
+                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
+                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
@@ -65,7 +65,7 @@ impl Decoder for DisconnectProperties {
                         properties.user_property = Some(vec);
                     }
                 }
-                ServerReference(v) => properties.server_reference = Some(v),
+                ServerReference(v) => set_once(&mut properties.server_reference, v)?,
                 _ => return Err(ReasonCode::MalformedPacket.into()),
             }
         }

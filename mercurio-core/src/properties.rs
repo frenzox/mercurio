@@ -264,6 +264,16 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
     Ok(property)
 }
 
+/// Stores a property that may appear at most once in a packet; a repeat is
+/// a protocol error [MQTT-2.2.2-2].
+pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
+    if slot.is_some() {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 impl Decoder for Property {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let id = VariableByteInteger::decode(buffer)?.0;

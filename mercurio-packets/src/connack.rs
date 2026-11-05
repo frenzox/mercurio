@@ -127,14 +127,14 @@ impl Decoder for ConnAckProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
-                ReceiveMaximum(v) => properties.receive_maximum = Some(v),
-                MaximumQoS(v) => properties.maximum_qos = Some(v),
-                RetainAvailable(v) => properties.retain_available = Some(v),
-                MaximumPacketSize(v) => properties.maximum_packet_size = Some(v),
-                AssignedClientIdentifier(v) => properties.assigned_client_id = Some(v),
-                TopicAliasMaximum(v) => properties.topic_alias_max = Some(v),
-                ReasonString(v) => properties.reason_string = Some(v),
+                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
+                ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v)?,
+                MaximumQoS(v) => set_once(&mut properties.maximum_qos, v)?,
+                RetainAvailable(v) => set_once(&mut properties.retain_available, v)?,
+                MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v)?,
+                AssignedClientIdentifier(v) => set_once(&mut properties.assigned_client_id, v)?,
+                TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_max, v)?,
+                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
@@ -144,19 +144,19 @@ impl Decoder for ConnAckProperties {
                     }
                 }
                 WildcardSubscriptionAvailable(v) => {
-                    properties.wildcard_subscription_available = Some(v)
+                    set_once(&mut properties.wildcard_subscription_available, v)?
                 }
                 SubscriptionIdentifierAvailable(v) => {
-                    properties.subscription_identifier_available = Some(v)
+                    set_once(&mut properties.subscription_identifier_available, v)?
                 }
                 SharedSubscriptionAvailable(v) => {
-                    properties.shared_subscription_available = Some(v)
+                    set_once(&mut properties.shared_subscription_available, v)?
                 }
-                ServerKeepAlive(v) => properties.server_keepalive = Some(v),
-                ResponseInformation(v) => properties.response_information = Some(v),
-                ServerReference(v) => properties.server_reference = Some(v),
-                AuthenticationMethod(v) => properties.authentication_method = Some(v),
-                AuthenticationData(v) => properties.authentication_data = Some(v),
+                ServerKeepAlive(v) => set_once(&mut properties.server_keepalive, v)?,
+                ResponseInformation(v) => set_once(&mut properties.response_information, v)?,
+                ServerReference(v) => set_once(&mut properties.server_reference, v)?,
+                AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v)?,
+                AuthenticationData(v) => set_once(&mut properties.authentication_data, v)?,
                 _ => return Err(ReasonCode::MalformedPacket.into()),
             }
         }

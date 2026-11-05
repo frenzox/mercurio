@@ -51,7 +51,7 @@ impl Decoder for SubscribeProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                SubscriptionIdentifier(v) => properties.subscription_id = Some(v),
+                SubscriptionIdentifier(v) => set_once(&mut properties.subscription_id, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);

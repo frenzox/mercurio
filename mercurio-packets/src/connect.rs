@@ -154,14 +154,18 @@ impl Decoder for ConnectProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => properties.session_expiry_interval = Some(v),
-                AuthenticationMethod(v) => properties.authentication_method = Some(v),
-                AuthenticationData(v) => properties.authentication_data = Some(v),
-                RequestProblemInformation(v) => properties.request_problem_information = Some(v),
-                RequestResponseInformation(v) => properties.request_response_information = Some(v),
-                ReceiveMaximum(v) => properties.receive_maximum = Some(v),
-                TopicAliasMaximum(v) => properties.topic_alias_maximum = Some(v),
-                MaximumPacketSize(v) => properties.maximum_packet_size = Some(v),
+                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
+                AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v)?,
+                AuthenticationData(v) => set_once(&mut properties.authentication_data, v)?,
+                RequestProblemInformation(v) => {
+                    set_once(&mut properties.request_problem_information, v)?
+                }
+                RequestResponseInformation(v) => {
+                    set_once(&mut properties.request_response_information, v)?
+                }
+                ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v)?,
+                TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_maximum, v)?,
+                MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
@@ -232,12 +236,12 @@ impl Decoder for WillProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                WillDelayInterval(v) => properties.will_delay_interval = Some(v),
-                PayloadFormatIndicator(v) => properties.payload_format_indicator = Some(v),
-                MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
-                ContentType(v) => properties.content_type = Some(v),
-                ResponseTopic(v) => properties.response_topic = Some(v),
-                CorrelationData(v) => properties.correlation_data = Some(v),
+                WillDelayInterval(v) => set_once(&mut properties.will_delay_interval, v)?,
+                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
+                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
+                ContentType(v) => set_once(&mut properties.content_type, v)?,
+                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
+                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);

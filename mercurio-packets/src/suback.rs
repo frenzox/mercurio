@@ -50,7 +50,7 @@ impl Decoder for SubAckProperties {
 
         while encoded_properties.has_remaining() {
             match Property::decode(&mut encoded_properties)? {
-                ReasonString(v) => properties.reason_string = Some(v),
+                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
                 UserProperty(v) => {
                     if let Some(vec) = &mut properties.user_property {
                         vec.push(v);
