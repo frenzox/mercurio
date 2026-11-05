@@ -155,10 +155,12 @@ fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
     buffer.to_vec()
 }
 
-// ponytail: unreadable properties are dropped rather than failing the load;
-// they were written by this module, so only corruption gets here
-fn decode_properties(encoded: Vec<u8>) -> MessageProperties {
-    MessageProperties::decode(&mut Bytes::from(encoded)).unwrap_or_default()
+/// Fails like any other unreadable column if the stored properties can't
+/// be decoded, rather than delivering the message without them.
+fn decode_properties(encoded: Vec<u8>) -> rusqlite::Result<MessageProperties> {
+    MessageProperties::decode(&mut Bytes::from(encoded)).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+    })
 }
 
 /// Stores each subscription as three digits (QoS, No Local, Retain As
@@ -358,7 +360,7 @@ impl RetainedMessageStore for SqliteStore {
                         qos: int_to_qos(qos),
                         retain: true,
                         payload: payload.map(Bytes::from),
-                        properties: decode_properties(properties),
+                        properties: decode_properties(properties)?,
                         expires_at: expires_at.map(|t| t as u64),
                         subscription_identifier: None,
                     });
@@ -421,7 +423,7 @@ impl WillStore for SqliteStore {
                         qos: int_to_qos(row.get(2)?),
                         retain: row.get(3)?,
                         delay_secs: row.get(4)?,
-                        properties: decode_properties(properties),
+                        properties: decode_properties(properties)?,
                     })
                 })
                 .optional()?;
@@ -520,7 +522,7 @@ impl InflightStore for SqliteStore {
                         dup,
                         sequence: sequence as u64,
                         released,
-                        properties: decode_properties(properties),
+                        properties: decode_properties(properties)?,
                         subscription_identifier,
                     })
                 })
@@ -586,7 +588,7 @@ impl InflightStore for SqliteStore {
                     dup,
                     sequence: sequence as u64,
                     released,
-                    properties: decode_properties(properties),
+                    properties: decode_properties(properties)?,
                     subscription_identifier,
                 })
             })?;
@@ -638,6 +640,25 @@ mod tests {
 
         let retained = store.get_retained("a/#").await.unwrap();
         assert_eq!(retained[0].properties, message.properties);
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_properties_are_an_error() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .blocking(|conn| {
+                // 0xff is not a property identifier
+                conn.execute(
+                    "INSERT INTO retained_messages (topic, payload, qos, dup, properties)
+                     VALUES ('t', x'00', 0, 0, x'ff')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(store.get_retained("t").await.is_err());
     }
 
     #[tokio::test]
