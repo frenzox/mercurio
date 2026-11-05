@@ -13,6 +13,9 @@ pub enum ClientError {
     #[error("Connection refused: {0:?}")]
     ConnectionRefused(ReasonCode),
 
+    #[error("Publish refused by the broker: {0:?}")]
+    PublishRefused(ReasonCode),
+
     #[error("Not connected")]
     NotConnected,
 
