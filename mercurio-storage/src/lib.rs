@@ -68,6 +68,11 @@ pub struct InflightMessage {
     pub payload: Option<Bytes>,
     pub qos: QoS,
     pub dup: bool,
+    /// Position in the order messages were sent, for resending in order
+    pub sequence: u64,
+    /// The client acknowledged a QoS 2 message with PUBREC, so PUBREL is
+    /// what remains to be sent
+    pub released: bool,
 }
 
 /// Trait for session persistence.
@@ -143,6 +148,10 @@ pub trait InflightStore: Send + Sync {
 
     /// Remove an inflight message (after acknowledgment).
     async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()>;
+
+    /// Mark a QoS 2 message as released: the client sent PUBREC, so only
+    /// PUBREL remains and the payload is no longer needed.
+    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()>;
 
     /// Get all inflight messages for a client (for retry on reconnect).
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;

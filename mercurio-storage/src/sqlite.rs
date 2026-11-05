@@ -87,6 +87,8 @@ impl SqliteStore {
                 payload BLOB,
                 qos INTEGER NOT NULL,
                 dup INTEGER NOT NULL,
+                sequence INTEGER NOT NULL,
+                released INTEGER NOT NULL,
                 PRIMARY KEY (client_id, packet_id)
             );
 
@@ -375,13 +377,16 @@ impl InflightStore for SqliteStore {
         let payload = message.payload.as_ref().map(|b| b.to_vec());
         let qos = qos_to_int(message.qos);
         let dup = message.dup;
+        // SQLite integers are signed; the bit pattern round-trips
+        let sequence = message.sequence as i64;
+        let released = message.released;
 
         self.blocking(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
-                 (client_id, packet_id, topic, payload, qos, dup)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![client_id, packet_id, topic, payload, qos, dup],
+                 (client_id, packet_id, topic, payload, qos, dup, sequence, released)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![client_id, packet_id, topic, payload, qos, dup, sequence, released],
             )?;
             Ok(())
         })
@@ -397,7 +402,7 @@ impl InflightStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, dup FROM inflight_messages
+                "SELECT topic, payload, qos, dup, sequence, released FROM inflight_messages
                  WHERE client_id = ?1 AND packet_id = ?2",
             )?;
 
@@ -407,17 +412,21 @@ impl InflightStore for SqliteStore {
                     let payload: Option<Vec<u8>> = row.get(1)?;
                     let qos: i32 = row.get(2)?;
                     let dup: bool = row.get(3)?;
-                    Ok((topic, payload, qos, dup))
+                    let sequence: i64 = row.get(4)?;
+                    let released: bool = row.get(5)?;
+                    Ok(InflightMessage {
+                        packet_id,
+                        topic,
+                        payload: payload.map(Bytes::from),
+                        qos: int_to_qos(qos),
+                        dup,
+                        sequence: sequence as u64,
+                        released,
+                    })
                 })
                 .optional()?;
 
-            Ok(result.map(|(topic, payload, qos, dup)| InflightMessage {
-                packet_id,
-                topic,
-                payload: payload.map(Bytes::from),
-                qos: int_to_qos(qos),
-                dup,
-            }))
+            Ok(result)
         })
         .await
     }
@@ -435,13 +444,27 @@ impl InflightStore for SqliteStore {
         .await
     }
 
+    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            conn.execute(
+                "UPDATE inflight_messages SET released = 1, payload = NULL
+                 WHERE client_id = ?1 AND packet_id = ?2",
+                params![client_id, packet_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT packet_id, topic, payload, qos, dup FROM inflight_messages
-                 WHERE client_id = ?1",
+                "SELECT packet_id, topic, payload, qos, dup, sequence, released
+                 FROM inflight_messages WHERE client_id = ?1",
             )?;
 
             let rows = stmt.query_map(params![client_id], |row| {
@@ -450,12 +473,16 @@ impl InflightStore for SqliteStore {
                 let payload: Option<Vec<u8>> = row.get(2)?;
                 let qos: i32 = row.get(3)?;
                 let dup: bool = row.get(4)?;
+                let sequence: i64 = row.get(5)?;
+                let released: bool = row.get(6)?;
                 Ok(InflightMessage {
                     packet_id,
                     topic,
                     payload: payload.map(Bytes::from),
                     qos: int_to_qos(qos),
                     dup,
+                    sequence: sequence as u64,
+                    released,
                 })
             })?;
 
@@ -572,17 +599,24 @@ mod tests {
             packet_id: 1,
             topic: "test/topic".to_string(),
             payload: Some(Bytes::from("data")),
-            qos: QoS::AtLeastOnce,
+            qos: QoS::ExactlyOnce,
             dup: false,
+            sequence: 7,
+            released: false,
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();
 
-        let loaded = store.get_inflight("client1", 1).await.unwrap();
-        assert!(loaded.is_some());
+        let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 7);
+        assert!(!loaded.released);
 
+        store.release_inflight("client1", 1).await.unwrap();
         let all = store.get_all_inflight("client1").await.unwrap();
         assert_eq!(all.len(), 1);
+        assert!(all[0].released);
+        assert!(all[0].payload.is_none());
+        assert_eq!(all[0].sequence, 7);
 
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();

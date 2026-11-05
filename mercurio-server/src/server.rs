@@ -10,16 +10,15 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use mercurio_core::{
-    error::Error, message::Message, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode, Result,
+    error::Error, message::Message, protocol::ProtocolVersion, reason::ReasonCode, Result,
 };
 use mercurio_packets::{
     connack::{ConnAckFlags, ConnAckPacket},
     connect::ConnectPacket,
     disconnect::DisconnectPacket,
-    publish::PublishPacket,
     ControlPacket,
 };
-use mercurio_storage::{memory::MemoryStore, InflightMessage};
+use mercurio_storage::memory::MemoryStore;
 
 use crate::{
     auth::{AuthManager, CredentialValidator},
@@ -360,24 +359,12 @@ where
                 session.set_will(will).await;
             }
 
-            // Retry inflight messages (QoS 1/2 awaiting acknowledgment)
-            for inflight in start_result.inflight_to_retry {
-                let publish = PublishPacket {
-                    dup: true, // Mark as duplicate since this is a retry
-                    qos_level: inflight.qos,
-                    retain: false,
-                    topic_name: inflight.topic,
-                    packet_id: Some(inflight.packet_id),
-                    properties: None,
-                    payload: inflight.payload,
-                };
-                if let Err(e) = self
-                    .connection
-                    .write_packet(ControlPacket::Publish(publish))
-                    .await
-                {
-                    error!("Failed to retry inflight message: {}", e);
-                }
+            // Resend whatever the client hadn't acknowledged when it left
+            session
+                .restore_inflight(start_result.inflight_to_retry)
+                .await;
+            for packet in session.pending_retransmissions().await {
+                self.connection.write_packet(packet).await?;
             }
 
             self.handle_connection(
@@ -522,6 +509,9 @@ where
                     let inflight_completed = match &packet {
                         ControlPacket::PubAck(ack) => Some(ack.packet_id),
                         ControlPacket::PubComp(comp) => Some(comp.packet_id),
+                        ControlPacket::PubRec(rec) if rec.reason.get_code() >= 0x80 => {
+                            Some(rec.packet_id)
+                        }
                         _ => None,
                     };
 
@@ -551,6 +541,17 @@ where
                             .await;
                     }
 
+                    // After PUBREC only PUBREL remains to be sent for a QoS 2 message
+                    if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
+                        if pubrel.reason == ReasonCode::Success {
+                            let client_id = session.get_client_id().await;
+                            let _ = self
+                                .session_manager
+                                .release_inflight(&client_id, pubrel.packet_id)
+                                .await;
+                        }
+                    }
+
                     if let Some(res) = maybe_res {
                         tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
                         self.connection.write_packet(res).await?;
@@ -564,32 +565,20 @@ where
 
                 // Try to send outgoing packet
                 message = session.next_outgoing() => {
-                    let Some(packet) = session.prepare_publish(message).await else {
+                    let Some(outgoing) = session.prepare_publish(message).await else {
                         continue;
                     };
-                    tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", packet, session.get_client_id().await);
+                    tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", outgoing.packet, session.get_client_id().await);
 
-                    // Store inflight for QoS 1/2 messages
-                    if let ControlPacket::Publish(ref publish) = packet {
-                        if let Some(packet_id) = publish.packet_id {
-                            if matches!(publish.qos_level, QoS::AtLeastOnce | QoS::ExactlyOnce) {
-                                let client_id = session.get_client_id().await;
-                                let inflight = InflightMessage {
-                                    packet_id,
-                                    topic: publish.topic_name.clone(),
-                                    payload: publish.payload.clone(),
-                                    qos: publish.qos_level,
-                                    dup: publish.dup,
-                                };
-                                let _ = self
-                                    .session_manager
-                                    .store_inflight(&client_id, packet_id, &inflight)
-                                    .await;
-                            }
-                        }
+                    if let Some(inflight) = outgoing.inflight {
+                        let client_id = session.get_client_id().await;
+                        let _ = self
+                            .session_manager
+                            .store_inflight(&client_id, inflight.packet_id, &inflight)
+                            .await;
                     }
 
-                    self.connection.write_packet(packet).await?;
+                    self.connection.write_packet(outgoing.packet).await?;
                 }
 
                 // Keep-alive timeout expired - disconnect client

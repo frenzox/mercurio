@@ -362,6 +362,13 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     }
 
     /// Remove an inflight message after acknowledgment.
+    pub(crate) async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.storage
+            .release_inflight(client_id, packet_id)
+            .await
+            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+    }
+
     pub(crate) async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
         self.storage
             .remove_inflight(client_id, packet_id)
@@ -414,6 +421,8 @@ mod tests {
                     payload: None,
                     qos: QoS::AtLeastOnce,
                     dup: false,
+                    sequence: 0,
+                    released: false,
                 },
             )
             .await
@@ -505,6 +514,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restored_session_resends_stored_inflight_in_order() {
+        let storage = create_test_storage();
+        storage
+            .save_session(
+                "c",
+                &SessionState {
+                    client_id: "c".to_string(),
+                    subscriptions: vec![],
+                    clean_start: false,
+                },
+            )
+            .await
+            .unwrap();
+        // A QoS 2 message past PUBREC, sent before a QoS 1 one
+        for (packet_id, sequence, released) in [(9, 1, true), (4, 2, false)] {
+            storage
+                .store_inflight(
+                    "c",
+                    packet_id,
+                    &InflightMessage {
+                        packet_id,
+                        topic: "t".to_string(),
+                        payload: (!released).then(|| Bytes::from("payload")),
+                        qos: if released {
+                            QoS::ExactlyOnce
+                        } else {
+                            QoS::AtLeastOnce
+                        },
+                        dup: false,
+                        sequence,
+                        released,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // A new manager over the same storage, as after a restart
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
+        let mut connect = connect_packet("c");
+        connect.flags.clean_start = false;
+        let started = manager.start_session(connect).await.unwrap();
+        assert!(started.resume);
+        started
+            .session
+            .restore_inflight(started.inflight_to_retry)
+            .await;
+
+        let pending = started.session.pending_retransmissions().await;
+        assert!(matches!(&pending[0], ControlPacket::PubRel(p) if p.packet_id == 9));
+        assert!(
+            matches!(&pending[1], ControlPacket::Publish(p) if p.packet_id == Some(4) && p.dup)
+        );
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_store_and_remove_inflight() {
         let storage = create_test_storage();
         let manager: SessionManager<MemoryStore> = SessionManager::new(storage);
@@ -515,6 +581,8 @@ mod tests {
             payload: Some(Bytes::from("hello")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            sequence: 0,
+            released: false,
         };
 
         // Store inflight message
@@ -562,6 +630,8 @@ mod tests {
             payload: Some(Bytes::from("msg1")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            sequence: 0,
+            released: false,
         };
         let inflight2 = InflightMessage {
             packet_id: 2,
@@ -569,6 +639,8 @@ mod tests {
             payload: Some(Bytes::from("msg2")),
             qos: QoS::ExactlyOnce,
             dup: false,
+            sequence: 0,
+            released: false,
         };
         storage
             .store_inflight("client1", 1, &inflight1)
@@ -614,6 +686,8 @@ mod tests {
             payload: Some(Bytes::from("hello")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            sequence: 0,
+            released: false,
         };
         storage
             .store_inflight("client1", 1, &inflight)
@@ -655,6 +729,8 @@ mod tests {
                     QoS::AtLeastOnce
                 },
                 dup: false,
+                sequence: i.into(),
+                released: false,
             };
             manager
                 .store_inflight("client1", i, &inflight)
