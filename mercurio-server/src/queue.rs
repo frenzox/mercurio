@@ -94,6 +94,7 @@ pub(crate) struct Subscriber {
     pub granted_qos: QoS,
     pub no_local: bool,
     pub retain_as_published: bool,
+    pub subscription_identifier: Option<u32>,
 }
 
 impl Subscriber {
@@ -120,6 +121,7 @@ impl Subscriber {
     /// Queues a message, downgraded to the QoS granted for the subscription
     /// [MQTT-3.8.4-8].
     fn queue_message(&self, mut message: Message) {
+        message.subscription_identifier = self.subscription_identifier;
         if (message.qos as u8) > (self.granted_qos as u8) {
             message.qos = self.granted_qos;
             if self.granted_qos == QoS::AtMostOnce {
@@ -149,6 +151,7 @@ mod tests {
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         }
     }
 

@@ -104,6 +104,7 @@ mod tests {
             granted_qos: QoS::AtMostOnce,
             no_local: false,
             retain_as_published: false,
+            subscription_identifier: None,
         }
     }
 
@@ -117,6 +118,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         }
     }
 
@@ -179,6 +181,7 @@ mod tests {
             payload: Some(Bytes::new()), // Empty payload
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 

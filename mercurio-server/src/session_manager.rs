@@ -441,6 +441,7 @@ mod tests {
                     sequence: 0,
                     released: false,
                     properties: Default::default(),
+                    subscription_identifier: None,
                 },
             )
             .await
@@ -561,6 +562,7 @@ mod tests {
                         sequence,
                         released,
                         properties: Default::default(),
+                        subscription_identifier: None,
                     },
                 )
                 .await
@@ -600,6 +602,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
 
         // Store inflight message
@@ -647,6 +650,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         let inflight2 = InflightMessage {
             packet_id: 2,
@@ -657,6 +661,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         storage
             .store_inflight("client1", 1, &inflight1)
@@ -705,6 +710,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         storage
             .store_inflight("client1", 1, &inflight)
@@ -749,6 +755,7 @@ mod tests {
                 sequence: i.into(),
                 released: false,
                 properties: Default::default(),
+                subscription_identifier: None,
             };
             manager
                 .store_inflight("client1", i, &inflight)

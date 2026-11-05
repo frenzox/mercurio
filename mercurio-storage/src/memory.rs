@@ -245,6 +245,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         }
     }
 
@@ -335,6 +336,7 @@ mod tests {
             sequence: 7,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();

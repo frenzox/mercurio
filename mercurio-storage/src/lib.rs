@@ -56,6 +56,8 @@ pub struct StoredSubscription {
     pub no_local: bool,
     /// Keep the RETAIN flag of forwarded messages as published
     pub retain_as_published: bool,
+    /// Sent back with every message delivered through the subscription
+    pub subscription_identifier: Option<u32>,
 }
 
 impl StoredSubscription {
@@ -66,6 +68,7 @@ impl StoredSubscription {
             qos,
             no_local: false,
             retain_as_published: false,
+            subscription_identifier: None,
         }
     }
 }
@@ -93,6 +96,7 @@ pub struct InflightMessage {
     /// what remains to be sent
     pub released: bool,
     pub properties: MessageProperties,
+    pub subscription_identifier: Option<u32>,
 }
 
 /// Trait for session persistence.

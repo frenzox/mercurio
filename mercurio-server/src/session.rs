@@ -15,8 +15,11 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
+    codec::VariableByteInteger,
     message::{unix_millis, Message, MessageProperties},
-    properties::{AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval},
+    properties::{
+        AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, SubscriptionIdentifier,
+    },
     qos::QoS,
     reason::ReasonCode,
     topic::{validate_publish_topic, validate_subscribe_filter},
@@ -139,9 +142,15 @@ fn message_properties(properties: Option<&PublishProperties>) -> MessageProperti
     }
 }
 
-/// The PUBLISH properties forwarding a message's application properties.
-fn publish_properties(properties: &MessageProperties) -> Option<PublishProperties> {
+/// The PUBLISH properties forwarding a message's application properties,
+/// along with the identifier of the subscription it was delivered through.
+fn publish_properties(
+    properties: &MessageProperties,
+    subscription_identifier: Option<u32>,
+) -> Option<PublishProperties> {
     Some(PublishProperties {
+        subscription_identifier: subscription_identifier
+            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(id))),
         payload_format_indicator: properties.payload_format_indicator.clone(),
         message_expiry_interval: properties.message_expiry_interval.clone(),
         content_type: properties.content_type.clone(),
@@ -384,6 +393,15 @@ impl Session {
             return Err(ReasonCode::TopicNameInvalid.into());
         }
 
+        // Only the server sets subscription identifiers [MQTT-3.3.4-6]
+        if packet
+            .properties
+            .as_ref()
+            .is_some_and(|p| p.subscription_identifier.is_some())
+        {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+
         let response = match packet.qos_level {
             QoS::AtMostOnce => Ok(None),
             QoS::AtLeastOnce => {
@@ -439,6 +457,7 @@ impl Session {
             payload: packet.payload,
             expires_at: Message::expiry_deadline(&properties),
             properties,
+            subscription_identifier: None,
         };
 
         broker
@@ -510,6 +529,16 @@ impl Session {
         packet: mercurio_packets::subscribe::SubscribePacket,
         broker: &Broker<S>,
     ) -> Result<Option<ControlPacket>> {
+        let subscription_identifier = packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.subscription_id.as_ref())
+            .map(|id| id.value.0);
+        // An identifier of 0 is a protocol error
+        if subscription_identifier == Some(0) {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+
         let mut session = self.shared.state.lock().await;
         // Pre-allocate payload vec based on subscription count
         let mut ack = SubAckPacket {
@@ -534,6 +563,7 @@ impl Session {
                 qos: granted_qos,
                 no_local: sub.subs_opt.no_local,
                 retain_as_published: sub.subs_opt.retain_as_pub,
+                subscription_identifier,
             };
             let subscriber = self.subscriber(&subscription);
             let existed = session.subscriptions.contains_key(&sub.topic_filter);
@@ -738,6 +768,7 @@ impl Session {
             granted_qos: subscription.qos,
             no_local: subscription.no_local,
             retain_as_published: subscription.retain_as_published,
+            subscription_identifier: subscription.subscription_identifier,
         }
     }
 
@@ -800,7 +831,10 @@ impl Session {
                 retain: message.retain,
                 topic_name: message.topic.to_string(),
                 packet_id,
-                properties: publish_properties(&message.properties),
+                properties: publish_properties(
+                    &message.properties,
+                    message.subscription_identifier,
+                ),
                 payload: message.payload,
             };
 
@@ -819,6 +853,7 @@ impl Session {
                     sequence,
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
+                    subscription_identifier: message.subscription_identifier,
                 }
             });
 
@@ -844,7 +879,10 @@ impl Session {
                     retain: false,
                     topic_name: message.topic,
                     packet_id: Some(message.packet_id),
-                    properties: publish_properties(&message.properties),
+                    properties: publish_properties(
+                        &message.properties,
+                        message.subscription_identifier,
+                    ),
                     payload: message.payload,
                 };
                 session
@@ -1147,6 +1185,7 @@ mod tests {
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         }
     }
 
@@ -1592,6 +1631,74 @@ mod tests {
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
+    }
+
+    fn subscribe_with_identifier(
+        topic_filter: &str,
+        identifier: u32,
+    ) -> mercurio_packets::subscribe::SubscribePacket {
+        let mut packet = subscribe_packet(topic_filter, QoS::AtMostOnce);
+        packet.properties = Some(mercurio_packets::subscribe::SubscribeProperties {
+            subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(identifier))),
+            user_property: None,
+        });
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_deliveries_carry_their_subscription_identifier() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        for (filter, identifier) in [("s/+", 7), ("s/#", 9)] {
+            session
+                .handle_subscribe(subscribe_with_identifier(filter, identifier), &broker)
+                .await
+                .unwrap();
+        }
+        broker
+            .publish("s/x", message("s/x", QoS::AtMostOnce, None, false))
+            .await
+            .unwrap();
+
+        let mut identifiers = Vec::new();
+        for _ in 0..2 {
+            let properties = next_publish(&mut session).await.properties.unwrap();
+            identifiers.push(properties.subscription_identifier.unwrap().value.0);
+        }
+        identifiers.sort();
+        assert_eq!(identifiers, [7, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_subscription_identifiers_are_protocol_errors() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let zero = session
+            .handle_subscribe(subscribe_with_identifier("z", 0), &broker)
+            .await;
+        assert!(matches!(
+            zero,
+            Err(mercurio_core::error::Error::MQTTReasonCode(
+                ReasonCode::ProtocolError
+            ))
+        ));
+
+        let from_client = ControlPacket::Publish(PublishPacket {
+            topic_name: "t".into(),
+            properties: Some(PublishProperties {
+                subscription_identifier: Some(SubscriptionIdentifier::new(VariableByteInteger(1))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(matches!(
+            session.process_incoming(from_client, &broker, None).await,
+            Err(mercurio_core::error::Error::MQTTReasonCode(
+                ReasonCode::ProtocolError
+            ))
+        ));
     }
 
     #[tokio::test]
