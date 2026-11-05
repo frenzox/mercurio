@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use mercurio_core::codec::VariableByteInteger;
-use mercurio_core::properties::{SessionExpiryInterval, SubscriptionIdentifier};
+use mercurio_core::properties::{
+    MaximumPacketSize, ReceiveMaximum, RequestProblemInformation, RequestResponseInformation,
+    SessionExpiryInterval, SubscriptionIdentifier, TopicAliasMaximum,
+};
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
 use mercurio_packets::connack::ConnAckProperties;
@@ -54,6 +57,7 @@ pub struct MqttClient {
     event_rx: Mutex<mpsc::Receiver<Event>>,
     #[allow(dead_code)]
     client_id: String,
+    response_information: Option<String>,
 }
 
 impl MqttClient {
@@ -63,6 +67,7 @@ impl MqttClient {
         // Reconnecting must present the same identity to find the session
         options.client_id = Some(session.client_id.clone());
         let client_id = session.client_id.clone();
+        let response_information = session.response_information.clone();
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -74,6 +79,7 @@ impl MqttClient {
             command_tx,
             event_rx: Mutex::new(event_rx),
             client_id,
+            response_information,
         })
     }
 
@@ -95,9 +101,17 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
-            Connection::new(tls_stream, options.protocol_version)
+            Connection::new(
+                tls_stream,
+                options.protocol_version,
+                options.maximum_packet_size,
+            )
         } else {
-            Connection::new(stream, options.protocol_version)
+            Connection::new(
+                stream,
+                options.protocol_version,
+                options.maximum_packet_size,
+            )
         };
 
         let session = Self::perform_connect(&mut connection, options).await?;
@@ -124,6 +138,7 @@ impl MqttClient {
         .map_err(|_| ClientError::Timeout)??
         .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
 
+        let response_information;
         let (session_present, client_id, keep_alive, limits) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
@@ -155,6 +170,11 @@ impl MqttClient {
                     .and_then(|p| p.server_keepalive.as_ref())
                     .map_or(options.keep_alive, |k| k.value);
                 let limits = BrokerLimits::from_connack(ack.properties.as_ref());
+                response_information = ack
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.response_information.as_ref())
+                    .map(|r| r.value.clone());
                 (ack.flags.session_present, client_id, keep_alive, limits)
             }
             _ => return Err(ClientError::Protocol("Expected CONNACK packet".to_string())),
@@ -171,6 +191,7 @@ impl MqttClient {
             keep_alive,
             limits,
             session_present,
+            response_information,
         })
     }
 
@@ -202,8 +223,18 @@ impl MqttClient {
             protocol_version: options.protocol_version,
             flags,
             keepalive: options.keep_alive,
-            properties: (options.session_expiry > 0).then(|| ConnectProperties {
-                session_expiry_interval: Some(SessionExpiryInterval::new(options.session_expiry)),
+            properties: Some(ConnectProperties {
+                session_expiry_interval: (options.session_expiry > 0)
+                    .then(|| SessionExpiryInterval::new(options.session_expiry)),
+                receive_maximum: options.receive_maximum.map(ReceiveMaximum::new),
+                maximum_packet_size: options.maximum_packet_size.map(MaximumPacketSize::new),
+                topic_alias_maximum: (options.topic_alias_maximum > 0)
+                    .then(|| TopicAliasMaximum::new(options.topic_alias_maximum)),
+                request_response_information: options
+                    .request_response_information
+                    .then(|| RequestResponseInformation::new(1)),
+                request_problem_information: (!options.request_problem_information)
+                    .then(|| RequestProblemInformation::new(0)),
                 ..Default::default()
             }),
             payload,
@@ -231,6 +262,9 @@ impl MqttClient {
             unsubscribes: HashMap::new(),
             limits: session.limits,
             waiting: VecDeque::new(),
+            topic_aliases: HashMap::new(),
+            topic_alias_maximum: options.topic_alias_maximum,
+            receive_maximum: options.receive_maximum.unwrap_or(u16::MAX),
         };
         let mut keep_alive = session.keep_alive;
 
@@ -252,6 +286,8 @@ impl MqttClient {
             };
             state.connection = connection;
             state.limits = session.limits;
+            // Aliases only last as long as the connection [MQTT-3.3.2-7]
+            state.topic_aliases.clear();
             keep_alive = session.keep_alive;
             let _ = state
                 .event_tx
@@ -384,6 +420,12 @@ impl MqttClient {
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
+    /// What the broker answered to `request_response_information`, often a
+    /// topic prefix this client may use for response topics.
+    pub fn response_information(&self) -> Option<&str> {
+        self.response_information.as_deref()
+    }
+
     /// Receive the next event from the broker.
     /// Returns None if the client is disconnected.
     pub async fn recv(&self) -> Option<Event> {
@@ -398,6 +440,7 @@ struct Session {
     keep_alive: u16,
     limits: BrokerLimits,
     session_present: bool,
+    response_information: Option<String>,
 }
 
 /// Whether a connection that ended this way is worth reopening. A broker
@@ -446,6 +489,11 @@ struct EventLoop {
     limits: BrokerLimits,
     /// QoS 1 and 2 publishes held back by the broker's Receive Maximum
     waiting: VecDeque<PublishRequest>,
+    /// Topics the broker gave aliases on this connection
+    topic_aliases: HashMap<u16, String>,
+    topic_alias_maximum: u16,
+    /// Most QoS 2 messages the broker may have in flight to this client
+    receive_maximum: u16,
 }
 
 /// A message the application asked to publish.
@@ -544,14 +592,21 @@ impl EventLoop {
                             if matches!(packet, ControlPacket::PingResp(_)) {
                                 awaiting_pingresp = false;
                             }
-                            if let Err(e) = self.handle_incoming(packet).await {
-                                warn!("Error handling packet: {}", e);
+                            match self.handle_incoming(packet).await {
+                                Err(ClientError::BrokerViolation(reason)) => {
+                                    return self.disconnect_for(reason).await;
+                                }
+                                Err(e) => warn!("Error handling packet: {}", e),
+                                Ok(()) => {}
                             }
                         }
                         Ok(None) => {
                             // Connection closed
                             info!("Connection closed by server");
                             return DisconnectReason::ConnectionClosed;
+                        }
+                        Err(ClientError::BrokerViolation(reason)) => {
+                            return self.disconnect_for(reason).await;
                         }
                         Err(e) => {
                             error!("Error reading packet: {}", e);
@@ -597,6 +652,20 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// Closes the connection over a broker's protocol violation, telling it
+    /// why [MQTT-4.13.1-1].
+    async fn disconnect_for(&mut self, reason: ReasonCode) -> DisconnectReason {
+        warn!("Broker violated the protocol: {:?}", reason);
+        let _ = self
+            .connection
+            .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                reason,
+                properties: None,
+            }))
+            .await;
+        DisconnectReason::ProtocolError(reason.to_string())
     }
 
     /// Waits `delay` between attempts to reopen the connection. Meanwhile
@@ -1052,7 +1121,34 @@ impl EventLoop {
         Ok(())
     }
 
-    async fn handle_publish(&mut self, publish: PublishPacket) -> Result<()> {
+    /// Fills in the topic of a PUBLISH that uses an alias, and remembers
+    /// aliases the broker sets [MQTT-3.3.2-12].
+    fn resolve_topic_alias(&mut self, publish: &mut PublishPacket) -> Result<()> {
+        let Some(alias) = publish
+            .properties
+            .as_ref()
+            .and_then(|p| p.topic_alias.as_ref())
+            .map(|a| a.value)
+        else {
+            return Ok(());
+        };
+        if alias == 0 || alias > self.topic_alias_maximum {
+            return Err(ClientError::BrokerViolation(ReasonCode::TopicAliasInvalid));
+        }
+        if publish.topic_name.is_empty() {
+            publish.topic_name = self
+                .topic_aliases
+                .get(&alias)
+                .cloned()
+                .ok_or(ClientError::BrokerViolation(ReasonCode::ProtocolError))?;
+        } else {
+            self.topic_aliases.insert(alias, publish.topic_name.clone());
+        }
+        Ok(())
+    }
+
+    async fn handle_publish(&mut self, mut publish: PublishPacket) -> Result<()> {
+        self.resolve_topic_alias(&mut publish)?;
         debug!("Received PUBLISH on topic: {}", publish.topic_name);
 
         let deliver = match (publish.qos_level, publish.packet_id) {
@@ -1067,6 +1163,15 @@ impl EventLoop {
                 true
             }
             (QoS::ExactlyOnce, Some(packet_id)) => {
+                // The broker must stay within this client's Receive Maximum
+                // [MQTT-3.3.4-9]
+                if !self.incoming_qos2.contains(&packet_id)
+                    && self.incoming_qos2.len() >= usize::from(self.receive_maximum)
+                {
+                    return Err(ClientError::BrokerViolation(
+                        ReasonCode::ReceiveMaximumExceeded,
+                    ));
+                }
                 // A retransmission before PUBREL was already delivered once
                 let first_delivery = self.incoming_qos2.insert(packet_id);
                 self.connection

@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 use mercurio_core::protocol::ProtocolVersion;
+use mercurio_core::reason::ReasonCode;
 use mercurio_packets::ControlPacket;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -17,15 +18,22 @@ pub struct Connection {
     protocol_version: ProtocolVersion,
     /// The largest packet the broker accepts, once it said so
     max_packet_size: Option<u32>,
+    /// The largest packet this client accepts
+    max_incoming_size: Option<u32>,
 }
 
 impl Connection {
-    pub fn new(stream: impl Stream + 'static, protocol_version: ProtocolVersion) -> Self {
+    pub fn new(
+        stream: impl Stream + 'static,
+        protocol_version: ProtocolVersion,
+        max_incoming_size: Option<u32>,
+    ) -> Self {
         Self {
             stream: Box::new(stream),
             read_buffer: BytesMut::with_capacity(4096),
             protocol_version,
             max_packet_size: None,
+            max_incoming_size,
         }
     }
 
@@ -57,11 +65,21 @@ impl Connection {
         loop {
             match ControlPacket::check(&mut self.read_buffer) {
                 Ok(()) => {
+                    let buffered = self.read_buffer.len();
                     let packet = ControlPacket::parse_with_version(
                         &mut self.read_buffer,
                         self.protocol_version,
                     )
                     .map_err(ClientError::Packet)?;
+                    // ponytail: checked once the packet is buffered; checking
+                    // the fixed header first would cap memory too
+                    let size = buffered - self.read_buffer.len();
+                    if self
+                        .max_incoming_size
+                        .is_some_and(|max| size > max as usize)
+                    {
+                        return Err(ClientError::BrokerViolation(ReasonCode::PacketTooLarge));
+                    }
                     return Ok(Some(packet));
                 }
                 Err(mercurio_core::error::Error::PacketIncomplete) => {}

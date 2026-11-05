@@ -25,6 +25,11 @@ pub enum ClientError {
     #[error("Not supported by the broker: {0}")]
     NotSupported(&'static str),
 
+    /// The broker broke the protocol; the client disconnects with this
+    /// reason
+    #[error("Broker violated the protocol: {0:?}")]
+    BrokerViolation(ReasonCode),
+
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 
