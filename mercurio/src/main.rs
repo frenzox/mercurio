@@ -1,10 +1,13 @@
 //! Mercurio - MQTT command-line client
 
 use std::io::{self, Read};
+use std::time::Duration;
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use mercurio_client::{Event, MqttClient, Will};
+use mercurio_client::{
+    Event, MessageProperties, MqttClient, RetainHandling, SubscriptionOptions, Will,
+};
 use mercurio_core::qos::QoS;
 use tokio::signal;
 
@@ -42,6 +45,9 @@ enum Commands {
         /// Retain the message on the broker
         #[arg(short = 'r', long)]
         retain: bool,
+
+        #[command(flatten)]
+        properties: PropertyArgs,
     },
     /// Subscribe to topics and print messages
     Sub {
@@ -59,6 +65,14 @@ enum Commands {
         /// Print topic name before each message
         #[arg(short = 'T', long)]
         print_topic: bool,
+
+        #[command(flatten)]
+        subscription: SubscriptionArgs,
+
+        /// Reconnect after losing the connection, waiting this many seconds
+        /// between attempts
+        #[arg(long)]
+        reconnect: Option<u64>,
 
         #[command(flatten)]
         will: WillArgs,
@@ -82,6 +96,80 @@ struct WillArgs {
     /// Retain the will message on the broker
     #[arg(long)]
     will_retain: bool,
+
+    /// Seconds the broker waits before publishing the will (MQTT 5)
+    #[arg(long, default_value = "0")]
+    will_delay: u32,
+}
+
+/// MQTT 5 properties of a published message.
+#[derive(clap::Args, Debug)]
+struct PropertyArgs {
+    /// Content type of the payload, such as a MIME type
+    #[arg(long)]
+    content_type: Option<String>,
+
+    /// Topic a reply should be published to
+    #[arg(long)]
+    response_topic: Option<String>,
+
+    /// Data that ties a reply to its request
+    #[arg(long)]
+    correlation_data: Option<String>,
+
+    /// Seconds the broker keeps the message for subscribers yet to get it
+    #[arg(long)]
+    message_expiry: Option<u32>,
+
+    /// Mark the payload as UTF-8 text
+    #[arg(long)]
+    utf8: bool,
+
+    /// User property as key=value (can be specified multiple times)
+    #[arg(long = "user-property", value_parser = parse_user_property)]
+    user_properties: Vec<(String, String)>,
+}
+
+impl From<PropertyArgs> for MessageProperties {
+    fn from(args: PropertyArgs) -> Self {
+        MessageProperties {
+            payload_is_utf8: args.utf8,
+            message_expiry: args.message_expiry,
+            content_type: args.content_type,
+            response_topic: args.response_topic,
+            correlation_data: args.correlation_data.map(Bytes::from),
+            user_properties: args.user_properties,
+        }
+    }
+}
+
+/// MQTT 5 subscription options.
+#[derive(clap::Args, Debug)]
+struct SubscriptionArgs {
+    /// Don't receive messages this client publishes itself
+    #[arg(long)]
+    no_local: bool,
+
+    /// Keep the retain flag messages were published with
+    #[arg(long)]
+    retain_as_published: bool,
+
+    /// Retained messages on subscribing: 0 always, 1 only for new
+    /// subscriptions, 2 never
+    #[arg(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=2))]
+    retain_handling: u8,
+
+    /// Identifier the broker attaches to messages matching these
+    /// subscriptions
+    #[arg(long)]
+    subscription_id: Option<u32>,
+}
+
+fn parse_user_property(value: &str) -> Result<(String, String), String> {
+    value
+        .split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .ok_or_else(|| format!("expected key=value, got `{value}`"))
 }
 
 #[tokio::main]
@@ -95,19 +183,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             message,
             qos,
             retain,
+            properties,
         } => {
             init_logging(connection.verbose);
-            run_publish(connection, topic, message, qos, retain).await?;
+            run_publish(connection, topic, message, qos, retain, properties.into()).await?;
         }
         Commands::Sub {
             connection,
             topic,
             qos,
             print_topic,
+            subscription,
+            reconnect,
             will,
         } => {
             init_logging(connection.verbose);
-            run_subscribe(connection, topic, qos, print_topic, will).await?;
+            run_subscribe(
+                connection,
+                topic,
+                qos,
+                print_topic,
+                subscription,
+                reconnect,
+                will,
+            )
+            .await?;
         }
     }
 
@@ -120,6 +220,7 @@ async fn run_publish(
     message: Option<String>,
     qos_level: u8,
     retain: bool,
+    properties: MessageProperties,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Get the message payload
     let payload = match message {
@@ -140,14 +241,9 @@ async fn run_publish(
     let client = MqttClient::connect(options).await?;
 
     // Publish the message
-    let payload_bytes = Bytes::from(payload);
-    if retain {
-        client
-            .publish_with_retain(&topic, payload_bytes, qos, true)
-            .await?;
-    } else {
-        client.publish(&topic, payload_bytes, qos).await?;
-    }
+    client
+        .publish_with_properties(&topic, Bytes::from(payload), qos, retain, properties)
+        .await?;
 
     // Disconnect gracefully
     client.disconnect().await?;
@@ -160,6 +256,8 @@ async fn run_subscribe(
     topics: Vec<String>,
     qos_level: u8,
     print_topic: bool,
+    subscription: SubscriptionArgs,
+    reconnect: Option<u64>,
     will: WillArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Parse QoS
@@ -174,15 +272,29 @@ async fn run_subscribe(
         options = options.will(
             Will::new(topic, Bytes::from(payload))
                 .qos(parse_qos(will.will_qos)?)
-                .retain(will.will_retain),
+                .retain(will.will_retain)
+                .delay(will.will_delay),
         );
+    }
+    if let Some(seconds) = reconnect {
+        options = options.reconnect(Duration::from_secs(seconds));
     }
 
     let client = MqttClient::connect(options).await?;
 
     // Subscribe to topics
-    let subscriptions: Vec<(&str, QoS)> = topics.iter().map(|t| (t.as_str(), qos)).collect();
-    client.subscribe(&subscriptions).await?;
+    let subscription_options = SubscriptionOptions {
+        qos,
+        no_local: subscription.no_local,
+        retain_as_pub: subscription.retain_as_published,
+        retain_handling: RetainHandling::from(subscription.retain_handling),
+    };
+    let subscriptions: Vec<(&str, SubscriptionOptions)> = topics
+        .iter()
+        .map(|t| (t.as_str(), subscription_options))
+        .collect();
+    let subscribe = || client.subscribe_with(&subscriptions, subscription.subscription_id);
+    subscribe().await?;
 
     // Handle Ctrl+C for graceful shutdown
     tokio::select! {
@@ -201,9 +313,23 @@ async fn run_subscribe(
                     }
                     Some(Event::Disconnected { reason }) => {
                         eprintln!("Disconnected: {:?}", reason);
-                        break;
+                        // With reconnection on, the client says when it
+                        // gives up by closing the event stream
+                        if reconnect.is_none() {
+                            break;
+                        }
                     }
-                    Some(Event::Reconnected { .. }) => eprintln!("Reconnected"),
+                    Some(Event::Reconnected { session_present }) => {
+                        eprintln!("Reconnected");
+                        // A broker that lost the session lost the
+                        // subscriptions with it
+                        if !session_present {
+                            if let Err(e) = subscribe().await {
+                                eprintln!("Resubscribing failed: {}", e);
+                                break;
+                            }
+                        }
+                    }
                     None => {
                         break;
                     }

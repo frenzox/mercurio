@@ -31,6 +31,15 @@ pub struct ConnectionArgs {
     #[arg(short = 'k', long, default_value = "60")]
     pub keep_alive: u16,
 
+    /// Keep the session after disconnecting instead of starting clean
+    #[arg(short = 'c', long)]
+    pub no_clean_start: bool,
+
+    /// Seconds the broker keeps the session after the connection closes
+    /// (MQTT 5)
+    #[arg(short = 'x', long, default_value = "0")]
+    pub session_expiry: u32,
+
     /// MQTT protocol version (5, 311, or 31)
     #[arg(short = 'V', long, default_value = "5")]
     pub protocol_version: String,
@@ -57,6 +66,8 @@ impl ConnectionArgs {
     pub fn to_connect_options(&self) -> ConnectOptions {
         let mut opts = ConnectOptions::new(&self.host, self.port)
             .keep_alive(self.keep_alive)
+            .clean_start(!self.no_clean_start)
+            .session_expiry(self.session_expiry)
             .protocol_version(self.parse_protocol_version());
 
         if let Some(ref id) = self.client_id {
