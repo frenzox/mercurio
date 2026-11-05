@@ -67,7 +67,9 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 client_id TEXT PRIMARY KEY,
                 subscriptions TEXT NOT NULL,
-                clean_start INTEGER NOT NULL
+                clean_start INTEGER NOT NULL,
+                expiry_interval INTEGER,
+                expires_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS retained_messages (
@@ -206,12 +208,21 @@ impl SessionStore for SqliteStore {
         let client_id = client_id.to_string();
         let subscriptions = encode_subscriptions(&session.subscriptions);
         let clean_start = session.clean_start;
+        let expiry_interval = session.expiry_interval;
+        let expires_at = session.expires_at.map(|t| t as i64);
 
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO sessions (client_id, subscriptions, clean_start)
-                 VALUES (?1, ?2, ?3)",
-                params![client_id, subscriptions, clean_start],
+                "INSERT OR REPLACE INTO sessions
+                 (client_id, subscriptions, clean_start, expiry_interval, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    client_id,
+                    subscriptions,
+                    clean_start,
+                    expiry_interval,
+                    expires_at
+                ],
             )?;
             Ok(())
         })
@@ -222,22 +233,25 @@ impl SessionStore for SqliteStore {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
-            let mut stmt = conn
-                .prepare("SELECT subscriptions, clean_start FROM sessions WHERE client_id = ?1")?;
+            let mut stmt = conn.prepare(
+                "SELECT subscriptions, clean_start, expiry_interval, expires_at
+                 FROM sessions WHERE client_id = ?1",
+            )?;
 
             let result = stmt
                 .query_row(params![client_id.clone()], |row| {
                     let subs: String = row.get(0)?;
-                    let clean_start: bool = row.get(1)?;
-                    Ok((subs, clean_start))
+                    Ok(SessionState {
+                        client_id: client_id.clone(),
+                        subscriptions: decode_subscriptions(&subs),
+                        clean_start: row.get(1)?,
+                        expiry_interval: row.get(2)?,
+                        expires_at: row.get::<_, Option<i64>>(3)?.map(|t| t as u64),
+                    })
                 })
                 .optional()?;
 
-            Ok(result.map(|(subs, clean_start)| SessionState {
-                client_id,
-                subscriptions: decode_subscriptions(&subs),
-                clean_start,
-            }))
+            Ok(result)
         })
         .await
     }
@@ -635,12 +649,16 @@ mod tests {
                 },
             ],
             clean_start: false,
+            expiry_interval: Some(60),
+            expires_at: Some(1_700_000_000_000),
         };
 
         // Save and load
         store.save_session("client1", &session).await.unwrap();
-        let loaded = store.load_session("client1").await.unwrap();
-        assert_eq!(loaded.unwrap().subscriptions, session.subscriptions);
+        let loaded = store.load_session("client1").await.unwrap().unwrap();
+        assert_eq!(loaded.subscriptions, session.subscriptions);
+        assert_eq!(loaded.expiry_interval, Some(60));
+        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
 
         // List sessions
         let sessions = store.list_sessions().await.unwrap();
@@ -771,6 +789,8 @@ mod tests {
                 client_id: "persistent_client".to_string(),
                 subscriptions: vec![StoredSubscription::new("topic/test", QoS::AtMostOnce)],
                 clean_start: false,
+                expiry_interval: None,
+                expires_at: None,
             };
             store
                 .save_session("persistent_client", &session)
