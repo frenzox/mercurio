@@ -10,7 +10,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use mercurio_core::{
-    message::Message, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode, Result,
+    error::Error, message::Message, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode, Result,
 };
 use mercurio_packets::{
     connack::{ConnAckFlags, ConnAckPacket},
@@ -222,6 +222,22 @@ impl Listener {
                 }
             }
             Err(_) => warn!("No CONNECT received in time, closing connection"),
+            Ok(Err(Error::MQTTReasonCode(ReasonCode::UnsupportedProtocolVersion))) => {
+                // Answered in the MQTT 3.1.1 format, which every version can
+                // read [MQTT-3.1.2-2]
+                let connack = ConnAckPacket {
+                    protocol_version: ProtocolVersion::V3_1_1,
+                    flags: ConnAckFlags {
+                        session_present: false,
+                    },
+                    reason_code: ReasonCode::UnsupportedProtocolVersion,
+                    properties: None,
+                };
+                let _ = handler
+                    .connection
+                    .write_packet(ControlPacket::ConnAck(connack))
+                    .await;
+            }
             _ => error!("ConnectPacket expectation not met"),
         }
     }
@@ -375,6 +391,19 @@ where
         }
         .await;
 
+        // Tell MQTT 5 clients why the server is closing the connection
+        if let Err(Error::MQTTReasonCode(reason)) = &result {
+            if protocol_version.supports_reason_codes() && reason.get_code() >= 0x80 {
+                let _ = self
+                    .connection
+                    .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                        reason: *reason,
+                        properties: None,
+                    }))
+                    .await;
+            }
+        }
+
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
         if let Some(will) = session.take_will().await {
@@ -467,13 +496,6 @@ where
                                 // A session that was to end with the connection can't
                                 // be extended on the way out [MQTT-3.14.2-2]
                                 if *expiry == Some(Duration::ZERO) && interval != 0 {
-                                    let _ = self
-                                        .connection
-                                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                                            reason: ReasonCode::ProtocolError,
-                                            properties: None,
-                                        }))
-                                        .await;
                                     return Err(ReasonCode::ProtocolError.into());
                                 }
                                 *expiry = (interval != u32::MAX)
