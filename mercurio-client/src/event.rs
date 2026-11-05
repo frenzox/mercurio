@@ -58,4 +58,15 @@ pub struct SubscribeResult {
     pub topic: String,
     pub qos: QoS,
     pub success: bool,
+    /// Why the broker refused, when it did
+    pub reason: ReasonCode,
+}
+
+/// Result of unsubscribing from one topic filter.
+#[derive(Debug, Clone)]
+pub struct UnsubscribeResult {
+    pub topic: String,
+    pub success: bool,
+    /// Why the broker refused, or `NoSubscriptionExisted`
+    pub reason: ReasonCode,
 }

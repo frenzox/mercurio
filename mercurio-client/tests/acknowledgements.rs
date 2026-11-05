@@ -89,3 +89,25 @@ async fn refused_publish_is_an_error() {
         Err(ClientError::PublishRefused(ReasonCode::NotAuthorized))
     ));
 }
+
+#[tokio::test]
+async fn unsubscribe_reports_each_topic() {
+    let addr = start_broker().await;
+    let client = client(addr, "c").await;
+    client.subscribe(&[("a", QoS::AtMostOnce)]).await.unwrap();
+
+    let results = client.unsubscribe(&["a", "never"]).await.unwrap();
+    let reasons: Vec<_> = results
+        .iter()
+        .map(|r| (r.topic.as_str(), r.reason))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("a", ReasonCode::Success),
+            ("never", ReasonCode::NoSubscriptionExisted)
+        ]
+    );
+    // No subscription to remove is still a success
+    assert!(results.iter().all(|r| r.success));
+}

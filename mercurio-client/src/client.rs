@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
-use crate::event::{DisconnectReason, Event, SubscribeResult};
+use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
 use crate::options::{ConnectOptions, MessageProperties, Will};
 use crate::tls::build_tls_connector;
 
@@ -41,7 +41,7 @@ enum Command {
     },
     Unsubscribe {
         topics: Vec<String>,
-        response: oneshot::Sender<Result<()>>,
+        response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
     },
     Disconnect {
         response: oneshot::Sender<Result<()>>,
@@ -356,8 +356,9 @@ impl MqttClient {
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
-    /// Unsubscribe from one or more topics.
-    pub async fn unsubscribe(&self, topics: &[&str]) -> Result<()> {
+    /// Unsubscribe from one or more topics. MQTT 3.x brokers report
+    /// success for every topic.
+    pub async fn unsubscribe(&self, topics: &[&str]) -> Result<Vec<UnsubscribeResult>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Unsubscribe {
@@ -441,7 +442,7 @@ struct EventLoop {
     /// QoS 2 messages received and awaiting PUBREL
     incoming_qos2: HashSet<u16>,
     subscribes: HashMap<u16, PendingSubscribe>,
-    unsubscribes: HashMap<u16, oneshot::Sender<Result<()>>>,
+    unsubscribes: HashMap<u16, PendingUnsubscribe>,
     limits: BrokerLimits,
     /// QoS 1 and 2 publishes held back by the broker's Receive Maximum
     waiting: VecDeque<PublishRequest>,
@@ -497,6 +498,11 @@ impl BrokerLimits {
                 .is_none_or(|s| s.value),
         }
     }
+}
+
+struct PendingUnsubscribe {
+    topics: Vec<String>,
+    response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
 }
 
 struct PendingSubscribe {
@@ -884,7 +890,11 @@ impl EventLoop {
         }
     }
 
-    async fn unsubscribe(&mut self, topics: Vec<String>, response: oneshot::Sender<Result<()>>) {
+    async fn unsubscribe(
+        &mut self,
+        topics: Vec<String>,
+        response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
+    ) {
         let Some(packet_id) = self.next_packet_id() else {
             let _ = response.send(Err(ClientError::Protocol(
                 "no free packet identifier".into(),
@@ -896,8 +906,10 @@ impl EventLoop {
             packet_id,
             properties: None,
             payload: topics
-                .into_iter()
-                .map(|topic_filter| UnsubscribePayload { topic_filter })
+                .iter()
+                .map(|topic_filter| UnsubscribePayload {
+                    topic_filter: topic_filter.clone(),
+                })
                 .collect(),
         };
         match self
@@ -906,7 +918,8 @@ impl EventLoop {
             .await
         {
             Ok(()) => {
-                self.unsubscribes.insert(packet_id, response);
+                self.unsubscribes
+                    .insert(packet_id, PendingUnsubscribe { topics, response });
             }
             Err(e) => {
                 let _ = response.send(Err(e));
@@ -1005,6 +1018,7 @@ impl EventLoop {
                                     QoS::AtMostOnce
                                 },
                                 success: code < 0x80,
+                                reason: granted.reason_code,
                             }
                         })
                         .collect();
@@ -1012,8 +1026,24 @@ impl EventLoop {
                 }
             }
             ControlPacket::UnsubAck(ack) => {
-                if let Some(response) = self.unsubscribes.remove(&ack.packet_id) {
-                    let _ = response.send(Ok(()));
+                if let Some(pending) = self.unsubscribes.remove(&ack.packet_id) {
+                    // MQTT 3.x UNSUBACKs carry no reason codes
+                    let reasons = ack
+                        .payload
+                        .into_iter()
+                        .map(|p| p.reason_code)
+                        .chain(std::iter::repeat(ReasonCode::Success));
+                    let results = pending
+                        .topics
+                        .into_iter()
+                        .zip(reasons)
+                        .map(|(topic, reason)| UnsubscribeResult {
+                            topic,
+                            success: reason.get_code() < 0x80,
+                            reason,
+                        })
+                        .collect();
+                    let _ = pending.response.send(Ok(results));
                 }
             }
             ControlPacket::PingResp(_) => debug!("Received PINGRESP"),
