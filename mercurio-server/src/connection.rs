@@ -14,6 +14,11 @@ const READ_BUFFER_CAPACITY: usize = 8192;
 /// Default capacity for write buffer (512 bytes - typical packet size)
 const WRITE_BUFFER_CAPACITY: usize = 512;
 
+/// Largest packet accepted from a client, fixed header included.
+// ponytail: fixed at 1 MiB, the EMQX default; make it a config option when a
+// deployment needs bigger payloads
+pub const MAX_PACKET_SIZE: usize = 1024 * 1024;
+
 /// A connection that can be either plain TCP or TLS-encrypted.
 pub struct Connection<S = TcpStream>
 where
@@ -89,6 +94,12 @@ where
     }
 
     fn parse_packet(&mut self) -> Result<Option<ControlPacket>> {
+        // Refuse oversized packets from the fixed header alone, before
+        // buffering them
+        if ControlPacket::frame_len(&self.read_buffer).is_ok_and(|len| len > MAX_PACKET_SIZE) {
+            return Err(ReasonCode::PacketTooLarge.into());
+        }
+
         match ControlPacket::check(&mut self.read_buffer) {
             Ok(_) => {
                 let packet = ControlPacket::parse_with_version(
