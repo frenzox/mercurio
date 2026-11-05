@@ -155,8 +155,10 @@ fn publish_properties(
     subscription_identifier: Option<u32>,
 ) -> Option<PublishProperties> {
     Some(PublishProperties {
-        subscription_identifier: subscription_identifier
-            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(id))),
+        subscription_identifiers: subscription_identifier
+            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(id)))
+            .into_iter()
+            .collect(),
         payload_format_indicator: properties.payload_format_indicator.clone(),
         message_expiry_interval: properties.message_expiry_interval.clone(),
         content_type: properties.content_type.clone(),
@@ -511,7 +513,7 @@ impl Session {
         if packet
             .properties
             .as_ref()
-            .is_some_and(|p| p.subscription_identifier.is_some())
+            .is_some_and(|p| !p.subscription_identifiers.is_empty())
         {
             return Err(ReasonCode::ProtocolError.into());
         }
@@ -2005,7 +2007,7 @@ mod tests {
         let mut identifiers = Vec::new();
         for _ in 0..2 {
             let properties = next_publish(&mut session).await.properties.unwrap();
-            identifiers.push(properties.subscription_identifier.unwrap().value.0);
+            identifiers.push(properties.subscription_identifiers[0].value.0);
         }
         identifiers.sort();
         assert_eq!(identifiers, [7, 9]);
@@ -2029,7 +2031,7 @@ mod tests {
         let from_client = ControlPacket::Publish(PublishPacket {
             topic_name: "t".into(),
             properties: Some(PublishProperties {
-                subscription_identifier: Some(SubscriptionIdentifier::new(VariableByteInteger(1))),
+                subscription_identifiers: vec![SubscriptionIdentifier::new(VariableByteInteger(1))],
                 ..Default::default()
             }),
             ..Default::default()

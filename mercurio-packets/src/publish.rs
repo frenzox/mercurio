@@ -19,7 +19,8 @@ pub struct PublishProperties {
     pub response_topic: Option<ResponseTopic>,
     pub correlation_data: Option<CorrelationData>,
     pub user_property: Option<Vec<UserProperty>>,
-    pub subscription_identifier: Option<SubscriptionIdentifier>,
+    /// One per matching subscription that has an identifier [MQTT-3.3.4-4]
+    pub subscription_identifiers: Vec<SubscriptionIdentifier>,
     pub content_type: Option<ContentType>,
 }
 
@@ -31,7 +32,7 @@ impl Encoder for PublishProperties {
         self.response_topic.encode(buffer);
         self.correlation_data.encode(buffer);
         self.user_property.encode(buffer);
-        self.subscription_identifier.encode(buffer);
+        self.subscription_identifiers.encode(buffer);
         self.content_type.encode(buffer);
     }
 
@@ -44,7 +45,7 @@ impl Encoder for PublishProperties {
         len += self.response_topic.encoded_size();
         len += self.correlation_data.encoded_size();
         len += self.user_property.encoded_size();
-        len += self.subscription_identifier.encoded_size();
+        len += self.subscription_identifiers.encoded_size();
         len += self.content_type.encoded_size();
         len
     }
@@ -80,7 +81,7 @@ impl Decoder for PublishProperties {
                         properties.user_property = Some(vec);
                     }
                 }
-                SubscriptionIdentifier(v) => properties.subscription_identifier = Some(v),
+                SubscriptionIdentifier(v) => properties.subscription_identifiers.push(v),
                 ContentType(v) => set_once(&mut properties.content_type, v)?,
                 _ => return Err(ReasonCode::MalformedPacket.into()),
             }
@@ -253,5 +254,22 @@ mod tests {
 
         let new_packet = PublishPacket::decode(&mut bytes).expect("Unexpected error");
         assert_eq!(packet, new_packet);
+    }
+
+    #[test]
+    fn test_publish_keeps_every_subscription_identifier() {
+        // QoS 0 PUBLISH on "t" with identifiers 3 and 9, empty payload
+        let mut bytes =
+            Bytes::from_static(&[0x30, 0x08, 0x00, 0x01, b't', 0x04, 0x0b, 0x03, 0x0b, 0x09]);
+
+        let packet = PublishPacket::decode(&mut bytes).unwrap();
+        let identifiers: Vec<u32> = packet
+            .properties
+            .unwrap()
+            .subscription_identifiers
+            .iter()
+            .map(|s| s.value.0)
+            .collect();
+        assert_eq!(identifiers, [3, 9]);
     }
 }

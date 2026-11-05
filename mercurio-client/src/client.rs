@@ -1029,11 +1029,16 @@ impl EventLoop {
         };
 
         if deliver {
-            let subscription_id = publish
+            let subscription_ids = publish
                 .properties
                 .as_ref()
-                .and_then(|p| p.subscription_identifier.as_ref())
-                .map(|s| s.value.0);
+                .map(|p| {
+                    p.subscription_identifiers
+                        .iter()
+                        .map(|s| s.value.0)
+                        .collect()
+                })
+                .unwrap_or_default();
             let _ = self
                 .event_tx
                 .send(Event::Message {
@@ -1042,7 +1047,7 @@ impl EventLoop {
                     qos: publish.qos_level,
                     retain: publish.retain,
                     properties: MessageProperties::from_publish(publish.properties),
-                    subscription_id,
+                    subscription_ids,
                 })
                 .await;
         }
