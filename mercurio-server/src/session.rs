@@ -499,6 +499,14 @@ impl Session {
             return Err(ReasonCode::TopicNameInvalid.into());
         }
 
+        // $SYS topics carry the broker's own statistics
+        if packet.topic_name == "$SYS" || packet.topic_name.starts_with("$SYS/") {
+            warn!("Client publish to `{}` refused", packet.topic_name);
+            return self
+                .refuse_publish(&packet, ReasonCode::NotAuthorized)
+                .await;
+        }
+
         // Only the server sets subscription identifiers [MQTT-3.3.4-6]
         if packet
             .properties

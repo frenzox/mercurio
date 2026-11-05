@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
@@ -205,6 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         policy,
         websocket_listener,
+        sys_interval: (config.server.sys_interval > 0)
+            .then(|| Duration::from_secs(config.server.sys_interval)),
     };
     match config.storage {
         StorageConfig::Memory => {

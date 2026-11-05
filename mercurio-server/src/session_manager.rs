@@ -472,6 +472,11 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
         journal
     }
 
+    /// How many sessions the broker holds, connected or not.
+    pub(crate) async fn session_count(&self) -> usize {
+        self.shared.state.lock().await.sessions.len()
+    }
+
     /// Claims a will returned by `restore_from_storage` for publishing.
     /// False if its client reconnected in the meantime.
     pub(crate) async fn take_restored_will(&self, client_id: &str) -> bool {

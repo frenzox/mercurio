@@ -46,6 +46,10 @@ port = 1883
 # Also serve MQTT over WebSocket (with TLS when it is enabled) on this port
 # websocket_port = 8080
 
+# Seconds between updates of the broker statistics published under
+# $SYS/broker/ (0 disables them)
+sys_interval = 10
+
 # Maximum number of concurrent connections
 max_connections = 10000
 

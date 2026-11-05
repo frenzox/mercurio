@@ -35,6 +35,7 @@ use crate::{
     session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
+    sys::{self, ConnectedGuard, Stats},
     tls::TlsConfig,
     websocket,
 };
@@ -97,7 +98,6 @@ impl Default for Limits {
 }
 
 /// Broker configuration.
-#[derive(Default)]
 pub struct ServerConfig {
     /// Serve TLS instead of plain TCP when set.
     pub tls: Option<TlsConfig>,
@@ -107,6 +107,21 @@ pub struct ServerConfig {
     /// Also serve MQTT over WebSocket on this listener, with TLS if `tls` is
     /// set.
     pub websocket_listener: Option<TcpListener>,
+    /// How often to publish statistics under `$SYS/broker/`; never if unset.
+    pub sys_interval: Option<Duration>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            tls: None,
+            auth: AuthConfig::default(),
+            limits: Limits::default(),
+            policy: ConnectPolicy::default(),
+            websocket_listener: None,
+            sys_interval: Some(Duration::from_secs(10)),
+        }
+    }
 }
 
 /// How MQTT is carried on a connection.
@@ -125,6 +140,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     auth_config: Arc<AuthConfig>,
     policy: Arc<ConnectPolicy>,
     limits: Limits,
+    stats: Arc<Stats>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -159,6 +175,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             auth_config: self.auth_config,
             policy: self.policy,
             limits: self.limits,
+            stats: self.stats,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -198,6 +215,7 @@ struct Listener<St: MqttStore + 'static> {
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
     policy: Arc<ConnectPolicy>,
+    stats: Arc<Stats>,
     limits: Limits,
     /// One permit per allowed concurrent connection, when limited
     connection_slots: Option<Arc<Semaphore>>,
@@ -214,6 +232,7 @@ where
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
     policy: Arc<ConnectPolicy>,
+    stats: Arc<Stats>,
     limits: Limits,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
@@ -244,7 +263,9 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         limits,
         policy,
         websocket_listener,
+        sys_interval,
     } = config;
+    let stats = Arc::new(Stats::default());
     let policy = Arc::new(policy);
 
     let (notify_shutdown, _) = broadcast::channel(1);
@@ -284,9 +305,18 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         auth_config,
         policy,
         limits,
+        stats,
     };
 
     let session_manager = server.session_manager_holder.session_manager();
+    if let Some(interval) = sys_interval {
+        sys::spawn_publisher(
+            server.broker.clone(),
+            session_manager.clone(),
+            Arc::clone(&server.stats),
+            interval,
+        );
+    }
     for (client_id, will, due) in session_manager.restore_from_storage(&server.broker).await {
         let broker = server.broker.clone();
         let session_manager = session_manager.clone();
@@ -350,6 +380,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 auth_config: Arc::clone(&self.auth_config),
                 policy: Arc::clone(&self.policy),
                 limits: self.limits,
+                stats: Arc::clone(&self.stats),
             };
             let tls_acceptor = self.tls_acceptor.clone();
 
@@ -604,6 +635,7 @@ where
                 self.connection.write_packet(packet).await?;
             }
 
+            let _connected = ConnectedGuard::new(Arc::clone(&self.stats));
             self.handle_connection(
                 &session,
                 keepalive,
@@ -871,6 +903,10 @@ where
                         Some(packet) => packet,
                     };
 
+                    if matches!(packet, ControlPacket::Publish(_)) {
+                        Stats::add(&self.stats.messages_received);
+                    }
+
                     let is_subscription_change = matches!(
                         packet,
                         ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
@@ -961,6 +997,7 @@ where
                     }
 
                     self.connection.write_packet(outgoing.packet).await?;
+                    Stats::add(&self.stats.messages_sent);
                 }
 
                 // Keep-alive timeout expired - disconnect client
