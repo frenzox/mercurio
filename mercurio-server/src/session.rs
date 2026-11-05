@@ -92,6 +92,32 @@ impl From<StoredWillMessage> for WillMessage {
     }
 }
 
+/// Yields the retained messages matching a new subscription, then live
+/// messages. Only retained deliveries carry the RETAIN flag; live messages are
+/// forwarded with it cleared [MQTT-3.3.1-9].
+fn subscription_stream(
+    mut rx: broadcast::Receiver<Message>,
+    retained_messages: Vec<Message>,
+) -> Messages {
+    Box::pin(async_stream::stream! {
+        for msg in retained_messages {
+            yield msg;
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(mut msg) => {
+                    msg.retain = false;
+                    yield msg;
+                }
+                // If we lagged in consuming messages, just resume.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
 pub struct SessionDropGuard {
     session: Session,
 }
@@ -206,25 +232,10 @@ impl Session {
         let mut session = self.shared.state.lock().await;
 
         for topic_filter in topic_filters {
-            let (mut rx, retained_messages) = broker.subscribe(&topic_filter).await?;
-
-            let stream = Box::pin(async_stream::stream! {
-                // First deliver any retained messages
-                for msg in retained_messages {
-                    yield msg;
-                }
-
-                // Then continue with live messages
-                loop {
-                    match rx.recv().await {
-                        Ok(msg) => yield msg,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            session.subscriptions.insert(topic_filter, stream);
+            let (rx, retained_messages) = broker.subscribe(&topic_filter).await?;
+            session
+                .subscriptions
+                .insert(topic_filter, subscription_stream(rx, retained_messages));
         }
 
         Ok(())
@@ -399,32 +410,15 @@ impl Session {
                 continue;
             }
 
-            let (mut rx, retained_messages) = broker.subscribe(&sub.topic_filter).await?;
+            let (rx, retained_messages) = broker.subscribe(&sub.topic_filter).await?;
             ack.payload.push(SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS0,
             });
 
-            // Create a stream that first yields retained messages, then live messages
-            let stream = Box::pin(async_stream::stream! {
-                // First deliver any retained messages
-                for msg in retained_messages {
-                    yield msg;
-                }
-
-                // Then continue with live messages
-                loop {
-                    match rx.recv().await {
-                        Ok(msg) => yield msg,
-                        // If we lagged in consuming messages, just resume.
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            session
-                .subscriptions
-                .insert(sub.topic_filter.to_string(), stream);
+            session.subscriptions.insert(
+                sub.topic_filter.to_string(),
+                subscription_stream(rx, retained_messages),
+            );
         }
 
         Ok(Some(ControlPacket::SubAck(ack)))
@@ -597,7 +591,7 @@ impl Session {
                 let publish = PublishPacket {
                     dup: message.dup,
                     qos_level: message.qos,
-                    retain: false,
+                    retain: message.retain,
                     topic_name: message.topic.to_string(),
                     packet_id: message.packet_id,
                     properties: None,
@@ -872,6 +866,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_publish(&mut session).await.topic_name, "a/b");
+    }
+
+    #[tokio::test]
+    async fn test_retained_delivery_sets_retain_flag_only_for_retained() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        broker
+            .publish("r/1", message("r/1", QoS::AtMostOnce, None, true))
+            .await
+            .unwrap();
+        session
+            .handle_subscribe(subscribe_packet("r/1", QoS::AtMostOnce), &broker)
+            .await
+            .unwrap();
+        assert!(next_publish(&mut session).await.retain);
+
+        broker
+            .publish("r/1", message("r/1", QoS::AtMostOnce, None, true))
+            .await
+            .unwrap();
+        assert!(!next_publish(&mut session).await.retain);
     }
 
     #[test]
