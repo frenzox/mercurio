@@ -60,13 +60,13 @@ async fn message_properties_and_subscription_ids_reach_the_subscriber() {
 
     let Some(Event::Message {
         properties: received,
-        subscription_id,
+        subscription_ids,
         ..
     }) = next_event(&subscriber).await
     else {
         panic!("no message");
     };
-    assert_eq!(subscription_id, Some(7));
+    assert_eq!(subscription_ids, [7]);
     // The broker counts the expiry down while the message waits
     assert!(received.message_expiry.is_some_and(|e| e <= 60));
     assert_eq!(

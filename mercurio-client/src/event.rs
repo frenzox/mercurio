@@ -13,8 +13,8 @@ pub enum Event {
         qos: QoS,
         retain: bool,
         properties: MessageProperties,
-        /// Identifier of the subscription that matched, if it had one
-        subscription_id: Option<u32>,
+        /// Identifiers of the matching subscriptions that have one
+        subscription_ids: Vec<u32>,
     },
 
     /// The client was disconnected from the broker.
