@@ -261,6 +261,22 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
         _ => return Err(ReasonCode::MalformedPacket.into()),
     };
 
+    // Values the spec rules out are protocol errors
+    let valid = match &property {
+        Property::PayloadFormatIndicator(p) => p.value <= 1,
+        Property::RequestProblemInformation(p) => p.value <= 1,
+        Property::RequestResponseInformation(p) => p.value <= 1,
+        Property::MaximumQoS(p) => p.value <= 1,
+        Property::SubscriptionIdentifier(p) => p.value.0 != 0,
+        Property::TopicAlias(p) => p.value != 0,
+        Property::ReceiveMaximum(p) => p.value != 0,
+        Property::MaximumPacketSize(p) => p.value != 0,
+        _ => true,
+    };
+    if !valid {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+
     Ok(property)
 }
 
@@ -279,5 +295,47 @@ impl Decoder for Property {
         let id = VariableByteInteger::decode(buffer)?.0;
 
         decode_with_id(id, buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> crate::Result<Property> {
+        Property::decode(&mut Bytes::copy_from_slice(bytes))
+    }
+
+    #[test]
+    fn test_out_of_range_values_are_protocol_errors() {
+        let invalid: [&[u8]; 6] = [
+            // Payload Format Indicator 2
+            &[0x01, 0x02],
+            // Request Problem Information 2
+            &[0x17, 0x02],
+            // Retain Available 2
+            &[0x25, 0x02],
+            // Topic Alias 0
+            &[0x23, 0x00, 0x00],
+            // Receive Maximum 0
+            &[0x21, 0x00, 0x00],
+            // Subscription Identifier 0
+            &[0x0b, 0x00],
+        ];
+        for bytes in invalid {
+            assert!(
+                matches!(
+                    decode(bytes),
+                    Err(crate::error::Error::MQTTReasonCode(
+                        ReasonCode::ProtocolError
+                    ))
+                ),
+                "{bytes:02x?}"
+            );
+        }
+
+        assert!(decode(&[0x01, 0x01]).is_ok());
+        assert!(decode(&[0x25, 0x00]).is_ok());
+        assert!(decode(&[0x23, 0x00, 0x01]).is_ok());
     }
 }

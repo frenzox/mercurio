@@ -124,6 +124,21 @@ impl ControlPacket {
         }
     }
 
+    /// The protocol version the CONNECT packet at the start of `frame` asks
+    /// for, read without decoding the rest, so even a malformed CONNECT can
+    /// be refused in the client's own protocol.
+    pub fn connect_version(frame: &[u8]) -> Option<ProtocolVersion> {
+        if frame.first()? >> 4 != PacketType::Connect as u8 {
+            return None;
+        }
+        let mut rest = frame.get(1..)?;
+        VariableByteInteger::decode(&mut rest).ok()?;
+        let name_len = usize::from(u16::from_be_bytes([*rest.first()?, *rest.get(1)?]));
+        let name = core::str::from_utf8(rest.get(2..2 + name_len)?).ok()?;
+        let level = *rest.get(2 + name_len)?;
+        ProtocolVersion::from_name_and_level(name, level)
+    }
+
     /// Total size of the packet at the start of `src`, fixed header included.
     /// Only needs the fixed header to be available.
     pub fn frame_len(src: &[u8]) -> crate::Result<usize> {
@@ -504,6 +519,22 @@ mod robustness_tests {
         ];
         let mut buffer = BytesMut::from(&user_properties[..]);
         assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+    }
+
+    #[test]
+    fn test_connect_version_is_read_from_raw_bytes() {
+        let v5 = [0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02];
+        let v311 = [0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02];
+        assert_eq!(
+            ControlPacket::connect_version(&v5),
+            Some(ProtocolVersion::V5)
+        );
+        assert_eq!(
+            ControlPacket::connect_version(&v311),
+            Some(ProtocolVersion::V3_1_1)
+        );
+        assert_eq!(ControlPacket::connect_version(&[0xc0, 0x00]), None);
+        assert_eq!(ControlPacket::connect_version(&v5[..6]), None);
     }
 
     #[test]
