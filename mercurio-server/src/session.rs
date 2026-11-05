@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
@@ -15,7 +15,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    codec::VariableByteInteger,
+    codec::{Encoder, VariableByteInteger},
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, ReceiveMaximum,
@@ -872,8 +872,8 @@ impl Session {
                 _ => match session.next_packet_id() {
                     Some(id) => Some(id),
                     None => {
-                        // ponytail: drops on exhaustion; enforce Receive Maximum to
-                        // apply backpressure instead
+                        // Only reachable when the client's Receive Maximum allows
+                        // every identifier to be in flight at once
                         warn!(
                             "No free packet identifier for client `{}`, dropping message",
                             session.client_id
@@ -895,6 +895,20 @@ impl Session {
                 ),
                 payload: message.payload,
             };
+
+            // Packets the client can't take are discarded as if delivered
+            // [MQTT-3.1.2-25]
+            if let Some(maximum) = session.client_maximum_packet_size() {
+                let mut encoded = BytesMut::new();
+                publish.encode(&mut encoded);
+                if encoded.len() > maximum {
+                    warn!(
+                        "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
+                        publish.topic_name, session.client_id
+                    );
+                    return None;
+                }
+            }
 
             let inflight = packet_id.map(|packet_id| {
                 let sequence = session.next_sequence;
@@ -987,6 +1001,15 @@ pub(crate) struct Outgoing {
 }
 
 impl State {
+    /// The largest packet the client accepts, if it set a limit.
+    fn client_maximum_packet_size(&self) -> Option<usize> {
+        self.connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.maximum_packet_size.as_ref())
+            .map(|m| m.value as usize)
+    }
+
     /// Reason for acknowledging a packet id with no exchange in progress.
     /// MQTT 3.x acknowledgements carry no reason, so it's always success.
     fn unknown_packet_id_reason(&self) -> ReasonCode {
@@ -1806,6 +1829,34 @@ mod tests {
                 "alias {alias}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_messages_beyond_client_maximum_packet_size_are_dropped() {
+        let mut connect = create_connect_packet_without_will();
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            maximum_packet_size: Some(MaximumPacketSize::new(32)),
+            ..Default::default()
+        });
+        let mut session = Session::new(connect);
+
+        let small = message("t", QoS::AtLeastOnce, None, false);
+        assert!(session.prepare_publish(small).await.is_some());
+
+        let mut large = message("t", QoS::AtLeastOnce, None, false);
+        large.payload = Some(Bytes::from(vec![0u8; 64]));
+        assert!(session.prepare_publish(large).await.is_none());
+        // Nothing is left awaiting an acknowledgement that will never come
+        assert_eq!(
+            session
+                .shared
+                .state
+                .lock()
+                .await
+                .unacknowledged_messages
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
