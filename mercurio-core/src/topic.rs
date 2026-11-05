@@ -167,9 +167,45 @@ fn validate_common(topic: &str) -> Result<(), TopicValidationError> {
     Ok(())
 }
 
+/// Whether `topic` matches the subscription `filter`, wildcards included.
+pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
+    // Wildcards at the first level never match topics starting with `$`,
+    // which are reserved for server use [MQTT-4.7.2-1]
+    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+
+    let mut topic_levels = topic.split('/');
+    for filter_level in filter.split('/') {
+        if filter_level == "#" {
+            return true;
+        }
+        match topic_levels.next() {
+            Some(level) if filter_level == "+" || filter_level == level => {}
+            _ => return false,
+        }
+    }
+    topic_levels.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_topic_matches_filter() {
+        assert!(topic_matches_filter("a/b/c", "a/b/c"));
+        assert!(topic_matches_filter("a/b/c", "a/+/c"));
+        assert!(topic_matches_filter("a/b/c", "a/#"));
+        assert!(topic_matches_filter("a", "a/#"));
+        assert!(topic_matches_filter("a/", "a/+"));
+        assert!(!topic_matches_filter("a/b", "a/b/c"));
+        assert!(!topic_matches_filter("a/b/c", "a/+"));
+
+        assert!(!topic_matches_filter("$SYS/load", "#"));
+        assert!(!topic_matches_filter("$SYS/load", "+/load"));
+        assert!(topic_matches_filter("$SYS/load", "$SYS/#"));
+    }
 
     #[test]
     fn test_valid_publish_topics() {
