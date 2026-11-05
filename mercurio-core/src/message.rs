@@ -33,6 +33,8 @@ pub struct Message {
     /// Unix time in milliseconds after which the message must no longer be
     /// delivered, from its Message Expiry Interval
     pub expires_at: Option<u64>,
+    /// Set per delivery: the identifier of the subscription it matched
+    pub subscription_identifier: Option<u32>,
 }
 
 #[cfg(feature = "std")]

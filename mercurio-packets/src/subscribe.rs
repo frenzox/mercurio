@@ -14,8 +14,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SubscribeProperties {
-    subscription_id: Option<SubscriptionIdentifier>,
-    user_property: Option<Vec<UserProperty>>,
+    pub subscription_id: Option<SubscriptionIdentifier>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for SubscribeProperties {

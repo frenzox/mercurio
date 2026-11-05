@@ -441,6 +441,7 @@ mod tests {
                     sequence: 0,
                     released: false,
                     properties: Default::default(),
+                    subscription_identifier: None,
                 },
             )
             .await
@@ -492,10 +493,7 @@ mod tests {
         let stored = storage.load_session("c").await.unwrap().unwrap();
         assert_eq!(
             stored.subscriptions,
-            vec![StoredSubscription {
-                topic_filter: "a".to_string(),
-                qos: QoS::AtMostOnce,
-            }]
+            vec![StoredSubscription::new("a", QoS::AtMostOnce)]
         );
     }
 
@@ -564,6 +562,7 @@ mod tests {
                         sequence,
                         released,
                         properties: Default::default(),
+                        subscription_identifier: None,
                     },
                 )
                 .await
@@ -603,6 +602,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
 
         // Store inflight message
@@ -633,10 +633,7 @@ mod tests {
         // First, store a session and inflight messages
         let session_state = SessionState {
             client_id: "client1".to_string(),
-            subscriptions: vec![StoredSubscription {
-                topic_filter: "topic/a".to_string(),
-                qos: QoS::AtLeastOnce,
-            }],
+            subscriptions: vec![StoredSubscription::new("topic/a", QoS::AtLeastOnce)],
             clean_start: false,
         };
         storage
@@ -653,6 +650,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         let inflight2 = InflightMessage {
             packet_id: 2,
@@ -663,6 +661,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         storage
             .store_inflight("client1", 1, &inflight1)
@@ -711,6 +710,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
+            subscription_identifier: None,
         };
         storage
             .store_inflight("client1", 1, &inflight)
@@ -755,6 +755,7 @@ mod tests {
                 sequence: i.into(),
                 released: false,
                 properties: Default::default(),
+                subscription_identifier: None,
             };
             manager
                 .store_inflight("client1", i, &inflight)

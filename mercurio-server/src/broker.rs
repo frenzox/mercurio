@@ -53,6 +53,16 @@ impl<S: RetainedMessageStore> Broker<S> {
     /// Publish a message to a topic. Delivers to all matching subscribers.
     /// If the retain flag is set, stores or clears the retained message for this topic.
     pub(crate) async fn publish(&self, topic: &str, message: Message) -> Result<()> {
+        self.publish_from(topic, message, None).await
+    }
+
+    /// Publishes a message on behalf of the session `origin`, if any.
+    pub(crate) async fn publish_from(
+        &self,
+        topic: &str,
+        message: Message,
+        origin: Option<u64>,
+    ) -> Result<()> {
         // Handle retained message storage
         if message.retain {
             if message.payload.as_ref().is_none_or(|p| p.is_empty()) {
@@ -72,12 +82,8 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        // Forwarded messages carry RETAIN only when sent because of a new
-        // subscription [MQTT-3.3.1-9]
-        let mut message = message;
-        message.retain = false;
         for subscriber in self.subscriptions.matching(topic) {
-            subscriber.deliver(message.clone());
+            subscriber.deliver(message.clone(), origin);
         }
         Ok(())
     }
@@ -94,7 +100,11 @@ mod tests {
     fn subscriber() -> Subscriber {
         Subscriber {
             queue: Default::default(),
+            session_id: 0,
             granted_qos: QoS::AtMostOnce,
+            no_local: false,
+            retain_as_published: false,
+            subscription_identifier: None,
         }
     }
 
@@ -108,6 +118,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         }
     }
 
@@ -170,6 +181,7 @@ mod tests {
             payload: Some(Bytes::new()), // Empty payload
             properties: Default::default(),
             expires_at: None,
+            subscription_identifier: None,
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 

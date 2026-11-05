@@ -676,6 +676,7 @@ async fn publish_will(broker: &Broker<MemoryStore>, will: WillMessage, client_id
         payload: Some(will.payload),
         expires_at: Message::expiry_deadline(&will.properties),
         properties: will.properties,
+        subscription_identifier: None,
     };
 
     if let Err(e) = broker.publish(&topic, message).await {
