@@ -118,11 +118,7 @@ pub async fn run_with_tls(
     };
 
     tokio::select! {
-        result = server.run() => {
-            if result.is_err() {
-                error!("Failed to accept new connection");
-            }
-        }
+        _ = server.run() => {}
         _ = shutdown => {
             info!("Shutting down!");
         }
@@ -130,9 +126,9 @@ pub async fn run_with_tls(
 }
 
 impl Listener {
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) {
         loop {
-            let socket = self.accept().await?;
+            let socket = self.accept().await;
             let peer_addr = socket.peer_addr().ok();
 
             info!("Got a connection: {:?}", peer_addr);
@@ -197,22 +193,25 @@ impl Listener {
         }
     }
 
-    async fn accept(&mut self) -> Result<TcpStream> {
-        let mut backoff = 1;
+    /// Waits for the next connection. Errors such as running out of file
+    /// descriptors are usually transient, so they are retried with a backoff
+    /// rather than shutting the listener down.
+    async fn accept(&mut self) -> TcpStream {
+        let mut backoff = Duration::from_millis(10);
 
         loop {
             match self.listener.accept().await {
-                Ok((socket, _)) => return Ok(socket),
+                Ok((socket, _)) => return socket,
                 Err(err) => {
-                    if backoff > 64 {
-                        return Err(err.into());
-                    }
+                    error!(
+                        "Failed to accept connection, retrying in {:?}: {}",
+                        backoff, err
+                    );
                 }
             }
 
-            time::sleep(Duration::from_secs(backoff)).await;
-
-            backoff *= 2;
+            time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(1));
         }
     }
 }
