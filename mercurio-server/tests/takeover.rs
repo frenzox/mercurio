@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
@@ -24,8 +26,7 @@ async fn connect(addr: SocketAddr, clean_start: bool) -> (TcpStream, u8) {
         b'd', b'u', b'p',
     ];
     stream.write_all(&connect).await.unwrap();
-    let connack = read(&mut stream, 5).await;
-    assert_eq!(connack[0], 0x20);
+    let connack = common::read_connack(&mut stream).await;
     assert_eq!(connack[3], 0x00, "connection refused");
     (stream, connack[2])
 }
@@ -62,7 +63,7 @@ async fn new_connection_takes_over_client_id() {
         ])
         .await
         .unwrap();
-    read(&mut publisher, 5).await;
+    common::read_connack(&mut publisher).await;
     publisher
         .write_all(&[0x30, 0x06, 0x00, 0x01, b't', 0x00, b'h', b'i'])
         .await

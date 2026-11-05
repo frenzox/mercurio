@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use mercurio_core::{
     message::Message,
-    properties::AssignedClientIdentifier,
+    properties::{AssignedClientIdentifier, MaximumPacketSize},
     qos::QoS,
     reason::ReasonCode,
     topic::{validate_publish_topic, validate_subscribe_filter},
@@ -41,7 +41,7 @@ use mercurio_packets::{
 use crate::{
     auth::{AuthManager, AuthResult},
     broker::Broker,
-    connection::Connection,
+    connection::{Connection, MAX_PACKET_SIZE},
     queue::{MessageQueue, Subscriber},
     topic_tree::TopicTree,
 };
@@ -294,17 +294,16 @@ impl Session {
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
 
-            // Assigned client ID is only supported in MQTT 5.0
-            if assigned_client_id
-                && session
-                    .connect_packet
-                    .protocol_version
-                    .supports_properties()
+            // CONNACK properties only exist in MQTT 5.0
+            if session
+                .connect_packet
+                .protocol_version
+                .supports_properties()
             {
                 ack.properties = Some(ConnAckProperties {
-                    assigned_client_id: Some(AssignedClientIdentifier::new(
-                        session.client_id.clone(),
-                    )),
+                    assigned_client_id: assigned_client_id
+                        .then(|| AssignedClientIdentifier::new(session.client_id.clone())),
+                    maximum_packet_size: Some(MaximumPacketSize::new(MAX_PACKET_SIZE as u32)),
                     ..Default::default()
                 });
             }

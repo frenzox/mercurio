@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
@@ -43,11 +45,7 @@ async fn connect_and_disconnect(
     connect.extend_from_slice(&packet);
     stream.write_all(&connect).await.unwrap();
 
-    let mut connack = vec![0u8; if level == 5 { 5 } else { 4 }];
-    timeout(Duration::from_secs(2), stream.read_exact(&mut connack))
-        .await
-        .expect("no CONNACK")
-        .unwrap();
+    let connack = common::read_connack(&mut stream).await;
     assert_eq!(connack[3], 0x00, "connection refused");
 
     stream.write_all(&[0xe0, 0x00]).await.unwrap();

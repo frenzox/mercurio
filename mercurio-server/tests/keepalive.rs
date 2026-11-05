@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use tokio::{
@@ -27,9 +29,7 @@ async fn keepalive_zero_keeps_connection_alive() {
     ];
     stream.write_all(&connect).await.unwrap();
 
-    let mut connack = [0u8; 5];
-    stream.read_exact(&mut connack).await.unwrap();
-    assert_eq!(connack[0], 0x20);
+    common::read_connack(&mut stream).await;
 
     for _ in 0..2 {
         stream.write_all(&PINGREQ).await.unwrap();
