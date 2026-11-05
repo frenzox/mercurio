@@ -315,15 +315,11 @@ where
     async fn handle_connection(&mut self, session: &Session, keepalive: u16) -> Result<()> {
         let mut session = session.clone();
 
-        // Calculate keep-alive timeout: 1.5x keepalive seconds per MQTT spec
-        // A keepalive of 0 means disabled (use a very long timeout)
-        let timeout_duration = if keepalive == 0 {
-            Duration::from_secs(u64::MAX / 2) // Effectively disabled
-        } else {
-            Duration::from_secs((keepalive as u64 * 3) / 2)
-        };
+        // Keep-alive timeout is 1.5x the keepalive interval; 0 disables it
+        let timeout_duration =
+            (keepalive > 0).then(|| Duration::from_millis(keepalive as u64 * 1500));
 
-        let deadline = time::sleep(timeout_duration);
+        let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
 
         while !self.shutdown.is_shutdown() {
@@ -389,7 +385,9 @@ where
                     }
 
                     // Reset keep-alive deadline after receiving any packet
-                    deadline.as_mut().reset(Instant::now() + timeout_duration);
+                    if let Some(timeout) = timeout_duration {
+                        deadline.as_mut().reset(Instant::now() + timeout);
+                    }
                 }
 
                 // Try to send outgoing packet
@@ -420,11 +418,11 @@ where
                 }
 
                 // Keep-alive timeout expired - disconnect client
-                _ = &mut deadline => {
+                _ = &mut deadline, if timeout_duration.is_some() => {
                     let client_id = session.get_client_id().await;
                     warn!(
-                        "Keep-alive timeout for client `{}` ({}s with no packets)",
-                        client_id, timeout_duration.as_secs()
+                        "Keep-alive timeout for client `{}` ({:?} with no packets)",
+                        client_id, timeout_duration.unwrap_or_default()
                     );
                     // Return normally to trigger abnormal disconnect handling
                     // (will message will be published)
