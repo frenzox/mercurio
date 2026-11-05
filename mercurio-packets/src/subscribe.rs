@@ -259,7 +259,20 @@ impl SubscribePacket {
         let mut payload = Vec::new();
 
         while buffer.remaining() > next_packet {
-            payload.push(SubscribePayload::decode(buffer)?);
+            let sub = SubscribePayload::decode(buffer)?;
+
+            // MQTT 3.x only defines the QoS bits; the rest are reserved [MQTT-3.8.3-4]
+            if !with_properties
+                && sub.subs_opt
+                    != (SubscriptionOptions {
+                        qos: sub.subs_opt.qos,
+                        ..Default::default()
+                    })
+            {
+                return Err(ReasonCode::MalformedPacket.into());
+            }
+
+            payload.push(sub);
         }
 
         Ok(SubscribePacket {
