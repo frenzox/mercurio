@@ -105,6 +105,28 @@ const PACKET_TYPE: u8 = 0x03;
 
 impl Encoder for PublishPacket {
     fn encode(&self, buffer: &mut BytesMut) {
+        self.encode_inner(buffer, true);
+    }
+}
+
+impl Decoder for PublishPacket {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        Self::decode_inner(buffer, true)
+    }
+}
+
+impl PublishPacket {
+    /// Encodes a PUBLISH packet in MQTT 3.x format (no properties).
+    pub fn encode_v3(&self, buffer: &mut BytesMut) {
+        self.encode_inner(buffer, false);
+    }
+
+    /// Decodes a PUBLISH packet in MQTT 3.x format (no properties).
+    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        Self::decode_inner(buffer, false)
+    }
+
+    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
         let mut remaining_len = 0;
 
         // Fixed header
@@ -116,8 +138,11 @@ impl Encoder for PublishPacket {
 
         remaining_len += self.topic_name.encoded_size();
         remaining_len += self.packet_id.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
+        if with_properties {
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+        }
 
         if let Some(payload) = &self.payload {
             remaining_len += payload.len();
@@ -128,18 +153,18 @@ impl Encoder for PublishPacket {
         // Variable header
         self.topic_name.encode(buffer);
         self.packet_id.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+        if with_properties {
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
+        }
 
         // Payload. Here it goes raw, shouldn't be encoded
         if let Some(payload) = &self.payload {
             buffer.extend(payload);
         }
     }
-}
 
-impl Decoder for PublishPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+    fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         // Fixed header
         let fixed_header = buffer.get_u8();
         let dup = (fixed_header & 0b0000_1000) != 0;
@@ -155,14 +180,20 @@ impl Decoder for PublishPacket {
             _ => Some(u16::decode(buffer)?),
         };
 
-        let properties = Some(PublishProperties::decode(buffer)?);
+        let mut header_len = topic_name.encoded_size() + packet_id.encoded_size();
+        let properties = if with_properties {
+            let properties = PublishProperties::decode(buffer)?;
+            header_len += properties.encoded_size()
+                + VariableByteInteger(properties.encoded_size() as u32).encoded_size();
+            Some(properties)
+        } else {
+            None
+        };
 
         // Payload
         let payload_len = remaining_len
-            - (topic_name.encoded_size()
-                + packet_id.encoded_size()
-                + properties.encoded_size()
-                + VariableByteInteger(properties.encoded_size() as u32).encoded_size());
+            .checked_sub(header_len)
+            .ok_or(ReasonCode::MalformedPacket)?;
 
         if buffer.remaining() < payload_len {
             return Err(ReasonCode::MalformedPacket.into());

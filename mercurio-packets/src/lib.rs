@@ -164,12 +164,24 @@ impl ControlPacket {
                     ConnAck(ConnAckPacket::decode_v3(src)?)
                 }
             }
-            PacketType::Publish => Publish(PublishPacket::decode(src)?),
+            PacketType::Publish => {
+                if version.supports_properties() {
+                    Publish(PublishPacket::decode(src)?)
+                } else {
+                    Publish(PublishPacket::decode_v3(src)?)
+                }
+            }
             PacketType::PubAck => PubAck(PubAckPacket::decode(src)?),
             PacketType::PubRec => PubRec(PubRecPacket::decode(src)?),
             PacketType::PubRel => PubRel(PubRelPacket::decode(src)?),
             PacketType::PubComp => PubComp(PubCompPacket::decode(src)?),
-            PacketType::Subscribe => Subscribe(SubscribePacket::decode(src)?),
+            PacketType::Subscribe => {
+                if version.supports_properties() {
+                    Subscribe(SubscribePacket::decode(src)?)
+                } else {
+                    Subscribe(SubscribePacket::decode_v3(src)?)
+                }
+            }
             PacketType::SubAck => {
                 if version.supports_properties() {
                     SubAck(SubAckPacket::decode(src)?)
@@ -177,7 +189,13 @@ impl ControlPacket {
                     SubAck(SubAckPacket::decode_v3(src)?)
                 }
             }
-            PacketType::Unsubscribe => Unsubscribe(UnsubscribePacket::decode(src)?),
+            PacketType::Unsubscribe => {
+                if version.supports_properties() {
+                    Unsubscribe(UnsubscribePacket::decode(src)?)
+                } else {
+                    Unsubscribe(UnsubscribePacket::decode_v3(src)?)
+                }
+            }
             PacketType::UnsubAck => {
                 if version.supports_properties() {
                     UnsubAck(UnsubAckPacket::decode(src)?)
@@ -192,6 +210,22 @@ impl ControlPacket {
         };
 
         Ok(packet)
+    }
+
+    /// Encode a control packet in the wire format of the given protocol version.
+    pub fn encode_with_version(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
+        use ControlPacket::*;
+
+        if version.supports_properties() {
+            return self.encode(buffer);
+        }
+
+        match self {
+            Publish(p) => p.encode_v3(buffer),
+            Subscribe(p) => p.encode_v3(buffer),
+            Unsubscribe(p) => p.encode_v3(buffer),
+            p => p.encode(buffer),
+        }
     }
 }
 
@@ -216,5 +250,68 @@ impl Encoder for ControlPacket {
             Disconnect(p) => p.encode(buffer),
             Auth(p) => p.encode(buffer),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use mercurio_core::qos::QoS;
+
+    use super::*;
+
+    fn parse_v3(bytes: &[u8]) -> ControlPacket {
+        let mut buffer = BytesMut::from(bytes);
+        let packet =
+            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1_1).unwrap();
+        assert!(buffer.is_empty(), "packet not fully consumed");
+        packet
+    }
+
+    #[test]
+    fn test_v3_publish_round_trip() {
+        // QoS 1 PUBLISH to "a/b", packet id 10, payload "hi"
+        let wire = [
+            0x32, 0x09, 0x00, 0x03, b'a', b'/', b'b', 0x00, 0x0a, b'h', b'i',
+        ];
+
+        let packet = parse_v3(&wire);
+        let ControlPacket::Publish(ref publish) = packet else {
+            panic!("Expected Publish, got {:?}", packet);
+        };
+        assert_eq!(publish.topic_name, "a/b");
+        assert_eq!(publish.qos_level, QoS::AtLeastOnce);
+        assert_eq!(publish.packet_id, Some(10));
+        assert_eq!(publish.payload, Some(Bytes::from("hi")));
+
+        let mut encoded = BytesMut::new();
+        packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
+        assert_eq!(&encoded[..], &wire[..]);
+    }
+
+    #[test]
+    fn test_v3_subscribe_decode() {
+        // SUBSCRIBE packet id 1, "a/#" at QoS 1
+        let wire = [0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'#', 0x01];
+
+        let ControlPacket::Subscribe(subscribe) = parse_v3(&wire) else {
+            panic!("Expected Subscribe");
+        };
+        assert_eq!(subscribe.packet_id, 1);
+        assert_eq!(subscribe.payload.len(), 1);
+        assert_eq!(subscribe.payload[0].topic_filter, "a/#");
+        assert_eq!(subscribe.payload[0].subs_opt.qos, QoS::AtLeastOnce);
+    }
+
+    #[test]
+    fn test_v3_unsubscribe_decode() {
+        // UNSUBSCRIBE packet id 2, "a/#"
+        let wire = [0xa2, 0x07, 0x00, 0x02, 0x00, 0x03, b'a', b'/', b'#'];
+
+        let ControlPacket::Unsubscribe(unsubscribe) = parse_v3(&wire) else {
+            panic!("Expected Unsubscribe");
+        };
+        assert_eq!(unsubscribe.packet_id, 2);
+        assert_eq!(unsubscribe.payload[0].topic_filter, "a/#");
     }
 }
