@@ -2,7 +2,7 @@ pub mod auth;
 mod broker;
 pub mod connection;
 pub mod error;
-mod queue;
+pub mod queue;
 pub mod server;
 mod session;
 pub mod session_manager;

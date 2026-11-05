@@ -8,29 +8,63 @@ use tracing::warn;
 
 use mercurio_core::{message::Message, qos::QoS};
 
-/// QoS 0 messages beyond this many queued for one session are dropped.
-// ponytail: fixed limit, make it configurable when deployments need tuning
-pub(crate) const QOS0_QUEUE_LIMIT: usize = 1000;
+/// How many messages one session may have waiting to be sent.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueLimits {
+    /// QoS 0 messages are dropped once this many messages are queued.
+    pub max_qos0: usize,
+    /// Any message is dropped once this many are queued, so a persistent
+    /// session whose client never returns can't grow without bound.
+    pub max_messages: usize,
+}
+
+impl Default for QueueLimits {
+    fn default() -> Self {
+        Self {
+            max_qos0: 1000,
+            max_messages: 10_000,
+        }
+    }
+}
 
 /// Messages waiting to be sent to one session's client.
 ///
 /// Each session has its own queue, so a slow or offline client never makes
-/// others lose messages. QoS 0 messages are dropped once the queue is full;
-/// QoS 1 and 2 messages are always kept, as the spec requires delivering
-/// them.
-#[derive(Default)]
+/// others lose messages. QoS 0 messages, which the sender accepted could be
+/// lost, are dropped first; QoS 1 and 2 messages only once the queue is at
+/// its hard limit.
 pub(crate) struct MessageQueue {
     messages: Mutex<VecDeque<Message>>,
     notify: Notify,
+    limits: QueueLimits,
+}
+
+impl Default for MessageQueue {
+    fn default() -> Self {
+        Self::new(QueueLimits::default())
+    }
 }
 
 impl MessageQueue {
+    pub(crate) fn new(limits: QueueLimits) -> Self {
+        Self {
+            messages: Mutex::default(),
+            notify: Notify::new(),
+            limits,
+        }
+    }
+
     pub(crate) fn push(&self, message: Message) {
         let mut messages = self.messages.lock().unwrap();
-        if message.qos == QoS::AtMostOnce && messages.len() >= QOS0_QUEUE_LIMIT {
+        let limit = if message.qos == QoS::AtMostOnce {
+            self.limits.max_qos0
+        } else {
+            self.limits.max_messages
+        };
+        if messages.len() >= limit {
             warn!(
-                "Message queue full, dropping QoS 0 message on `{}`",
-                message.topic
+                "Message queue full, dropping QoS {} message on `{}`",
+                message.qos as u8, message.topic
             );
             return;
         }
@@ -93,18 +127,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_queue_drops_only_qos0() {
-        let queue = MessageQueue::default();
-        for _ in 0..QOS0_QUEUE_LIMIT {
+    async fn test_full_queue_drops_qos0_first() {
+        let queue = MessageQueue::new(QueueLimits {
+            max_qos0: 2,
+            max_messages: 3,
+        });
+        for _ in 0..2 {
             queue.push(message(QoS::AtMostOnce));
         }
 
+        // Past the QoS 0 limit only QoS 1 and 2 are queued, up to the hard limit
         queue.push(message(QoS::AtMostOnce));
         queue.push(message(QoS::AtLeastOnce));
+        queue.push(message(QoS::ExactlyOnce));
 
         let messages = queue.messages.lock().unwrap();
-        assert_eq!(messages.len(), QOS0_QUEUE_LIMIT + 1);
-        assert_eq!(messages.back().unwrap().qos, QoS::AtLeastOnce);
+        let qos: Vec<QoS> = messages.iter().map(|m| m.qos).collect();
+        assert_eq!(qos, [QoS::AtMostOnce, QoS::AtMostOnce, QoS::AtLeastOnce]);
     }
 
     #[tokio::test]
