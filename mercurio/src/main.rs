@@ -203,6 +203,7 @@ async fn run_subscribe(
                         eprintln!("Disconnected: {:?}", reason);
                         break;
                     }
+                    Some(Event::Reconnected { .. }) => eprintln!("Reconnected"),
                     None => {
                         break;
                     }

@@ -19,6 +19,10 @@ pub enum Event {
 
     /// The client was disconnected from the broker.
     Disconnected { reason: DisconnectReason },
+
+    /// The client reconnected after losing the connection. Without
+    /// `session_present` the broker forgot the subscriptions.
+    Reconnected { session_present: bool },
 }
 
 /// Reason for disconnection.

@@ -1,58 +1,32 @@
 use bytes::BytesMut;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::ControlPacket;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-};
-use tokio_rustls::client::TlsStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{ClientError, Result};
 
+/// A byte stream to the broker: plain TCP or TLS.
+pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Stream for S {}
+
 /// A connection to an MQTT broker with packet framing.
-/// Generic over the stream type to support both plain TCP and TLS.
-pub struct Connection<S = TcpStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    stream: S,
+pub struct Connection {
+    stream: Box<dyn Stream>,
     read_buffer: BytesMut,
     protocol_version: ProtocolVersion,
     /// The largest packet the broker accepts, once it said so
     max_packet_size: Option<u32>,
 }
 
-impl Connection<TcpStream> {
-    /// Create a new plain TCP connection.
-    pub fn new(stream: TcpStream) -> Self {
+impl Connection {
+    pub fn new(stream: impl Stream + 'static, protocol_version: ProtocolVersion) -> Self {
         Self {
-            stream,
+            stream: Box::new(stream),
             read_buffer: BytesMut::with_capacity(4096),
-            protocol_version: ProtocolVersion::V5,
+            protocol_version,
             max_packet_size: None,
         }
-    }
-}
-
-impl Connection<TlsStream<TcpStream>> {
-    /// Create a new TLS-encrypted connection.
-    pub fn new_tls(stream: TlsStream<TcpStream>) -> Self {
-        Self {
-            stream,
-            read_buffer: BytesMut::with_capacity(4096),
-            protocol_version: ProtocolVersion::V5,
-            max_packet_size: None,
-        }
-    }
-}
-
-impl<S> Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    /// Set the protocol version for version-aware packet parsing.
-    pub fn set_protocol_version(&mut self, version: ProtocolVersion) {
-        self.protocol_version = version;
     }
 
     /// Write a control packet to the connection.
