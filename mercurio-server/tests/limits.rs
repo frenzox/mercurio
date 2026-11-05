@@ -118,3 +118,79 @@ async fn keep_alive_is_capped_for_mqtt5_clients() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn response_information_is_given_to_clients_that_ask() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ServerConfig {
+        policy: mercurio_server::server::ConnectPolicy {
+            response_information: Some("responses/%c".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // CONNECT for client "r" with Request Response Information 1
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x02, 0x19,
+            0x01, 0x00, 0x01, b'r',
+        ])
+        .await
+        .unwrap();
+    let connack = common::read_connack(&mut stream).await;
+
+    // Response Information (0x1a) "responses/r"
+    let expected = [&[0x1a, 0x00, 0x0b][..], b"responses/r"].concat();
+    assert!(connack.windows(expected.len()).any(|w| w == expected));
+
+    // Clients that don't ask don't get it
+    let (_, connack) = connect(addr, b'n').await;
+    assert!(!connack.contains(&0x1a));
+}
+
+#[tokio::test]
+async fn clients_are_redirected_when_configured() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = ServerConfig {
+        policy: mercurio_server::server::ConnectPolicy {
+            redirect: Some(mercurio_server::server::Redirect {
+                server_reference: "other:1883".into(),
+                permanent: true,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // MQTT 5: Server Moved, with Server Reference (0x1c) "other:1883"
+    let (_, connack) = connect(addr, b'c').await;
+    assert_eq!(connack[3], 0x9d);
+    let expected = [&[0x1c, 0x00, 0x0a][..], b"other:1883"].concat();
+    assert!(connack.windows(expected.len()).any(|w| w == expected));
+
+    // MQTT 3.1.1: Server unavailable
+    let mut v3 = TcpStream::connect(addr).await.unwrap();
+    v3.write_all(&[
+        0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x01, b'v',
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        common::read_connack(&mut v3).await,
+        [0x20, 0x02, 0x00, 0x03]
+    );
+}

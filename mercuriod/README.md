@@ -69,6 +69,16 @@ receive_maximum = 65535
 # more, or for none, are told to use this instead
 # max_keepalive = 300
 
+# Response topic prefix given to MQTT 5 clients that request Response
+# Information; %c is replaced by the client id
+# response_information = "responses/%c"
+
+# Send every client to another server instead of serving it. MQTT 5 clients
+# are told where to go; MQTT 3.x clients only learn this server is unavailable.
+# [server.redirect]
+# server_reference = "broker2.example.com:1883"
+# permanent = false
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

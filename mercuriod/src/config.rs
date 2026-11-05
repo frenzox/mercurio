@@ -87,6 +87,13 @@ pub struct ServerConfig {
     /// Longest keep-alive, in seconds, MQTT 5 clients may use
     pub max_keepalive: Option<u16>,
 
+    /// Response topic prefix for MQTT 5 clients that ask for one; `%c` is
+    /// replaced by the client id
+    pub response_information: Option<String>,
+
+    /// Send every client to another server instead of serving it
+    pub redirect: Option<RedirectConfig>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -105,6 +112,8 @@ impl Default for ServerConfig {
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
             max_keepalive: None,
+            response_information: None,
+            redirect: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -126,6 +135,16 @@ pub struct TlsServerConfig {
 
     /// Optional path to CA certificate for client authentication (mTLS)
     pub ca_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RedirectConfig {
+    /// The server clients should use, such as `broker2.example.com:1883`
+    pub server_reference: String,
+
+    /// Whether the move is permanent rather than temporary
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 fn default_host() -> String {
