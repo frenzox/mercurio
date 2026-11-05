@@ -16,7 +16,7 @@ use mercurio_server::server::{
 use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod config;
@@ -153,7 +153,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls = tls.with_client_auth(ca_path);
         }
 
-        info!("TLS enabled");
         Some(tls)
     } else {
         None
@@ -209,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };
-    match config.storage {
+    let result = match config.storage {
         StorageConfig::Memory => {
             mercurio_server::server::run_with_config(listener, server_config, shutdown_signal())
                 .await
@@ -225,6 +224,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+    };
+    // A non-zero status tells service managers the broker failed to start
+    if let Err(e) = result {
+        error!("Failed to start the broker: {}", e);
+        std::process::exit(1);
     }
 
     info!("Mercurio MQTT broker stopped");
