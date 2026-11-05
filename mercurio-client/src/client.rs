@@ -166,7 +166,7 @@ impl MqttClient {
         .map_err(|_| ClientError::Timeout)??
         .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
 
-        let (session_present, client_id) = match connack {
+        let (session_present, client_id, keep_alive) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
                     return Err(ClientError::ConnectionRefused(ack.reason_code));
@@ -178,7 +178,13 @@ impl MqttClient {
                     .map(|id| id.value.clone());
                 let client_id =
                     assigned_id.unwrap_or_else(|| options.client_id.clone().unwrap_or_default());
-                (ack.flags.session_present, client_id)
+                // The broker may require a different keep-alive [MQTT-3.2.2-21]
+                let keep_alive = ack
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.server_keepalive.as_ref())
+                    .map_or(options.keep_alive, |k| k.value);
+                (ack.flags.session_present, client_id, keep_alive)
             }
             _ => return Err(ClientError::Protocol("Expected CONNACK packet".to_string())),
         };
@@ -188,7 +194,7 @@ impl MqttClient {
             client_id, session_present
         );
 
-        Ok((client_id, options.keep_alive))
+        Ok((client_id, keep_alive))
     }
 
     /// Build a CONNECT packet from options.
@@ -246,14 +252,13 @@ impl MqttClient {
             unsubscribes: HashMap::new(),
         };
 
-        // Keep-alive interval (send PINGREQ at half the keep-alive time)
-        let ping_interval = if keep_alive > 0 {
-            Duration::from_secs((keep_alive / 2).max(1) as u64)
-        } else {
-            Duration::from_secs(u64::MAX / 2) // Effectively disabled
-        };
-        let mut ping_timer = time::interval(ping_interval);
+        // Ping at half the keep-alive, so a PINGRESP has the other half to
+        // arrive; a keep-alive of 0 means no pings at all
+        let ping_interval =
+            (keep_alive > 0).then(|| Duration::from_millis(u64::from(keep_alive) * 500));
+        let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
         ping_timer.tick().await; // Skip the first immediate tick
+        let mut awaiting_pingresp = false;
 
         loop {
             tokio::select! {
@@ -261,6 +266,9 @@ impl MqttClient {
                 maybe_packet = state.connection.read_packet() => {
                     match maybe_packet {
                         Ok(Some(packet)) => {
+                            if matches!(packet, ControlPacket::PingResp(_)) {
+                                awaiting_pingresp = false;
+                            }
                             if let Err(e) = state.handle_incoming(packet).await {
                                 warn!("Error handling packet: {}", e);
                             }
@@ -307,7 +315,17 @@ impl MqttClient {
                 }
 
                 // Send PINGREQ for keep-alive
-                _ = ping_timer.tick() => {
+                _ = ping_timer.tick(), if ping_interval.is_some() => {
+                    // The previous PINGREQ went unanswered: the broker or the
+                    // network is gone
+                    if awaiting_pingresp {
+                        warn!("No PINGRESP from the broker, closing the connection");
+                        let _ = state.event_tx.send(Event::Disconnected {
+                            reason: DisconnectReason::KeepAliveTimeout,
+                        }).await;
+                        break;
+                    }
+                    awaiting_pingresp = true;
                     debug!("Sending PINGREQ");
                     if let Err(e) = state.connection.write_packet(
                         ControlPacket::PingReq(PingReqPacket {})
