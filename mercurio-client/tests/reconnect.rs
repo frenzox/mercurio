@@ -93,10 +93,9 @@ async fn publish_across_reconnect(session_present: bool) -> (Vec<Vec<u8>>, Vec<E
 async fn resumed_session_gets_unacknowledged_packets_again() {
     let (resent, events) = publish_across_reconnect(true).await;
 
-    // The QoS 1 PUBLISH again with DUP set, then the QoS 2 PUBREL, in the
-    // order they were first sent
-    assert_eq!(resent[0][0], 0x3a, "{resent:02x?}");
-    assert_eq!(resent[1][0], 0x62, "{resent:02x?}");
+    // The QoS 2 PUBREL again, and the QoS 1 PUBLISH with DUP set
+    assert_eq!(resent[0][0], 0x62, "{resent:02x?}");
+    assert_eq!(resent[1][0], 0x3a, "{resent:02x?}");
     assert!(matches!(
         events[0],
         Event::Disconnected {
@@ -145,4 +144,70 @@ async fn without_reconnect_the_client_stays_disconnected() {
         Some(Event::Disconnected { .. })
     ));
     assert!(broker.await.unwrap(), "client reconnected");
+}
+
+#[tokio::test]
+async fn resent_messages_respect_a_lowered_receive_maximum() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        let mut socket = accept(&listener, false).await;
+        let first = read_packet(&mut socket).await;
+        let second = read_packet(&mut socket).await;
+        drop(socket);
+
+        // Session kept, but now only one message may be in flight
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket
+            .write_all(&[0x20, 0x06, 0x01, 0x00, 0x03, 0x21, 0x00, 0x01])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut socket).await[..7],
+            [0x3a, first[1], 0x00, 0x01, b'a', first[5], first[6]]
+        );
+        let mut early = [0u8; 1];
+        assert!(
+            timeout(Duration::from_millis(300), socket.read(&mut early))
+                .await
+                .is_err(),
+            "second message resent beyond Receive Maximum"
+        );
+        socket
+            .write_all(&[0x40, 0x02, first[5], first[6]])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_packet(&mut socket).await[..7],
+            [0x3a, second[1], 0x00, 0x01, b'a', second[5], second[6]]
+        );
+        socket
+            .write_all(&[0x40, 0x02, second[5], second[6]])
+            .await
+            .unwrap();
+        let mut sink = [0u8; 64];
+        while socket.read(&mut sink).await.unwrap_or(0) > 0 {}
+    });
+
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let (a, b) = timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            client.publish("a", "1", QoS::AtLeastOnce),
+            client.publish("a", "2", QoS::AtLeastOnce)
+        )
+    })
+    .await
+    .expect("publishes never completed");
+    a.unwrap();
+    b.unwrap();
+    client.disconnect().await.unwrap();
+    broker.await.unwrap();
 }
