@@ -50,7 +50,7 @@ async fn slow_subscriber_receives_every_qos1_message() {
     let mut subscriber = connect(addr, b's').await;
     // SUBSCRIBE packet id 1, "t" at QoS 1
     subscriber
-        .write_all(&[0x82, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x01])
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x01])
         .await
         .unwrap();
     let mut buffer = BytesMut::new();

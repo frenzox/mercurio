@@ -107,7 +107,7 @@ async fn disconnect_with_will_message_publishes_the_will() {
     let (mut subscriber, _) = connect(addr, b's', true, 0, false).await;
     // SUBSCRIBE packet id 1, "w" at QoS 0
     subscriber
-        .write_all(&[0x82, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01, b'w', 0x00])
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'w', 0x00])
         .await
         .unwrap();
     read(&mut subscriber, 6).await;

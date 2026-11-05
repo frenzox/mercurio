@@ -66,7 +66,7 @@ async fn will_subscriber(addr: SocketAddr) -> TcpStream {
     let mut subscriber = connect(addr, b's', true, 0, None).await;
     // SUBSCRIBE packet id 1, "w" at QoS 0
     subscriber
-        .write_all(&[0x82, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01, b'w', 0x00])
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'w', 0x00])
         .await
         .unwrap();
     read_within(&mut subscriber, 6, Duration::from_secs(2))
