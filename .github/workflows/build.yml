@@ -1,37 +1,47 @@
 name: build
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # New advisories appear without any change to the code
+  schedule:
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  check:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-    - name: Format
-      run: |
-        rustup component add rustfmt
-        cargo fmt --all -- --check
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --all-features
 
-    - name: Lint
-      run: |
-        rustup component add clippy
-        cargo clippy -- -D warnings
-
-    - name: Build
-      run: cargo build --verbose --release
-
-    - name: Run tests
-      run: cargo test --verbose --lib
-
-    - name: Code audit
-      run: |
-        cargo install cargo-audit
-        cargo audit
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit dependencies
+        run: cargo audit
