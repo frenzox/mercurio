@@ -169,6 +169,18 @@ impl ControlPacket {
         use ControlPacket::*;
 
         let packet_type: u8 = src[0] >> 4;
+        let flags = src[0] & 0x0f;
+
+        // Fixed header flags are reserved except on PUBLISH, and must be
+        // 0b0010 on PUBREL, SUBSCRIBE and UNSUBSCRIBE [MQTT-2.1.3-1]
+        let expected_flags = match packet_type {
+            0x03 => flags,
+            0x06 | 0x08 | 0x0a => 0b0010,
+            _ => 0,
+        };
+        if flags != expected_flags {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
 
         let packet = match packet_type.try_into()? {
             PacketType::Connect => Connect(ConnectPacket::decode(src)?),
@@ -451,6 +463,54 @@ mod robustness_tests {
             let result = ControlPacket::parse_with_version(&mut buffer, version);
             assert!(result.is_ok(), "{:02x?}: {:?}", bytes, result);
             assert_eq!(&buffer[..], &[0xc0, 0x00], "{:02x?}", bytes);
+        }
+    }
+
+    #[test]
+    fn test_reserved_flags_are_malformed() {
+        let malformed: [(&[u8], ProtocolVersion); 6] = [
+            // PINGREQ with a reserved flag set
+            (&[0xc1, 0x00], ProtocolVersion::V5),
+            // SUBSCRIBE without the mandatory 0b0010 flags
+            (
+                &[0x80, 0x08, 0x00, 0x01, 0x00, 0x00, 0x02, b'a', b'#', 0x01],
+                ProtocolVersion::V5,
+            ),
+            // PUBREL without the mandatory 0b0010 flags
+            (&[0x60, 0x02, 0x00, 0x01], ProtocolVersion::V5),
+            // QoS 0 PUBLISH with DUP set
+            (
+                &[0x38, 0x05, 0x00, 0x01, b't', b'h', b'i'],
+                ProtocolVersion::V3_1_1,
+            ),
+            // CONNECT with will QoS 1 but no will flag
+            (
+                &[
+                    0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x0a, 0x00, 0x3c, 0x00,
+                    0x01, b'c',
+                ],
+                ProtocolVersion::V3_1_1,
+            ),
+            // MQTT 3.1.1 CONNECT with a password but no user name
+            (
+                &[
+                    0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x42, 0x00, 0x3c, 0x00,
+                    0x01, b'c', 0x00, 0x01, b'p',
+                ],
+                ProtocolVersion::V3_1_1,
+            ),
+        ];
+
+        for (bytes, version) in malformed {
+            let mut buffer = BytesMut::from(bytes);
+            assert!(
+                matches!(
+                    ControlPacket::parse_with_version(&mut buffer, version),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{:02x?}",
+                bytes
+            );
         }
     }
 
