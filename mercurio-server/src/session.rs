@@ -19,7 +19,8 @@ use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, ReceiveMaximum,
-        SubscriptionIdentifier, TopicAliasMaximum,
+        RetainAvailable, SharedSubscriptionAvailable, SubscriptionIdentifier,
+        SubscriptionIdentifierAvailable, TopicAliasMaximum, WildcardSubscriptionAvailable,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -389,6 +390,14 @@ impl Session {
                         .as_ref()
                         .and_then(|p| p.authentication_method.clone()),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
+                    // Spelled out even where absence means the same, for
+                    // clients and tools that inspect them
+                    retain_available: Some(RetainAvailable::new(true)),
+                    wildcard_subscription_available: Some(WildcardSubscriptionAvailable::new(true)),
+                    subscription_identifier_available: Some(SubscriptionIdentifierAvailable::new(
+                        true,
+                    )),
+                    shared_subscription_available: Some(SharedSubscriptionAvailable::new(true)),
                     ..Default::default()
                 });
             }
