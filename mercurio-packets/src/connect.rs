@@ -68,6 +68,11 @@ impl Decoder for ConnectFlags {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
+        // Will QoS and retain only mean something with a will [MQTT-3.1.2-11]
+        if (byte & 0b0000_0100) == 0 && (byte & 0b0011_1000) != 0 {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+
         let mut flags = ConnectFlags {
             user_name: (byte & 0b1000_0000) != 0,
             password: (byte & 0b0100_0000) != 0,
@@ -434,6 +439,12 @@ impl Decoder for ConnectPacket {
             .ok_or(ReasonCode::UnsupportedProtocolVersion)?;
 
         let flags = ConnectFlags::decode(buffer)?;
+
+        // MQTT 3.x has no password without a user name [MQTT-3.1.2-22]
+        if flags.password && !flags.user_name && !protocol_version.supports_properties() {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+
         let keepalive = u16::decode(buffer)?;
 
         // Properties only exist in MQTT 5.0

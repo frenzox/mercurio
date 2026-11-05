@@ -179,6 +179,10 @@ impl PublishPacket {
             QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
             _ => Some(u16::decode(buffer)?),
         };
+        // A QoS 0 message is never retransmitted [MQTT-3.3.1-2]
+        if dup && qos_level == QoS::AtMostOnce {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
 
         let mut header_len = topic_name.encoded_size() + packet_id.encoded_size();
         let properties = if with_properties {
