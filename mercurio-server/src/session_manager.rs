@@ -135,7 +135,9 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         let mut inflight_to_retry = Vec::new();
 
         if connect_packet.flags.clean_start {
-            manager.sessions.remove(client_id);
+            if let Some(discarded) = manager.sessions.remove(client_id) {
+                discarded.session().unsubscribe_all().await;
+            }
             self.discard_stored(client_id).await;
         } else {
             // Try to resume existing session
@@ -300,7 +302,9 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         }
 
         info!("Session for client `{}` ended", client_id);
-        manager.sessions.remove(client_id);
+        if let Some(ended) = manager.sessions.remove(client_id) {
+            ended.session().unsubscribe_all().await;
+        }
         self.discard_stored(client_id).await;
     }
 
@@ -466,6 +470,38 @@ mod tests {
                 qos: QoS::AtMostOnce,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn test_ended_session_is_unsubscribed_from_broker() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+        let broker = crate::broker::Broker::new(storage);
+
+        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let mut session = started.session;
+        session
+            .process_incoming(
+                ControlPacket::Subscribe(SubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: vec![SubscribePayload {
+                        topic_filter: "a/+".to_string(),
+                        subs_opt: Default::default(),
+                    }],
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(broker.topics().matching("a/b").len(), 1);
+
+        manager
+            .end_connection(started.lease, Some(Duration::ZERO))
+            .await;
+
+        assert!(broker.topics().matching("a/b").is_empty());
     }
 
     #[tokio::test]

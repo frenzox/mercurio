@@ -509,7 +509,10 @@ where
                 }
 
                 // Try to send outgoing packet
-                Some(packet) = session.process_outgoing() => {
+                message = session.next_outgoing() => {
+                    let Some(packet) = session.prepare_publish(message).await else {
+                        continue;
+                    };
                     tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", packet, session.get_client_id().await);
 
                     // Store inflight for QoS 1/2 messages

@@ -1,19 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
-    pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{broadcast, Mutex},
+    sync::Mutex,
     time::Duration,
 };
-use tokio_stream::{Stream, StreamExt, StreamMap};
 use tracing::{info, warn};
-
-type Messages = Pin<Box<dyn Stream<Item = Message> + Send>>;
 
 use mercurio_core::{
     message::Message,
@@ -43,6 +42,8 @@ use crate::{
     auth::{AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
+    queue::{MessageQueue, Subscriber},
+    topic_tree::TopicTree,
 };
 use mercurio_storage::{RetainedMessageStore, StoredSubscription, StoredWillMessage};
 
@@ -108,43 +109,8 @@ impl From<StoredWillMessage> for WillMessage {
     }
 }
 
-/// Yields the retained messages matching a new subscription, then live
-/// messages. Only retained deliveries carry the RETAIN flag; live messages are
-/// forwarded with it cleared [MQTT-3.3.1-9]. Every message is downgraded to
-/// the QoS granted for the subscription [MQTT-3.8.4-8].
-fn subscription_stream(
-    mut rx: broadcast::Receiver<Message>,
-    retained_messages: Vec<Message>,
-    granted_qos: QoS,
-) -> Messages {
-    let downgrade = move |mut msg: Message| {
-        if (msg.qos as u8) > (granted_qos as u8) {
-            msg.qos = granted_qos;
-            if granted_qos == QoS::AtMostOnce {
-                msg.packet_id = None;
-            }
-        }
-        msg
-    };
-
-    Box::pin(async_stream::stream! {
-        for msg in retained_messages {
-            yield downgrade(msg);
-        }
-
-        loop {
-            match rx.recv().await {
-                Ok(mut msg) => {
-                    msg.retain = false;
-                    yield downgrade(msg);
-                }
-                // If we lagged in consuming messages, just resume.
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => break,
-            }
-        }
-    })
-}
+/// Source of unique subscriber ids, one per session.
+static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct SessionDropGuard {
     session: Session,
@@ -157,6 +123,10 @@ pub struct Session {
 
 struct Shared {
     state: Mutex<State>,
+    /// Messages waiting to be sent, filled by the broker
+    queue: Arc<MessageQueue>,
+    /// Identifies this session's subscriptions in the topic tree
+    subscriber_id: u64,
 }
 
 struct State {
@@ -165,9 +135,10 @@ struct State {
     generation: u64,
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
-    subscriptions: StreamMap<String, Messages>,
-    /// QoS granted for each entry of `subscriptions`
+    /// Topic filters subscribed to, with their granted QoS
     granted_qos: HashMap<String, QoS>,
+    /// Where the subscriptions are registered, once there are any
+    topics: Option<TopicTree<Subscriber>>,
     /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
     unacknowledged_messages: HashMap<u16, PublishPacket>,
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id
@@ -204,8 +175,8 @@ impl Session {
                     connect_packet,
                     generation: 0,
                     client_id,
-                    subscriptions: StreamMap::new(),
                     granted_qos: HashMap::new(),
+                    topics: None,
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
@@ -214,6 +185,8 @@ impl Session {
                     will_message,
                     auth_method: None,
                 }),
+                queue: Arc::default(),
+                subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
             }),
         }
     }
@@ -286,12 +259,17 @@ impl Session {
     ) -> Result<()> {
         let mut session = self.shared.state.lock().await;
 
+        session.topics = Some(broker.topics());
         for StoredSubscription { topic_filter, qos } in subscriptions {
             // Retained messages are only sent for a new SUBSCRIBE, not when an
             // existing subscription is resumed [MQTT-3.3.1-9]
-            let (rx, _) = broker.subscribe(&topic_filter).await?;
-            let stream = subscription_stream(rx, Vec::new(), qos);
-            session.subscriptions.insert(topic_filter.clone(), stream);
+            broker
+                .subscribe(
+                    &topic_filter,
+                    self.shared.subscriber_id,
+                    self.subscriber(qos),
+                )
+                .await?;
             session.granted_qos.insert(topic_filter, qos);
         }
 
@@ -478,8 +456,18 @@ impl Session {
                 continue;
             }
 
-            let (rx, retained_messages) = broker.subscribe(&sub.topic_filter).await?;
             let granted_qos = sub.subs_opt.qos;
+            let subscriber = self.subscriber(granted_qos);
+            let retained_messages = broker
+                .subscribe(
+                    &sub.topic_filter,
+                    self.shared.subscriber_id,
+                    subscriber.clone(),
+                )
+                .await?;
+            for message in retained_messages {
+                subscriber.deliver(message);
+            }
             ack.payload.push(SubAckPayload {
                 reason_code: match granted_qos {
                     QoS::AtLeastOnce => ReasonCode::GrantedQoS1,
@@ -488,10 +476,7 @@ impl Session {
                 },
             });
 
-            session.subscriptions.insert(
-                sub.topic_filter.to_string(),
-                subscription_stream(rx, retained_messages, granted_qos),
-            );
+            session.topics = Some(broker.topics());
             session
                 .granted_qos
                 .insert(sub.topic_filter.to_string(), granted_qos);
@@ -500,9 +485,10 @@ impl Session {
         Ok(Some(ControlPacket::SubAck(ack)))
     }
 
-    async fn handle_unsubscribe(
+    async fn handle_unsubscribe<S: RetainedMessageStore>(
         &mut self,
         packet: UnsubscribePacket,
+        broker: &Broker<S>,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
@@ -513,10 +499,8 @@ impl Session {
         };
 
         for unsub in &packet.payload {
-            // Remove the subscription from the StreamMap
-            // Returns Some if the subscription existed, None otherwise
-            session.granted_qos.remove(&unsub.topic_filter);
-            let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
+            broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
+            let reason_code = if session.granted_qos.remove(&unsub.topic_filter).is_some() {
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -648,7 +632,7 @@ impl Session {
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
             ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker).await,
-            ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet).await,
+            ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet, broker).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
             ControlPacket::Auth(packet) => self.handle_auth(packet, auth_manager).await,
@@ -660,12 +644,37 @@ impl Session {
         }
     }
 
-    pub(crate) async fn process_outgoing(&mut self) -> Option<ControlPacket> {
+    fn subscriber(&self, granted_qos: QoS) -> Subscriber {
+        Subscriber {
+            queue: Arc::clone(&self.shared.queue),
+            granted_qos,
+        }
+    }
+
+    /// Removes every subscription of this session from the broker. Called
+    /// when the session ends, so nothing is queued for it anymore.
+    pub(crate) async fn unsubscribe_all(&self) {
+        let mut session = self.shared.state.lock().await;
+        if let Some(topics) = session.topics.take() {
+            for topic_filter in session.granted_qos.keys() {
+                topics.unsubscribe(topic_filter, self.shared.subscriber_id);
+            }
+        }
+        session.granted_qos.clear();
+    }
+
+    /// Waits for the next message to send to the client. Cancel safe, and
+    /// doesn't hold the session state while waiting.
+    pub(crate) async fn next_outgoing(&self) -> Message {
+        self.shared.queue.pop().await
+    }
+
+    /// Turns a queued message into the PUBLISH to send, tracking it until
+    /// acknowledged. Returns None if the message had to be dropped.
+    pub(crate) async fn prepare_publish(&mut self, message: Message) -> Option<ControlPacket> {
         let mut session = self.shared.state.lock().await;
 
-        loop {
-            let (_, message) = session.subscriptions.next().await?;
-
+        {
             let packet_id = match message.qos {
                 QoS::AtMostOnce => None,
                 _ => match session.next_packet_id() {
@@ -677,7 +686,7 @@ impl Session {
                             "No free packet identifier for client `{}`, dropping message",
                             session.client_id
                         );
-                        continue;
+                        return None;
                     }
                 },
             };
@@ -698,7 +707,7 @@ impl Session {
                     .insert(packet_id, publish.clone());
             }
 
-            return Some(ControlPacket::Publish(publish));
+            Some(ControlPacket::Publish(publish))
         }
     }
 }
@@ -793,6 +802,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe_nonexistent_topic() {
         let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let packet = UnsubscribePacket {
             packet_id: 1,
@@ -802,7 +812,7 @@ mod tests {
             }],
         };
 
-        let result = session.handle_unsubscribe(packet).await.unwrap();
+        let result = session.handle_unsubscribe(packet, &broker).await.unwrap();
 
         match result {
             Some(ControlPacket::UnsubAck(ack)) => {
@@ -845,7 +855,10 @@ mod tests {
             }],
         };
 
-        let result = session.handle_unsubscribe(unsub_packet).await.unwrap();
+        let result = session
+            .handle_unsubscribe(unsub_packet, &broker)
+            .await
+            .unwrap();
 
         match result {
             Some(ControlPacket::UnsubAck(ack)) => {
@@ -899,7 +912,10 @@ mod tests {
             ],
         };
 
-        let result = session.handle_unsubscribe(unsub_packet).await.unwrap();
+        let result = session
+            .handle_unsubscribe(unsub_packet, &broker)
+            .await
+            .unwrap();
 
         match result {
             Some(ControlPacket::UnsubAck(ack)) => {
@@ -945,7 +961,8 @@ mod tests {
     }
 
     async fn next_publish(session: &mut Session) -> PublishPacket {
-        match session.process_outgoing().await {
+        let message = session.next_outgoing().await;
+        match session.prepare_publish(message).await {
             Some(ControlPacket::Publish(p)) => p,
             other => panic!("Expected Publish packet, got {:?}", other),
         }
@@ -1086,7 +1103,7 @@ mod tests {
 
         next_publish(&mut subscriber).await;
         assert!(
-            timeout(Duration::from_millis(50), subscriber.process_outgoing())
+            timeout(Duration::from_millis(50), subscriber.next_outgoing())
                 .await
                 .is_err()
         );

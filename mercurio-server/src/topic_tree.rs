@@ -4,45 +4,53 @@ use std::{
 };
 
 use smallvec::SmallVec;
-use tokio::sync::broadcast;
 
 #[derive(Debug)]
-struct TopicNode<T: Clone> {
-    channel: broadcast::Sender<T>,
+struct TopicNode<T> {
+    /// Subscribers whose filter ends at this node, keyed by subscriber id
+    subscribers: HashMap<u64, T>,
     children: HashMap<String, TopicNode<T>>,
 }
 
-impl<T: Clone> TopicNode<T> {
+impl<T> TopicNode<T> {
     fn new() -> TopicNode<T> {
-        // TODO: Make channel capacity configurable
-        let (sender, _) = broadcast::channel(16);
-
         TopicNode {
-            channel: sender,
+            subscribers: HashMap::new(),
             children: HashMap::new(),
         }
     }
+
+    fn is_empty(&self) -> bool {
+        self.subscribers.is_empty() && self.children.is_empty()
+    }
+
+    /// Removes the subscriber at the end of `levels`, pruning nodes left empty.
+    fn remove(&mut self, levels: &[&str], id: u64) -> bool {
+        let Some((level, rest)) = levels.split_first() else {
+            return self.subscribers.remove(&id).is_some();
+        };
+
+        let Some(child) = self.children.get_mut(*level) else {
+            return false;
+        };
+        let removed = child.remove(rest, id);
+        if child.is_empty() {
+            self.children.remove(*level);
+        }
+        removed
+    }
 }
 
+/// Maps topic filters to their subscribers.
 #[derive(Debug)]
-pub(crate) struct TopicTree<T: Clone> {
-    shared: Arc<Shared<T>>,
+pub(crate) struct TopicTree<T> {
+    root: Arc<RwLock<TopicNode<T>>>,
 }
 
-#[derive(Debug)]
-struct Shared<T: Clone> {
-    state: RwLock<State<T>>,
-}
-
-#[derive(Debug)]
-struct State<T: Clone> {
-    root: TopicNode<T>,
-}
-
-impl<T: Clone> Clone for TopicTree<T> {
+impl<T> Clone for TopicTree<T> {
     fn clone(&self) -> Self {
         TopicTree {
-            shared: Arc::clone(&self.shared),
+            root: Arc::clone(&self.root),
         }
     }
 }
@@ -50,214 +58,142 @@ impl<T: Clone> Clone for TopicTree<T> {
 impl<T: Clone> TopicTree<T> {
     pub fn new() -> TopicTree<T> {
         TopicTree {
-            shared: Arc::new(Shared {
-                state: RwLock::new(State {
-                    root: TopicNode::new(),
-                }),
-            }),
+            root: Arc::new(RwLock::new(TopicNode::new())),
         }
     }
 
-    /// Subscribe to a topic filter. Returns a receiver for messages matching the filter.
-    ///
-    /// This method acquires a write lock as it may create new nodes in the tree.
-    pub fn subscribe(&self, topic: &str) -> broadcast::Receiver<T> {
-        let mut state = self.shared.state.write().unwrap();
-        let mut node = &mut state.root;
+    /// Adds or replaces the subscription of `id` to `filter`.
+    pub fn subscribe(&self, filter: &str, id: u64, subscriber: T) {
+        let mut root = self.root.write().unwrap();
+        let mut node = &mut *root;
 
-        for level in topic.split('/') {
+        for level in filter.split('/') {
             node = node
                 .children
                 .entry(level.to_string())
                 .or_insert_with(TopicNode::new);
         }
 
-        node.channel.subscribe()
+        node.subscribers.insert(id, subscriber);
     }
 
-    /// Publish a message to a topic.
-    ///
-    /// This method only acquires a read lock since it doesn't modify the tree structure.
-    /// Messages are sent to all subscribers whose topic filters match the topic.
-    pub fn publish(&self, topic: &str, value: T) {
-        let state = self.shared.state.read().unwrap();
+    /// Removes the subscription of `id` to `filter`. Returns whether it existed.
+    pub fn unsubscribe(&self, filter: &str, id: u64) -> bool {
+        let levels: SmallVec<[&str; 8]> = filter.split('/').collect();
+        self.root.write().unwrap().remove(&levels, id)
+    }
+
+    /// Returns the subscribers of every filter matching `topic`, once per
+    /// matching filter.
+    pub fn matching(&self, topic: &str) -> Vec<T> {
+        let root = self.root.read().unwrap();
+        let mut matches = Vec::new();
 
         // Use SmallVec to avoid heap allocation for typical topic depths (< 8 levels)
-        // Stack holds (node reference, current depth in topic)
         let mut stack: SmallVec<[(&TopicNode<T>, usize); 8]> = SmallVec::new();
-
-        // Collect topic levels into SmallVec (avoids heap for < 8 levels)
         let levels: SmallVec<[&str; 8]> = topic.split('/').collect();
         let target_depth = levels.len();
 
-        stack.push((&state.root, 0));
+        stack.push((&root, 0));
 
         while let Some((node, depth)) = stack.pop() {
             if depth == target_depth {
-                // Reached the target depth - send to subscribers at this node
-                let _ = node.channel.send(value.clone());
+                matches.extend(node.subscribers.values().cloned());
 
-                // Also send to multi-level wildcard (#) subscribers at the next level
+                // "a/#" also matches "a" itself
                 if let Some(wildcard) = node.children.get("#") {
-                    let _ = wildcard.channel.send(value.clone());
+                    matches.extend(wildcard.subscribers.values().cloned());
                 }
                 continue;
             }
 
-            let level = levels[depth];
-            let next_depth = depth + 1;
-
-            // Check for exact match
-            if let Some(child) = node.children.get(level) {
-                stack.push((child, next_depth));
+            if let Some(child) = node.children.get(levels[depth]) {
+                stack.push((child, depth + 1));
             }
 
-            // Check for single-level wildcard (+)
             if let Some(child) = node.children.get("+") {
-                stack.push((child, next_depth));
+                stack.push((child, depth + 1));
             }
 
             // Multi-level wildcard (#) matches the remainder of the topic
             if let Some(child) = node.children.get("#") {
-                let _ = child.channel.send(value.clone());
+                matches.extend(child.subscribers.values().cloned());
             }
         }
+
+        matches
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use tokio::time::timeout;
-
     use super::TopicTree;
 
-    #[tokio::test]
-    async fn test_pubsub_normal_topics() {
-        let tree = TopicTree::<String>::new();
-        let mut subscriber = tree.subscribe("a/b/c");
-        let mut subscriber2 = tree.subscribe("/a/b/c");
-
-        tree.publish("a/b/c", "test_message".to_string());
-        tree.publish("/a/b/c", "test_message2".to_string());
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message".to_string()
-        );
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber2.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message2".to_string()
-        );
-
-        timeout(Duration::from_millis(10), subscriber.recv())
-            .await
-            .expect_err("Expected Elapsed error");
-
-        timeout(Duration::from_millis(10), subscriber2.recv())
-            .await
-            .expect_err("Expected Elapsed error");
+    fn matching(tree: &TopicTree<&'static str>, topic: &str) -> Vec<&'static str> {
+        let mut matches = tree.matching(topic);
+        matches.sort();
+        matches
     }
 
-    #[tokio::test]
-    async fn test_pubsub_multi_level_wildcard() {
-        let tree = TopicTree::<String>::new();
+    #[test]
+    fn test_normal_topics() {
+        let tree = TopicTree::new();
+        tree.subscribe("a/b/c", 1, "abc");
+        tree.subscribe("/a/b/c", 2, "/abc");
 
-        let mut subscriber = tree.subscribe("sport/tennis/player1/#");
-        tree.publish("sport/tennis/player1", "test_message".into());
-
-        tree.publish("sport/tennis/player1/ranking", "test_message_1".into());
-
-        tree.publish(
-            "sport/tennis/player1/score/wimbledon",
-            "test_message_2".into(),
-        );
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message".to_string()
-        );
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message_1".to_string()
-        );
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message_2".to_string()
-        );
-
-        let mut subscriber = tree.subscribe("sport/#");
-        tree.publish("sport", "test_message_3".into());
-
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message_3".to_string()
-        );
+        assert_eq!(matching(&tree, "a/b/c"), ["abc"]);
+        assert_eq!(matching(&tree, "/a/b/c"), ["/abc"]);
+        assert!(matching(&tree, "a/b").is_empty());
     }
 
-    #[tokio::test]
-    async fn test_pubsub_single_level_wildcard() {
-        let tree = TopicTree::<String>::new();
-        let mut subscriber = tree.subscribe("sport/tennis/+");
-        let mut subscriber2 = tree.subscribe("sport/tennis/+/ranking");
-        tree.publish("sport/tennis/player1", "test_message".into());
-        tree.publish("sport/tennis/player1/ranking", "test_message".into());
-        tree.publish("sport/tennis", "test_message".into());
+    #[test]
+    fn test_multi_level_wildcard() {
+        let tree = TopicTree::new();
+        tree.subscribe("sport/tennis/player1/#", 1, "player1");
+        tree.subscribe("sport/#", 2, "sport");
 
         assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message".to_string()
+            matching(&tree, "sport/tennis/player1"),
+            ["player1", "sport"]
         );
-
         assert_eq!(
-            timeout(Duration::from_millis(10), subscriber2.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message".to_string()
+            matching(&tree, "sport/tennis/player1/score/wimbledon"),
+            ["player1", "sport"]
         );
+        assert_eq!(matching(&tree, "sport"), ["sport"]);
+        assert!(matching(&tree, "music").is_empty());
+    }
 
-        timeout(Duration::from_millis(10), subscriber.recv())
-            .await
-            .expect_err("Expected Elapsed error");
+    #[test]
+    fn test_single_level_wildcard() {
+        let tree = TopicTree::new();
+        tree.subscribe("sport/tennis/+", 1, "plus");
+        tree.subscribe("sport/tennis/+/ranking", 2, "ranking");
 
-        timeout(Duration::from_millis(10), subscriber.recv())
-            .await
-            .expect_err("Expected Elapsed error");
+        assert_eq!(matching(&tree, "sport/tennis/player1"), ["plus"]);
+        assert_eq!(matching(&tree, "sport/tennis/player1/ranking"), ["ranking"]);
+        assert!(matching(&tree, "sport/tennis").is_empty());
+        assert_eq!(matching(&tree, "sport/tennis/"), ["plus"]);
+    }
 
-        tree.publish("sport/tennis/", "test_message".into());
+    #[test]
+    fn test_resubscribe_replaces_and_unsubscribe_prunes() {
+        let tree = TopicTree::new();
+        tree.subscribe("a/+/c", 1, "first");
+        tree.subscribe("a/+/c", 1, "second");
+        tree.subscribe("a/b", 2, "other");
 
-        assert_eq!(
-            timeout(Duration::from_millis(10), subscriber.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            "test_message".to_string()
-        );
+        assert_eq!(matching(&tree, "a/x/c"), ["second"]);
+
+        assert!(tree.unsubscribe("a/+/c", 1));
+        assert!(!tree.unsubscribe("a/+/c", 1));
+        assert!(matching(&tree, "a/x/c").is_empty());
+
+        let root = tree.root.read().unwrap();
+        assert!(!root.children["a"].children.contains_key("+"));
+        drop(root);
+
+        assert!(tree.unsubscribe("a/b", 2));
+        assert!(tree.root.read().unwrap().is_empty());
     }
 }
