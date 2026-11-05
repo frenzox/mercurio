@@ -422,6 +422,9 @@ struct OutgoingPublish {
     released: bool,
     /// Messages are resent in the order they were first sent [MQTT-4.6.0-1]
     seq: u64,
+    /// On the current connection; a resumed message waits for room under
+    /// Receive Maximum before it goes out again
+    sent: bool,
     response: oneshot::Sender<Result<()>>,
 }
 
@@ -656,31 +659,29 @@ impl EventLoop {
             }
         }
 
-        let mut pending: Vec<_> = self.outgoing.iter().collect();
-        pending.sort_by_key(|(_, o)| o.seq);
-        let packets: Vec<ControlPacket> = pending
-            .into_iter()
-            .map(|(id, o)| {
-                if o.released {
-                    ControlPacket::PubRel(PubRelPacket {
-                        packet_id: *id,
-                        reason: ReasonCode::Success,
-                        properties: None,
-                    })
-                } else {
-                    ControlPacket::Publish(PublishPacket {
-                        dup: session_present,
-                        ..o.packet.clone()
-                    })
-                }
-            })
-            .collect();
-        // ponytail: a broker that lowered Receive Maximum across the
-        // reconnect may see more in flight than it now allows
-        for packet in packets {
+        // Releases go out again straight away: the broker already counts
+        // their messages against Receive Maximum. Unacknowledged messages
+        // wait their turn, with their packet identifier and DUP set, so a
+        // broker that lowered the limit isn't sent more than it allows
+        let mut releases: Vec<(u64, u16)> = Vec::new();
+        for (id, outgoing) in &mut self.outgoing {
+            if outgoing.released {
+                releases.push((outgoing.seq, *id));
+            } else {
+                outgoing.sent = false;
+                outgoing.packet.dup = session_present;
+            }
+        }
+        releases.sort();
+        for (_, packet_id) in releases {
+            let release = ControlPacket::PubRel(PubRelPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            });
             // A failed write ends this connection too, and the next
             // reconnect resends again
-            if self.connection.write_packet(packet).await.is_err() {
+            if self.connection.write_packet(release).await.is_err() {
                 return;
             }
         }
@@ -722,18 +723,39 @@ impl EventLoop {
             return;
         }
 
-        if request.qos != QoS::AtMostOnce
-            && self.outgoing.len() >= usize::from(self.limits.receive_maximum)
-        {
+        if request.qos != QoS::AtMostOnce && self.in_flight() >= self.window() {
             self.waiting.push_back(request);
             return;
         }
         self.send_publish(request).await;
     }
 
-    /// Sends publishes held back by Receive Maximum while there is room.
+    fn window(&self) -> usize {
+        usize::from(self.limits.receive_maximum)
+    }
+
+    /// QoS 1 and 2 messages the broker has and hasn't fully acknowledged.
+    fn in_flight(&self) -> usize {
+        self.outgoing.values().filter(|o| o.sent).count()
+    }
+
+    /// Sends publishes held back by Receive Maximum while there is room,
+    /// those resumed from the previous connection first.
     async fn send_waiting(&mut self) {
-        while self.outgoing.len() < usize::from(self.limits.receive_maximum) {
+        while self.in_flight() < self.window() {
+            let resumed = self
+                .outgoing
+                .iter_mut()
+                .filter(|(_, o)| !o.sent)
+                .min_by_key(|(_, o)| o.seq);
+            if let Some((_, outgoing)) = resumed {
+                outgoing.sent = true;
+                let packet = ControlPacket::Publish(outgoing.packet.clone());
+                if self.connection.write_packet(packet).await.is_err() {
+                    return;
+                }
+                continue;
+            }
             let Some(request) = self.waiting.pop_front() else {
                 break;
             };
@@ -790,6 +812,7 @@ impl EventLoop {
                         packet: publish,
                         released: false,
                         seq: self.next_seq,
+                        sent: true,
                         response,
                     },
                 );
