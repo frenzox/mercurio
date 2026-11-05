@@ -21,7 +21,8 @@ use mercurio_core::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
         MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
         ServerKeepAlive, SharedSubscriptionAvailable, SubscriptionIdentifier,
-        SubscriptionIdentifierAvailable, TopicAliasMaximum, WildcardSubscriptionAvailable,
+        SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
+        WildcardSubscriptionAvailable,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -228,6 +229,9 @@ struct State {
     topic_aliases: HashMap<u16, String>,
     /// Highest alias the client may use, as advertised in CONNACK
     topic_alias_maximum: u16,
+    /// Aliases this connection assigned to topics sent to the client
+    outgoing_aliases: HashMap<String, u16>,
+    send_topic_aliases: bool,
     /// QoS 2 messages the client may have awaiting PUBREL, as advertised
     receive_maximum: u16,
     /// Will message to be published on abnormal disconnect
@@ -281,6 +285,8 @@ impl Session {
                     last_packet_id: 0,
                     topic_aliases: HashMap::new(),
                     topic_alias_maximum: 0,
+                    outgoing_aliases: HashMap::new(),
+                    send_topic_aliases: false,
                     receive_maximum: u16::MAX,
                     will_message,
                     auth_exchange: None,
@@ -386,6 +392,8 @@ impl Session {
 
             // Topic aliases only live as long as the connection [MQTT-3.3.2-7]
             session.topic_aliases.clear();
+            session.outgoing_aliases.clear();
+            session.send_topic_aliases = limits.send_topic_aliases;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
 
@@ -1085,7 +1093,7 @@ impl Session {
             });
 
             Some(Outgoing {
-                packet: ControlPacket::Publish(publish),
+                packet: ControlPacket::Publish(session.apply_topic_alias(publish)),
                 inflight,
             })
         }
@@ -1156,6 +1164,41 @@ pub(crate) struct Outgoing {
 }
 
 impl State {
+    /// Replaces the topic of an outgoing PUBLISH with an alias where the
+    /// client accepts them, assigning new aliases until its maximum is
+    /// reached. Only the copy sent is aliased: aliases end with the
+    /// connection, so a retransmission must carry the full topic.
+    fn apply_topic_alias(&mut self, mut publish: PublishPacket) -> PublishPacket {
+        let maximum = self
+            .connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.topic_alias_maximum.as_ref())
+            .filter(|_| self.send_topic_aliases)
+            .map_or(0, |m| m.value);
+
+        let alias = match self.outgoing_aliases.get(&publish.topic_name) {
+            // Already known to the client: the alias alone stands for it
+            Some(&alias) => {
+                publish.topic_name.clear();
+                alias
+            }
+            None if self.outgoing_aliases.len() < usize::from(maximum) => {
+                let alias = self.outgoing_aliases.len() as u16 + 1;
+                self.outgoing_aliases
+                    .insert(publish.topic_name.clone(), alias);
+                alias
+            }
+            None => return publish,
+        };
+
+        publish
+            .properties
+            .get_or_insert_with(Default::default)
+            .topic_alias = Some(TopicAlias::new(alias));
+        publish
+    }
+
     /// The largest packet the client accepts, if it set a limit.
     fn client_maximum_packet_size(&self) -> Option<usize> {
         self.connect_packet
@@ -2122,6 +2165,60 @@ mod tests {
             panic!("Expected UNSUBACK");
         };
         assert_eq!(ack.payload[0].reason_code, ReasonCode::TopicFilterInvalid);
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_topics_are_aliased_up_to_the_client_maximum() {
+        let mut connect = create_connect_packet_without_will();
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            topic_alias_maximum: Some(TopicAliasMaximum::new(1)),
+            ..Default::default()
+        });
+        let mut session = Session::new(connect);
+
+        // Off unless the operator enables it
+        let outgoing = session
+            .prepare_publish(message("a", QoS::AtMostOnce, None, false))
+            .await
+            .unwrap();
+        let ControlPacket::Publish(publish) = outgoing.packet else {
+            panic!("Expected Publish");
+        };
+        assert!(publish.properties.unwrap().topic_alias.is_none());
+
+        session.shared.state.lock().await.send_topic_aliases = true;
+
+        let mut sent = Vec::new();
+        for topic in ["a", "a", "b"] {
+            let outgoing = session
+                .prepare_publish(message(topic, QoS::AtLeastOnce, None, false))
+                .await
+                .unwrap();
+            let ControlPacket::Publish(publish) = outgoing.packet else {
+                panic!("Expected Publish");
+            };
+            let alias = publish
+                .properties
+                .unwrap()
+                .topic_alias
+                .map(|alias| alias.value);
+            sent.push((publish.topic_name, alias));
+        }
+        assert_eq!(
+            sent,
+            [
+                ("a".to_string(), Some(1)),
+                (String::new(), Some(1)),
+                ("b".to_string(), None)
+            ]
+        );
+
+        // What would be resent after a reconnect keeps the full topic
+        let state = session.shared.state.lock().await;
+        assert!(state
+            .unacknowledged_messages
+            .values()
+            .all(|(_, p)| !p.topic_name.is_empty()));
     }
 
     #[tokio::test]

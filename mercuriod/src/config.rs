@@ -94,6 +94,11 @@ pub struct ServerConfig {
     /// Send every client to another server instead of serving it
     pub redirect: Option<RedirectConfig>,
 
+    /// Replace repeated topics with aliases for MQTT 5 clients that accept
+    /// them
+    #[serde(default)]
+    pub send_topic_aliases: bool,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -114,6 +119,7 @@ impl Default for ServerConfig {
             max_keepalive: None,
             response_information: None,
             redirect: None,
+            send_topic_aliases: false,
             tls: TlsServerConfig::default(),
         }
     }
@@ -196,6 +202,7 @@ impl ServerConfig {
             topic_alias_maximum: self.max_topic_alias,
             receive_maximum: self.receive_maximum,
             max_keepalive: self.max_keepalive,
+            send_topic_aliases: self.send_topic_aliases,
         }
     }
 }

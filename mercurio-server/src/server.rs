@@ -74,6 +74,10 @@ pub struct Limits {
     /// Longest keep-alive MQTT 5 clients may use; those asking for more, or
     /// for none, are told to use this one instead.
     pub max_keepalive: Option<u16>,
+    /// Replace repeated topics with aliases for clients that accept them.
+    /// Off by default: some client libraries announce support they don't
+    /// actually have.
+    pub send_topic_aliases: bool,
 }
 
 impl Default for Limits {
@@ -86,6 +90,7 @@ impl Default for Limits {
             topic_alias_maximum: 10,
             receive_maximum: u16::MAX,
             max_keepalive: None,
+            send_topic_aliases: false,
         }
     }
 }
