@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
+use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, WillProperties};
 use mercurio_packets::disconnect::DisconnectPacket;
 use mercurio_packets::pingreq::PingReqPacket;
@@ -30,13 +31,7 @@ use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
 enum Command {
-    Publish {
-        topic: String,
-        payload: Bytes,
-        qos: QoS,
-        retain: bool,
-        response: oneshot::Sender<Result<()>>,
-    },
+    Publish(PublishRequest),
     Subscribe {
         topics: Vec<(String, QoS)>,
         response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
@@ -93,7 +88,8 @@ impl MqttClient {
             let mut connection = Connection::new_tls(tls_stream);
             connection.set_protocol_version(options.protocol_version);
 
-            let (client_id, keep_alive) = Self::perform_connect(&mut connection, &options).await?;
+            let (client_id, keep_alive, limits) =
+                Self::perform_connect(&mut connection, &options).await?;
 
             tokio::spawn(async move {
                 if let Err(e) = Self::event_loop(
@@ -102,6 +98,7 @@ impl MqttClient {
                     event_tx,
                     keep_alive,
                     options.protocol_version,
+                    limits,
                 )
                 .await
                 {
@@ -119,7 +116,8 @@ impl MqttClient {
             let mut connection = Connection::new(stream);
             connection.set_protocol_version(options.protocol_version);
 
-            let (client_id, keep_alive) = Self::perform_connect(&mut connection, &options).await?;
+            let (client_id, keep_alive, limits) =
+                Self::perform_connect(&mut connection, &options).await?;
 
             tokio::spawn(async move {
                 if let Err(e) = Self::event_loop(
@@ -128,6 +126,7 @@ impl MqttClient {
                     event_tx,
                     keep_alive,
                     options.protocol_version,
+                    limits,
                 )
                 .await
                 {
@@ -147,7 +146,7 @@ impl MqttClient {
     async fn perform_connect<S>(
         connection: &mut Connection<S>,
         options: &ConnectOptions,
-    ) -> Result<(String, u16)>
+    ) -> Result<(String, u16, BrokerLimits)>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -166,7 +165,7 @@ impl MqttClient {
         .map_err(|_| ClientError::Timeout)??
         .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
 
-        let (session_present, client_id, keep_alive) = match connack {
+        let (session_present, client_id, keep_alive, limits) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
                     // A refusal may name the server to use instead
@@ -196,7 +195,8 @@ impl MqttClient {
                     .as_ref()
                     .and_then(|p| p.server_keepalive.as_ref())
                     .map_or(options.keep_alive, |k| k.value);
-                (ack.flags.session_present, client_id, keep_alive)
+                let limits = BrokerLimits::from_connack(ack.properties.as_ref());
+                (ack.flags.session_present, client_id, keep_alive, limits)
             }
             _ => return Err(ClientError::Protocol("Expected CONNACK packet".to_string())),
         };
@@ -206,7 +206,8 @@ impl MqttClient {
             client_id, session_present
         );
 
-        Ok((client_id, keep_alive))
+        connection.set_max_packet_size(limits.maximum_packet_size);
+        Ok((client_id, keep_alive, limits))
     }
 
     /// Build a CONNECT packet from options.
@@ -249,6 +250,7 @@ impl MqttClient {
         event_tx: mpsc::Sender<Event>,
         keep_alive: u16,
         protocol_version: ProtocolVersion,
+        limits: BrokerLimits,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -262,6 +264,8 @@ impl MqttClient {
             incoming_qos2: HashSet::new(),
             subscribes: HashMap::new(),
             unsubscribes: HashMap::new(),
+            limits,
+            waiting: VecDeque::new(),
         };
 
         // Ping at half the keep-alive, so a PINGRESP has the other half to
@@ -319,9 +323,7 @@ impl MqttClient {
                 // Handle commands from the client API
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
-                        Command::Publish { topic, payload, qos, retain, response } => {
-                            state.publish(topic, payload, qos, retain, response).await;
-                        }
+                        Command::Publish(request) => state.publish(request).await,
                         Command::Subscribe { topics, response } => {
                             state.subscribe(topics, response).await;
                         }
@@ -402,13 +404,13 @@ impl MqttClient {
     ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
-            .send(Command::Publish {
+            .send(Command::Publish(PublishRequest {
                 topic: topic.to_string(),
                 payload: payload.into(),
                 qos,
                 retain,
                 response: response_tx,
-            })
+            }))
             .await
             .map_err(|_| ClientError::SendError)?;
 
@@ -482,6 +484,56 @@ struct EventLoop<S: AsyncRead + AsyncWrite + Unpin> {
     incoming_qos2: HashSet<u16>,
     subscribes: HashMap<u16, PendingSubscribe>,
     unsubscribes: HashMap<u16, oneshot::Sender<Result<()>>>,
+    limits: BrokerLimits,
+    /// QoS 1 and 2 publishes held back by the broker's Receive Maximum
+    waiting: VecDeque<PublishRequest>,
+}
+
+/// A message the application asked to publish.
+struct PublishRequest {
+    topic: String,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+    response: oneshot::Sender<Result<()>>,
+}
+
+/// What the broker said it supports, in CONNACK.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BrokerLimits {
+    receive_maximum: u16,
+    maximum_packet_size: Option<u32>,
+    maximum_qos: QoS,
+    retain_available: bool,
+    wildcard_subscriptions: bool,
+    shared_subscriptions: bool,
+}
+
+impl BrokerLimits {
+    /// Absent properties mean the most permissive value.
+    fn from_connack(properties: Option<&ConnAckProperties>) -> Self {
+        let p = properties;
+        BrokerLimits {
+            receive_maximum: p
+                .and_then(|p| p.receive_maximum.as_ref())
+                .map_or(u16::MAX, |r| r.value),
+            maximum_packet_size: p
+                .and_then(|p| p.maximum_packet_size.as_ref())
+                .map(|m| m.value),
+            maximum_qos: p
+                .and_then(|p| p.maximum_qos.as_ref())
+                .map_or(QoS::ExactlyOnce, |q| q.value.into()),
+            retain_available: p
+                .and_then(|p| p.retain_available.as_ref())
+                .is_none_or(|r| r.value),
+            wildcard_subscriptions: p
+                .and_then(|p| p.wildcard_subscription_available.as_ref())
+                .is_none_or(|w| w.value),
+            shared_subscriptions: p
+                .and_then(|p| p.shared_subscription_available.as_ref())
+                .is_none_or(|s| s.value),
+        }
+    }
 }
 
 struct PendingSubscribe {
@@ -507,15 +559,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
     }
 
     /// Sends a PUBLISH. QoS 0 completes at once; QoS 1 and 2 complete when
-    /// the broker has acknowledged them.
-    async fn publish(
-        &mut self,
-        topic: String,
-        payload: Bytes,
-        qos: QoS,
-        retain: bool,
-        response: oneshot::Sender<Result<()>>,
-    ) {
+    /// the broker has acknowledged them, and wait their turn if the broker's
+    /// Receive Maximum is reached [MQTT-3.3.4-7].
+    async fn publish(&mut self, request: PublishRequest) {
+        // Features the broker doesn't support are refused here rather than
+        // sent [MQTT-3.2.2-11, MQTT-3.2.2-14]
+        if (request.qos as u8) > (self.limits.maximum_qos as u8) {
+            let _ = request
+                .response
+                .send(Err(ClientError::NotSupported("this QoS")));
+            return;
+        }
+        if request.retain && !self.limits.retain_available {
+            let _ = request
+                .response
+                .send(Err(ClientError::NotSupported("retained messages")));
+            return;
+        }
+
+        if request.qos != QoS::AtMostOnce
+            && self.outgoing.len() >= usize::from(self.limits.receive_maximum)
+        {
+            self.waiting.push_back(request);
+            return;
+        }
+        self.send_publish(request).await;
+    }
+
+    /// Sends publishes held back by Receive Maximum while there is room.
+    async fn send_waiting(&mut self) {
+        while self.outgoing.len() < usize::from(self.limits.receive_maximum) {
+            let Some(request) = self.waiting.pop_front() else {
+                break;
+            };
+            self.send_publish(request).await;
+        }
+    }
+
+    async fn send_publish(&mut self, request: PublishRequest) {
+        let PublishRequest {
+            topic,
+            payload,
+            qos,
+            retain,
+            response,
+        } = request;
         let packet_id = match qos {
             QoS::AtMostOnce => None,
             _ => match self.next_packet_id() {
@@ -563,6 +651,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
         topics: Vec<(String, QoS)>,
         response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
     ) {
+        let uses_wildcards = topics
+            .iter()
+            .any(|(t, _)| t.split('/').any(|level| level == "+" || level == "#"));
+        let uses_shared = topics.iter().any(|(t, _)| t.starts_with("$share/"));
+        if (uses_wildcards && !self.limits.wildcard_subscriptions)
+            || (uses_shared && !self.limits.shared_subscriptions)
+        {
+            let _ = response.send(Err(ClientError::NotSupported(
+                "wildcard or shared subscriptions",
+            )));
+            return;
+        }
+
         let Some(packet_id) = self.next_packet_id() else {
             let _ = response.send(Err(ClientError::Protocol(
                 "no free packet identifier".into(),
@@ -653,6 +754,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
     }
 
     async fn handle_incoming(&mut self, packet: ControlPacket) -> Result<()> {
+        let acknowledges_publish = matches!(
+            packet,
+            ControlPacket::PubAck(_) | ControlPacket::PubRec(_) | ControlPacket::PubComp(_)
+        );
+        self.dispatch(packet).await?;
+        // An acknowledgement may have made room under Receive Maximum
+        if acknowledges_publish {
+            self.send_waiting().await;
+        }
+        Ok(())
+    }
+
+    async fn dispatch(&mut self, packet: ControlPacket) -> Result<()> {
         match packet {
             ControlPacket::Publish(publish) => self.handle_publish(publish).await?,
             ControlPacket::PubAck(ack) => self.complete_publish(ack.packet_id, ack.reason),
