@@ -674,6 +674,7 @@ async fn publish_will(broker: &Broker<MemoryStore>, will: WillMessage, client_id
         qos: will.qos,
         retain: will.retain,
         payload: Some(will.payload),
+        expires_at: Message::expiry_deadline(&will.properties),
         properties: will.properties,
     };
 

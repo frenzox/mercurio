@@ -30,6 +30,33 @@ pub struct Message {
     /// Payload data - Bytes is already reference-counted for cheap cloning
     pub payload: Option<Bytes>,
     pub properties: MessageProperties,
+    /// Unix time in milliseconds after which the message must no longer be
+    /// delivered, from its Message Expiry Interval
+    pub expires_at: Option<u64>,
+}
+
+#[cfg(feature = "std")]
+impl Message {
+    /// Deadline for a message received now with these properties.
+    pub fn expiry_deadline(properties: &MessageProperties) -> Option<u64> {
+        properties
+            .message_expiry_interval
+            .as_ref()
+            .map(|interval| unix_millis() + u64::from(interval.value) * 1000)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|deadline| unix_millis() >= deadline)
+    }
+}
+
+/// Current Unix time in milliseconds.
+#[cfg(feature = "std")]
+pub fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// MQTT 5 properties that belong to the application message and are

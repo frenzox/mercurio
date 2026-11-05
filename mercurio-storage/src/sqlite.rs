@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder},
-    message::{Message, MessageProperties},
+    message::{unix_millis, Message, MessageProperties},
     qos::QoS,
     topic::topic_matches_filter,
 };
@@ -75,7 +75,8 @@ impl SqliteStore {
                 payload BLOB,
                 qos INTEGER NOT NULL,
                 dup INTEGER NOT NULL,
-                properties BLOB NOT NULL
+                properties BLOB NOT NULL,
+                expires_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS will_messages (
@@ -258,11 +259,19 @@ impl RetainedMessageStore for SqliteStore {
                 Some(msg) => {
                     let payload = msg.payload.as_ref().map(|b| b.to_vec());
                     let properties = encode_properties(&msg.properties);
+                    let expires_at = msg.expires_at.map(|t| t as i64);
                     conn.execute(
                         "INSERT OR REPLACE INTO retained_messages
-                         (topic, payload, qos, dup, properties)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![topic, payload, qos_to_int(msg.qos), msg.dup, properties],
+                         (topic, payload, qos, dup, properties, expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            topic,
+                            payload,
+                            qos_to_int(msg.qos),
+                            msg.dup,
+                            properties,
+                            expires_at
+                        ],
                     )?;
                 }
                 None => {
@@ -281,22 +290,26 @@ impl RetainedMessageStore for SqliteStore {
         let filter = topic_filter.to_string();
 
         self.blocking(move |conn| {
-            let mut stmt =
-                conn.prepare("SELECT topic, payload, qos, dup, properties FROM retained_messages")?;
+            let mut stmt = conn.prepare(
+                "SELECT topic, payload, qos, dup, properties, expires_at FROM retained_messages",
+            )?;
             let rows = stmt.query_map([], |row| {
                 let topic: String = row.get(0)?;
                 let payload: Option<Vec<u8>> = row.get(1)?;
                 let qos: i32 = row.get(2)?;
                 let dup: bool = row.get(3)?;
                 let properties: Vec<u8> = row.get(4)?;
-                Ok((topic, payload, qos, dup, properties))
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((topic, payload, qos, dup, properties, expires_at))
             })?;
 
             let mut messages = Vec::new();
 
             for row in rows {
-                let (topic, payload, qos, dup, properties) = row?;
-                if topic_matches_filter(&topic, &filter) {
+                let (topic, payload, qos, dup, properties, expires_at) = row?;
+                let expires_at = expires_at.map(|t| t as u64);
+                let expired = expires_at.is_some_and(|t| unix_millis() >= t);
+                if topic_matches_filter(&topic, &filter) && !expired {
                     messages.push(Message {
                         packet_id: None,
                         topic: Arc::from(topic.as_str()),
@@ -305,6 +318,7 @@ impl RetainedMessageStore for SqliteStore {
                         retain: true,
                         payload: payload.map(Bytes::from),
                         properties: decode_properties(properties),
+                        expires_at,
                     });
                 }
             }
@@ -539,6 +553,7 @@ mod tests {
             retain: false,
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
+            expires_at: None,
         }
     }
 

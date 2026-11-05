@@ -15,8 +15,8 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    message::{Message, MessageProperties},
-    properties::{AssignedClientIdentifier, MaximumPacketSize},
+    message::{unix_millis, Message, MessageProperties},
+    properties::{AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval},
     qos::QoS,
     reason::ReasonCode,
     topic::{validate_publish_topic, validate_subscribe_filter},
@@ -432,6 +432,7 @@ impl Session {
 
         // Publish to broker - convert topic to Arc<str> for cheap cloning to subscribers
         let topic: Arc<str> = packet.topic_name.into();
+        let properties = message_properties(packet.properties.as_ref());
         let message = Message {
             packet_id: packet.packet_id,
             topic: Arc::clone(&topic),
@@ -439,7 +440,8 @@ impl Session {
             retain: packet.retain,
             qos: packet.qos_level,
             payload: packet.payload,
-            properties: message_properties(packet.properties.as_ref()),
+            expires_at: Message::expiry_deadline(&properties),
+            properties,
         };
 
         broker.publish(&topic, message).await?;
@@ -742,7 +744,20 @@ impl Session {
 
     /// Turns a queued message into the PUBLISH to send, tracking it until
     /// acknowledged. Returns None if the message had to be dropped.
-    pub(crate) async fn prepare_publish(&mut self, message: Message) -> Option<Outgoing> {
+    pub(crate) async fn prepare_publish(&mut self, mut message: Message) -> Option<Outgoing> {
+        // Expired messages are never delivered, and the rest carry only the
+        // time they have left [MQTT-3.3.2-5, MQTT-3.3.2-6]
+        if let Some(deadline) = message.expires_at {
+            let now = unix_millis();
+            if now >= deadline {
+                return None;
+            }
+            let remaining_secs = (deadline - now).div_ceil(1000);
+            message.properties.message_expiry_interval = Some(MessageExpiryInterval::new(
+                remaining_secs.try_into().unwrap_or(u32::MAX),
+            ));
+        }
+
         let mut session = self.shared.state.lock().await;
 
         {
@@ -1114,6 +1129,7 @@ mod tests {
             retain,
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
+            expires_at: None,
         }
     }
 
@@ -1430,6 +1446,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_publish(&mut session).await.qos_level, QoS::AtMostOnce);
+    }
+
+    #[tokio::test]
+    async fn test_expired_messages_are_dropped_and_others_carry_remaining_time() {
+        let mut session = create_test_session();
+
+        let mut expired = message("t", QoS::AtMostOnce, None, false);
+        expired.expires_at = Some(unix_millis() - 1);
+        assert!(session.prepare_publish(expired).await.is_none());
+
+        let mut fresh = message("t", QoS::AtMostOnce, None, false);
+        fresh.expires_at = Some(unix_millis() + 5000);
+        let Some(ControlPacket::Publish(publish)) =
+            session.prepare_publish(fresh).await.map(|o| o.packet)
+        else {
+            panic!("Expected Publish");
+        };
+        let interval = publish.properties.unwrap().message_expiry_interval.unwrap();
+        assert_eq!(interval.value, 5);
     }
 
     #[tokio::test]

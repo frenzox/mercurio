@@ -107,6 +107,7 @@ mod tests {
             retain,
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
+            expires_at: None,
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
             retain: true,
             payload: Some(Bytes::new()), // Empty payload
             properties: Default::default(),
+            expires_at: None,
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 
