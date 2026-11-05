@@ -108,6 +108,41 @@ async fn sends_no_more_than_the_client_receive_maximum() {
 }
 
 #[tokio::test]
+async fn qos0_messages_are_not_held_back_by_a_full_window() {
+    let addr = start_broker(Limits::default()).await;
+
+    let mut subscriber = connect(addr, b's', Some(1)).await;
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x01])
+        .await
+        .unwrap();
+    let mut buffer = BytesMut::new();
+    next_packet(&mut subscriber, &mut buffer).await.unwrap();
+
+    let mut publisher = connect(addr, b'p', None).await;
+    // QoS 1 "1" and "2", then QoS 0 "3"
+    for (header, id, payload) in [(0x32, 1u8, b'1'), (0x32, 2, b'2')] {
+        publisher
+            .write_all(&[header, 0x07, 0x00, 0x01, b't', 0x00, id, 0x00, payload])
+            .await
+            .unwrap();
+    }
+    publisher
+        .write_all(&[0x30, 0x05, 0x00, 0x01, b't', 0x00, b'3'])
+        .await
+        .unwrap();
+
+    let mut payloads = Vec::new();
+    while let Some(ControlPacket::Publish(publish)) =
+        next_packet(&mut subscriber, &mut buffer).await
+    {
+        payloads.push(publish.payload.unwrap()[0]);
+    }
+    // "2" waits for "1" to be acknowledged, "3" doesn't
+    assert_eq!(payloads, [b'1', b'3']);
+}
+
+#[tokio::test]
 async fn client_exceeding_the_broker_receive_maximum_is_disconnected() {
     let addr = start_broker(Limits {
         receive_maximum: 1,

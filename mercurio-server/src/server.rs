@@ -751,9 +751,8 @@ where
                 }
 
                 // Try to send outgoing packet
-                // ponytail: QoS 0 messages wait behind a full window too, which
-                // keeps ordering; split the queue if they should overtake
-                message = session.next_outgoing(), if window_open => {
+                // With the client's window full only QoS 0 messages can go out
+                message = session.next_outgoing(window_open) => {
                     // Checked per message: a permitted subscription can still
                     // match topics the client may not read
                     if let Some(authorizer) = &self.auth_config.authorizer {
