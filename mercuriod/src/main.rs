@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Authentication enabled");
         ServerAuthConfig {
             require_auth: true,
+            allow_anonymous: config.auth.allow_anonymous,
             credential_validator,
             auth_manager: None,
         }
