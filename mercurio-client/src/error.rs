@@ -13,6 +13,12 @@ pub enum ClientError {
     #[error("Connection refused: {0:?}")]
     ConnectionRefused(ReasonCode),
 
+    #[error("Connection refused ({reason:?}), use {server_reference} instead")]
+    Redirected {
+        reason: ReasonCode,
+        server_reference: String,
+    },
+
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 
