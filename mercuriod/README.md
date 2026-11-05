@@ -46,6 +46,19 @@ port = 1883
 # Maximum number of concurrent connections
 max_connections = 10000
 
+# Largest packet accepted from a client, in bytes
+max_packet_size = 1048576
+
+# Messages that may wait for one client (QoS 1 and 2 included) before
+# further ones are dropped
+max_queued_messages = 10000
+
+# Queued messages beyond which QoS 0 messages are dropped
+max_queued_qos0_messages = 1000
+
+# Seconds a new connection has to complete TLS and send CONNECT
+connect_timeout = 10
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"
