@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
+use mercurio_core::codec::VariableByteInteger;
+use mercurio_core::properties::{SessionExpiryInterval, SubscriptionIdentifier};
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
 use mercurio_packets::connack::ConnAckProperties;
-use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, WillProperties};
+use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
 use mercurio_packets::disconnect::DisconnectPacket;
 use mercurio_packets::pingreq::PingReqPacket;
 use mercurio_packets::puback::PubAckPacket;
@@ -14,7 +16,9 @@ use mercurio_packets::pubcomp::PubCompPacket;
 use mercurio_packets::publish::PublishPacket;
 use mercurio_packets::pubrec::PubRecPacket;
 use mercurio_packets::pubrel::PubRelPacket;
-use mercurio_packets::subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions};
+use mercurio_packets::subscribe::{
+    SubscribePacket, SubscribePayload, SubscribeProperties, SubscriptionOptions,
+};
 use mercurio_packets::unsubscribe::{UnsubscribePacket, UnsubscribePayload};
 use mercurio_packets::ControlPacket;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -26,14 +30,15 @@ use tracing::{debug, error, info, warn};
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::event::{DisconnectReason, Event, SubscribeResult};
-use crate::options::ConnectOptions;
+use crate::options::{ConnectOptions, MessageProperties, Will};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
 enum Command {
     Publish(PublishRequest),
     Subscribe {
-        topics: Vec<(String, QoS)>,
+        topics: Vec<(String, SubscriptionOptions)>,
+        subscription_id: Option<u32>,
         response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
     },
     Unsubscribe {
@@ -227,7 +232,7 @@ impl MqttClient {
 
         let payload = ConnectPayload {
             client_id: options.client_id.clone().unwrap_or_default(),
-            will_properties: options.will.as_ref().map(|_| WillProperties::default()),
+            will_properties: options.will.as_ref().map(Will::to_properties),
             will_topic: options.will.as_ref().map(|w| w.topic.clone()),
             will_payload: options.will.as_ref().map(|w| w.payload.clone()),
             user_name: options.username.clone(),
@@ -238,7 +243,10 @@ impl MqttClient {
             protocol_version: options.protocol_version,
             flags,
             keepalive: options.keep_alive,
-            properties: None,
+            properties: (options.session_expiry > 0).then(|| ConnectProperties {
+                session_expiry_interval: Some(SessionExpiryInterval::new(options.session_expiry)),
+                ..Default::default()
+            }),
             payload,
         }
     }
@@ -324,8 +332,8 @@ impl MqttClient {
                 Some(cmd) = command_rx.recv() => {
                     match cmd {
                         Command::Publish(request) => state.publish(request).await,
-                        Command::Subscribe { topics, response } => {
-                            state.subscribe(topics, response).await;
+                        Command::Subscribe { topics, subscription_id, response } => {
+                            state.subscribe(topics, subscription_id, response).await;
                         }
                         Command::Unsubscribe { topics, response } => {
                             state.unsubscribe(topics, response).await;
@@ -402,6 +410,19 @@ impl MqttClient {
         qos: QoS,
         retain: bool,
     ) -> Result<()> {
+        self.publish_with_properties(topic, payload, qos, retain, MessageProperties::default())
+            .await
+    }
+
+    /// Publish a message with MQTT 5 properties.
+    pub async fn publish_with_properties(
+        &self,
+        topic: &str,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+        properties: MessageProperties,
+    ) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Publish(PublishRequest {
@@ -409,6 +430,7 @@ impl MqttClient {
                 payload: payload.into(),
                 qos,
                 retain,
+                properties,
                 response: response_tx,
             }))
             .await
@@ -419,10 +441,31 @@ impl MqttClient {
 
     /// Subscribe to one or more topics.
     pub async fn subscribe(&self, topics: &[(&str, QoS)]) -> Result<Vec<SubscribeResult>> {
+        let topics: Vec<_> = topics
+            .iter()
+            .map(|(t, qos)| {
+                let options = SubscriptionOptions {
+                    qos: *qos,
+                    ..Default::default()
+                };
+                (*t, options)
+            })
+            .collect();
+        self.subscribe_with(&topics, None).await
+    }
+
+    /// Subscribe with MQTT 5 subscription options, optionally tagging the
+    /// subscription so matching messages carry `subscription_id`.
+    pub async fn subscribe_with(
+        &self,
+        topics: &[(&str, SubscriptionOptions)],
+        subscription_id: Option<u32>,
+    ) -> Result<Vec<SubscribeResult>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Subscribe {
-                topics: topics.iter().map(|(t, q)| (t.to_string(), *q)).collect(),
+                topics: topics.iter().map(|(t, o)| (t.to_string(), *o)).collect(),
+                subscription_id,
                 response: response_tx,
             })
             .await
@@ -495,6 +538,7 @@ struct PublishRequest {
     payload: Bytes,
     qos: QoS,
     retain: bool,
+    properties: MessageProperties,
     response: oneshot::Sender<Result<()>>,
 }
 
@@ -507,6 +551,7 @@ pub(crate) struct BrokerLimits {
     retain_available: bool,
     wildcard_subscriptions: bool,
     shared_subscriptions: bool,
+    subscription_identifiers: bool,
 }
 
 impl BrokerLimits {
@@ -531,6 +576,9 @@ impl BrokerLimits {
                 .is_none_or(|w| w.value),
             shared_subscriptions: p
                 .and_then(|p| p.shared_subscription_available.as_ref())
+                .is_none_or(|s| s.value),
+            subscription_identifiers: p
+                .and_then(|p| p.subscription_identifier_available.as_ref())
                 .is_none_or(|s| s.value),
         }
     }
@@ -602,6 +650,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
             payload,
             qos,
             retain,
+            properties,
             response,
         } = request;
         let packet_id = match qos {
@@ -623,7 +672,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
             retain,
             topic_name: topic,
             packet_id,
-            properties: None,
+            properties: properties.to_publish(),
             payload: Some(payload),
         };
         if let Err(e) = self
@@ -648,7 +697,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
 
     async fn subscribe(
         &mut self,
-        topics: Vec<(String, QoS)>,
+        topics: Vec<(String, SubscriptionOptions)>,
+        subscription_id: Option<u32>,
         response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
     ) {
         let uses_wildcards = topics
@@ -663,6 +713,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
             )));
             return;
         }
+        if subscription_id.is_some() && !self.limits.subscription_identifiers {
+            let _ = response.send(Err(ClientError::NotSupported("subscription identifiers")));
+            return;
+        }
 
         let Some(packet_id) = self.next_packet_id() else {
             let _ = response.send(Err(ClientError::Protocol(
@@ -673,19 +727,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
 
         let payload = topics
             .iter()
-            .map(|(topic, qos)| SubscribePayload {
+            .map(|(topic, options)| SubscribePayload {
                 topic_filter: topic.clone(),
-                subs_opt: SubscriptionOptions {
-                    qos: *qos,
-                    ..Default::default()
-                },
+                subs_opt: *options,
             })
             .collect();
         let subscribe = SubscribePacket {
             packet_id,
-            properties: None,
+            properties: subscription_id.map(|id| SubscribeProperties {
+                subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(id))),
+                user_property: None,
+            }),
             payload,
         };
+        let topics = topics.into_iter().map(|(t, o)| (t, o.qos)).collect();
         match self
             .connection
             .write_packet(ControlPacket::Subscribe(subscribe))
@@ -867,6 +922,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
         };
 
         if deliver {
+            let subscription_id = publish
+                .properties
+                .as_ref()
+                .and_then(|p| p.subscription_identifier.as_ref())
+                .map(|s| s.value.0);
             let _ = self
                 .event_tx
                 .send(Event::Message {
@@ -874,6 +934,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
                     payload: publish.payload.unwrap_or_default(),
                     qos: publish.qos_level,
                     retain: publish.retain,
+                    properties: MessageProperties::from_publish(publish.properties),
+                    subscription_id,
                 })
                 .await;
         }

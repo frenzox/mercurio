@@ -171,12 +171,11 @@ async fn run_subscribe(
     // Configure will message if topic is provided
     if let Some(topic) = will.will_topic {
         let payload = will.will_message.unwrap_or_default();
-        options = options.will(Will {
-            topic,
-            payload: Bytes::from(payload),
-            qos: parse_qos(will.will_qos)?,
-            retain: will.will_retain,
-        });
+        options = options.will(
+            Will::new(topic, Bytes::from(payload))
+                .qos(parse_qos(will.will_qos)?)
+                .retain(will.will_retain),
+        );
     }
 
     let client = MqttClient::connect(options).await?;

@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use mercurio_core::{qos::QoS, reason::ReasonCode};
 
+use crate::options::MessageProperties;
+
 /// Events received from the MQTT broker.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -10,6 +12,9 @@ pub enum Event {
         payload: Bytes,
         qos: QoS,
         retain: bool,
+        properties: MessageProperties,
+        /// Identifier of the subscription that matched, if it had one
+        subscription_id: Option<u32>,
     },
 
     /// The client was disconnected from the broker.
