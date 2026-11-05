@@ -25,3 +25,4 @@ thiserror = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mercurio-server = { path = "../mercurio-server" }
