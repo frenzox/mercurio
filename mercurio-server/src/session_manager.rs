@@ -10,29 +10,34 @@ use tokio::{
 use tracing::info;
 use uuid::Uuid;
 
-use mercurio_core::{message::unix_millis, Result};
+use mercurio_core::{message::unix_millis, protocol::ProtocolVersion, Result};
 use mercurio_packets::connect::ConnectPacket;
+use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
-    InflightMessage, InflightStore, SessionState, SessionStore, StoredSubscription,
-    StoredWillMessage, WillStore,
+    InflightMessage, InflightStore, QueueStore, RetainedMessageStore, SessionState, SessionStore,
+    StoredSubscription, StoredWillMessage, WillStore,
 };
+use tokio::sync::mpsc;
+use tracing::error;
 
 use crate::{
-    queue::QueueLimits,
+    broker::Broker,
+    queue::{JournalEvent, QueueLimits},
     session::{Session, SessionDropGuard, WillMessage},
 };
 
-pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore + InflightStore> {
+pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore + InflightStore + QueueStore>
+{
     session_manager: SessionManager<S>,
 }
 
-pub(crate) struct SessionManager<S: SessionStore + WillStore + InflightStore> {
+pub(crate) struct SessionManager<S: SessionStore + WillStore + InflightStore + QueueStore> {
     shared: Arc<Shared>,
     storage: Arc<S>,
     queue_limits: QueueLimits,
 }
 
-impl<S: SessionStore + WillStore + InflightStore> Clone for SessionManager<S> {
+impl<S: SessionStore + WillStore + InflightStore + QueueStore> Clone for SessionManager<S> {
     fn clone(&self) -> Self {
         SessionManager {
             shared: Arc::clone(&self.shared),
@@ -74,7 +79,9 @@ pub(crate) struct ConnectionLease {
     pub takeover: watch::Receiver<bool>,
 }
 
-impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManagerDropGuard<S> {
+impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static>
+    SessionManagerDropGuard<S>
+{
     pub(crate) fn new(storage: Arc<S>, queue_limits: QueueLimits) -> SessionManagerDropGuard<S> {
         SessionManagerDropGuard {
             session_manager: SessionManager::with_queue_limits(storage, queue_limits),
@@ -101,7 +108,7 @@ pub(crate) struct SessionStartResult {
     pub inflight_to_retry: Vec<InflightMessage>,
 }
 
-impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
+impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> SessionManager<S> {
     #[cfg(test)]
     pub(crate) fn new(storage: Arc<S>) -> SessionManager<S> {
         Self::with_queue_limits(storage, QueueLimits::default())
@@ -158,6 +165,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         let mut resume = false;
         let mut subscriptions_to_restore = Vec::new();
         let mut inflight_to_retry = Vec::new();
+        let mut queue_to_restore = Vec::new();
 
         if connect_packet.flags.clean_start {
             if let Some(discarded) = manager.sessions.remove(client_id) {
@@ -180,6 +188,8 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
                     subscriptions_to_restore = stored_session.subscriptions;
                     resume = true;
 
+                    queue_to_restore = self.storage.load_queue(client_id).await.unwrap_or_default();
+
                     // Restore inflight messages for retry
                     if let Ok(inflight) = self.storage.get_all_inflight(client_id).await {
                         if !inflight.is_empty() {
@@ -200,6 +210,8 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             std::collections::hash_map::Entry::Occupied(e) => {
                 let mut s = e.into_mut().session();
                 s.set_connect_packet(connect_packet).await;
+                // The client is back to take its queue from memory
+                s.stop_queue_journal();
                 s
             }
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -210,6 +222,10 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         drop(manager);
         session.set_generation(lease.generation).await;
+        if !queue_to_restore.is_empty() {
+            session.restore_queue(queue_to_restore);
+            let _ = self.storage.clear_queue(&client_id).await;
+        }
 
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
@@ -291,6 +307,16 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         // over can never observe a session that is about to vanish
         if expiry == Some(Duration::ZERO) {
             self.end_session(&client_id, generation).await;
+        } else if self.storage.is_durable() {
+            // Messages for the client now wait in its queue until it returns;
+            // keep them on disk meanwhile, unless another connection already
+            // took the session over
+            let manager = self.shared.state.lock().await;
+            if let Some(session) = manager.sessions.get(&client_id).map(|s| s.session()) {
+                if session.generation().await == generation {
+                    session.start_queue_journal(self.spawn_queue_writer(client_id.clone()));
+                }
+            }
         }
         drop(guard);
 
@@ -329,7 +355,10 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     /// Schedules the expiry of sessions persisted by a previous run, and
     /// discards those that expired while the broker was down. Returns the
     /// wills those sessions left behind, with when they are due.
-    pub(crate) async fn restore_from_storage(&self) -> Vec<(String, WillMessage, Duration)> {
+    pub(crate) async fn restore_from_storage<B: RetainedMessageStore>(
+        &self,
+        broker: &Broker<B>,
+    ) -> Vec<(String, WillMessage, Duration)> {
         let Ok(client_ids) = self.storage.list_sessions().await else {
             return Vec::new();
         };
@@ -346,6 +375,12 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
                 .expires_at
                 .or_else(|| state.expiry_interval.map(|i| now + u64::from(i) * 1000));
             let until_expiry = deadline.map(|d| Duration::from_millis(d.saturating_sub(now)));
+
+            // Live sessions go back in memory, subscribed, so messages keep
+            // being queued for their clients until they reconnect
+            if deadline.is_none_or(|d| d > now) {
+                self.restore_session(&client_id, state, broker).await;
+            }
 
             // The clients were disconnected by the shutdown, so their wills
             // are due after their delay, or when the session ends if sooner
@@ -368,6 +403,73 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         }
 
         wills
+    }
+
+    /// Recreates the in-memory state of a session persisted by a previous
+    /// run, whose client has not reconnected yet.
+    async fn restore_session<B: RetainedMessageStore>(
+        &self,
+        client_id: &str,
+        state: SessionState,
+        broker: &Broker<B>,
+    ) {
+        // Stands in for the client's CONNECT until it sends a new one
+        let connect_packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V5,
+            flags: ConnectFlags::default(),
+            keepalive: 0,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: client_id.to_string(),
+                ..Default::default()
+            },
+        };
+        let mut session = SessionDropGuard::new(connect_packet, self.queue_limits).session();
+
+        if let Err(e) = session
+            .restore_subscriptions(state.subscriptions, broker)
+            .await
+        {
+            error!("Failed to restore subscriptions of `{}`: {}", client_id, e);
+        }
+        session.restore_queue(self.storage.load_queue(client_id).await.unwrap_or_default());
+        session
+            .restore_inflight(
+                self.storage
+                    .get_all_inflight(client_id)
+                    .await
+                    .unwrap_or_default(),
+            )
+            .await;
+        session.start_queue_journal(self.spawn_queue_writer(client_id.to_string()));
+
+        self.shared
+            .state
+            .lock()
+            .await
+            .sessions
+            .insert(client_id.to_string(), SessionDropGuard::from(session));
+    }
+
+    /// Applies a queue's journal to storage, in order, until the session
+    /// stops journaling.
+    fn spawn_queue_writer(&self, client_id: String) -> mpsc::UnboundedSender<JournalEvent> {
+        let (journal, mut events) = mpsc::unbounded_channel();
+        let storage = Arc::clone(&self.storage);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let result = match event {
+                    JournalEvent::Enqueued(sequence, message) => {
+                        storage.enqueue(&client_id, sequence, &message).await
+                    }
+                    JournalEvent::Clear => storage.clear_queue(&client_id).await,
+                };
+                if let Err(e) = result {
+                    error!("Failed to store the queue of `{}`: {}", client_id, e);
+                }
+            }
+        });
+        journal
     }
 
     /// Claims a will returned by `restore_from_storage` for publishing.
@@ -399,6 +501,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         info!("Session for client `{}` ended", client_id);
         if let Some(ended) = manager.sessions.remove(client_id) {
+            ended.session().stop_queue_journal();
             ended.session().unsubscribe_all().await;
         }
         self.discard_stored(client_id).await;
@@ -408,6 +511,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     async fn discard_stored(&self, client_id: &str) {
         let _ = self.storage.delete_session(client_id).await;
         let _ = self.storage.delete_will(client_id).await;
+        let _ = self.storage.clear_queue(client_id).await;
         if let Ok(inflight) = self.storage.get_all_inflight(client_id).await {
             for message in inflight {
                 let _ = self
@@ -713,7 +817,8 @@ mod tests {
         }
 
         let manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
-        manager.restore_from_storage().await;
+        let broker = crate::broker::Broker::new(storage.clone());
+        manager.restore_from_storage(&broker).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(storage.load_session("expired").await.unwrap().is_none());
@@ -767,8 +872,9 @@ mod tests {
         save_persistent_session(&storage, "b", 3600).await;
         storage.store_will("b", &stored_will(5)).await.unwrap();
 
+        let broker = crate::broker::Broker::new(storage.clone());
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
-        let mut wills = manager.restore_from_storage().await;
+        let mut wills = manager.restore_from_storage(&broker).await;
         wills.sort_by(|x, y| x.0.cmp(&y.0));
         let due: Vec<(&str, u64)> = wills
             .iter()

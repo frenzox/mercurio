@@ -9,7 +9,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Mutex,
+    sync::{mpsc::UnboundedSender, Mutex},
     time::Duration,
 };
 use tracing::{info, warn};
@@ -50,7 +50,7 @@ use crate::{
     auth::{AuthExchange, AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
-    queue::{MessageQueue, QueueLimits, Subscriber},
+    queue::{JournalEvent, MessageQueue, QueueLimits, Subscriber},
     server::Limits,
     topic_tree::TopicTree,
 };
@@ -220,6 +220,12 @@ struct State {
     auth_exchange: Option<Box<dyn AuthExchange>>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
+}
+
+impl From<Session> for SessionDropGuard {
+    fn from(session: Session) -> Self {
+        SessionDropGuard { session }
+    }
 }
 
 impl SessionDropGuard {
@@ -582,6 +588,20 @@ impl Session {
             client_id: session.client_id.clone(),
             username: session.verified_user.clone(),
         }
+    }
+
+    /// Starts keeping the queue on disk while the client is away.
+    pub(crate) fn start_queue_journal(&self, journal: UnboundedSender<JournalEvent>) {
+        self.shared.queue.start_journal(journal);
+    }
+
+    pub(crate) fn stop_queue_journal(&self) {
+        self.shared.queue.stop_journal();
+    }
+
+    /// Puts back messages queued for the client before a restart.
+    pub(crate) fn restore_queue(&self, messages: Vec<(u64, Message)>) {
+        self.shared.queue.restore(messages);
     }
 
     /// Records the user name authentication verified for this connection.

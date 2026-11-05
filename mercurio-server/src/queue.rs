@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::Notify;
+use tokio::sync::{mpsc::UnboundedSender, Notify};
 use tracing::warn;
 
 use mercurio_core::{message::Message, qos::QoS};
@@ -34,9 +34,26 @@ impl Default for QueueLimits {
 /// lost, are dropped first; QoS 1 and 2 messages only once the queue is at
 /// its hard limit.
 pub(crate) struct MessageQueue {
-    messages: Mutex<VecDeque<Message>>,
+    state: Mutex<QueueState>,
     notify: Notify,
     limits: QueueLimits,
+}
+
+#[derive(Default)]
+struct QueueState {
+    /// Messages with their sequence in this queue
+    messages: VecDeque<(u64, Message)>,
+    next_sequence: u64,
+    /// Where QoS 1 and 2 messages are recorded while the client is away
+    journal: Option<UnboundedSender<JournalEvent>>,
+}
+
+/// A change to a queue to apply to its stored copy.
+#[derive(Debug)]
+pub(crate) enum JournalEvent {
+    Enqueued(u64, Box<Message>),
+    /// The stored copy is no longer needed
+    Clear,
 }
 
 impl Default for MessageQueue {
@@ -48,28 +65,70 @@ impl Default for MessageQueue {
 impl MessageQueue {
     pub(crate) fn new(limits: QueueLimits) -> Self {
         Self {
-            messages: Mutex::default(),
+            state: Mutex::default(),
             notify: Notify::new(),
             limits,
         }
     }
 
     pub(crate) fn push(&self, message: Message) {
-        let mut messages = self.messages.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let limit = if message.qos == QoS::AtMostOnce {
             self.limits.max_qos0
         } else {
             self.limits.max_messages
         };
-        if messages.len() >= limit {
+        if state.messages.len() >= limit {
             warn!(
                 "Message queue full, dropping QoS {} message on `{}`",
                 message.qos as u8, message.topic
             );
             return;
         }
-        messages.push_back(message);
-        drop(messages);
+
+        let sequence = state.next_sequence;
+        state.next_sequence += 1;
+        // QoS 0 messages may be lost, so only QoS 1 and 2 are kept
+        if let Some(journal) = state
+            .journal
+            .as_ref()
+            .filter(|_| message.qos != QoS::AtMostOnce)
+        {
+            let _ = journal.send(JournalEvent::Enqueued(sequence, Box::new(message.clone())));
+        }
+        state.messages.push_back((sequence, message));
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    /// Starts recording QoS 1 and 2 messages in `journal`, beginning with
+    /// those already queued. Used while the client is disconnected.
+    pub(crate) fn start_journal(&self, journal: UnboundedSender<JournalEvent>) {
+        let mut state = self.state.lock().unwrap();
+        for (sequence, message) in &state.messages {
+            if message.qos != QoS::AtMostOnce {
+                let _ = journal.send(JournalEvent::Enqueued(*sequence, Box::new(message.clone())));
+            }
+        }
+        state.journal = Some(journal);
+    }
+
+    /// Stops recording and discards the recorded copy, once the client is
+    /// back to receive the queue or the session is gone.
+    pub(crate) fn stop_journal(&self) {
+        if let Some(journal) = self.state.lock().unwrap().journal.take() {
+            let _ = journal.send(JournalEvent::Clear);
+        }
+    }
+
+    /// Puts back messages recorded by a previous run, keeping their order.
+    pub(crate) fn restore(&self, messages: Vec<(u64, Message)>) {
+        let mut state = self.state.lock().unwrap();
+        for (sequence, message) in messages {
+            state.next_sequence = state.next_sequence.max(sequence + 1);
+            state.messages.push_back((sequence, message));
+        }
+        drop(state);
         self.notify.notify_one();
     }
 
@@ -80,15 +139,18 @@ impl MessageQueue {
     pub(crate) async fn pop(&self, qos0_only: bool) -> Message {
         loop {
             {
-                let mut messages = self.messages.lock().unwrap();
+                let mut state = self.state.lock().unwrap();
                 let position = if qos0_only {
-                    messages.iter().position(|m| m.qos == QoS::AtMostOnce)
-                } else if messages.is_empty() {
+                    state
+                        .messages
+                        .iter()
+                        .position(|(_, m)| m.qos == QoS::AtMostOnce)
+                } else if state.messages.is_empty() {
                     None
                 } else {
                     Some(0)
                 };
-                if let Some(message) = position.and_then(|p| messages.remove(p)) {
+                if let Some((_, message)) = position.and_then(|p| state.messages.remove(p)) {
                     return message;
                 }
             }
@@ -182,8 +244,8 @@ mod tests {
         queue.push(message(QoS::AtLeastOnce));
         queue.push(message(QoS::ExactlyOnce));
 
-        let messages = queue.messages.lock().unwrap();
-        let qos: Vec<QoS> = messages.iter().map(|m| m.qos).collect();
+        let state = queue.state.lock().unwrap();
+        let qos: Vec<QoS> = state.messages.iter().map(|(_, m)| m.qos).collect();
         assert_eq!(qos, [QoS::AtMostOnce, QoS::AtMostOnce, QoS::AtLeastOnce]);
     }
 
@@ -198,6 +260,43 @@ mod tests {
             .await
             .is_err());
         assert_eq!(queue.pop(false).await.qos, QoS::AtLeastOnce);
+    }
+
+    #[tokio::test]
+    async fn test_journal_records_qos12_while_active() {
+        let queue = MessageQueue::default();
+        queue.push(message(QoS::AtLeastOnce));
+        queue.push(message(QoS::AtMostOnce));
+
+        let (journal, mut events) = tokio::sync::mpsc::unbounded_channel();
+        queue.start_journal(journal);
+        queue.push(message(QoS::ExactlyOnce));
+        queue.stop_journal();
+        queue.push(message(QoS::AtLeastOnce));
+
+        let mut recorded = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            recorded.push(match event {
+                JournalEvent::Enqueued(sequence, m) => format!("{sequence}:{}", m.qos as u8),
+                JournalEvent::Clear => "clear".to_string(),
+            });
+        }
+        // The queued QoS 1 message, then the new QoS 2 one; QoS 0 is skipped
+        assert_eq!(recorded, ["0:1", "2:2", "clear"]);
+    }
+
+    #[tokio::test]
+    async fn test_restore_keeps_order_and_sequences() {
+        let queue = MessageQueue::default();
+        queue.restore(vec![
+            (5, message(QoS::AtLeastOnce)),
+            (9, message(QoS::ExactlyOnce)),
+        ]);
+        queue.push(message(QoS::AtMostOnce));
+
+        let state = queue.state.lock().unwrap();
+        let sequences: Vec<u64> = state.messages.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sequences, [5, 9, 10]);
     }
 
     #[tokio::test]
