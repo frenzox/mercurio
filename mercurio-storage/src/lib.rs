@@ -85,6 +85,9 @@ pub struct StoredWillMessage {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// Seconds to wait after the connection ends before publishing
+    pub delay_secs: u32,
+    pub properties: MessageProperties,
 }
 
 /// Inflight message for QoS 1/2 tracking.

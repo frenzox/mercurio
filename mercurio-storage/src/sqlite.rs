@@ -86,7 +86,9 @@ impl SqliteStore {
                 topic TEXT NOT NULL,
                 payload BLOB NOT NULL,
                 qos INTEGER NOT NULL,
-                retain INTEGER NOT NULL
+                retain INTEGER NOT NULL,
+                delay_secs INTEGER NOT NULL,
+                properties BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS inflight_messages (
@@ -381,12 +383,15 @@ impl WillStore for SqliteStore {
         let payload = will.payload.to_vec();
         let qos = qos_to_int(will.qos);
         let retain = will.retain;
+        let delay_secs = will.delay_secs;
+        let properties = encode_properties(&will.properties);
 
         self.blocking(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO will_messages (client_id, topic, payload, qos, retain)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![client_id, topic, payload, qos, retain],
+                "INSERT OR REPLACE INTO will_messages
+                 (client_id, topic, payload, qos, retain, delay_secs, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![client_id, topic, payload, qos, retain, delay_secs, properties],
             )?;
             Ok(())
         })
@@ -398,27 +403,26 @@ impl WillStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, retain FROM will_messages WHERE client_id = ?1",
+                "SELECT topic, payload, qos, retain, delay_secs, properties
+                 FROM will_messages WHERE client_id = ?1",
             )?;
 
             let result = stmt
                 .query_row(params![client_id], |row| {
-                    let topic: String = row.get(0)?;
                     let payload: Vec<u8> = row.get(1)?;
-                    let qos: i32 = row.get(2)?;
-                    let retain: bool = row.get(3)?;
-                    Ok((topic, payload, qos, retain))
+                    let properties: Vec<u8> = row.get(5)?;
+                    Ok(StoredWillMessage {
+                        topic: row.get(0)?,
+                        payload: Bytes::from(payload),
+                        qos: int_to_qos(row.get(2)?),
+                        retain: row.get(3)?,
+                        delay_secs: row.get(4)?,
+                        properties: decode_properties(properties),
+                    })
                 })
                 .optional()?;
 
-            Ok(
-                result.map(|(topic, payload, qos, retain)| StoredWillMessage {
-                    topic,
-                    payload: Bytes::from(payload),
-                    qos: int_to_qos(qos),
-                    retain,
-                }),
-            )
+            Ok(result)
         })
         .await
     }
@@ -703,12 +707,18 @@ mod tests {
             payload: Bytes::from("offline"),
             qos: QoS::AtLeastOnce,
             retain: true,
+            delay_secs: 30,
+            properties: MessageProperties {
+                content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
+                ..Default::default()
+            },
         };
 
         store.store_will("client1", &will).await.unwrap();
-        let loaded = store.get_will("client1").await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().topic, "client/status");
+        let loaded = store.get_will("client1").await.unwrap().unwrap();
+        assert_eq!(loaded.topic, "client/status");
+        assert_eq!(loaded.delay_secs, 30);
+        assert_eq!(loaded.properties, will.properties);
 
         store.delete_will("client1").await.unwrap();
         let loaded = store.get_will("client1").await.unwrap();

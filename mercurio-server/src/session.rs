@@ -110,6 +110,8 @@ impl From<WillMessage> for StoredWillMessage {
             payload: will.payload,
             qos: will.qos,
             retain: will.retain,
+            delay_secs: will.delay.as_secs().try_into().unwrap_or(u32::MAX),
+            properties: will.properties,
         }
     }
 }
@@ -121,10 +123,8 @@ impl From<StoredWillMessage> for WillMessage {
             payload: stored.payload,
             qos: stored.qos,
             retain: stored.retain,
-            // ponytail: storage doesn't keep the delay or properties, so wills
-            // restored after a restart publish immediately and without them
-            delay: Duration::ZERO,
-            properties: MessageProperties::default(),
+            delay: Duration::from_secs(stored.delay_secs.into()),
+            properties: stored.properties,
         }
     }
 }
@@ -297,12 +297,6 @@ impl Session {
     pub(crate) async fn get_will(&self) -> Option<WillMessage> {
         let session = self.shared.state.lock().await;
         session.will_message.clone()
-    }
-
-    /// Set the will message. Called when restoring from storage.
-    pub(crate) async fn set_will(&self, will: WillMessage) {
-        let mut session = self.shared.state.lock().await;
-        session.will_message = Some(will);
     }
 
     /// Returns a clone of the client ID. For logging, prefer using the cached version.

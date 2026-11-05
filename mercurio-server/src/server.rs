@@ -176,11 +176,18 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         limits,
     };
 
-    server
-        .session_manager_holder
-        .session_manager()
-        .restore_expiry()
-        .await;
+    let session_manager = server.session_manager_holder.session_manager();
+    for (client_id, will, due) in session_manager.restore_from_storage().await {
+        let broker = server.broker.clone();
+        let session_manager = session_manager.clone();
+        tokio::spawn(async move {
+            time::sleep(due).await;
+            if session_manager.take_restored_will(&client_id).await {
+                publish_will(&broker, will, &client_id).await;
+                let _ = session_manager.delete_will(&client_id).await;
+            }
+        });
+    }
 
     tokio::select! {
         _ = server.run() => {}
@@ -431,11 +438,6 @@ where
                 session
                     .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker)
                     .await?;
-            }
-
-            // Restore will message if resuming a persisted session
-            if let Some(will) = start_result.will_to_restore {
-                session.set_will(will).await;
             }
 
             // Resend whatever the client hadn't acknowledged when it left
