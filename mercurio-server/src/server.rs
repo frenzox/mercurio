@@ -97,6 +97,16 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     pub auth: AuthConfig,
     pub limits: Limits,
+    pub policy: ConnectPolicy,
+}
+
+/// What the broker tells clients when they connect, beyond limits.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectPolicy {
+    /// Returned to MQTT 5 clients that ask for Response Information, with
+    /// `%c` replaced by their client id: a topic prefix they may use for the
+    /// responses of request/response exchanges.
+    pub response_information: Option<String>,
 }
 
 struct Listener<St: MqttStore + 'static> {
@@ -108,6 +118,7 @@ struct Listener<St: MqttStore + 'static> {
     shutdown_complete: mpsc::Sender<()>,
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
+    policy: Arc<ConnectPolicy>,
     limits: Limits,
     /// One permit per allowed concurrent connection, when limited
     connection_slots: Option<Arc<Semaphore>>,
@@ -123,6 +134,7 @@ where
     connection: Connection<S>,
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
+    policy: Arc<ConnectPolicy>,
     limits: Limits,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
@@ -151,7 +163,9 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         tls: tls_config,
         auth: auth_config,
         limits,
+        policy,
     } = config;
+    let policy = Arc::new(policy);
 
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
@@ -187,6 +201,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         shutdown_complete,
         tls_acceptor,
         auth_config,
+        policy,
         limits,
     };
 
@@ -251,6 +266,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
             let shutdown_complete = self.shutdown_complete.clone();
             let auth_config = Arc::clone(&self.auth_config);
+            let policy = Arc::clone(&self.policy);
             let limits = self.limits;
 
             if let Some(ref tls_acceptor) = self.tls_acceptor {
@@ -267,6 +283,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                                 connection: Connection::new_tls(tls_stream),
                                 shutdown,
                                 auth_config,
+                                policy,
                                 limits,
                                 _shutdown_complete: shutdown_complete,
                             };
@@ -290,6 +307,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         connection: Connection::new(socket),
                         shutdown,
                         auth_config,
+                        policy,
                         limits,
                         _shutdown_complete: shutdown_complete,
                     };
@@ -497,6 +515,7 @@ where
                     start_result.resume,
                     start_result.assigned_client_id,
                     &self.limits,
+                    &self.policy,
                 )
                 .await?;
 

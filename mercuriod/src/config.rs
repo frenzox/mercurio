@@ -87,6 +87,10 @@ pub struct ServerConfig {
     /// Longest keep-alive, in seconds, MQTT 5 clients may use
     pub max_keepalive: Option<u16>,
 
+    /// Response topic prefix for MQTT 5 clients that ask for one; `%c` is
+    /// replaced by the client id
+    pub response_information: Option<String>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -105,6 +109,7 @@ impl Default for ServerConfig {
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
             max_keepalive: None,
+            response_information: None,
             tls: TlsServerConfig::default(),
         }
     }

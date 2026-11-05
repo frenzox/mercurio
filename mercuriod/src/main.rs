@@ -9,7 +9,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
-use mercurio_server::server::{AuthConfig as ServerAuthConfig, ServerConfig};
+use mercurio_server::server::{AuthConfig as ServerAuthConfig, ConnectPolicy, ServerConfig};
 use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
@@ -115,6 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build TLS configuration if enabled
     let limits = config.server.limits();
+    let policy = ConnectPolicy {
+        response_information: config.server.response_information.clone(),
+    };
 
     let tls_config = if config.server.tls.enabled {
         let cert_path = config
@@ -184,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls: tls_config,
         auth: auth_config,
         limits,
+        policy,
     };
     match config.storage {
         StorageConfig::Memory => {

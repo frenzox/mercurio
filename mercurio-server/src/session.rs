@@ -19,9 +19,9 @@ use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
-        MessageExpiryInterval, ReceiveMaximum, RetainAvailable, ServerKeepAlive,
-        SharedSubscriptionAvailable, SubscriptionIdentifier, SubscriptionIdentifierAvailable,
-        TopicAliasMaximum, WildcardSubscriptionAvailable,
+        MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
+        ServerKeepAlive, SharedSubscriptionAvailable, SubscriptionIdentifier,
+        SubscriptionIdentifierAvailable, TopicAliasMaximum, WildcardSubscriptionAvailable,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -51,7 +51,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     queue::{JournalEvent, MessageQueue, QueueLimits, Subscriber},
-    server::Limits,
+    server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
@@ -373,6 +373,7 @@ impl Session {
         resume: bool,
         assigned_client_id: bool,
         limits: &Limits,
+        policy: &ConnectPolicy,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -411,6 +412,20 @@ impl Session {
                         .as_ref()
                         .and_then(|p| p.authentication_method.clone()),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
+                    response_information: policy
+                        .response_information
+                        .as_ref()
+                        .filter(|_| {
+                            session
+                                .connect_packet
+                                .properties
+                                .as_ref()
+                                .and_then(|p| p.request_response_information.as_ref())
+                                .is_some_and(|r| r.value == 1)
+                        })
+                        .map(|template| {
+                            ResponseInformation::new(template.replace("%c", &session.client_id))
+                        }),
                     server_keepalive: {
                         let keepalive = effective_keepalive(&session.connect_packet, limits);
                         (keepalive != session.connect_packet.keepalive)
