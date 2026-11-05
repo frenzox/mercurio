@@ -3,7 +3,7 @@ use std::{future::Future, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, Semaphore},
+    sync::{broadcast, mpsc, Semaphore},
     time::{self, Duration, Instant},
 };
 use tokio_rustls::TlsAcceptor;
@@ -100,6 +100,8 @@ struct Listener<St: MqttStore + 'static> {
     broker: Broker<St>,
     session_manager_holder: SessionManagerDropGuard<St>,
     notify_shutdown: broadcast::Sender<()>,
+    /// Cloned into every connection handler; see `Handler::_shutdown_complete`
+    shutdown_complete: mpsc::Sender<()>,
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
     limits: Limits,
@@ -118,6 +120,8 @@ where
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
     limits: Limits,
+    /// Dropped when the handler finishes, so shutdown can wait for it
+    _shutdown_complete: mpsc::Sender<()>,
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -146,6 +150,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     } = config;
 
     let (notify_shutdown, _) = broadcast::channel(1);
+    let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
 
     // Build TLS acceptor if configured
     let tls_acceptor = match tls_config {
@@ -175,6 +180,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
             .max_connections
             .map(|max| Arc::new(Semaphore::new(max))),
         notify_shutdown,
+        shutdown_complete,
         tls_acceptor,
         auth_config,
         limits,
@@ -198,6 +204,21 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         _ = shutdown => {
             info!("Shutting down!");
         }
+    }
+
+    // Let connections tell their clients and finish up, for a moment
+    let Listener {
+        notify_shutdown,
+        shutdown_complete,
+        ..
+    } = server;
+    let _ = notify_shutdown.send(());
+    drop(shutdown_complete);
+    if time::timeout(Duration::from_secs(5), shutdown_complete_rx.recv())
+        .await
+        .is_err()
+    {
+        warn!("Connections still open after waiting to shut down");
     }
 }
 
@@ -224,6 +245,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             let broker = self.broker.clone();
             let session_manager = self.session_manager_holder.session_manager();
             let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
+            let shutdown_complete = self.shutdown_complete.clone();
             let auth_config = Arc::clone(&self.auth_config);
             let limits = self.limits;
 
@@ -242,6 +264,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                                 shutdown,
                                 auth_config,
                                 limits,
+                                _shutdown_complete: shutdown_complete,
                             };
                             Self::handle_connection(&mut handler).await;
                         }
@@ -264,6 +287,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         shutdown,
                         auth_config,
                         limits,
+                        _shutdown_complete: shutdown_complete,
                     };
                     Self::handle_connection(&mut handler).await;
                 });
@@ -790,9 +814,8 @@ where
                         "Keep-alive timeout for client `{}` ({:?} with no packets)",
                         client_id, timeout_duration.unwrap_or_default()
                     );
-                    // Return normally to trigger abnormal disconnect handling
-                    // (will message will be published)
-                    return Ok(());
+                    // An abnormal disconnect: the will is published
+                    return Err(ReasonCode::KeepAliveTimeout.into());
                 }
 
                 // Another connection with the same client id replaces this one
@@ -815,7 +838,7 @@ where
 
                 // Exit in case a signal is received
                 _ = self.shutdown.recv() => {
-                    return Ok(());
+                    return Err(ReasonCode::ServerShuttingDown.into());
                 },
             }
         }

@@ -90,3 +90,41 @@ async fn unsupported_protocol_version_is_refused() {
         [0x20, 0x02, 0x00, 0x01]
     );
 }
+
+#[tokio::test]
+async fn keep_alive_timeout_is_explained_before_closing() {
+    let addr = start_broker().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // CONNECT with a keepalive of 1 second, then silence
+    stream
+        .write_all(&[
+            0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x01, 0x00, 0x00,
+            0x01, b'k',
+        ])
+        .await
+        .unwrap();
+    common::read_connack(&mut stream).await;
+
+    // DISCONNECT, Keep Alive timeout
+    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x8d]);
+}
+
+#[tokio::test]
+async fn shutdown_is_announced_to_connected_clients() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(mercurio_server::server::run(listener, async {
+        let _ = stopped.await;
+    }));
+
+    let mut stream = connect_v5(addr).await;
+    stop.send(()).unwrap();
+
+    // DISCONNECT, Server shutting down
+    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x8b]);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not finish shutting down")
+        .unwrap();
+}
