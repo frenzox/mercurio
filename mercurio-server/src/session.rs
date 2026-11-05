@@ -18,8 +18,8 @@ use mercurio_core::{
     codec::VariableByteInteger,
     message::{unix_millis, Message, MessageProperties},
     properties::{
-        AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, SubscriptionIdentifier,
-        TopicAliasMaximum,
+        AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, ReceiveMaximum,
+        SubscriptionIdentifier, TopicAliasMaximum,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -209,6 +209,8 @@ struct State {
     topic_aliases: HashMap<u16, String>,
     /// Highest alias the client may use, as advertised in CONNACK
     topic_alias_maximum: u16,
+    /// QoS 2 messages the client may have awaiting PUBREL, as advertised
+    receive_maximum: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Current authentication method name for ongoing re-authentication
@@ -252,6 +254,7 @@ impl Session {
                     last_packet_id: 0,
                     topic_aliases: HashMap::new(),
                     topic_alias_maximum: 0,
+                    receive_maximum: u16::MAX,
                     will_message,
                     auth_method: None,
                 }),
@@ -361,6 +364,7 @@ impl Session {
             // Topic aliases only live as long as the connection [MQTT-3.3.2-7]
             session.topic_aliases.clear();
             session.topic_alias_maximum = limits.topic_alias_maximum;
+            session.receive_maximum = limits.receive_maximum;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
@@ -378,6 +382,7 @@ impl Session {
                         limits.max_packet_size.try_into().unwrap_or(u32::MAX),
                     )),
                     topic_alias_max: Some(TopicAliasMaximum::new(limits.topic_alias_maximum)),
+                    receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
                     ..Default::default()
                 });
             }
@@ -453,13 +458,17 @@ impl Session {
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = packet.packet_id {
-                    let first_delivery = self
-                        .shared
-                        .state
-                        .lock()
-                        .await
-                        .incoming_qos2
-                        .insert(packet_id);
+                    let first_delivery = {
+                        let mut session = self.shared.state.lock().await;
+                        // The client may only have as many QoS 2 messages
+                        // awaiting PUBREL as advertised [MQTT-3.3.4-8]
+                        if !session.incoming_qos2.contains(&packet_id)
+                            && session.incoming_qos2.len() >= usize::from(session.receive_maximum)
+                        {
+                            return Err(ReasonCode::ReceiveMaximumExceeded.into());
+                        }
+                        session.incoming_qos2.insert(packet_id)
+                    };
 
                     let pubrec = ControlPacket::PubRec(PubRecPacket {
                         packet_id,
@@ -818,6 +827,19 @@ impl Session {
             }
         }
         session.subscriptions.clear();
+    }
+
+    /// Whether another QoS 1 or 2 message may be sent without exceeding the
+    /// client's Receive Maximum [MQTT-3.3.4-9].
+    pub(crate) async fn can_send_more(&self) -> bool {
+        let session = self.shared.state.lock().await;
+        let receive_maximum = session
+            .connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.receive_maximum.as_ref())
+            .map_or(u16::MAX, |r| r.value);
+        session.unacknowledged_messages.len() + session.pubrecs.len() < usize::from(receive_maximum)
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and

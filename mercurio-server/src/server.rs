@@ -59,6 +59,8 @@ pub struct Limits {
     pub max_connections: Option<usize>,
     /// Highest topic alias MQTT 5 clients may use; 0 disables aliases.
     pub topic_alias_maximum: u16,
+    /// QoS 2 messages a client may have awaiting PUBREL at once.
+    pub receive_maximum: u16,
 }
 
 impl Default for Limits {
@@ -69,6 +71,7 @@ impl Default for Limits {
             queue: QueueLimits::default(),
             max_connections: None,
             topic_alias_maximum: 10,
+            receive_maximum: u16::MAX,
         }
     }
 }
@@ -359,6 +362,23 @@ where
             }
         }
 
+        // Zero is not a valid Receive Maximum or Maximum Packet Size
+        if let Some(properties) = &connect_packet.properties {
+            if properties
+                .receive_maximum
+                .as_ref()
+                .is_some_and(|r| r.value == 0)
+                || properties
+                    .maximum_packet_size
+                    .as_ref()
+                    .is_some_and(|m| m.value == 0)
+            {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::ProtocolError)
+                    .await;
+            }
+        }
+
         // MQTT 3.x servers must reject a zero-length client id unless the
         // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
         if connect_packet.payload.client_id.is_empty()
@@ -505,6 +525,9 @@ where
         tokio::pin!(deadline);
 
         while !self.shutdown.is_shutdown() {
+            // Re-evaluated after every packet, so acknowledgements reopen it
+            let window_open = session.can_send_more().await;
+
             tokio::select! {
                 // Try to read and process new incoming packet
                 maybe_packet = self.connection.read_packet() => {
@@ -605,7 +628,9 @@ where
                 }
 
                 // Try to send outgoing packet
-                message = session.next_outgoing() => {
+                // ponytail: QoS 0 messages wait behind a full window too, which
+                // keeps ordering; split the queue if they should overtake
+                message = session.next_outgoing(), if window_open => {
                     let Some(outgoing) = session.prepare_publish(message).await else {
                         continue;
                     };
