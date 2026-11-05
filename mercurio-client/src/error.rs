@@ -30,6 +30,9 @@ pub enum ClientError {
     #[error("Broker violated the protocol: {0:?}")]
     BrokerViolation(ReasonCode),
 
+    #[error("Authentication failed: {0}")]
+    AuthenticationFailed(String),
+
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 

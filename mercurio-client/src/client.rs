@@ -4,11 +4,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use mercurio_core::codec::VariableByteInteger;
 use mercurio_core::properties::{
-    MaximumPacketSize, ReceiveMaximum, RequestProblemInformation, RequestResponseInformation,
-    SessionExpiryInterval, SubscriptionIdentifier, TopicAliasMaximum,
+    AuthenticationData, AuthenticationMethod, MaximumPacketSize, ReceiveMaximum,
+    RequestProblemInformation, RequestResponseInformation, SessionExpiryInterval,
+    SubscriptionIdentifier, TopicAliasMaximum,
 };
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
+use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
 use mercurio_packets::disconnect::DisconnectPacket;
@@ -31,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
-use crate::options::{ConnectOptions, MessageProperties, Will};
+use crate::options::{ConnectOptions, MessageProperties, SharedAuthenticator, Will};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
@@ -47,6 +49,9 @@ enum Command {
         response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
     },
     Disconnect {
+        response: oneshot::Sender<Result<()>>,
+    },
+    Reauthenticate {
         response: oneshot::Sender<Result<()>>,
     },
 }
@@ -123,20 +128,32 @@ impl MqttClient {
         connection: &mut Connection,
         options: &ConnectOptions,
     ) -> Result<Session> {
-        // Build CONNECT packet
         let connect_packet = Self::build_connect_packet(options);
         connection
             .write_packet(ControlPacket::Connect(connect_packet))
             .await?;
 
-        // Wait for CONNACK with timeout
-        let connack = timeout(
-            Duration::from_secs(options.connect_timeout_secs),
-            connection.read_packet(),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout)??
-        .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
+        // Answer the broker's challenges until it sends CONNACK
+        let connack = loop {
+            let packet = timeout(
+                Duration::from_secs(options.connect_timeout_secs),
+                connection.read_packet(),
+            )
+            .await
+            .map_err(|_| ClientError::Timeout)??
+            .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
+            let ControlPacket::Auth(auth) = packet else {
+                break packet;
+            };
+            let (Some(authenticator), ReasonCode::ContinueAuthentication) =
+                (&options.authenticator, auth.reason)
+            else {
+                return Err(ClientError::Protocol("unexpected AUTH".into()));
+            };
+            let answer = auth_answer(authenticator, auth.properties.auth_data.map(|d| d.value))
+                .map_err(ClientError::AuthenticationFailed)?;
+            connection.write_packet(answer).await?;
+        };
 
         let response_information;
         let (session_present, client_id, keep_alive, limits) = match connack {
@@ -169,6 +186,17 @@ impl MqttClient {
                     .as_ref()
                     .and_then(|p| p.server_keepalive.as_ref())
                     .map_or(options.keep_alive, |k| k.value);
+                if let Some(authenticator) = &options.authenticator {
+                    let data = ack
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.authentication_data.as_ref())
+                        .map(|d| d.value.clone());
+                    authenticator
+                        .lock()
+                        .finish(data)
+                        .map_err(ClientError::AuthenticationFailed)?;
+                }
                 let limits = BrokerLimits::from_connack(ack.properties.as_ref());
                 response_information = ack
                     .properties
@@ -197,6 +225,10 @@ impl MqttClient {
 
     /// Build a CONNECT packet from options.
     fn build_connect_packet(options: &ConnectOptions) -> ConnectPacket {
+        let authentication = options.authenticator.as_ref().map(|a| {
+            let mut authenticator = a.lock();
+            (authenticator.method(), authenticator.start())
+        });
         let flags = ConnectFlags {
             user_name: options.username.is_some(),
             password: options.password.is_some(),
@@ -235,6 +267,12 @@ impl MqttClient {
                     .then(|| RequestResponseInformation::new(1)),
                 request_problem_information: (!options.request_problem_information)
                     .then(|| RequestProblemInformation::new(0)),
+                authentication_method: authentication
+                    .as_ref()
+                    .map(|(method, _)| AuthenticationMethod::new(method.clone())),
+                authentication_data: authentication
+                    .and_then(|(_, data)| data)
+                    .map(AuthenticationData::new),
                 ..Default::default()
             }),
             payload,
@@ -265,6 +303,8 @@ impl MqttClient {
             topic_aliases: HashMap::new(),
             topic_alias_maximum: options.topic_alias_maximum,
             receive_maximum: options.receive_maximum.unwrap_or(u16::MAX),
+            authenticator: options.authenticator.clone(),
+            reauthentication: None,
         };
         let mut keep_alive = session.keep_alive;
 
@@ -407,6 +447,21 @@ impl MqttClient {
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
+    /// Runs the enhanced authentication exchange again on the open
+    /// connection, for instance to renew expiring credentials. A broker that
+    /// refuses the client closes the connection.
+    pub async fn reauthenticate(&self) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(Command::Reauthenticate {
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ClientError::SendError)?;
+
+        response_rx.await.map_err(|_| ClientError::Disconnected)?
+    }
+
     /// Disconnect from the broker gracefully.
     pub async fn disconnect(&self) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -432,6 +487,24 @@ impl MqttClient {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
+}
+
+/// AUTH answering a broker challenge, or an error if the authenticator
+/// gives up.
+fn auth_answer(
+    authenticator: &SharedAuthenticator,
+    challenge: Option<Bytes>,
+) -> std::result::Result<ControlPacket, String> {
+    let mut authenticator = authenticator.lock();
+    let data = authenticator.respond(challenge)?;
+    Ok(ControlPacket::Auth(AuthPacket {
+        reason: ReasonCode::ContinueAuthentication,
+        properties: AuthProperties {
+            auth_method: Some(AuthenticationMethod::new(authenticator.method())),
+            auth_data: data.map(AuthenticationData::new),
+            ..Default::default()
+        },
+    }))
 }
 
 /// What CONNACK settled for a connection.
@@ -494,6 +567,9 @@ struct EventLoop {
     topic_alias_maximum: u16,
     /// Most QoS 2 messages the broker may have in flight to this client
     receive_maximum: u16,
+    authenticator: Option<SharedAuthenticator>,
+    /// The application waiting for a re-authentication to finish
+    reauthentication: Option<oneshot::Sender<Result<()>>>,
 }
 
 /// A message the application asked to publish.
@@ -596,6 +672,10 @@ impl EventLoop {
                                 Err(ClientError::BrokerViolation(reason)) => {
                                     return self.disconnect_for(reason).await;
                                 }
+                                Err(ClientError::AuthenticationFailed(e)) => {
+                                    warn!("Re-authentication failed: {}", e);
+                                    return self.disconnect_for(ReasonCode::NotAuthorized).await;
+                                }
                                 Err(e) => warn!("Error handling packet: {}", e),
                                 Ok(()) => {}
                             }
@@ -625,6 +705,9 @@ impl EventLoop {
                         Command::Unsubscribe { topics, response } => {
                             self.unsubscribe(topics, response).await;
                         }
+                        Command::Reauthenticate { response } => {
+                            self.reauthenticate(response).await;
+                        }
                         Command::Disconnect { response } => {
                             let result = MqttClient::handle_disconnect(&mut self.connection).await;
                             let _ = response.send(result);
@@ -650,6 +733,67 @@ impl EventLoop {
                         return DisconnectReason::KeepAliveTimeout;
                     }
                 }
+            }
+        }
+    }
+
+    /// Starts re-authenticating [MQTT-4.12.1-1].
+    async fn reauthenticate(&mut self, response: oneshot::Sender<Result<()>>) {
+        let Some(authenticator) = &self.authenticator else {
+            let _ = response.send(Err(ClientError::Protocol(
+                "no authenticator configured".into(),
+            )));
+            return;
+        };
+        if self.reauthentication.is_some() {
+            let _ = response.send(Err(ClientError::Protocol(
+                "re-authentication already in progress".into(),
+            )));
+            return;
+        }
+        let packet = {
+            let mut authenticator = authenticator.lock();
+            ControlPacket::Auth(AuthPacket {
+                reason: ReasonCode::ReAuthenticate,
+                properties: AuthProperties {
+                    auth_method: Some(AuthenticationMethod::new(authenticator.method())),
+                    auth_data: authenticator.start().map(AuthenticationData::new),
+                    ..Default::default()
+                },
+            })
+        };
+        match self.connection.write_packet(packet).await {
+            Ok(()) => self.reauthentication = Some(response),
+            Err(e) => {
+                let _ = response.send(Err(e));
+            }
+        }
+    }
+
+    /// Continues or completes a re-authentication.
+    async fn handle_auth(&mut self, auth: AuthPacket) -> Result<()> {
+        let (Some(authenticator), true) = (&self.authenticator, self.reauthentication.is_some())
+        else {
+            return Err(ClientError::BrokerViolation(ReasonCode::ProtocolError));
+        };
+        let data = auth.properties.auth_data.map(|d| d.value);
+        let result = match auth.reason {
+            ReasonCode::ContinueAuthentication => match auth_answer(authenticator, data) {
+                Ok(answer) => return self.connection.write_packet(answer).await,
+                Err(e) => Err(e),
+            },
+            ReasonCode::Success => authenticator.lock().finish(data),
+            _ => return Err(ClientError::BrokerViolation(ReasonCode::ProtocolError)),
+        };
+        let response = self.reauthentication.take().expect("checked above");
+        match result {
+            Ok(()) => {
+                let _ = response.send(Ok(()));
+                Ok(())
+            }
+            Err(e) => {
+                let _ = response.send(Err(ClientError::AuthenticationFailed(e.clone())));
+                Err(ClientError::AuthenticationFailed(e))
             }
         }
     }
@@ -694,6 +838,9 @@ impl EventLoop {
                             let _ = response.send(Err(ClientError::Disconnected));
                         }
                         Command::Unsubscribe { response, .. } => {
+                            let _ = response.send(Err(ClientError::Disconnected));
+                        }
+                        Command::Reauthenticate { response } => {
                             let _ = response.send(Err(ClientError::Disconnected));
                         }
                         Command::Disconnect { response } => {
@@ -1115,6 +1262,7 @@ impl EventLoop {
                     let _ = pending.response.send(Ok(results));
                 }
             }
+            ControlPacket::Auth(auth) => self.handle_auth(auth).await?,
             ControlPacket::PingResp(_) => debug!("Received PINGRESP"),
             other => debug!("Received packet: {:?}", other),
         }

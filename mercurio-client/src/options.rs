@@ -1,3 +1,5 @@
+use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -126,6 +128,44 @@ impl Will {
     }
 }
 
+/// The client's side of an MQTT 5 enhanced authentication method, such as
+/// SCRAM. An exchange begins with `start` on every connection, reconnection
+/// and re-authentication, then answers the broker's challenges until it
+/// accepts or refuses the client.
+pub trait Authenticator: Send {
+    /// The method name the broker knows it by.
+    fn method(&self) -> String;
+
+    /// Begins an exchange, returning the data to send first.
+    fn start(&mut self) -> Option<Bytes>;
+
+    /// Answers a challenge from the broker. An error gives up, closing the
+    /// connection.
+    fn respond(&mut self, challenge: Option<Bytes>) -> Result<Option<Bytes>, String>;
+
+    /// Checks the data the broker sent along with accepting the client,
+    /// such as proof that the broker knows the credentials too.
+    fn finish(&mut self, _data: Option<Bytes>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// An authenticator shared by every connection the client makes.
+#[derive(Clone)]
+pub(crate) struct SharedAuthenticator(Arc<Mutex<dyn Authenticator>>);
+
+impl SharedAuthenticator {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, dyn Authenticator + 'static> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl fmt::Debug for SharedAuthenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Authenticator({})", self.lock().method())
+    }
+}
+
 /// TLS configuration for client connections.
 #[derive(Debug, Clone, Default)]
 pub struct TlsOptions {
@@ -159,6 +199,7 @@ pub struct ConnectOptions {
     pub(crate) topic_alias_maximum: u16,
     pub(crate) request_response_information: bool,
     pub(crate) request_problem_information: bool,
+    pub(crate) authenticator: Option<SharedAuthenticator>,
 }
 
 impl ConnectOptions {
@@ -183,6 +224,7 @@ impl ConnectOptions {
             topic_alias_maximum: 0,
             request_response_information: false,
             request_problem_information: true,
+            authenticator: None,
         }
     }
 
@@ -295,6 +337,12 @@ impl ConnectOptions {
     /// out of everything but PUBLISH, CONNACK and DISCONNECT. MQTT 5 only.
     pub fn request_problem_information(mut self, request: bool) -> Self {
         self.request_problem_information = request;
+        self
+    }
+
+    /// Authenticate with an MQTT 5 enhanced authentication method.
+    pub fn authenticator(mut self, authenticator: impl Authenticator + 'static) -> Self {
+        self.authenticator = Some(SharedAuthenticator(Arc::new(Mutex::new(authenticator))));
         self
     }
 
