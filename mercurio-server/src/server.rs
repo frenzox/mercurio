@@ -476,6 +476,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             }
             _ => error!("ConnectPacket expectation not met"),
         }
+        handler.connection.close().await;
     }
 
     /// Waits for the next connection. Errors such as running out of file

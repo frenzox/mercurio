@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use bytes::BytesMut;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
+    time,
 };
 
 use mercurio_core::{error::Error, protocol::ProtocolVersion, reason::ReasonCode, Result};
@@ -16,6 +19,9 @@ const WRITE_BUFFER_CAPACITY: usize = 512;
 /// Largest packet accepted from a client unless configured otherwise, fixed
 /// header included. 1 MiB, the same default as EMQX.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
+
+/// How long a closing connection waits for the client to close its side.
+const LINGER: Duration = Duration::from_secs(1);
 
 /// A connection that can be either plain TCP or TLS-encrypted.
 pub struct Connection<S = TcpStream>
@@ -83,6 +89,20 @@ where
         self.stream.flush().await?;
 
         Ok(())
+    }
+
+    /// Closes the connection without losing what was just sent. Closing a
+    /// socket while the client is still sending makes the kernel answer with
+    /// a reset, and a reset can make the client drop a DISCONNECT or CONNACK
+    /// it hasn't read yet. So writing stops first, then whatever the client
+    /// still sends is discarded until it closes too, for at most a second.
+    pub async fn close(&mut self) {
+        let _ = self.stream.shutdown().await;
+        let mut discard = [0u8; 4096];
+        let _ = time::timeout(LINGER, async {
+            while matches!(self.stream.read(&mut discard).await, Ok(n) if n > 0) {}
+        })
+        .await;
     }
 
     /// The protocol version of the last CONNECT read, even if it turned out
