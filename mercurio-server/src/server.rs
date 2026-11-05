@@ -428,7 +428,7 @@ where
                     // Persist subscriptions after subscribe/unsubscribe operations
                     if is_subscription_change {
                         let client_id = session.get_client_id().await;
-                        let subscriptions = session.get_subscription_filters().await;
+                        let subscriptions = session.get_subscriptions().await;
                         let _ = self
                             .session_manager
                             .save_subscriptions(&client_id, subscriptions)

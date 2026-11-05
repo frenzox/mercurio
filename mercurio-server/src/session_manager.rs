@@ -10,7 +10,8 @@ use uuid::Uuid;
 use mercurio_core::Result;
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_storage::{
-    InflightMessage, InflightStore, SessionState, SessionStore, StoredWillMessage, WillStore,
+    InflightMessage, InflightStore, SessionState, SessionStore, StoredSubscription,
+    StoredWillMessage, WillStore,
 };
 
 use crate::session::{Session, SessionDropGuard, WillMessage};
@@ -83,7 +84,7 @@ pub(crate) struct SessionStartResult {
     /// Whether the server generated the client id
     pub assigned_client_id: bool,
     /// Topic filters to restore (re-subscribe to broker) if resuming a persisted session.
-    pub subscriptions_to_restore: Vec<String>,
+    pub subscriptions_to_restore: Vec<StoredSubscription>,
     /// Will message restored from storage (if resuming and will was persisted).
     pub will_to_restore: Option<WillMessage>,
     /// Must be held until the connection has finished, will message included.
@@ -182,10 +183,13 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         drop(manager);
 
-        // Save session state to storage
+        // A session resumed from memory already holds its subscriptions; one
+        // loaded from storage gets them restored after this returns
+        let mut subscriptions = session.get_subscriptions().await;
+        subscriptions.extend(subscriptions_to_restore.iter().cloned());
         let session_state = SessionState {
             client_id: client_id.clone(),
-            subscriptions: subscriptions_to_restore.clone(),
+            subscriptions,
             clean_start: false,
         };
         let _ = self.storage.save_session(&client_id, &session_state).await;
@@ -311,7 +315,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     pub(crate) async fn save_subscriptions(
         &self,
         client_id: &str,
-        subscriptions: Vec<String>,
+        subscriptions: Vec<StoredSubscription>,
     ) -> Result<()> {
         let session_state = SessionState {
             client_id: client_id.to_string(),
@@ -360,6 +364,10 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use mercurio_core::qos::QoS;
+    use mercurio_packets::{
+        subscribe::{SubscribePacket, SubscribePayload},
+        ControlPacket,
+    };
     use mercurio_storage::memory::MemoryStore;
 
     fn create_test_storage() -> Arc<MemoryStore> {
@@ -412,6 +420,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resuming_in_memory_session_keeps_stored_subscriptions() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+        let broker = crate::broker::Broker::new(storage.clone());
+
+        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let mut session = started.session;
+        session
+            .process_incoming(
+                ControlPacket::Subscribe(SubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: vec![SubscribePayload {
+                        topic_filter: "a".to_string(),
+                        subs_opt: Default::default(),
+                    }],
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .save_subscriptions("c", session.get_subscriptions().await)
+            .await
+            .unwrap();
+        manager.end_connection(started.lease, None).await;
+
+        let resumed = manager.start_session(connect_packet("c")).await.unwrap();
+        assert!(resumed.resume);
+
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert_eq!(
+            stored.subscriptions,
+            vec![StoredSubscription {
+                topic_filter: "a".to_string(),
+                qos: QoS::AtMostOnce,
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn test_store_and_remove_inflight() {
         let storage = create_test_storage();
         let manager: SessionManager<MemoryStore> = SessionManager::new(storage);
@@ -452,7 +502,10 @@ mod tests {
         // First, store a session and inflight messages
         let session_state = SessionState {
             client_id: "client1".to_string(),
-            subscriptions: vec!["topic/a".to_string()],
+            subscriptions: vec![StoredSubscription {
+                topic_filter: "topic/a".to_string(),
+                qos: QoS::AtLeastOnce,
+            }],
             clean_start: false,
         };
         storage

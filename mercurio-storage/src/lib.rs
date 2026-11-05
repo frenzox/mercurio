@@ -40,8 +40,15 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub client_id: String,
-    pub subscriptions: Vec<String>,
+    pub subscriptions: Vec<StoredSubscription>,
     pub clean_start: bool,
+}
+
+/// A subscription and the QoS granted for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSubscription {
+    pub topic_filter: String,
+    pub qos: QoS,
 }
 
 /// Will message for persistence.
