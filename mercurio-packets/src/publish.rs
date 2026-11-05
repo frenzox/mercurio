@@ -13,14 +13,14 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct PublishProperties {
-    payload_format_indicator: Option<PayloadFormatIndicator>,
-    message_expiry_interval: Option<MessageExpiryInterval>,
-    topic_alias: Option<TopicAlias>,
-    response_topic: Option<ResponseTopic>,
-    correlation_data: Option<CorrelationData>,
-    user_property: Option<Vec<UserProperty>>,
-    subscription_identifier: Option<SubscriptionIdentifier>,
-    content_type: Option<ContentType>,
+    pub payload_format_indicator: Option<PayloadFormatIndicator>,
+    pub message_expiry_interval: Option<MessageExpiryInterval>,
+    pub topic_alias: Option<TopicAlias>,
+    pub response_topic: Option<ResponseTopic>,
+    pub correlation_data: Option<CorrelationData>,
+    pub user_property: Option<Vec<UserProperty>>,
+    pub subscription_identifier: Option<SubscriptionIdentifier>,
+    pub content_type: Option<ContentType>,
 }
 
 impl Encoder for PublishProperties {

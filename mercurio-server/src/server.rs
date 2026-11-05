@@ -674,6 +674,7 @@ async fn publish_will(broker: &Broker<MemoryStore>, will: WillMessage, client_id
         qos: will.qos,
         retain: will.retain,
         payload: Some(will.payload),
+        properties: will.properties,
     };
 
     if let Err(e) = broker.publish(&topic, message).await {

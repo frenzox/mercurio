@@ -106,6 +106,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain,
             payload: Some(Bytes::from(payload.to_string())),
+            properties: Default::default(),
         }
     }
 
@@ -166,6 +167,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: true,
             payload: Some(Bytes::new()), // Empty payload
+            properties: Default::default(),
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 
