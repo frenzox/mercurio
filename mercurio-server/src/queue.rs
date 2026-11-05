@@ -124,6 +124,7 @@ mod tests {
             retain: false,
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
+            expires_at: None,
         }
     }
 

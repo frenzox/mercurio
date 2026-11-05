@@ -99,7 +99,9 @@ impl RetainedMessageStore for MemoryStore {
 
         let messages: Vec<Message> = retained
             .iter()
-            .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
+            // ponytail: expired messages are skipped, not removed, so they stay in
+            // memory until their topic gets a new retained message
+            .filter(|(topic, msg)| topic_matches_filter(topic, topic_filter) && !msg.is_expired())
             .map(|(_, msg)| {
                 let mut msg = msg.clone();
                 msg.retain = true; // Mark as retained when delivering
@@ -242,6 +244,7 @@ mod tests {
             retain: false,
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
+            expires_at: None,
         }
     }
 
