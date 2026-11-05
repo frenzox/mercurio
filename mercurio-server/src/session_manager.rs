@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use tokio::{
     sync::{watch, Mutex, OwnedMutexGuard},
@@ -48,6 +51,8 @@ struct State {
     connections: HashMap<String, ConnectionSlot>,
     /// Source of ConnectionSlot::generation, unique across slots
     next_generation: u64,
+    /// Clients whose will, left over from a previous run, is still due
+    restored_wills: HashSet<String>,
 }
 
 /// Tracks the network connection currently using a client id.
@@ -90,8 +95,6 @@ pub(crate) struct SessionStartResult {
     pub assigned_client_id: bool,
     /// Topic filters to restore (re-subscribe to broker) if resuming a persisted session.
     pub subscriptions_to_restore: Vec<StoredSubscription>,
-    /// Will message restored from storage (if resuming and will was persisted).
-    pub will_to_restore: Option<WillMessage>,
     /// Must be held until the connection has finished, will message included.
     pub lease: ConnectionLease,
     /// Inflight messages to retry (QoS 1/2 messages awaiting acknowledgment).
@@ -113,6 +116,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
                 sessions: HashMap::new(),
                 connections: HashMap::new(),
                 next_generation: 0,
+                restored_wills: HashSet::new(),
             }),
         });
 
@@ -143,6 +147,9 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
 
+        // Reconnecting cancels a will left over from before a restart
+        manager.restored_wills.remove(client_id);
+
         // Marks the previous connection's pending will as superseded, whether
         // this connection resumes the session or replaces it
         if let Some(existing) = manager.sessions.get(client_id) {
@@ -150,7 +157,6 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         }
         let mut resume = false;
         let mut subscriptions_to_restore = Vec::new();
-        let mut will_to_restore = None;
         let mut inflight_to_retry = Vec::new();
 
         if connect_packet.flags.clean_start {
@@ -173,12 +179,6 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
                     );
                     subscriptions_to_restore = stored_session.subscriptions;
                     resume = true;
-
-                    // Also restore will message if present
-                    if let Ok(Some(stored_will)) = self.storage.get_will(client_id).await {
-                        info!("Restoring will message for client `{}`", client_id);
-                        will_to_restore = Some(stored_will.into());
-                    }
 
                     // Restore inflight messages for retry
                     if let Ok(inflight) = self.storage.get_all_inflight(client_id).await {
@@ -224,10 +224,15 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         };
         let _ = self.storage.save_session(&client_id, &session_state).await;
 
-        // Store will message if present in the new CONNECT packet
-        if let Some(will) = session.get_will().await {
-            let stored_will: StoredWillMessage = will.into();
-            let _ = self.storage.store_will(&client_id, &stored_will).await;
+        // The will of this CONNECT replaces any earlier one
+        match session.get_will().await {
+            Some(will) => {
+                let stored_will: StoredWillMessage = will.into();
+                let _ = self.storage.store_will(&client_id, &stored_will).await;
+            }
+            None => {
+                let _ = self.storage.delete_will(&client_id).await;
+            }
         }
 
         Ok(SessionStartResult {
@@ -235,7 +240,6 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             resume,
             assigned_client_id,
             subscriptions_to_restore,
-            will_to_restore,
             lease,
             inflight_to_retry,
         })
@@ -323,12 +327,14 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     }
 
     /// Schedules the expiry of sessions persisted by a previous run, and
-    /// discards those that expired while the broker was down.
-    pub(crate) async fn restore_expiry(&self) {
+    /// discards those that expired while the broker was down. Returns the
+    /// wills those sessions left behind, with when they are due.
+    pub(crate) async fn restore_from_storage(&self) -> Vec<(String, WillMessage, Duration)> {
         let Ok(client_ids) = self.storage.list_sessions().await else {
-            return;
+            return Vec::new();
         };
         let now = unix_millis();
+        let mut wills = Vec::new();
 
         for client_id in client_ids {
             let Ok(Some(state)) = self.storage.load_session(&client_id).await else {
@@ -339,12 +345,40 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             let deadline = state
                 .expires_at
                 .or_else(|| state.expiry_interval.map(|i| now + u64::from(i) * 1000));
-            if let Some(deadline) = deadline {
+            let until_expiry = deadline.map(|d| Duration::from_millis(d.saturating_sub(now)));
+
+            // The clients were disconnected by the shutdown, so their wills
+            // are due after their delay, or when the session ends if sooner
+            if let Ok(Some(will)) = self.storage.get_will(&client_id).await {
+                let will = WillMessage::from(will);
+                let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
+                self.shared
+                    .state
+                    .lock()
+                    .await
+                    .restored_wills
+                    .insert(client_id.clone());
+                wills.push((client_id.clone(), will, due));
+            }
+
+            if let Some(delay) = until_expiry {
                 // Generation 0 predates every connection of this run
-                let delay = Duration::from_millis(deadline.saturating_sub(now));
                 self.schedule_end(client_id, 0, delay);
             }
         }
+
+        wills
+    }
+
+    /// Claims a will returned by `restore_from_storage` for publishing.
+    /// False if its client reconnected in the meantime.
+    pub(crate) async fn take_restored_will(&self, client_id: &str) -> bool {
+        self.shared
+            .state
+            .lock()
+            .await
+            .restored_wills
+            .remove(client_id)
     }
 
     /// Discards the session of `client_id` unless a connection newer than
@@ -677,11 +711,75 @@ mod tests {
         }
 
         let manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
-        manager.restore_expiry().await;
+        manager.restore_from_storage().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(storage.load_session("expired").await.unwrap().is_none());
         assert!(storage.load_session("forever").await.unwrap().is_some());
+    }
+
+    fn stored_will(delay_secs: u32) -> StoredWillMessage {
+        StoredWillMessage {
+            topic: "status".into(),
+            payload: Bytes::from("offline"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            delay_secs,
+            properties: Default::default(),
+        }
+    }
+
+    async fn save_persistent_session(storage: &MemoryStore, client_id: &str, expiry: u32) {
+        storage
+            .save_session(
+                client_id,
+                &SessionState {
+                    client_id: client_id.to_string(),
+                    subscriptions: vec![],
+                    clean_start: false,
+                    expiry_interval: Some(expiry),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_without_will_clears_the_stored_one() {
+        let storage = create_test_storage();
+        storage.store_will("c", &stored_will(0)).await.unwrap();
+
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+        manager.start_session(connect_packet("c")).await.unwrap();
+
+        assert!(storage.get_will("c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wills_left_by_a_previous_run_are_restored() {
+        let storage = create_test_storage();
+        // Will delay 30s, but the session expires in 10s
+        save_persistent_session(&storage, "a", 10).await;
+        storage.store_will("a", &stored_will(30)).await.unwrap();
+        save_persistent_session(&storage, "b", 3600).await;
+        storage.store_will("b", &stored_will(5)).await.unwrap();
+
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
+        let mut wills = manager.restore_from_storage().await;
+        wills.sort_by(|x, y| x.0.cmp(&y.0));
+        let due: Vec<(&str, u64)> = wills
+            .iter()
+            .map(|(id, _, due)| (id.as_str(), due.as_secs()))
+            .collect();
+        assert_eq!(due, [("a", 10), ("b", 5)]);
+
+        // Reconnecting before the will is due cancels it
+        let mut reconnect = connect_packet("b");
+        reconnect.flags.clean_start = false;
+        manager.start_session(reconnect).await.unwrap();
+        assert!(manager.take_restored_will("a").await);
+        assert!(!manager.take_restored_will("b").await);
     }
 
     #[tokio::test]

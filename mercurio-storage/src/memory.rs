@@ -313,6 +313,8 @@ mod tests {
             payload: Bytes::from("offline"),
             qos: QoS::AtLeastOnce,
             retain: true,
+            delay_secs: 0,
+            properties: Default::default(),
         };
 
         store.store_will("client1", &will).await.unwrap();
