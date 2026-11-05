@@ -188,7 +188,12 @@ impl Decoder for bool {
             return Err(Error::PacketIncomplete);
         }
 
-        Ok(buffer.get_u8() != 0)
+        // Byte flags only take 0 and 1
+        match buffer.get_u8() {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ReasonCode::ProtocolError.into()),
+        }
     }
 }
 

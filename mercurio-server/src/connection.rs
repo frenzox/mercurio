@@ -31,6 +31,7 @@ where
     /// Negotiated in CONNECT; decides the wire format of every other packet
     protocol_version: ProtocolVersion,
     max_packet_size: usize,
+    connect_version: Option<ProtocolVersion>,
 }
 
 impl Connection<TcpStream> {
@@ -42,6 +43,7 @@ impl Connection<TcpStream> {
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
             protocol_version: ProtocolVersion::V5,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            connect_version: None,
         }
     }
 }
@@ -55,6 +57,7 @@ impl Connection<TlsStream<TcpStream>> {
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
             protocol_version: ProtocolVersion::V5,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            connect_version: None,
         }
     }
 }
@@ -99,7 +102,17 @@ where
         Ok(())
     }
 
+    /// The protocol version of the last CONNECT read, even if it turned out
+    /// to be malformed.
+    pub fn connect_version(&self) -> Option<ProtocolVersion> {
+        self.connect_version
+    }
+
     fn parse_packet(&mut self) -> Result<Option<ControlPacket>> {
+        if let Some(version) = ControlPacket::connect_version(&self.read_buffer) {
+            self.connect_version = Some(version);
+        }
+
         // Refuse oversized packets from the fixed header alone, before
         // buffering them
         if ControlPacket::frame_len(&self.read_buffer).is_ok_and(|len| len > self.max_packet_size) {

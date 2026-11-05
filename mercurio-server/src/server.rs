@@ -312,6 +312,25 @@ impl<St: MqttStore + 'static> Listener<St> {
                     .write_packet(ControlPacket::ConnAck(connack))
                     .await;
             }
+            // MQTT 5 clients are told why their CONNECT was refused; earlier
+            // versions have no reason code for it and are just disconnected
+            Ok(Err(Error::MQTTReasonCode(reason)))
+                if handler.connection.connect_version() == Some(ProtocolVersion::V5) =>
+            {
+                warn!("Refusing invalid CONNECT: {:?}", reason);
+                let connack = ConnAckPacket {
+                    protocol_version: ProtocolVersion::V5,
+                    flags: ConnAckFlags {
+                        session_present: false,
+                    },
+                    reason_code: reason,
+                    properties: None,
+                };
+                let _ = handler
+                    .connection
+                    .write_packet(ControlPacket::ConnAck(connack))
+                    .await;
+            }
             _ => error!("ConnectPacket expectation not met"),
         }
     }
@@ -410,23 +429,6 @@ where
             if !authorizer.authorize(&identity, will_topic, Access::Write) {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
-                    .await;
-            }
-        }
-
-        // Zero is not a valid Receive Maximum or Maximum Packet Size
-        if let Some(properties) = &connect_packet.properties {
-            if properties
-                .receive_maximum
-                .as_ref()
-                .is_some_and(|r| r.value == 0)
-                || properties
-                    .maximum_packet_size
-                    .as_ref()
-                    .is_some_and(|m| m.value == 0)
-            {
-                return self
-                    .reject_connect(&connect_packet, ReasonCode::ProtocolError)
                     .await;
             }
         }
