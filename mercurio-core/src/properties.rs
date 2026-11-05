@@ -244,7 +244,7 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
         AuthenticationData::ID => dec_prop!(AuthenticationData, buffer),
         RequestProblemInformation::ID => dec_prop!(RequestProblemInformation, buffer),
         WillDelayInterval::ID => dec_prop!(WillDelayInterval, buffer),
-        RequestResponseInformation::ID => dec_prop!(RequestProblemInformation, buffer),
+        RequestResponseInformation::ID => dec_prop!(RequestResponseInformation, buffer),
         ResponseInformation::ID => dec_prop!(ResponseInformation, buffer),
         ServerReference::ID => dec_prop!(ServerReference, buffer),
         ReasonString::ID => dec_prop!(ReasonString, buffer),

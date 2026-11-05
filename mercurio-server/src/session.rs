@@ -15,7 +15,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    message::Message,
+    message::{Message, MessageProperties},
     properties::{AssignedClientIdentifier, MaximumPacketSize},
     qos::QoS,
     reason::ReasonCode,
@@ -29,7 +29,7 @@ use mercurio_packets::{
     pingresp::PingRespPacket,
     puback::PubAckPacket,
     pubcomp::PubCompPacket,
-    publish::PublishPacket,
+    publish::{PublishPacket, PublishProperties},
     pubrec::PubRecPacket,
     pubrel::PubRelPacket,
     suback::{SubAckPacket, SubAckPayload},
@@ -58,6 +58,7 @@ pub struct WillMessage {
     pub retain: bool,
     /// How long to wait after the connection closes before publishing
     pub delay: Duration,
+    pub properties: MessageProperties,
 }
 
 impl WillMessage {
@@ -69,12 +70,20 @@ impl WillMessage {
 
         let topic = packet.payload.will_topic.as_ref()?;
         let payload = packet.payload.will_payload.clone().unwrap_or_default();
-        let delay = packet
-            .payload
-            .will_properties
-            .as_ref()
+        let will_properties = packet.payload.will_properties.as_ref();
+        let delay = will_properties
             .and_then(|p| p.will_delay_interval.as_ref())
             .map_or(0, |d| d.value);
+        let properties = will_properties
+            .map(|p| MessageProperties {
+                payload_format_indicator: p.payload_format_indicator.clone(),
+                message_expiry_interval: p.message_expiry_interval.clone(),
+                content_type: p.content_type.clone(),
+                response_topic: p.response_topic.clone(),
+                correlation_data: p.correlation_data.clone(),
+                user_property: p.user_property.clone(),
+            })
+            .unwrap_or_default();
 
         Some(WillMessage {
             topic: topic.clone(),
@@ -82,6 +91,7 @@ impl WillMessage {
             qos: packet.flags.will_qos,
             retain: packet.flags.will_retain,
             delay: Duration::from_secs(delay.into()),
+            properties,
         })
     }
 }
@@ -104,11 +114,41 @@ impl From<StoredWillMessage> for WillMessage {
             payload: stored.payload,
             qos: stored.qos,
             retain: stored.retain,
-            // ponytail: storage doesn't keep the delay, so wills restored after a
-            // restart publish immediately; add a column if that matters
+            // ponytail: storage doesn't keep the delay or properties, so wills
+            // restored after a restart publish immediately and without them
             delay: Duration::ZERO,
+            properties: MessageProperties::default(),
         }
     }
+}
+
+/// The application properties of a received PUBLISH, which are forwarded to
+/// subscribers. Per-hop properties such as the topic alias are left out.
+fn message_properties(properties: Option<&PublishProperties>) -> MessageProperties {
+    let Some(p) = properties else {
+        return MessageProperties::default();
+    };
+    MessageProperties {
+        payload_format_indicator: p.payload_format_indicator.clone(),
+        message_expiry_interval: p.message_expiry_interval.clone(),
+        content_type: p.content_type.clone(),
+        response_topic: p.response_topic.clone(),
+        correlation_data: p.correlation_data.clone(),
+        user_property: p.user_property.clone(),
+    }
+}
+
+/// The PUBLISH properties forwarding a message's application properties.
+fn publish_properties(properties: &MessageProperties) -> Option<PublishProperties> {
+    Some(PublishProperties {
+        payload_format_indicator: properties.payload_format_indicator.clone(),
+        message_expiry_interval: properties.message_expiry_interval.clone(),
+        content_type: properties.content_type.clone(),
+        response_topic: properties.response_topic.clone(),
+        correlation_data: properties.correlation_data.clone(),
+        user_property: properties.user_property.clone(),
+        ..Default::default()
+    })
 }
 
 /// Source of unique subscriber ids, one per session.
@@ -399,6 +439,7 @@ impl Session {
             retain: packet.retain,
             qos: packet.qos_level,
             payload: packet.payload,
+            properties: message_properties(packet.properties.as_ref()),
         };
 
         broker.publish(&topic, message).await?;
@@ -727,7 +768,7 @@ impl Session {
                 retain: message.retain,
                 topic_name: message.topic.to_string(),
                 packet_id,
-                properties: None,
+                properties: publish_properties(&message.properties),
                 payload: message.payload,
             };
 
@@ -745,6 +786,7 @@ impl Session {
                     dup: false,
                     sequence,
                     released: false,
+                    properties: message_properties(publish.properties.as_ref()),
                 }
             });
 
@@ -770,7 +812,7 @@ impl Session {
                     retain: false,
                     topic_name: message.topic,
                     packet_id: Some(message.packet_id),
-                    properties: None,
+                    properties: publish_properties(&message.properties),
                     payload: message.payload,
                 };
                 session
@@ -1071,6 +1113,7 @@ mod tests {
             qos,
             retain,
             payload: Some(Bytes::from("payload")),
+            properties: Default::default(),
         }
     }
 
@@ -1422,6 +1465,18 @@ mod tests {
         assert_eq!(will.payload.as_ref(), b"goodbye");
         assert_eq!(will.qos, QoS::AtLeastOnce);
         assert!(will.retain);
+    }
+
+    #[test]
+    fn test_will_message_keeps_will_properties() {
+        let mut packet = create_connect_packet_with_will();
+        packet.payload.will_properties = Some(mercurio_packets::connect::WillProperties {
+            content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
+            ..Default::default()
+        });
+
+        let will = WillMessage::from_connect_packet(&packet).unwrap();
+        assert_eq!(will.properties.content_type.unwrap().value, "text");
     }
 
     #[test]

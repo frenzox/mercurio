@@ -241,6 +241,7 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             payload: Some(Bytes::from(payload.to_string())),
+            properties: Default::default(),
         }
     }
 
@@ -336,6 +337,7 @@ mod tests {
             dup: false,
             sequence: 7,
             released: false,
+            properties: Default::default(),
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();

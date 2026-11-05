@@ -1,13 +1,18 @@
 //! MQTT message types for internal routing.
 
 #[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 
-use crate::qos::QoS;
+use crate::{
+    codec::{Decoder, Encoder},
+    properties::*,
+    qos::QoS,
+    reason::ReasonCode,
+};
 
 /// MQTT message for internal routing.
 ///
@@ -24,4 +29,88 @@ pub struct Message {
     pub retain: bool,
     /// Payload data - Bytes is already reference-counted for cheap cloning
     pub payload: Option<Bytes>,
+    pub properties: MessageProperties,
+}
+
+/// MQTT 5 properties that belong to the application message and are
+/// forwarded unchanged from the publisher to every subscriber.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageProperties {
+    pub payload_format_indicator: Option<PayloadFormatIndicator>,
+    pub message_expiry_interval: Option<MessageExpiryInterval>,
+    pub content_type: Option<ContentType>,
+    pub response_topic: Option<ResponseTopic>,
+    pub correlation_data: Option<CorrelationData>,
+    pub user_property: Option<Vec<UserProperty>>,
+}
+
+/// Encoded as a bare property list, without the length prefix packets use.
+impl Encoder for MessageProperties {
+    fn encode(&self, buffer: &mut BytesMut) {
+        self.payload_format_indicator.encode(buffer);
+        self.message_expiry_interval.encode(buffer);
+        self.content_type.encode(buffer);
+        self.response_topic.encode(buffer);
+        self.correlation_data.encode(buffer);
+        self.user_property.encode(buffer);
+    }
+
+    fn encoded_size(&self) -> usize {
+        self.payload_format_indicator.encoded_size()
+            + self.message_expiry_interval.encoded_size()
+            + self.content_type.encoded_size()
+            + self.response_topic.encoded_size()
+            + self.correlation_data.encoded_size()
+            + self.user_property.encoded_size()
+    }
+}
+
+/// Decodes a bare property list until the buffer is exhausted.
+impl Decoder for MessageProperties {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let mut properties = MessageProperties::default();
+
+        while buffer.has_remaining() {
+            match Property::decode(buffer)? {
+                Property::PayloadFormatIndicator(v) => {
+                    properties.payload_format_indicator = Some(v)
+                }
+                Property::MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
+                Property::ContentType(v) => properties.content_type = Some(v),
+                Property::ResponseTopic(v) => properties.response_topic = Some(v),
+                Property::CorrelationData(v) => properties.correlation_data = Some(v),
+                Property::UserProperty(v) => match &mut properties.user_property {
+                    Some(user_properties) => user_properties.push(v),
+                    None => properties.user_property = Some(vec![v]),
+                },
+                _ => return Err(ReasonCode::MalformedPacket.into()),
+            }
+        }
+
+        Ok(properties)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_properties_round_trip() {
+        let properties = MessageProperties {
+            payload_format_indicator: Some(PayloadFormatIndicator::new(1)),
+            response_topic: Some(ResponseTopic::new("reply".into())),
+            correlation_data: Some(CorrelationData::new(Bytes::from_static(b"id"))),
+            user_property: Some(vec![
+                UserProperty::new("a".into(), "1".into()),
+                UserProperty::new("a".into(), "2".into()),
+            ]),
+            ..Default::default()
+        };
+
+        let mut buffer = BytesMut::new();
+        properties.encode(&mut buffer);
+        assert_eq!(buffer.len(), properties.encoded_size());
+        assert_eq!(MessageProperties::decode(&mut buffer).unwrap(), properties);
+    }
 }

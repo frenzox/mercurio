@@ -9,8 +9,13 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use mercurio_core::{message::Message, qos::QoS, topic::topic_matches_filter};
+use bytes::{Bytes, BytesMut};
+use mercurio_core::{
+    codec::{Decoder, Encoder},
+    message::{Message, MessageProperties},
+    qos::QoS,
+    topic::topic_matches_filter,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
@@ -69,7 +74,8 @@ impl SqliteStore {
                 topic TEXT PRIMARY KEY,
                 payload BLOB,
                 qos INTEGER NOT NULL,
-                dup INTEGER NOT NULL
+                dup INTEGER NOT NULL,
+                properties BLOB NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS will_messages (
@@ -89,6 +95,7 @@ impl SqliteStore {
                 dup INTEGER NOT NULL,
                 sequence INTEGER NOT NULL,
                 released INTEGER NOT NULL,
+                properties BLOB NOT NULL,
                 PRIMARY KEY (client_id, packet_id)
             );
 
@@ -134,6 +141,18 @@ fn int_to_qos(val: i32) -> QoS {
         2 => QoS::ExactlyOnce,
         _ => QoS::Invalid,
     }
+}
+
+fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
+    let mut buffer = BytesMut::new();
+    properties.encode(&mut buffer);
+    buffer.to_vec()
+}
+
+// ponytail: unreadable properties are dropped rather than failing the load;
+// they were written by this module, so only corruption gets here
+fn decode_properties(encoded: Vec<u8>) -> MessageProperties {
+    MessageProperties::decode(&mut Bytes::from(encoded)).unwrap_or_default()
 }
 
 /// Stores each subscription as its QoS digit followed by the topic filter,
@@ -238,10 +257,12 @@ impl RetainedMessageStore for SqliteStore {
             match message {
                 Some(msg) => {
                     let payload = msg.payload.as_ref().map(|b| b.to_vec());
+                    let properties = encode_properties(&msg.properties);
                     conn.execute(
-                        "INSERT OR REPLACE INTO retained_messages (topic, payload, qos, dup)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![topic, payload, qos_to_int(msg.qos), msg.dup],
+                        "INSERT OR REPLACE INTO retained_messages
+                         (topic, payload, qos, dup, properties)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![topic, payload, qos_to_int(msg.qos), msg.dup, properties],
                     )?;
                 }
                 None => {
@@ -261,19 +282,20 @@ impl RetainedMessageStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt =
-                conn.prepare("SELECT topic, payload, qos, dup FROM retained_messages")?;
+                conn.prepare("SELECT topic, payload, qos, dup, properties FROM retained_messages")?;
             let rows = stmt.query_map([], |row| {
                 let topic: String = row.get(0)?;
                 let payload: Option<Vec<u8>> = row.get(1)?;
                 let qos: i32 = row.get(2)?;
                 let dup: bool = row.get(3)?;
-                Ok((topic, payload, qos, dup))
+                let properties: Vec<u8> = row.get(4)?;
+                Ok((topic, payload, qos, dup, properties))
             })?;
 
             let mut messages = Vec::new();
 
             for row in rows {
-                let (topic, payload, qos, dup) = row?;
+                let (topic, payload, qos, dup, properties) = row?;
                 if topic_matches_filter(&topic, &filter) {
                     messages.push(Message {
                         packet_id: None,
@@ -282,6 +304,7 @@ impl RetainedMessageStore for SqliteStore {
                         qos: int_to_qos(qos),
                         retain: true,
                         payload: payload.map(Bytes::from),
+                        properties: decode_properties(properties),
                     });
                 }
             }
@@ -380,13 +403,16 @@ impl InflightStore for SqliteStore {
         // SQLite integers are signed; the bit pattern round-trips
         let sequence = message.sequence as i64;
         let released = message.released;
+        let properties = encode_properties(&message.properties);
 
         self.blocking(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
-                 (client_id, packet_id, topic, payload, qos, dup, sequence, released)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![client_id, packet_id, topic, payload, qos, dup, sequence, released],
+                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    client_id, packet_id, topic, payload, qos, dup, sequence, released, properties
+                ],
             )?;
             Ok(())
         })
@@ -402,8 +428,8 @@ impl InflightStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, dup, sequence, released FROM inflight_messages
-                 WHERE client_id = ?1 AND packet_id = ?2",
+                "SELECT topic, payload, qos, dup, sequence, released, properties
+                 FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
             )?;
 
             let result = stmt
@@ -414,6 +440,7 @@ impl InflightStore for SqliteStore {
                     let dup: bool = row.get(3)?;
                     let sequence: i64 = row.get(4)?;
                     let released: bool = row.get(5)?;
+                    let properties: Vec<u8> = row.get(6)?;
                     Ok(InflightMessage {
                         packet_id,
                         topic,
@@ -422,6 +449,7 @@ impl InflightStore for SqliteStore {
                         dup,
                         sequence: sequence as u64,
                         released,
+                        properties: decode_properties(properties),
                     })
                 })
                 .optional()?;
@@ -463,7 +491,7 @@ impl InflightStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT packet_id, topic, payload, qos, dup, sequence, released
+                "SELECT packet_id, topic, payload, qos, dup, sequence, released, properties
                  FROM inflight_messages WHERE client_id = ?1",
             )?;
 
@@ -475,6 +503,7 @@ impl InflightStore for SqliteStore {
                 let dup: bool = row.get(4)?;
                 let sequence: i64 = row.get(5)?;
                 let released: bool = row.get(6)?;
+                let properties: Vec<u8> = row.get(7)?;
                 Ok(InflightMessage {
                     packet_id,
                     topic,
@@ -483,6 +512,7 @@ impl InflightStore for SqliteStore {
                     dup,
                     sequence: sequence as u64,
                     released,
+                    properties: decode_properties(properties),
                 })
             })?;
 
@@ -508,7 +538,29 @@ mod tests {
             qos: QoS::AtMostOnce,
             retain: false,
             payload: Some(Bytes::from(payload.to_string())),
+            properties: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_retained_keeps_properties() {
+        use mercurio_core::properties::{ResponseTopic, UserProperty};
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mut message = create_test_message("a/b", "payload");
+        message.properties = MessageProperties {
+            response_topic: Some(ResponseTopic::new("reply".into())),
+            user_property: Some(vec![UserProperty::new("k".into(), "v".into())]),
+            ..Default::default()
+        };
+
+        store
+            .store_retained("a/b", Some(message.clone()))
+            .await
+            .unwrap();
+
+        let retained = store.get_retained("a/#").await.unwrap();
+        assert_eq!(retained[0].properties, message.properties);
     }
 
     #[tokio::test]
@@ -603,6 +655,7 @@ mod tests {
             dup: false,
             sequence: 7,
             released: false,
+            properties: Default::default(),
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();

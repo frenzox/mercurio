@@ -158,6 +158,7 @@ impl Decoder for ConnectProperties {
                 AuthenticationMethod(v) => properties.authentication_method = Some(v),
                 AuthenticationData(v) => properties.authentication_data = Some(v),
                 RequestProblemInformation(v) => properties.request_problem_information = Some(v),
+                RequestResponseInformation(v) => properties.request_response_information = Some(v),
                 ReceiveMaximum(v) => properties.receive_maximum = Some(v),
                 TopicAliasMaximum(v) => properties.topic_alias_maximum = Some(v),
                 MaximumPacketSize(v) => properties.maximum_packet_size = Some(v),

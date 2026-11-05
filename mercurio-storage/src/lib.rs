@@ -10,7 +10,10 @@ pub mod sqlite;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mercurio_core::{message::Message, qos::QoS};
+use mercurio_core::{
+    message::{Message, MessageProperties},
+    qos::QoS,
+};
 use thiserror::Error;
 
 /// Error type for storage operations.
@@ -73,6 +76,7 @@ pub struct InflightMessage {
     /// The client acknowledged a QoS 2 message with PUBREC, so PUBREL is
     /// what remains to be sent
     pub released: bool,
+    pub properties: MessageProperties,
 }
 
 /// Trait for session persistence.

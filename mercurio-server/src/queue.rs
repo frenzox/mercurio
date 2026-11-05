@@ -123,6 +123,7 @@ mod tests {
             qos,
             retain: false,
             payload: Some(Bytes::from("payload")),
+            properties: Default::default(),
         }
     }
 
