@@ -1,4 +1,8 @@
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use tokio::{
@@ -148,10 +152,12 @@ struct State {
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     subscriptions: StreamMap<String, Messages>,
-    /// Maps packet_id -> PublishPacket for O(1) lookup/removal
+    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
     unacknowledged_messages: HashMap<u16, PublishPacket>,
-    /// Maps packet_id -> PubRecPacket for O(1) lookup/removal
+    /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id
     pubrecs: HashMap<u16, PubRecPacket>,
+    /// Incoming QoS 2 packet ids already delivered and awaiting PUBREL
+    incoming_qos2: HashSet<u16>,
     /// Last packet identifier assigned to an outgoing QoS > 0 PUBLISH
     last_packet_id: u16,
     /// Will message to be published on abnormal disconnect
@@ -185,6 +191,7 @@ impl Session {
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
+                    incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
                     will_message,
                     auth_method: None,
@@ -327,17 +334,27 @@ impl Session {
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = packet.packet_id {
-                    // Store for QoS 2 flow - use packet_id as key for O(1) lookup
-                    let mut session = self.shared.state.lock().await;
-                    session
-                        .unacknowledged_messages
-                        .insert(packet_id, packet.clone());
+                    let first_delivery = self
+                        .shared
+                        .state
+                        .lock()
+                        .await
+                        .incoming_qos2
+                        .insert(packet_id);
 
-                    Ok(Some(ControlPacket::PubRec(PubRecPacket {
+                    let pubrec = ControlPacket::PubRec(PubRecPacket {
                         packet_id,
                         reason: ReasonCode::Success,
                         properties: None,
-                    })))
+                    });
+
+                    // A retransmission before PUBREL was already delivered
+                    // once; forwarding it again would break exactly-once.
+                    if !first_delivery {
+                        return Ok(Some(pubrec));
+                    }
+
+                    Ok(Some(pubrec))
                 } else {
                     Err(ReasonCode::ProtocolError.into())
                 }
@@ -393,8 +410,7 @@ impl Session {
 
     async fn handle_pubrel(&mut self, packet: PubRelPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        // O(1) removal
-        session.pubrecs.remove(&packet.packet_id);
+        session.incoming_qos2.remove(&packet.packet_id);
 
         Ok(Some(ControlPacket::PubComp(PubCompPacket {
             packet_id: packet.packet_id,
@@ -672,6 +688,7 @@ mod tests {
         unsubscribe::UnsubscribePayload,
     };
     use mercurio_storage::memory::MemoryStore;
+    use tokio::time::{timeout, Duration};
 
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
@@ -994,6 +1011,97 @@ mod tests {
             .insert(1, PublishPacket::default());
 
         assert_eq!(state.next_packet_id(), Some(2));
+    }
+
+    fn qos2_publish(topic: &str, packet_id: u16, dup: bool) -> ControlPacket {
+        ControlPacket::Publish(PublishPacket {
+            dup,
+            qos_level: QoS::ExactlyOnce,
+            retain: false,
+            topic_name: topic.to_string(),
+            packet_id: Some(packet_id),
+            properties: None,
+            payload: Some(Bytes::from("payload")),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_incoming_qos2_retransmission_is_delivered_once() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        subscriber
+            .handle_subscribe(subscribe_packet("t", QoS::ExactlyOnce), &broker)
+            .await
+            .unwrap();
+
+        for dup in [false, true] {
+            let response = publisher
+                .process_incoming(qos2_publish("t", 5, dup), &broker, None)
+                .await
+                .unwrap();
+            assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
+        }
+
+        next_publish(&mut subscriber).await;
+        assert!(
+            timeout(Duration::from_millis(50), subscriber.process_outgoing())
+                .await
+                .is_err()
+        );
+
+        // After PUBREL the packet id is free again for a new message
+        publisher
+            .process_incoming(
+                ControlPacket::PubRel(PubRelPacket {
+                    packet_id: 5,
+                    reason: ReasonCode::Success,
+                    properties: None,
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+        publisher
+            .process_incoming(qos2_publish("t", 5, false), &broker, None)
+            .await
+            .unwrap();
+        next_publish(&mut subscriber).await;
+    }
+
+    #[tokio::test]
+    async fn test_incoming_pubrel_leaves_outgoing_qos2_state_alone() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        session
+            .process_incoming(
+                ControlPacket::PubRec(PubRecPacket {
+                    packet_id: 9,
+                    reason: ReasonCode::Success,
+                    properties: None,
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .process_incoming(
+                ControlPacket::PubRel(PubRelPacket {
+                    packet_id: 9,
+                    reason: ReasonCode::Success,
+                    properties: None,
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(session.shared.state.lock().await.pubrecs.contains_key(&9));
     }
 
     #[tokio::test]
