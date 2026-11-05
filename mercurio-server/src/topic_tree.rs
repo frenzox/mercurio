@@ -87,12 +87,15 @@ impl<T> TopicNode<T> {
 #[derive(Debug)]
 pub(crate) struct TopicTree<T> {
     root: Arc<RwLock<TopicNode<T>>>,
+    /// Subscriptions in the tree, kept for statistics
+    count: Arc<AtomicUsize>,
 }
 
 impl<T> Clone for TopicTree<T> {
     fn clone(&self) -> Self {
         TopicTree {
             root: Arc::clone(&self.root),
+            count: Arc::clone(&self.count),
         }
     }
 }
@@ -101,7 +104,13 @@ impl<T: Clone> TopicTree<T> {
     pub fn new() -> TopicTree<T> {
         TopicTree {
             root: Arc::new(RwLock::new(TopicNode::new())),
+            count: Arc::default(),
         }
+    }
+
+    /// How many subscriptions the tree holds.
+    pub fn subscription_count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Adds or replaces the subscription of `id` to `filter`, which may be a
@@ -119,7 +128,9 @@ impl<T: Clone> TopicTree<T> {
         }
 
         let Some(share_name) = share_name else {
-            node.subscribers.insert(id, subscriber);
+            if node.subscribers.insert(id, subscriber).is_none() {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         };
         let group = node
@@ -131,7 +142,10 @@ impl<T: Clone> TopicTree<T> {
             });
         match group.members.iter_mut().find(|(member, _)| *member == id) {
             Some((_, existing)) => *existing = subscriber,
-            None => group.members.push((id, subscriber)),
+            None => {
+                group.members.push((id, subscriber));
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -139,7 +153,11 @@ impl<T: Clone> TopicTree<T> {
     pub fn unsubscribe(&self, filter: &str, id: u64) -> bool {
         let (share_name, filter) = split_shared(filter);
         let levels: SmallVec<[&str; 8]> = filter.split('/').collect();
-        self.root.write().unwrap().remove(&levels, id, share_name)
+        let removed = self.root.write().unwrap().remove(&levels, id, share_name);
+        if removed {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Returns the subscribers of every filter matching `topic`, once per

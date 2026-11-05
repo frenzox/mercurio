@@ -59,6 +59,10 @@ pub struct ServerConfig {
     /// Also serve MQTT over WebSocket on this port
     pub websocket_port: Option<u16>,
 
+    /// Seconds between updates of the $SYS statistics; 0 disables them
+    #[serde(default = "default_sys_interval")]
+    pub sys_interval: u64,
+
     /// Maximum number of concurrent connections
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -113,6 +117,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             websocket_port: None,
+            sys_interval: default_sys_interval(),
             max_connections: default_max_connections(),
             max_packet_size: default_max_packet_size(),
             max_queued_messages: default_max_queued_messages(),
@@ -163,6 +168,10 @@ fn default_host() -> String {
 
 fn default_port() -> u16 {
     1883
+}
+
+fn default_sys_interval() -> u64 {
+    10
 }
 
 fn default_max_connections() -> usize {
