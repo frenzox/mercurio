@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
@@ -13,7 +20,7 @@ use mercurio_packets::{
     ControlPacket,
 };
 use mercurio_server::{
-    auth::{AuthManager, AuthMethod, AuthResult},
+    auth::{AuthExchange, AuthManager, AuthMethod, AuthResult},
     server::{AuthConfig, ServerConfig},
 };
 use tokio::{
@@ -22,23 +29,46 @@ use tokio::{
     time::timeout,
 };
 
-/// Challenges with "nonce" and expects "nonce-signed" back.
-struct Challenge;
+/// Challenges each client with a fresh nonce and expects it back signed,
+/// which needs state kept between the steps of an exchange.
+#[derive(Default)]
+struct Challenge {
+    issued: AtomicU32,
+}
+
+enum ChallengeExchange {
+    Start(String),
+    Issued(String),
+    Done,
+}
 
 impl AuthMethod for Challenge {
     fn name(&self) -> &str {
         "CHALLENGE"
     }
 
-    fn auth_start(&self, _initial_data: Option<&Bytes>) -> AuthResult {
-        AuthResult::Continue(Bytes::from_static(b"nonce"))
+    fn begin(&self) -> Box<dyn AuthExchange> {
+        let nonce = format!("nonce-{}", self.issued.fetch_add(1, Ordering::Relaxed));
+        Box::new(ChallengeExchange::Start(nonce))
     }
+}
 
-    fn auth_continue(&self, response_data: &Bytes) -> AuthResult {
-        if response_data.as_ref() == b"nonce-signed" {
-            AuthResult::Success
-        } else {
-            AuthResult::Failed(ReasonCode::NotAuthorized)
+impl AuthExchange for ChallengeExchange {
+    fn step(&mut self, data: Option<&Bytes>) -> AuthResult {
+        match std::mem::replace(self, ChallengeExchange::Done) {
+            ChallengeExchange::Start(nonce) => {
+                let challenge = Bytes::from(nonce.clone());
+                *self = ChallengeExchange::Issued(nonce);
+                AuthResult::Continue(challenge)
+            }
+            ChallengeExchange::Issued(nonce)
+                if data.is_some_and(|d| d.as_ref() == format!("{nonce}-signed").as_bytes()) =>
+            {
+                AuthResult::Success {
+                    username: Some("challenger".into()),
+                }
+            }
+            _ => AuthResult::Failed(ReasonCode::NotAuthorized),
         }
     }
 }
@@ -47,7 +77,7 @@ async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut manager = AuthManager::new();
-    manager.register(Box::new(Challenge));
+    manager.register(Box::new(Challenge::default()));
     let config = ServerConfig {
         auth: AuthConfig {
             auth_manager: Some(Arc::new(manager)),
@@ -82,12 +112,12 @@ async fn receive(stream: &mut TcpStream, buffer: &mut BytesMut) -> ControlPacket
     }
 }
 
-fn auth(reason: ReasonCode, method: &str, data: &'static [u8]) -> ControlPacket {
+fn auth(reason: ReasonCode, data: Bytes) -> ControlPacket {
     ControlPacket::Auth(AuthPacket {
         reason,
         properties: AuthProperties {
-            auth_method: Some(AuthenticationMethod::new(method.into())),
-            auth_data: Some(AuthenticationData::new(Bytes::from_static(data))),
+            auth_method: Some(AuthenticationMethod::new("CHALLENGE".into())),
+            auth_data: Some(AuthenticationData::new(data)),
             ..Default::default()
         },
     })
@@ -115,20 +145,20 @@ async fn connect_with(addr: SocketAddr, method: &str) -> (TcpStream, BytesMut) {
     (stream, BytesMut::new())
 }
 
-async fn answer_challenge(stream: &mut TcpStream, buffer: &mut BytesMut, answer: &'static [u8]) {
+/// Answers the challenge, signing it correctly or not. Returns the nonce.
+async fn answer_challenge(stream: &mut TcpStream, buffer: &mut BytesMut, sign: bool) -> Bytes {
     let ControlPacket::Auth(challenge) = receive(stream, buffer).await else {
         panic!("Expected AUTH challenge");
     };
     assert_eq!(challenge.reason, ReasonCode::ContinueAuthentication);
-    assert_eq!(
-        challenge.properties.auth_data.unwrap().value.as_ref(),
-        b"nonce"
-    );
-    send(
-        stream,
-        auth(ReasonCode::ContinueAuthentication, "CHALLENGE", answer),
-    )
-    .await;
+    let nonce = challenge.properties.auth_data.unwrap().value;
+    let answer = if sign {
+        Bytes::from([nonce.as_ref(), b"-signed"].concat())
+    } else {
+        Bytes::from_static(b"guess")
+    };
+    send(stream, auth(ReasonCode::ContinueAuthentication, answer)).await;
+    nonce
 }
 
 #[tokio::test]
@@ -136,7 +166,7 @@ async fn challenge_response_during_connect() {
     let addr = start_broker().await;
     let (mut stream, mut buffer) = connect_with(addr, "CHALLENGE").await;
 
-    answer_challenge(&mut stream, &mut buffer, b"nonce-signed").await;
+    let first_nonce = answer_challenge(&mut stream, &mut buffer, true).await;
 
     let ControlPacket::ConnAck(connack) = receive(&mut stream, &mut buffer).await else {
         panic!("Expected CONNACK");
@@ -145,13 +175,10 @@ async fn challenge_response_during_connect() {
     let method = connack.properties.unwrap().authentication_method.unwrap();
     assert_eq!(method.value, "CHALLENGE");
 
-    // Re-authentication goes through the same method
-    send(
-        &mut stream,
-        auth(ReasonCode::ReAuthenticate, "CHALLENGE", b""),
-    )
-    .await;
-    answer_challenge(&mut stream, &mut buffer, b"nonce-signed").await;
+    // Re-authentication runs a new exchange, with its own nonce
+    send(&mut stream, auth(ReasonCode::ReAuthenticate, Bytes::new())).await;
+    let second_nonce = answer_challenge(&mut stream, &mut buffer, true).await;
+    assert_ne!(first_nonce, second_nonce);
     let ControlPacket::Auth(done) = receive(&mut stream, &mut buffer).await else {
         panic!("Expected AUTH");
     };
@@ -163,7 +190,7 @@ async fn wrong_answer_is_not_authorized() {
     let addr = start_broker().await;
     let (mut stream, mut buffer) = connect_with(addr, "CHALLENGE").await;
 
-    answer_challenge(&mut stream, &mut buffer, b"guess").await;
+    answer_challenge(&mut stream, &mut buffer, false).await;
 
     let ControlPacket::ConnAck(connack) = receive(&mut stream, &mut buffer).await else {
         panic!("Expected CONNACK");

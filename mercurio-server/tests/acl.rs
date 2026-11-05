@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{codec::Encoder, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
@@ -10,6 +10,7 @@ use mercurio_packets::{
 };
 use mercurio_server::{
     acl::AclFile,
+    auth::SimpleCredentialValidator,
     server::{AuthConfig, ServerConfig},
 };
 use tokio::{
@@ -27,11 +28,17 @@ topic readwrite alice/#
 topic write public/#
 ";
 
-async fn start_broker() -> SocketAddr {
+/// With `verify_users`, user names are checked against a password.
+async fn start_broker(verify_users: bool) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = ServerConfig {
         auth: AuthConfig {
+            require_auth: verify_users,
+            allow_anonymous: true,
+            credential_validator: Some(Arc::new(SimpleCredentialValidator::new(HashMap::from([
+                ("alice".to_string(), "secret".to_string()),
+            ])))),
             authorizer: Some(Arc::new(AclFile::parse(ACL).unwrap())),
             ..Default::default()
         },
@@ -54,14 +61,15 @@ impl Client {
     async fn connect(
         addr: SocketAddr,
         client_id: &str,
-        user: Option<&str>,
+        credentials: Option<(&str, &str)>,
         will: Option<&str>,
     ) -> (Self, ReasonCode) {
         let connect = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
             flags: ConnectFlags {
                 clean_start: true,
-                user_name: user.is_some(),
+                user_name: credentials.is_some(),
+                password: credentials.is_some(),
                 will_flag: will.is_some(),
                 ..Default::default()
             },
@@ -69,11 +77,11 @@ impl Client {
             properties: Some(ConnectProperties::default()),
             payload: ConnectPayload {
                 client_id: client_id.into(),
-                user_name: user.map(Into::into),
+                user_name: credentials.map(|(user, _)| user.into()),
+                password: credentials.map(|(_, password)| Bytes::from(password.to_string())),
                 will_properties: will.map(|_| Default::default()),
                 will_topic: will.map(Into::into),
                 will_payload: will.map(|_| Bytes::from_static(b"bye")),
-                ..Default::default()
             },
         };
         let mut client = Client {
@@ -147,9 +155,9 @@ impl Client {
 
 #[tokio::test]
 async fn topics_follow_the_acl() {
-    let addr = start_broker().await;
+    let addr = start_broker(true).await;
     let (mut reader, _) = Client::connect(addr, "reader", None, None).await;
-    let (mut alice, _) = Client::connect(addr, "alice", Some("alice"), None).await;
+    let (mut alice, _) = Client::connect(addr, "alice", Some(("alice", "secret")), None).await;
 
     assert_eq!(reader.subscribe("alice/#").await, ReasonCode::NotAuthorized);
     // Granted QoS 0
@@ -173,11 +181,27 @@ async fn topics_follow_the_acl() {
 
 #[tokio::test]
 async fn will_topic_needs_write_access() {
-    let addr = start_broker().await;
+    let addr = start_broker(true).await;
 
     let (_, refused) = Client::connect(addr, "c", None, Some("public/will")).await;
     assert_eq!(refused, ReasonCode::NotAuthorized);
 
-    let (_, accepted) = Client::connect(addr, "a", Some("alice"), Some("alice/will")).await;
+    let (_, accepted) =
+        Client::connect(addr, "a", Some(("alice", "secret")), Some("alice/will")).await;
     assert_eq!(accepted, ReasonCode::Success);
+}
+
+#[tokio::test]
+async fn unverified_user_names_get_anonymous_rights() {
+    // Without authentication anyone can claim to be alice
+    let addr = start_broker(false).await;
+    let (mut impostor, accepted) =
+        Client::connect(addr, "i", Some(("alice", "anything")), None).await;
+    assert_eq!(accepted, ReasonCode::Success);
+
+    assert_eq!(
+        impostor.subscribe("alice/#").await,
+        ReasonCode::NotAuthorized
+    );
+    assert_eq!(impostor.subscribe("public/#").await.get_code(), 0x00);
 }
