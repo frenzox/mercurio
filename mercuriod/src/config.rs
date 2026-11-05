@@ -84,6 +84,9 @@ pub struct ServerConfig {
     #[serde(default = "default_receive_maximum")]
     pub receive_maximum: u16,
 
+    /// Longest keep-alive, in seconds, MQTT 5 clients may use
+    pub max_keepalive: Option<u16>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -101,6 +104,7 @@ impl Default for ServerConfig {
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
+            max_keepalive: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -172,6 +176,7 @@ impl ServerConfig {
             max_connections: Some(self.max_connections),
             topic_alias_maximum: self.max_topic_alias,
             receive_maximum: self.receive_maximum,
+            max_keepalive: self.max_keepalive,
         }
     }
 }

@@ -90,3 +90,31 @@ async fn connections_beyond_the_limit_are_refused() {
     sleep(Duration::from_millis(100)).await;
     connect(addr, b'b').await;
 }
+
+#[tokio::test]
+async fn keep_alive_is_capped_for_mqtt5_clients() {
+    let addr = start_broker(Limits {
+        max_keepalive: Some(1),
+        ..Default::default()
+    })
+    .await;
+
+    // MQTT 5 client asking for a one minute keep-alive
+    let (mut stream, connack) = connect(addr, b'c').await;
+    // Server Keep Alive property (0x13) of 1 second
+    assert!(connack.windows(3).any(|w| w == [0x13, 0x00, 0x01]));
+    let disconnect = read_until_closed(&mut stream).await;
+    assert_eq!(common::disconnect_reason(&disconnect), 0x8d);
+
+    // MQTT 3.1.1 can't be told, so its keep-alive is left alone
+    let mut v3 = TcpStream::connect(addr).await.unwrap();
+    v3.write_all(&[
+        0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x00, 0x00, 0x01, b'v',
+    ])
+    .await
+    .unwrap();
+    common::read_connack(&mut v3).await;
+    assert!(timeout(Duration::from_secs(2), v3.read(&mut [0u8; 1]))
+        .await
+        .is_err());
+}
