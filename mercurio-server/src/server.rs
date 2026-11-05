@@ -10,9 +10,15 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use mercurio_core::{
-    error::Error, message::Message, protocol::ProtocolVersion, reason::ReasonCode, Result,
+    error::Error,
+    message::Message,
+    properties::{AuthenticationData, AuthenticationMethod},
+    protocol::ProtocolVersion,
+    reason::ReasonCode,
+    Result,
 };
 use mercurio_packets::{
+    auth::{AuthPacket, AuthProperties},
     connack::{ConnAckFlags, ConnAckPacket},
     connect::ConnectPacket,
     disconnect::DisconnectPacket,
@@ -21,7 +27,7 @@ use mercurio_packets::{
 use mercurio_storage::memory::MemoryStore;
 
 use crate::{
-    auth::{AuthManager, CredentialValidator},
+    auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
     queue::QueueLimits,
@@ -330,8 +336,19 @@ where
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
 
-        // Validate credentials if authentication is configured
-        if self.auth_config.require_auth {
+        let authentication_method = connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.authentication_method.as_ref())
+            .map(|m| m.value.clone());
+
+        // MQTT 5 enhanced authentication replaces the user name and password
+        // check when the client asks for it
+        if let Some(method) = authentication_method {
+            if !self.authenticate_enhanced(&connect_packet, &method).await? {
+                return Ok(());
+            }
+        } else if self.auth_config.require_auth {
             let authenticated = match (
                 &connect_packet.payload.user_name,
                 &connect_packet.payload.password,
@@ -485,6 +502,85 @@ where
         self.session_manager.end_connection(lease, expiry).await;
 
         result
+    }
+
+    /// Runs the AUTH exchange of MQTT 5 enhanced authentication during
+    /// CONNECT. Returns false, having refused the connection, if it fails.
+    async fn authenticate_enhanced(
+        &mut self,
+        connect_packet: &ConnectPacket,
+        method: &str,
+    ) -> Result<bool> {
+        let Some(manager) = self.auth_config.auth_manager.clone() else {
+            self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
+                .await?;
+            return Ok(false);
+        };
+        if !manager.supports_method(method) {
+            self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
+                .await?;
+            return Ok(false);
+        }
+
+        let initial_data = connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.authentication_data.as_ref())
+            .map(|d| &d.value);
+        let mut result = manager.start_auth(method, initial_data);
+
+        loop {
+            let challenge = match result {
+                AuthResult::Success => return Ok(true),
+                AuthResult::Failed(reason) => {
+                    warn!("Enhanced authentication with `{}` failed", method);
+                    self.reject_connect(connect_packet, reason).await?;
+                    return Ok(false);
+                }
+                AuthResult::Continue(challenge) => challenge,
+            };
+
+            self.connection
+                .write_packet(ControlPacket::Auth(AuthPacket {
+                    reason: ReasonCode::ContinueAuthentication,
+                    properties: AuthProperties {
+                        auth_method: Some(AuthenticationMethod::new(method.to_string())),
+                        auth_data: Some(AuthenticationData::new(challenge)),
+                        ..Default::default()
+                    },
+                }))
+                .await?;
+
+            // The exchange counts towards the time allowed to connect
+            let response =
+                time::timeout(self.limits.connect_timeout, self.connection.read_packet())
+                    .await
+                    .map_err(|_| ReasonCode::MaximumConnectTime)??;
+
+            // Only AUTH continuing the same method may answer a challenge
+            let Some(ControlPacket::Auth(auth)) = response else {
+                self.reject_connect(connect_packet, ReasonCode::ProtocolError)
+                    .await?;
+                return Ok(false);
+            };
+            let same_method = auth
+                .properties
+                .auth_method
+                .as_ref()
+                .is_some_and(|m| m.value == method);
+            if auth.reason != ReasonCode::ContinueAuthentication || !same_method {
+                self.reject_connect(connect_packet, ReasonCode::ProtocolError)
+                    .await?;
+                return Ok(false);
+            }
+
+            let data = auth
+                .properties
+                .auth_data
+                .map(|d| d.value)
+                .unwrap_or_default();
+            result = manager.continue_auth(method, &data);
+        }
     }
 
     async fn reject_connect(

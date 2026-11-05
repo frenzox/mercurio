@@ -382,6 +382,12 @@ impl Session {
                         limits.max_packet_size.try_into().unwrap_or(u32::MAX),
                     )),
                     topic_alias_max: Some(TopicAliasMaximum::new(limits.topic_alias_maximum)),
+                    // Echoes the method a successful enhanced authentication used
+                    authentication_method: session
+                        .connect_packet
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.authentication_method.clone()),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
                     ..Default::default()
                 });
@@ -713,6 +719,18 @@ impl Session {
                 let Some(method_name) = method_name else {
                     return Err(ReasonCode::ProtocolError.into());
                 };
+
+                // Re-authentication must use the method the connection was
+                // authenticated with [MQTT-4.12.1-1]
+                let connect_method = session
+                    .connect_packet
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.authentication_method.as_ref())
+                    .map(|m| m.value.as_str());
+                if connect_method != Some(method_name) {
+                    return Err(ReasonCode::ProtocolError.into());
+                }
 
                 if !auth_manager.supports_method(method_name) {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
