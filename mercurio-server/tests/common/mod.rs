@@ -15,3 +15,28 @@ pub async fn read_connack(stream: &mut TcpStream) -> Vec<u8> {
     .await
     .expect("no CONNACK")
 }
+
+/// The reason code of the DISCONNECT that `bytes` start with.
+#[allow(dead_code)]
+pub fn disconnect_reason(bytes: &[u8]) -> u8 {
+    assert_eq!(
+        bytes.first(),
+        Some(&0xe0),
+        "expected DISCONNECT: {bytes:02x?}"
+    );
+    bytes[2]
+}
+
+/// Reads a whole DISCONNECT, whatever properties it carries.
+#[allow(dead_code)]
+pub async fn read_disconnect(stream: &mut TcpStream) -> Vec<u8> {
+    timeout(Duration::from_secs(2), async {
+        let mut disconnect = vec![0u8; 2];
+        stream.read_exact(&mut disconnect).await.unwrap();
+        disconnect.resize(2 + disconnect[1] as usize, 0);
+        stream.read_exact(&mut disconnect[2..]).await.unwrap();
+        disconnect
+    })
+    .await
+    .expect("no DISCONNECT")
+}

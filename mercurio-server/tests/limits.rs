@@ -66,7 +66,10 @@ async fn configured_packet_size_is_advertised_and_enforced() {
     stream.write_all(&publish).await.unwrap();
 
     // DISCONNECT, Packet Too Large
-    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x95]);
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x95
+    );
 }
 
 #[tokio::test]

@@ -604,6 +604,12 @@ impl Session {
         self.shared.queue.restore(messages);
     }
 
+    /// The largest packet the client accepts, if it set a limit.
+    pub(crate) async fn client_maximum_packet_size(&self) -> Option<u32> {
+        let session = self.shared.state.lock().await;
+        session.client_maximum_packet_size().map(|m| m as u32)
+    }
+
     /// Records the user name authentication verified for this connection.
     pub(crate) async fn set_verified_user(&self, username: Option<String>) {
         self.shared.state.lock().await.verified_user = username;
