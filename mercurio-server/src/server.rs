@@ -214,6 +214,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
+        self.connection
+            .set_protocol_version(connect_packet.protocol_version);
+
         // Validate credentials if authentication is configured
         if self.auth_config.require_auth {
             let authenticated = match (

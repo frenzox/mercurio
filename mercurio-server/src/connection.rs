@@ -5,7 +5,7 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 
-use mercurio_core::{codec::Encoder, error::Error, reason::ReasonCode, Result};
+use mercurio_core::{error::Error, protocol::ProtocolVersion, reason::ReasonCode, Result};
 use mercurio_packets::ControlPacket;
 
 /// Default capacity for read buffer (8KB)
@@ -24,6 +24,8 @@ where
     read_buffer: BytesMut,
     /// Reusable write buffer - avoids allocation per write
     write_buffer: BytesMut,
+    /// Negotiated in CONNECT; decides the wire format of every other packet
+    protocol_version: ProtocolVersion,
 }
 
 impl Connection<TcpStream> {
@@ -33,6 +35,7 @@ impl Connection<TcpStream> {
             stream: BufWriter::new(socket),
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
+            protocol_version: ProtocolVersion::V5,
         }
     }
 }
@@ -44,6 +47,7 @@ impl Connection<TlsStream<TcpStream>> {
             stream: BufWriter::new(stream),
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
+            protocol_version: ProtocolVersion::V5,
         }
     }
 }
@@ -52,6 +56,10 @@ impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    pub fn set_protocol_version(&mut self, version: ProtocolVersion) {
+        self.protocol_version = version;
+    }
+
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
             if let Some(e) = self.parse_packet()? {
@@ -72,7 +80,7 @@ where
         // Clear and reuse the write buffer instead of allocating a new one
         self.write_buffer.clear();
 
-        packet.encode(&mut self.write_buffer);
+        packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
 
         self.stream.write_all(&self.write_buffer).await?;
         self.stream.flush().await?;
@@ -83,7 +91,10 @@ where
     fn parse_packet(&mut self) -> Result<Option<ControlPacket>> {
         match ControlPacket::check(&mut self.read_buffer) {
             Ok(_) => {
-                let packet = ControlPacket::parse(&mut self.read_buffer)?;
+                let packet = ControlPacket::parse_with_version(
+                    &mut self.read_buffer,
+                    self.protocol_version,
+                )?;
                 Ok(Some(packet))
             }
             // Not enough bytes in the buffer to parse a packet

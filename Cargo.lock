@@ -515,6 +515,7 @@ dependencies = [
  "bytes",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-server",
  "rustls",
  "rustls-pemfile",
  "thiserror 1.0.69",

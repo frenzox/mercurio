@@ -100,6 +100,28 @@ const PACKET_TYPE: u8 = 0x0a;
 
 impl Encoder for UnsubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
+        self.encode_inner(buffer, true);
+    }
+}
+
+impl Decoder for UnsubscribePacket {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        Self::decode_inner(buffer, true)
+    }
+}
+
+impl UnsubscribePacket {
+    /// Encodes the packet in MQTT 3.x format (no properties).
+    pub fn encode_v3(&self, buffer: &mut bytes::BytesMut) {
+        self.encode_inner(buffer, false);
+    }
+
+    /// Decodes the packet in MQTT 3.x format (no properties).
+    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        Self::decode_inner(buffer, false)
+    }
+
+    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
         let mut remaining_len = 0;
 
         // Fixed header
@@ -108,27 +130,34 @@ impl Encoder for UnsubscribePacket {
         fixed_header.encode(buffer);
 
         remaining_len += self.packet_id.encoded_size();
-        remaining_len += VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-        remaining_len += self.properties.encoded_size();
+        if with_properties {
+            remaining_len +=
+                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
+            remaining_len += self.properties.encoded_size();
+        }
         remaining_len += self.payload.encoded_size();
 
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+        if with_properties {
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
+        }
         self.payload.encode(buffer);
     }
-}
 
-impl Decoder for UnsubscribePacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+    fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         buffer.advance(1); // Packet type
         let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
         let buffer_len = buffer.remaining();
 
         let packet_id = u16::decode(buffer)?;
-        let properties = Some(UnsubscribeProperties::decode(buffer)?);
+        let properties = if with_properties {
+            Some(UnsubscribeProperties::decode(buffer)?)
+        } else {
+            None
+        };
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError.into());
