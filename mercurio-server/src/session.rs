@@ -593,12 +593,12 @@ impl Session {
         let mut session = self.shared.state.lock().await;
 
         match session.subscriptions.next().await {
-            Some((topic, message)) => {
+            Some((_, message)) => {
                 let publish = PublishPacket {
                     dup: message.dup,
                     qos_level: message.qos,
                     retain: false,
-                    topic_name: topic,
+                    topic_name: message.topic.to_string(),
                     packet_id: message.packet_id,
                     properties: None,
                     payload: message.payload,
@@ -820,6 +820,58 @@ mod tests {
             }
             _ => panic!("Expected UnsubAck packet"),
         }
+    }
+
+    fn subscribe_packet(
+        topic_filter: &str,
+        qos: QoS,
+    ) -> mercurio_packets::subscribe::SubscribePacket {
+        mercurio_packets::subscribe::SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![SubscribePayload {
+                topic_filter: topic_filter.to_string(),
+                subs_opt: SubscriptionOptions {
+                    qos,
+                    ..Default::default()
+                },
+            }],
+        }
+    }
+
+    fn message(topic: &str, qos: QoS, packet_id: Option<u16>, retain: bool) -> Message {
+        Message {
+            packet_id,
+            topic: Arc::from(topic),
+            dup: false,
+            qos,
+            retain,
+            payload: Some(Bytes::from("payload")),
+        }
+    }
+
+    async fn next_publish(session: &mut Session) -> PublishPacket {
+        match session.process_outgoing().await {
+            Some(ControlPacket::Publish(p)) => p,
+            other => panic!("Expected Publish packet, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_publish_uses_published_topic_name() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        session
+            .handle_subscribe(subscribe_packet("a/+", QoS::AtMostOnce), &broker)
+            .await
+            .unwrap();
+        broker
+            .publish("a/b", message("a/b", QoS::AtMostOnce, None, false))
+            .await
+            .unwrap();
+
+        assert_eq!(next_publish(&mut session).await.topic_name, "a/b");
     }
 
     #[test]
