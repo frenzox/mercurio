@@ -196,6 +196,22 @@ impl InflightStore for MemoryStore {
         Ok(())
     }
 
+    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        let mut inflight = self
+            .inflight
+            .write()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+
+        if let Some(message) = inflight
+            .get_mut(client_id)
+            .and_then(|msgs| msgs.get_mut(&packet_id))
+        {
+            message.released = true;
+            message.payload = None;
+        }
+        Ok(())
+    }
+
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
         let inflight = self
             .inflight
@@ -316,17 +332,24 @@ mod tests {
             packet_id: 1,
             topic: "test/topic".to_string(),
             payload: Some(Bytes::from("data")),
-            qos: QoS::AtLeastOnce,
+            qos: QoS::ExactlyOnce,
             dup: false,
+            sequence: 7,
+            released: false,
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();
 
-        let loaded = store.get_inflight("client1", 1).await.unwrap();
-        assert!(loaded.is_some());
+        let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 7);
+        assert!(!loaded.released);
 
+        store.release_inflight("client1", 1).await.unwrap();
         let all = store.get_all_inflight("client1").await.unwrap();
         assert_eq!(all.len(), 1);
+        assert!(all[0].released);
+        assert!(all[0].payload.is_none());
+        assert_eq!(all[0].sequence, 7);
 
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();

@@ -45,7 +45,9 @@ use crate::{
     queue::{MessageQueue, Subscriber},
     topic_tree::TopicTree,
 };
-use mercurio_storage::{RetainedMessageStore, StoredSubscription, StoredWillMessage};
+use mercurio_storage::{
+    InflightMessage, RetainedMessageStore, StoredSubscription, StoredWillMessage,
+};
 
 /// Will message to be published on abnormal client disconnect.
 #[derive(Debug, Clone)]
@@ -139,10 +141,14 @@ struct State {
     granted_qos: HashMap<String, QoS>,
     /// Where the subscriptions are registered, once there are any
     topics: Option<TopicTree<Subscriber>>,
-    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
-    unacknowledged_messages: HashMap<u16, PublishPacket>,
-    /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id
-    pubrecs: HashMap<u16, PubRecPacket>,
+    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id, with
+    /// the sequence they were sent in
+    unacknowledged_messages: HashMap<u16, (u64, PublishPacket)>,
+    /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
+    /// sequence they were sent in
+    pubrecs: HashMap<u16, u64>,
+    /// Sequence number of the next outgoing QoS 1/2 message
+    next_sequence: u64,
     /// Incoming QoS 2 packet ids already delivered and awaiting PUBREL
     incoming_qos2: HashSet<u16>,
     /// Last packet identifier assigned to an outgoing QoS > 0 PUBLISH
@@ -180,6 +186,7 @@ impl Session {
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
+                    next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
                     will_message,
@@ -401,8 +408,10 @@ impl Session {
     async fn handle_pubrec(&mut self, packet: PubRecPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
-        let known = session.unacknowledged_messages.remove(&packet_id).is_some()
-            || session.pubrecs.contains_key(&packet_id);
+        let sequence = match session.unacknowledged_messages.remove(&packet_id) {
+            Some((sequence, _)) => Some(sequence),
+            None => session.pubrecs.get(&packet_id).copied(),
+        };
 
         // A failure reason ends the exchange: the client won't take the message
         if packet.reason.get_code() >= 0x80 {
@@ -410,8 +419,8 @@ impl Session {
             return Ok(None);
         }
 
-        let reason = if known {
-            session.pubrecs.insert(packet_id, packet);
+        let reason = if let Some(sequence) = sequence {
+            session.pubrecs.insert(packet_id, sequence);
             ReasonCode::Success
         } else {
             session.unknown_packet_id_reason()
@@ -684,7 +693,7 @@ impl Session {
 
     /// Turns a queued message into the PUBLISH to send, tracking it until
     /// acknowledged. Returns None if the message had to be dropped.
-    pub(crate) async fn prepare_publish(&mut self, message: Message) -> Option<ControlPacket> {
+    pub(crate) async fn prepare_publish(&mut self, message: Message) -> Option<Outgoing> {
         let mut session = self.shared.state.lock().await;
 
         {
@@ -714,15 +723,89 @@ impl Session {
                 payload: message.payload,
             };
 
-            if let Some(packet_id) = packet_id {
+            let inflight = packet_id.map(|packet_id| {
+                let sequence = session.next_sequence;
+                session.next_sequence += 1;
                 session
                     .unacknowledged_messages
-                    .insert(packet_id, publish.clone());
-            }
+                    .insert(packet_id, (sequence, publish.clone()));
+                InflightMessage {
+                    packet_id,
+                    topic: publish.topic_name.clone(),
+                    payload: publish.payload.clone(),
+                    qos: publish.qos_level,
+                    dup: false,
+                    sequence,
+                    released: false,
+                }
+            });
 
-            Some(ControlPacket::Publish(publish))
+            Some(Outgoing {
+                packet: ControlPacket::Publish(publish),
+                inflight,
+            })
         }
     }
+
+    /// Adds in-flight messages loaded from storage to a restored session.
+    pub(crate) async fn restore_inflight(&self, inflight: Vec<InflightMessage>) {
+        let mut session = self.shared.state.lock().await;
+
+        for message in inflight {
+            session.next_sequence = session.next_sequence.max(message.sequence + 1);
+            if message.released {
+                session.pubrecs.insert(message.packet_id, message.sequence);
+            } else {
+                let publish = PublishPacket {
+                    dup: false,
+                    qos_level: message.qos,
+                    retain: false,
+                    topic_name: message.topic,
+                    packet_id: Some(message.packet_id),
+                    properties: None,
+                    payload: message.payload,
+                };
+                session
+                    .unacknowledged_messages
+                    .insert(message.packet_id, (message.sequence, publish));
+            }
+        }
+    }
+
+    /// Packets to resend when a session resumes: unacknowledged PUBLISH
+    /// packets flagged as duplicates and pending PUBRELs, in the order they
+    /// were first sent [MQTT-4.4.0-1].
+    pub(crate) async fn pending_retransmissions(&self) -> Vec<ControlPacket> {
+        let session = self.shared.state.lock().await;
+
+        let mut pending: Vec<(u64, ControlPacket)> = session
+            .unacknowledged_messages
+            .values()
+            .map(|(sequence, publish)| {
+                let mut publish = publish.clone();
+                publish.dup = true;
+                (*sequence, ControlPacket::Publish(publish))
+            })
+            .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
+                let pubrel = PubRelPacket {
+                    packet_id: *packet_id,
+                    reason: ReasonCode::Success,
+                    properties: None,
+                };
+                (*sequence, ControlPacket::PubRel(pubrel))
+            }))
+            .collect();
+
+        pending.sort_by_key(|(sequence, _)| *sequence);
+        pending.into_iter().map(|(_, packet)| packet).collect()
+    }
+}
+
+/// A PUBLISH ready to send.
+pub(crate) struct Outgoing {
+    pub packet: ControlPacket,
+    /// For QoS 1 and 2, the state to persist until the client acknowledges it
+    pub inflight: Option<InflightMessage>,
 }
 
 impl State {
@@ -985,7 +1068,7 @@ mod tests {
 
     async fn next_publish(session: &mut Session) -> PublishPacket {
         let message = session.next_outgoing().await;
-        match session.prepare_publish(message).await {
+        match session.prepare_publish(message).await.map(|o| o.packet) {
             Some(ControlPacket::Publish(p)) => p,
             other => panic!("Expected Publish packet, got {:?}", other),
         }
@@ -1085,10 +1168,10 @@ mod tests {
         state.last_packet_id = u16::MAX - 1;
         state
             .unacknowledged_messages
-            .insert(u16::MAX, PublishPacket::default());
+            .insert(u16::MAX, (0, PublishPacket::default()));
         state
             .unacknowledged_messages
-            .insert(1, PublishPacket::default());
+            .insert(1, (1, PublishPacket::default()));
 
         assert_eq!(state.next_packet_id(), Some(2));
     }
