@@ -70,16 +70,35 @@ impl<T> TopicNode<T> {
 
     /// Adds every subscriber of this node to `matches`: all regular ones and
     /// one member of each share group.
-    fn collect(&self, matches: &mut Vec<T>)
+    fn collect(&self, matches: &mut Matches<T>)
     where
         T: Clone,
     {
-        matches.extend(self.subscribers.values().cloned());
+        matches.regular.extend(self.subscribers.values().cloned());
         for group in self.shared.values() {
             let turn = group.next.fetch_add(1, Ordering::Relaxed);
             let (_, member) = &group.members[turn % group.members.len()];
-            matches.push(member.clone());
+            matches.shared.push(member.clone());
         }
+    }
+}
+
+/// The subscribers matching a topic, once per matching filter.
+#[derive(Debug)]
+pub(crate) struct Matches<T> {
+    pub regular: Vec<T>,
+    /// The member chosen in each matching share group
+    pub shared: Vec<T>,
+}
+
+impl<T> Matches<T> {
+    pub fn len(&self) -> usize {
+        self.regular.len() + self.shared.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -162,9 +181,12 @@ impl<T: Clone> TopicTree<T> {
 
     /// Returns the subscribers of every filter matching `topic`, once per
     /// matching filter.
-    pub fn matching(&self, topic: &str) -> Vec<T> {
+    pub fn matching(&self, topic: &str) -> Matches<T> {
         let root = self.root.read().unwrap();
-        let mut matches = Vec::new();
+        let mut matches = Matches {
+            regular: Vec::new(),
+            shared: Vec::new(),
+        };
 
         // Use SmallVec to avoid heap allocation for typical topic depths (< 8 levels)
         let mut stack: SmallVec<[(&TopicNode<T>, usize); 8]> = SmallVec::new();
@@ -222,7 +244,8 @@ mod tests {
     use super::TopicTree;
 
     fn matching(tree: &TopicTree<&'static str>, topic: &str) -> Vec<&'static str> {
-        let mut matches = tree.matching(topic);
+        let found = tree.matching(topic);
+        let mut matches = [found.regular, found.shared].concat();
         matches.sort();
         matches
     }

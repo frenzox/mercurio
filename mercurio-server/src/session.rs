@@ -149,15 +149,15 @@ fn message_properties(properties: Option<&PublishProperties>) -> MessageProperti
 }
 
 /// The PUBLISH properties forwarding a message's application properties,
-/// along with the identifier of the subscription it was delivered through.
+/// along with the identifiers of the subscriptions it was delivered through.
 fn publish_properties(
     properties: &MessageProperties,
-    subscription_identifier: Option<u32>,
+    subscription_identifiers: &[u32],
 ) -> Option<PublishProperties> {
     Some(PublishProperties {
-        subscription_identifiers: subscription_identifier
-            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(id)))
-            .into_iter()
+        subscription_identifiers: subscription_identifiers
+            .iter()
+            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(*id)))
             .collect(),
         payload_format_indicator: properties.payload_format_indicator.clone(),
         message_expiry_interval: properties.message_expiry_interval.clone(),
@@ -611,7 +611,7 @@ impl Session {
             payload: packet.payload,
             expires_at: Message::expiry_deadline(&properties),
             properties,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
 
         let subscribers = broker
@@ -1121,7 +1121,7 @@ impl Session {
                 packet_id,
                 properties: publish_properties(
                     &message.properties,
-                    message.subscription_identifier,
+                    &message.subscription_identifiers,
                 ),
                 payload: message.payload,
             };
@@ -1155,7 +1155,7 @@ impl Session {
                     sequence,
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
-                    subscription_identifier: message.subscription_identifier,
+                    subscription_identifiers: message.subscription_identifiers.clone(),
                 }
             });
 
@@ -1183,7 +1183,7 @@ impl Session {
                     packet_id: Some(message.packet_id),
                     properties: publish_properties(
                         &message.properties,
-                        message.subscription_identifier,
+                        &message.subscription_identifiers,
                     ),
                     payload: message.payload,
                 };
@@ -1531,7 +1531,7 @@ mod tests {
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
@@ -1994,7 +1994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deliveries_carry_their_subscription_identifier() {
+    async fn test_overlapping_subscriptions_get_one_copy_with_every_identifier() {
         let mut session = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
@@ -2009,13 +2009,39 @@ mod tests {
             .await
             .unwrap();
 
-        let mut identifiers = Vec::new();
-        for _ in 0..2 {
-            let properties = next_publish(&mut session).await.properties.unwrap();
-            identifiers.push(properties.subscription_identifiers[0].value.0);
-        }
+        let properties = next_publish(&mut session).await.properties.unwrap();
+        let mut identifiers: Vec<u32> = properties
+            .subscription_identifiers
+            .iter()
+            .map(|id| id.value.0)
+            .collect();
         identifiers.sort();
         assert_eq!(identifiers, [7, 9]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), session.next_outgoing(true))
+                .await
+                .is_err(),
+            "second copy delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overlapping_subscriptions_deliver_at_the_highest_qos() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        for (filter, qos) in [("q/+", QoS::AtMostOnce), ("q/#", QoS::ExactlyOnce)] {
+            session
+                .handle_subscribe(subscribe_packet(filter, qos), &broker, None)
+                .await
+                .unwrap();
+        }
+        broker
+            .publish("q/x", message("q/x", QoS::ExactlyOnce, Some(1), false))
+            .await
+            .unwrap();
+
+        assert_eq!(next_publish(&mut session).await.qos_level, QoS::ExactlyOnce);
     }
 
     #[tokio::test]
