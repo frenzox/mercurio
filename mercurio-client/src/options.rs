@@ -1,5 +1,65 @@
 use bytes::Bytes;
+use mercurio_core::properties::{
+    ContentType, CorrelationData, MessageExpiryInterval, PayloadFormatIndicator, ResponseTopic,
+    UserProperty,
+};
 use mercurio_core::{protocol::ProtocolVersion, qos::QoS};
+use mercurio_packets::connect::WillProperties;
+use mercurio_packets::publish::PublishProperties;
+
+/// MQTT 5 properties of an application message. MQTT 3.x ignores them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageProperties {
+    /// The payload is UTF-8 text
+    pub payload_is_utf8: bool,
+    /// Seconds the broker keeps the message for subscribers yet to get it
+    pub message_expiry: Option<u32>,
+    pub content_type: Option<String>,
+    /// Where a request's reply should be published
+    pub response_topic: Option<String>,
+    /// Matches a reply to its request
+    pub correlation_data: Option<Bytes>,
+    pub user_properties: Vec<(String, String)>,
+}
+
+impl MessageProperties {
+    pub(crate) fn to_publish(&self) -> Option<PublishProperties> {
+        if *self == MessageProperties::default() {
+            return None;
+        }
+        Some(PublishProperties {
+            payload_format_indicator: self.payload_is_utf8.then(|| PayloadFormatIndicator::new(1)),
+            message_expiry_interval: self.message_expiry.map(MessageExpiryInterval::new),
+            content_type: self.content_type.clone().map(ContentType::new),
+            response_topic: self.response_topic.clone().map(ResponseTopic::new),
+            correlation_data: self.correlation_data.clone().map(CorrelationData::new),
+            user_property: (!self.user_properties.is_empty()).then(|| {
+                self.user_properties
+                    .iter()
+                    .map(|(k, v)| UserProperty::new(k.clone(), v.clone()))
+                    .collect()
+            }),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn from_publish(properties: Option<PublishProperties>) -> Self {
+        let p = properties.unwrap_or_default();
+        MessageProperties {
+            payload_is_utf8: p.payload_format_indicator.is_some_and(|f| f.value == 1),
+            message_expiry: p.message_expiry_interval.map(|e| e.value),
+            content_type: p.content_type.map(|c| c.value),
+            response_topic: p.response_topic.map(|r| r.value),
+            correlation_data: p.correlation_data.map(|c| c.value),
+            user_properties: p
+                .user_property
+                .unwrap_or_default()
+                .into_iter()
+                .map(|u| (u.key, u.value))
+                .collect(),
+        }
+    }
+}
 
 /// Will message configuration.
 #[derive(Debug, Clone)]
@@ -8,6 +68,26 @@ pub struct Will {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// Seconds the broker waits after the connection drops before
+    /// publishing the will
+    pub delay: u32,
+    pub properties: MessageProperties,
+}
+
+impl Will {
+    pub(crate) fn to_properties(&self) -> WillProperties {
+        let p = self.properties.to_publish().unwrap_or_default();
+        WillProperties {
+            will_delay_interval: (self.delay > 0)
+                .then(|| mercurio_core::properties::WillDelayInterval::new(self.delay)),
+            payload_format_indicator: p.payload_format_indicator,
+            message_expiry_interval: p.message_expiry_interval,
+            content_type: p.content_type,
+            response_topic: p.response_topic,
+            correlation_data: p.correlation_data,
+            user_property: p.user_property,
+        }
+    }
 }
 
 impl Will {
@@ -17,7 +97,20 @@ impl Will {
             payload: payload.into(),
             qos: QoS::AtMostOnce,
             retain: false,
+            delay: 0,
+            properties: MessageProperties::default(),
         }
+    }
+
+    /// Delay publishing the will, so a quick reconnect can cancel it.
+    pub fn delay(mut self, seconds: u32) -> Self {
+        self.delay = seconds;
+        self
+    }
+
+    pub fn properties(mut self, properties: MessageProperties) -> Self {
+        self.properties = properties;
+        self
     }
 
     pub fn qos(mut self, qos: QoS) -> Self {
@@ -53,6 +146,7 @@ pub struct ConnectOptions {
     pub(crate) password: Option<Bytes>,
     pub(crate) keep_alive: u16,
     pub(crate) clean_start: bool,
+    pub(crate) session_expiry: u32,
     pub(crate) will: Option<Will>,
     pub(crate) protocol_version: ProtocolVersion,
     pub(crate) connect_timeout_secs: u64,
@@ -70,6 +164,7 @@ impl ConnectOptions {
             password: None,
             keep_alive: 60,
             clean_start: true,
+            session_expiry: 0,
             will: None,
             protocol_version: ProtocolVersion::V5,
             connect_timeout_secs: 30,
@@ -122,6 +217,13 @@ impl ConnectOptions {
     /// Set clean start flag. If true, the broker will discard any existing session.
     pub fn clean_start(mut self, clean: bool) -> Self {
         self.clean_start = clean;
+        self
+    }
+
+    /// Keep the session this many seconds after the connection closes;
+    /// `u32::MAX` keeps it forever. MQTT 5 only.
+    pub fn session_expiry(mut self, seconds: u32) -> Self {
+        self.session_expiry = seconds;
         self
     }
 

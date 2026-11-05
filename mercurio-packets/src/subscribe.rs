@@ -90,7 +90,7 @@ impl From<u8> for RetainHandling {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionOptions {
     pub qos: QoS,
     pub no_local: bool,
