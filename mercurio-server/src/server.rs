@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -36,6 +36,7 @@ use crate::{
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     tls::TlsConfig,
+    websocket,
 };
 
 /// Authentication configuration for the server.
@@ -103,6 +104,65 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     pub limits: Limits,
     pub policy: ConnectPolicy,
+    /// Also serve MQTT over WebSocket on this listener, with TLS if `tls` is
+    /// set.
+    pub websocket_listener: Option<TcpListener>,
+}
+
+/// How MQTT is carried on a connection.
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    Mqtt,
+    WebSocket,
+}
+
+/// Everything a connection handler needs besides its stream.
+struct HandlerParts<St: MqttStore + 'static> {
+    broker: Broker<St>,
+    session_manager: SessionManager<St>,
+    shutdown: Shutdown,
+    shutdown_complete: mpsc::Sender<()>,
+    auth_config: Arc<AuthConfig>,
+    policy: Arc<ConnectPolicy>,
+    limits: Limits,
+}
+
+impl<St: MqttStore + 'static> HandlerParts<St> {
+    /// Serves one client on `stream`, after the WebSocket handshake if it
+    /// came in on the WebSocket listener.
+    async fn serve<S>(self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        match transport {
+            Transport::Mqtt => self.handle(Connection::new(stream)).await,
+            Transport::WebSocket => {
+                let handshake = websocket::accept(stream);
+                match time::timeout(self.limits.connect_timeout, handshake).await {
+                    Ok(Ok(websocket)) => self.handle(Connection::new(websocket)).await,
+                    Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
+                    Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
+                }
+            }
+        }
+    }
+
+    async fn handle<S>(self, connection: Connection<S>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut handler = Handler {
+            broker: self.broker,
+            session_manager: self.session_manager,
+            connection,
+            shutdown: self.shutdown,
+            auth_config: self.auth_config,
+            policy: self.policy,
+            limits: self.limits,
+            _shutdown_complete: self.shutdown_complete,
+        };
+        Listener::<St>::handle_connection(&mut handler).await;
+    }
 }
 
 /// What the broker tells clients when they connect, beyond limits.
@@ -129,6 +189,7 @@ pub struct Redirect {
 
 struct Listener<St: MqttStore + 'static> {
     listener: TcpListener,
+    websocket_listener: Option<TcpListener>,
     broker: Broker<St>,
     session_manager_holder: SessionManagerDropGuard<St>,
     notify_shutdown: broadcast::Sender<()>,
@@ -182,6 +243,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         auth: auth_config,
         limits,
         policy,
+        websocket_listener,
     } = config;
     let policy = Arc::new(policy);
 
@@ -210,6 +272,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 
     let mut server = Listener {
         listener,
+        websocket_listener,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
         connection_slots: limits
@@ -262,7 +325,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 impl<St: MqttStore + 'static> Listener<St> {
     async fn run(&mut self) {
         loop {
-            let socket = self.accept().await;
+            let (socket, transport) = self.accept().await;
             let peer_addr = socket.peer_addr().ok();
 
             // Held by the connection's task for as long as it runs
@@ -279,59 +342,31 @@ impl<St: MqttStore + 'static> Listener<St> {
 
             info!("Got a connection: {:?}", peer_addr);
 
-            let broker = self.broker.clone();
-            let session_manager = self.session_manager_holder.session_manager();
-            let shutdown = Shutdown::new(self.notify_shutdown.subscribe());
-            let shutdown_complete = self.shutdown_complete.clone();
-            let auth_config = Arc::clone(&self.auth_config);
-            let policy = Arc::clone(&self.policy);
-            let limits = self.limits;
+            let parts = HandlerParts {
+                broker: self.broker.clone(),
+                session_manager: self.session_manager_holder.session_manager(),
+                shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
+                shutdown_complete: self.shutdown_complete.clone(),
+                auth_config: Arc::clone(&self.auth_config),
+                policy: Arc::clone(&self.policy),
+                limits: self.limits,
+            };
+            let tls_acceptor = self.tls_acceptor.clone();
 
-            if let Some(ref tls_acceptor) = self.tls_acceptor {
-                // TLS connection
-                let acceptor = tls_acceptor.clone();
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    match time::timeout(limits.connect_timeout, acceptor.accept(socket)).await {
-                        Ok(Ok(tls_stream)) => {
-                            debug!("TLS handshake completed for {:?}", peer_addr);
-                            let mut handler = Handler {
-                                broker,
-                                session_manager,
-                                connection: Connection::new_tls(tls_stream),
-                                shutdown,
-                                auth_config,
-                                policy,
-                                limits,
-                                _shutdown_complete: shutdown_complete,
-                            };
-                            Self::handle_connection(&mut handler).await;
-                        }
-                        Ok(Err(e)) => {
-                            error!("TLS handshake failed for {:?}: {}", peer_addr, e);
-                        }
-                        Err(_) => {
-                            warn!("TLS handshake timed out for {:?}", peer_addr);
-                        }
+            tokio::spawn(async move {
+                let _slot = slot;
+                let Some(acceptor) = tls_acceptor else {
+                    return parts.serve(socket, transport, peer_addr).await;
+                };
+                match time::timeout(parts.limits.connect_timeout, acceptor.accept(socket)).await {
+                    Ok(Ok(tls_stream)) => {
+                        debug!("TLS handshake completed for {:?}", peer_addr);
+                        parts.serve(tls_stream, transport, peer_addr).await;
                     }
-                });
-            } else {
-                // Plain TCP connection
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    let mut handler = Handler {
-                        broker,
-                        session_manager,
-                        connection: Connection::new(socket),
-                        shutdown,
-                        auth_config,
-                        policy,
-                        limits,
-                        _shutdown_complete: shutdown_complete,
-                    };
-                    Self::handle_connection(&mut handler).await;
-                });
-            }
+                    Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
+                    Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
+                }
+            });
         }
     }
 
@@ -405,12 +440,25 @@ impl<St: MqttStore + 'static> Listener<St> {
     /// Waits for the next connection. Errors such as running out of file
     /// descriptors are usually transient, so they are retried with a backoff
     /// rather than shutting the listener down.
-    async fn accept(&mut self) -> TcpStream {
+    async fn accept(&mut self) -> (TcpStream, Transport) {
         let mut backoff = Duration::from_millis(10);
 
         loop {
-            match self.listener.accept().await {
-                Ok((socket, _)) => return socket,
+            let accepted = match &self.websocket_listener {
+                Some(websocket_listener) => tokio::select! {
+                    accepted = self.listener.accept() => accepted.map(|(s, _)| (s, Transport::Mqtt)),
+                    accepted = websocket_listener.accept() => {
+                        accepted.map(|(s, _)| (s, Transport::WebSocket))
+                    }
+                },
+                None => self
+                    .listener
+                    .accept()
+                    .await
+                    .map(|(s, _)| (s, Transport::Mqtt)),
+            };
+            match accepted {
+                Ok(accepted) => return accepted,
                 Err(err) => {
                     error!(
                         "Failed to accept connection, retrying in {:?}: {}",

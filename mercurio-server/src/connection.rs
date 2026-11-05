@@ -3,7 +3,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
 };
-use tokio_rustls::server::TlsStream;
 
 use mercurio_core::{error::Error, protocol::ProtocolVersion, reason::ReasonCode, Result};
 use mercurio_packets::ControlPacket;
@@ -34,23 +33,12 @@ where
     connect_version: Option<ProtocolVersion>,
 }
 
-impl Connection<TcpStream> {
-    /// Create a new plain TCP connection.
-    pub fn new(socket: TcpStream) -> Connection<TcpStream> {
-        Connection {
-            stream: BufWriter::new(socket),
-            read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
-            write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
-            protocol_version: ProtocolVersion::V5,
-            max_packet_size: DEFAULT_MAX_PACKET_SIZE,
-            connect_version: None,
-        }
-    }
-}
-
-impl Connection<TlsStream<TcpStream>> {
-    /// Create a new TLS-encrypted connection.
-    pub fn new_tls(stream: TlsStream<TcpStream>) -> Connection<TlsStream<TcpStream>> {
+impl<S> Connection<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Speaks MQTT over `stream`: plain TCP, TLS or a WebSocket.
+    pub fn new(stream: S) -> Connection<S> {
         Connection {
             stream: BufWriter::new(stream),
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
@@ -60,12 +48,7 @@ impl Connection<TlsStream<TcpStream>> {
             connect_version: None,
         }
     }
-}
 
-impl<S> Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
     pub fn set_max_packet_size(&mut self, max_packet_size: usize) {
         self.max_packet_size = max_packet_size;
     }

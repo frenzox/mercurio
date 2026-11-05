@@ -56,6 +56,9 @@ pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
+    /// Also serve MQTT over WebSocket on this port
+    pub websocket_port: Option<u16>,
+
     /// Maximum number of concurrent connections
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -109,6 +112,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            websocket_port: None,
             max_connections: default_max_connections(),
             max_packet_size: default_max_packet_size(),
             max_queued_messages: default_max_queued_messages(),
