@@ -18,6 +18,8 @@ where
     stream: S,
     read_buffer: BytesMut,
     protocol_version: ProtocolVersion,
+    /// The largest packet the broker accepts, once it said so
+    max_packet_size: Option<u32>,
 }
 
 impl Connection<TcpStream> {
@@ -27,6 +29,7 @@ impl Connection<TcpStream> {
             stream,
             read_buffer: BytesMut::with_capacity(4096),
             protocol_version: ProtocolVersion::V5,
+            max_packet_size: None,
         }
     }
 }
@@ -38,6 +41,7 @@ impl Connection<TlsStream<TcpStream>> {
             stream,
             read_buffer: BytesMut::with_capacity(4096),
             protocol_version: ProtocolVersion::V5,
+            max_packet_size: None,
         }
     }
 }
@@ -52,9 +56,21 @@ where
     }
 
     /// Write a control packet to the connection.
+    pub fn set_max_packet_size(&mut self, max_packet_size: Option<u32>) {
+        self.max_packet_size = max_packet_size;
+    }
+
+    /// Sends a packet, unless it exceeds what the broker accepts
+    /// [MQTT-3.2.2-15].
     pub async fn write_packet(&mut self, packet: ControlPacket) -> Result<()> {
         let mut buffer = BytesMut::new();
         packet.encode_with_version(&mut buffer, self.protocol_version);
+        if self
+            .max_packet_size
+            .is_some_and(|max| buffer.len() > max as usize)
+        {
+            return Err(ClientError::PacketTooLarge);
+        }
         self.stream.write_all(&buffer).await?;
         self.stream.flush().await?;
         Ok(())

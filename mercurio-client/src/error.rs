@@ -19,6 +19,12 @@ pub enum ClientError {
         server_reference: String,
     },
 
+    #[error("Packet larger than the broker accepts")]
+    PacketTooLarge,
+
+    #[error("Not supported by the broker: {0}")]
+    NotSupported(&'static str),
+
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 
