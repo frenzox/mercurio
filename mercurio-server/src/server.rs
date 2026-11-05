@@ -217,6 +217,22 @@ impl Listener {
     }
 }
 
+/// How long a session outlives its connection; `None` means forever.
+fn session_expiry(connect_packet: &ConnectPacket) -> Option<Duration> {
+    if !connect_packet.protocol_version.supports_properties() {
+        // MQTT 3.x: a clean session ends with the connection, others persist
+        return connect_packet.flags.clean_start.then_some(Duration::ZERO);
+    }
+
+    let interval = connect_packet
+        .properties
+        .as_ref()
+        .and_then(|p| p.session_expiry_interval.as_ref())
+        .map_or(0, |p| p.value);
+
+    (interval != u32::MAX).then(|| Duration::from_secs(interval.into()))
+}
+
 impl<S> Handler<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -268,51 +284,58 @@ where
         }
 
         let keepalive = connect_packet.keepalive;
-
         let protocol_version = connect_packet.protocol_version;
-        let start_result = self
-            .session_manager
-            .start_session(&mut self.connection, connect_packet)
-            .await?;
+        let expiry = session_expiry(&connect_packet);
 
+        let start_result = self.session_manager.start_session(connect_packet).await?;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
 
-        // Restore subscriptions if resuming a persisted session
-        if !start_result.subscriptions_to_restore.is_empty() {
+        let result = async {
             session
-                .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker)
+                .begin(
+                    &mut self.connection,
+                    start_result.resume,
+                    start_result.assigned_client_id,
+                )
                 .await?;
-        }
 
-        // Restore will message if resuming a persisted session
-        if let Some(will) = start_result.will_to_restore {
-            session.set_will(will).await;
-        }
-
-        // Retry inflight messages (QoS 1/2 awaiting acknowledgment)
-        for inflight in start_result.inflight_to_retry {
-            let publish = PublishPacket {
-                dup: true, // Mark as duplicate since this is a retry
-                qos_level: inflight.qos,
-                retain: false,
-                topic_name: inflight.topic,
-                packet_id: Some(inflight.packet_id),
-                properties: None,
-                payload: inflight.payload,
-            };
-            if let Err(e) = self
-                .connection
-                .write_packet(ControlPacket::Publish(publish))
-                .await
-            {
-                error!("Failed to retry inflight message: {}", e);
+            // Restore subscriptions if resuming a persisted session
+            if !start_result.subscriptions_to_restore.is_empty() {
+                session
+                    .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker)
+                    .await?;
             }
-        }
 
-        let result = self
-            .handle_connection(&session, keepalive, &mut lease, protocol_version)
-            .await;
+            // Restore will message if resuming a persisted session
+            if let Some(will) = start_result.will_to_restore {
+                session.set_will(will).await;
+            }
+
+            // Retry inflight messages (QoS 1/2 awaiting acknowledgment)
+            for inflight in start_result.inflight_to_retry {
+                let publish = PublishPacket {
+                    dup: true, // Mark as duplicate since this is a retry
+                    qos_level: inflight.qos,
+                    retain: false,
+                    topic_name: inflight.topic,
+                    packet_id: Some(inflight.packet_id),
+                    properties: None,
+                    payload: inflight.payload,
+                };
+                if let Err(e) = self
+                    .connection
+                    .write_packet(ControlPacket::Publish(publish))
+                    .await
+                {
+                    error!("Failed to retry inflight message: {}", e);
+                }
+            }
+
+            self.handle_connection(&session, keepalive, &mut lease, protocol_version)
+                .await
+        }
+        .await;
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
@@ -322,6 +345,8 @@ where
             let client_id = session.get_client_id().await;
             let _ = self.session_manager.delete_will(&client_id).await;
         }
+
+        self.session_manager.end_connection(lease, expiry).await;
 
         result
     }

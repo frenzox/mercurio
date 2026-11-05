@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
     sync::{watch, Mutex, OwnedMutexGuard},
+    time::Duration,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -13,10 +13,7 @@ use mercurio_storage::{
     InflightMessage, InflightStore, SessionState, SessionStore, StoredWillMessage, WillStore,
 };
 
-use crate::{
-    connection::Connection,
-    session::{Session, SessionDropGuard, WillMessage},
-};
+use crate::session::{Session, SessionDropGuard, WillMessage};
 
 pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore + InflightStore> {
     session_manager: SessionManager<S>,
@@ -43,6 +40,8 @@ struct Shared {
 struct State {
     sessions: HashMap<String, SessionDropGuard>,
     connections: HashMap<String, ConnectionSlot>,
+    /// Source of ConnectionSlot::generation, unique across slots
+    next_generation: u64,
 }
 
 /// Tracks the network connection currently using a client id.
@@ -51,16 +50,20 @@ struct ConnectionSlot {
     lease: Arc<Mutex<()>>,
     /// Tells the active connection that another one is taking over
     takeover: watch::Sender<bool>,
+    /// Identifies the latest connection to acquire this client id
+    generation: u64,
 }
 
 /// Ownership of a client id for the lifetime of one connection.
 pub(crate) struct ConnectionLease {
-    _guard: OwnedMutexGuard<()>,
+    guard: OwnedMutexGuard<()>,
+    client_id: String,
+    generation: u64,
     /// Changes when a new connection takes over this client id
     pub takeover: watch::Receiver<bool>,
 }
 
-impl<S: SessionStore + WillStore + InflightStore> SessionManagerDropGuard<S> {
+impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManagerDropGuard<S> {
     pub(crate) fn new(storage: Arc<S>) -> SessionManagerDropGuard<S> {
         SessionManagerDropGuard {
             session_manager: SessionManager::new(storage),
@@ -75,6 +78,10 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManagerDropGuard<S> {
 /// Result of starting a session, includes subscriptions, will, and inflight to restore if resuming.
 pub(crate) struct SessionStartResult {
     pub session: Session,
+    /// Whether an existing session was resumed
+    pub resume: bool,
+    /// Whether the server generated the client id
+    pub assigned_client_id: bool,
     /// Topic filters to restore (re-subscribe to broker) if resuming a persisted session.
     pub subscriptions_to_restore: Vec<String>,
     /// Will message restored from storage (if resuming and will was persisted).
@@ -85,26 +92,23 @@ pub(crate) struct SessionStartResult {
     pub inflight_to_retry: Vec<InflightMessage>,
 }
 
-impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
+impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
     pub(crate) fn new(storage: Arc<S>) -> SessionManager<S> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 sessions: HashMap::new(),
                 connections: HashMap::new(),
+                next_generation: 0,
             }),
         });
 
         SessionManager { shared, storage }
     }
 
-    pub(crate) async fn start_session<Stream>(
+    pub(crate) async fn start_session(
         &mut self,
-        connection: &mut Connection<Stream>,
         mut connect_packet: ConnectPacket,
-    ) -> Result<SessionStartResult>
-    where
-        Stream: AsyncRead + AsyncWrite + Unpin,
-    {
+    ) -> Result<SessionStartResult> {
         // Clients without an identifier each get a unique one, so they never
         // share a session entry
         let assigned_client_id = connect_packet.payload.client_id.is_empty();
@@ -124,11 +128,8 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
         let mut inflight_to_retry = Vec::new();
 
         if connect_packet.flags.clean_start {
-            // Clean start: remove any existing session (in-memory and storage)
             manager.sessions.remove(client_id);
-            let _ = self.storage.delete_session(client_id).await;
-            let _ = self.storage.delete_will(client_id).await;
-            // Note: inflight messages are implicitly cleared when session is deleted
+            self.discard_stored(client_id).await;
         } else {
             // Try to resume existing session
             // First check in-memory sessions
@@ -166,7 +167,8 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
             }
         }
 
-        let mut session = match manager.sessions.entry(client_id.clone()) {
+        let client_id = client_id.clone();
+        let session = match manager.sessions.entry(client_id.clone()) {
             std::collections::hash_map::Entry::Occupied(e) => {
                 let mut s = e.into_mut().session();
                 s.set_connect_packet(connect_packet).await;
@@ -178,11 +180,7 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
             }
         };
 
-        session
-            .begin(connection, resume, assigned_client_id)
-            .await?;
-
-        let client_id = session.get_client_id().await;
+        drop(manager);
 
         // Save session state to storage
         let session_state = SessionState {
@@ -200,6 +198,8 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
 
         Ok(SessionStartResult {
             session,
+            resume,
+            assigned_client_id,
             subscriptions_to_restore,
             will_to_restore,
             lease,
@@ -212,23 +212,98 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
     async fn acquire_client_id(&self, client_id: &str) -> ConnectionLease {
         let (takeover_tx, takeover) = watch::channel(false);
 
-        let lease = {
+        let (lease, generation) = {
             let mut manager = self.shared.state.lock().await;
+            manager.next_generation += 1;
+            let generation = manager.next_generation;
             let slot = manager
                 .connections
                 .entry(client_id.to_string())
                 .or_insert_with(|| ConnectionSlot {
                     lease: Arc::new(Mutex::new(())),
                     takeover: watch::channel(false).0,
+                    generation,
                 });
             slot.takeover.send_replace(true);
             slot.takeover = takeover_tx;
-            Arc::clone(&slot.lease)
+            slot.generation = generation;
+            (Arc::clone(&slot.lease), generation)
         };
 
         ConnectionLease {
-            _guard: lease.lock_owned().await,
+            guard: lease.lock_owned().await,
+            client_id: client_id.to_string(),
+            generation,
             takeover,
+        }
+    }
+
+    /// Releases the client id once its connection has finished and ends the
+    /// session after `expiry`, unless a new connection resumes it first.
+    /// `None` keeps the session forever.
+    pub(crate) async fn end_connection(&self, lease: ConnectionLease, expiry: Option<Duration>) {
+        let ConnectionLease {
+            guard,
+            client_id,
+            generation,
+            ..
+        } = lease;
+
+        // Ending before releasing the id means a connection waiting to take
+        // over can never observe a session that is about to vanish
+        if expiry == Some(Duration::ZERO) {
+            self.end_session(&client_id, generation).await;
+        }
+        drop(guard);
+
+        {
+            let mut manager = self.shared.state.lock().await;
+            if manager
+                .connections
+                .get(&client_id)
+                .is_some_and(|slot| slot.generation == generation)
+            {
+                manager.connections.remove(&client_id);
+            }
+        }
+
+        if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
+            let manager = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(expiry).await;
+                manager.end_session(&client_id, generation).await;
+            });
+        }
+    }
+
+    /// Discards the session of `client_id` unless a connection newer than
+    /// `generation` has used it since.
+    async fn end_session(&self, client_id: &str, generation: u64) {
+        let mut manager = self.shared.state.lock().await;
+        if manager
+            .connections
+            .get(client_id)
+            .is_some_and(|slot| slot.generation != generation)
+        {
+            return;
+        }
+
+        info!("Session for client `{}` ended", client_id);
+        manager.sessions.remove(client_id);
+        self.discard_stored(client_id).await;
+    }
+
+    /// Removes everything persisted for `client_id`.
+    async fn discard_stored(&self, client_id: &str) {
+        let _ = self.storage.delete_session(client_id).await;
+        let _ = self.storage.delete_will(client_id).await;
+        if let Ok(inflight) = self.storage.get_all_inflight(client_id).await {
+            for message in inflight {
+                let _ = self
+                    .storage
+                    .remove_inflight(client_id, message.packet_id)
+                    .await;
+            }
         }
     }
 
@@ -289,6 +364,51 @@ mod tests {
 
     fn create_test_storage() -> Arc<MemoryStore> {
         Arc::new(MemoryStore::new())
+    }
+
+    fn connect_packet(client_id: &str) -> ConnectPacket {
+        ConnectPacket {
+            protocol_version: mercurio_core::protocol::ProtocolVersion::V5,
+            flags: Default::default(),
+            keepalive: 60,
+            properties: None,
+            payload: mercurio_packets::connect::ConnectPayload {
+                client_id: client_id.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ended_session_leaves_nothing_behind() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+
+        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        storage
+            .store_inflight(
+                "c",
+                1,
+                &InflightMessage {
+                    packet_id: 1,
+                    topic: "t".to_string(),
+                    payload: None,
+                    qos: QoS::AtLeastOnce,
+                    dup: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        manager
+            .end_connection(started.lease, Some(Duration::ZERO))
+            .await;
+
+        let state = manager.shared.state.lock().await;
+        assert!(state.sessions.is_empty());
+        assert!(state.connections.is_empty());
+        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert!(storage.get_all_inflight("c").await.unwrap().is_empty());
     }
 
     #[tokio::test]
