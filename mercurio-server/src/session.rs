@@ -8,6 +8,7 @@ use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{broadcast, Mutex},
+    time::Duration,
 };
 use tokio_stream::{Stream, StreamExt, StreamMap};
 use tracing::{info, warn};
@@ -52,6 +53,8 @@ pub struct WillMessage {
     pub payload: Bytes,
     pub qos: QoS,
     pub retain: bool,
+    /// How long to wait after the connection closes before publishing
+    pub delay: Duration,
 }
 
 impl WillMessage {
@@ -63,12 +66,19 @@ impl WillMessage {
 
         let topic = packet.payload.will_topic.as_ref()?;
         let payload = packet.payload.will_payload.clone().unwrap_or_default();
+        let delay = packet
+            .payload
+            .will_properties
+            .as_ref()
+            .and_then(|p| p.will_delay_interval.as_ref())
+            .map_or(0, |d| d.value);
 
         Some(WillMessage {
             topic: topic.clone(),
             payload,
             qos: packet.flags.will_qos,
             retain: packet.flags.will_retain,
+            delay: Duration::from_secs(delay.into()),
         })
     }
 }
@@ -91,6 +101,9 @@ impl From<StoredWillMessage> for WillMessage {
             payload: stored.payload,
             qos: stored.qos,
             retain: stored.retain,
+            // ponytail: storage doesn't keep the delay, so wills restored after a
+            // restart publish immediately; add a column if that matters
+            delay: Duration::ZERO,
         }
     }
 }
@@ -148,6 +161,8 @@ struct Shared {
 
 struct State {
     pub connect_packet: ConnectPacket,
+    /// Generation of the latest connection to use this session
+    generation: u64,
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     subscriptions: StreamMap<String, Messages>,
@@ -187,6 +202,7 @@ impl Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     connect_packet,
+                    generation: 0,
                     client_id,
                     subscriptions: StreamMap::new(),
                     granted_qos: HashMap::new(),
@@ -220,6 +236,14 @@ impl Session {
     pub(crate) async fn take_will(&self) -> Option<WillMessage> {
         let mut session = self.shared.state.lock().await;
         session.will_message.take()
+    }
+
+    pub(crate) async fn generation(&self) -> u64 {
+        self.shared.state.lock().await.generation
+    }
+
+    pub(crate) async fn set_generation(&self, generation: u64) {
+        self.shared.state.lock().await.generation = generation;
     }
 
     /// Get a clone of the will message without removing it.
