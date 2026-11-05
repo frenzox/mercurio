@@ -102,12 +102,14 @@ impl Decoder for MessageProperties {
         while buffer.has_remaining() {
             match Property::decode(buffer)? {
                 Property::PayloadFormatIndicator(v) => {
-                    properties.payload_format_indicator = Some(v)
+                    set_once(&mut properties.payload_format_indicator, v)?
                 }
-                Property::MessageExpiryInterval(v) => properties.message_expiry_interval = Some(v),
-                Property::ContentType(v) => properties.content_type = Some(v),
-                Property::ResponseTopic(v) => properties.response_topic = Some(v),
-                Property::CorrelationData(v) => properties.correlation_data = Some(v),
+                Property::MessageExpiryInterval(v) => {
+                    set_once(&mut properties.message_expiry_interval, v)?
+                }
+                Property::ContentType(v) => set_once(&mut properties.content_type, v)?,
+                Property::ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
+                Property::CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
                 Property::UserProperty(v) => match &mut properties.user_property {
                     Some(user_properties) => user_properties.push(v),
                     None => properties.user_property = Some(vec![v]),

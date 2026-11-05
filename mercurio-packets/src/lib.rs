@@ -486,6 +486,27 @@ mod robustness_tests {
     }
 
     #[test]
+    fn test_repeated_properties_are_protocol_errors() {
+        // PUBLISH QoS 0 to "t" with Content Type "a" twice
+        let repeated = [
+            0x30, 0x0c, 0x00, 0x01, b't', 0x08, 0x03, 0x00, 0x01, b'a', 0x03, 0x00, 0x01, b'a',
+        ];
+        let mut buffer = BytesMut::from(&repeated[..]);
+        assert!(matches!(
+            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5),
+            Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+        ));
+
+        // The same with two User Properties, which may repeat
+        let user_properties = [
+            0x30, 0x10, 0x00, 0x01, b't', 0x0c, 0x26, 0x00, 0x01, b'k', 0x00, 0x00, 0x26, 0x00,
+            0x01, b'k', 0x00, 0x00,
+        ];
+        let mut buffer = BytesMut::from(&user_properties[..]);
+        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+    }
+
+    #[test]
     fn test_reserved_flags_are_malformed() {
         let malformed: [(&[u8], ProtocolVersion); 6] = [
             // PINGREQ with a reserved flag set
