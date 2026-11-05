@@ -94,21 +94,33 @@ impl From<StoredWillMessage> for WillMessage {
 
 /// Yields the retained messages matching a new subscription, then live
 /// messages. Only retained deliveries carry the RETAIN flag; live messages are
-/// forwarded with it cleared [MQTT-3.3.1-9].
+/// forwarded with it cleared [MQTT-3.3.1-9]. Every message is downgraded to
+/// the QoS granted for the subscription [MQTT-3.8.4-8].
 fn subscription_stream(
     mut rx: broadcast::Receiver<Message>,
     retained_messages: Vec<Message>,
+    granted_qos: QoS,
 ) -> Messages {
+    let downgrade = move |mut msg: Message| {
+        if (msg.qos as u8) > (granted_qos as u8) {
+            msg.qos = granted_qos;
+            if granted_qos == QoS::AtMostOnce {
+                msg.packet_id = None;
+            }
+        }
+        msg
+    };
+
     Box::pin(async_stream::stream! {
         for msg in retained_messages {
-            yield msg;
+            yield downgrade(msg);
         }
 
         loop {
             match rx.recv().await {
                 Ok(mut msg) => {
                     msg.retain = false;
-                    yield msg;
+                    yield downgrade(msg);
                 }
                 // If we lagged in consuming messages, just resume.
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -233,9 +245,10 @@ impl Session {
 
         for topic_filter in topic_filters {
             let (rx, retained_messages) = broker.subscribe(&topic_filter).await?;
-            session
-                .subscriptions
-                .insert(topic_filter, subscription_stream(rx, retained_messages));
+            // ponytail: granted QoS isn't persisted yet, so restored subscriptions
+            // deliver at the publisher's QoS; store it alongside the filter to fix
+            let stream = subscription_stream(rx, retained_messages, QoS::ExactlyOnce);
+            session.subscriptions.insert(topic_filter, stream);
         }
 
         Ok(())
@@ -411,13 +424,18 @@ impl Session {
             }
 
             let (rx, retained_messages) = broker.subscribe(&sub.topic_filter).await?;
+            let granted_qos = sub.subs_opt.qos;
             ack.payload.push(SubAckPayload {
-                reason_code: ReasonCode::GrantedQoS0,
+                reason_code: match granted_qos {
+                    QoS::AtLeastOnce => ReasonCode::GrantedQoS1,
+                    QoS::ExactlyOnce => ReasonCode::GrantedQoS2,
+                    _ => ReasonCode::GrantedQoS0,
+                },
             });
 
             session.subscriptions.insert(
                 sub.topic_filter.to_string(),
-                subscription_stream(rx, retained_messages),
+                subscription_stream(rx, retained_messages, granted_qos),
             );
         }
 
@@ -866,6 +884,50 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_publish(&mut session).await.topic_name, "a/b");
+    }
+
+    #[tokio::test]
+    async fn test_subscription_grants_requested_qos_and_downgrades_delivery() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let ack = session
+            .handle_subscribe(subscribe_packet("q/0", QoS::AtMostOnce), &broker)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ack,
+            Some(ControlPacket::SubAck(ref a)) if a.payload[0].reason_code == ReasonCode::GrantedQoS0
+        ));
+
+        let ack = session
+            .handle_subscribe(subscribe_packet("q/1", QoS::AtLeastOnce), &broker)
+            .await
+            .unwrap();
+        assert!(matches!(
+            ack,
+            Some(ControlPacket::SubAck(ref a)) if a.payload[0].reason_code == ReasonCode::GrantedQoS1
+        ));
+
+        broker
+            .publish("q/0", message("q/0", QoS::ExactlyOnce, Some(7), false))
+            .await
+            .unwrap();
+        let publish = next_publish(&mut session).await;
+        assert_eq!(publish.qos_level, QoS::AtMostOnce);
+        assert_eq!(publish.packet_id, None);
+
+        broker
+            .publish("q/1", message("q/1", QoS::ExactlyOnce, Some(8), false))
+            .await
+            .unwrap();
+        assert_eq!(next_publish(&mut session).await.qos_level, QoS::AtLeastOnce);
+
+        broker
+            .publish("q/1", message("q/1", QoS::AtMostOnce, None, false))
+            .await
+            .unwrap();
+        assert_eq!(next_publish(&mut session).await.qos_level, QoS::AtMostOnce);
     }
 
     #[tokio::test]
