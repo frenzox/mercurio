@@ -876,6 +876,21 @@ impl Session {
         auth_manager: Option<&AuthManager>,
         authorizer: Option<&dyn Authorizer>,
     ) -> Result<Option<ControlPacket>> {
+        // Packet identifiers are never 0 [MQTT-2.2.1-3]
+        let packet_id = match &packet {
+            ControlPacket::Publish(p) => p.packet_id,
+            ControlPacket::PubAck(p) => Some(p.packet_id),
+            ControlPacket::PubRec(p) => Some(p.packet_id),
+            ControlPacket::PubRel(p) => Some(p.packet_id),
+            ControlPacket::PubComp(p) => Some(p.packet_id),
+            ControlPacket::Subscribe(p) => Some(p.packet_id),
+            ControlPacket::Unsubscribe(p) => Some(p.packet_id),
+            _ => None,
+        };
+        if packet_id == Some(0) {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+
         match packet {
             ControlPacket::Publish(packet) => self.handle_publish(packet, broker, authorizer).await,
             ControlPacket::PubAck(packet) => self.handle_puback(packet).await,
@@ -2007,6 +2022,37 @@ mod tests {
                 ReasonCode::ProtocolError
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_packet_identifier_zero_is_a_protocol_error() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let mut subscribe = subscribe_packet("t", QoS::AtMostOnce);
+        subscribe.packet_id = 0;
+        let packets = [
+            qos2_publish("t", 0, false),
+            ControlPacket::Subscribe(subscribe),
+            ControlPacket::Unsubscribe(UnsubscribePacket {
+                packet_id: 0,
+                properties: None,
+                payload: vec![UnsubscribePayload {
+                    topic_filter: "t".into(),
+                }],
+            }),
+            pubrel_packet(0),
+        ];
+
+        for packet in packets {
+            let result = session.process_incoming(packet, &broker, None, None).await;
+            assert!(matches!(
+                result,
+                Err(mercurio_core::error::Error::MQTTReasonCode(
+                    ReasonCode::ProtocolError
+                ))
+            ));
+        }
     }
 
     #[tokio::test]
