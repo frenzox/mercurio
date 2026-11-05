@@ -211,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     match config.storage {
         StorageConfig::Memory => {
-            mercurio_server::server::run_with_config(listener, server_config, signal::ctrl_c())
+            mercurio_server::server::run_with_config(listener, server_config, shutdown_signal())
                 .await
         }
         StorageConfig::Sqlite { path } => {
@@ -221,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 listener,
                 server_config,
                 storage,
-                signal::ctrl_c(),
+                shutdown_signal(),
             )
             .await
         }
@@ -230,6 +230,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// Resolves on Ctrl+C or, on Unix, SIGTERM: what service managers and
+/// container runtimes send to stop the daemon.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM");
+        tokio::select! {
+            _ = signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = signal::ctrl_c().await;
 }
 
 /// Load a password file with format: `username:hash` per line.
