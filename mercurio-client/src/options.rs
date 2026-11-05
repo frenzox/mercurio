@@ -154,6 +154,11 @@ pub struct ConnectOptions {
     pub(crate) connect_timeout_secs: u64,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
+    pub(crate) receive_maximum: Option<u16>,
+    pub(crate) maximum_packet_size: Option<u32>,
+    pub(crate) topic_alias_maximum: u16,
+    pub(crate) request_response_information: bool,
+    pub(crate) request_problem_information: bool,
 }
 
 impl ConnectOptions {
@@ -173,6 +178,11 @@ impl ConnectOptions {
             connect_timeout_secs: 30,
             tls: TlsOptions::default(),
             reconnect_delay: None,
+            receive_maximum: None,
+            maximum_packet_size: None,
+            topic_alias_maximum: 0,
+            request_response_information: false,
+            request_problem_information: true,
         }
     }
 
@@ -248,6 +258,43 @@ impl ConnectOptions {
     /// the broker keeps subscriptions and messages in flight meanwhile.
     pub fn reconnect(mut self, delay: Duration) -> Self {
         self.reconnect_delay = Some(delay);
+        self
+    }
+
+    /// Most QoS 2 messages the broker may have in flight to this client at
+    /// once. MQTT 5 only.
+    pub fn receive_maximum(mut self, maximum: u16) -> Self {
+        self.receive_maximum = Some(maximum);
+        self
+    }
+
+    /// Largest packet the broker may send; it drops larger messages
+    /// instead. MQTT 5 only.
+    pub fn maximum_packet_size(mut self, bytes: u32) -> Self {
+        self.maximum_packet_size = Some(bytes);
+        self
+    }
+
+    /// Let the broker replace topic names with up to this many aliases,
+    /// saving bandwidth on repeated topics. MQTT 5 only.
+    pub fn topic_alias_maximum(mut self, maximum: u16) -> Self {
+        self.topic_alias_maximum = maximum;
+        self
+    }
+
+    /// Ask the broker for response information, a basis for response
+    /// topics; see [`MqttClient::response_information`]. MQTT 5 only.
+    ///
+    /// [`MqttClient::response_information`]: crate::MqttClient::response_information
+    pub fn request_response_information(mut self, request: bool) -> Self {
+        self.request_response_information = request;
+        self
+    }
+
+    /// With `false`, the broker leaves reason strings and user properties
+    /// out of everything but PUBLISH, CONNACK and DISCONNECT. MQTT 5 only.
+    pub fn request_problem_information(mut self, request: bool) -> Self {
+        self.request_problem_information = request;
         self
     }
 
