@@ -119,7 +119,12 @@ impl Decoder for PubCompPacket {
         }
 
         let reason = ReasonCode::decode(buffer)?;
-        let properties = Some(PubCompProperties::decode(buffer)?);
+        // The property length is omitted when there are none [MQTT-3.4.2.2]
+        let properties = if remaining_len.0 > 3 {
+            Some(PubCompProperties::decode(buffer)?)
+        } else {
+            None
+        };
 
         Ok(PubCompPacket {
             packet_id,
