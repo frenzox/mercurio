@@ -19,9 +19,9 @@ use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
-        MessageExpiryInterval, ReceiveMaximum, RetainAvailable, SharedSubscriptionAvailable,
-        SubscriptionIdentifier, SubscriptionIdentifierAvailable, TopicAliasMaximum,
-        WildcardSubscriptionAvailable,
+        MessageExpiryInterval, ReceiveMaximum, RetainAvailable, ServerKeepAlive,
+        SharedSubscriptionAvailable, SubscriptionIdentifier, SubscriptionIdentifierAvailable,
+        TopicAliasMaximum, WildcardSubscriptionAvailable,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -164,6 +164,22 @@ fn publish_properties(
         user_property: properties.user_property.clone(),
         ..Default::default()
     })
+}
+
+/// The keep-alive the connection runs with: the client's own, unless it
+/// exceeds the server's maximum or disables keep-alive, in which case MQTT 5
+/// clients are told to use the maximum. MQTT 3.x has no way to tell them.
+pub(crate) fn effective_keepalive(connect_packet: &ConnectPacket, limits: &Limits) -> u16 {
+    let requested = connect_packet.keepalive;
+    match limits.max_keepalive {
+        Some(max)
+            if connect_packet.protocol_version.supports_properties()
+                && (requested == 0 || requested > max) =>
+        {
+            max
+        }
+        _ => requested,
+    }
 }
 
 /// Source of unique subscriber ids, one per session.
@@ -395,6 +411,11 @@ impl Session {
                         .as_ref()
                         .and_then(|p| p.authentication_method.clone()),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
+                    server_keepalive: {
+                        let keepalive = effective_keepalive(&session.connect_packet, limits);
+                        (keepalive != session.connect_packet.keepalive)
+                            .then(|| ServerKeepAlive::new(keepalive))
+                    },
                     // Spelled out even where absence means the same, for
                     // clients and tools that inspect them
                     retain_available: Some(RetainAvailable::new(true)),

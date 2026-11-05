@@ -32,7 +32,7 @@ use crate::{
     broker::Broker,
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
     queue::QueueLimits,
-    session::{Session, WillMessage},
+    session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     tls::TlsConfig,
@@ -71,6 +71,9 @@ pub struct Limits {
     pub topic_alias_maximum: u16,
     /// QoS 2 messages a client may have awaiting PUBREL at once.
     pub receive_maximum: u16,
+    /// Longest keep-alive MQTT 5 clients may use; those asking for more, or
+    /// for none, are told to use this one instead.
+    pub max_keepalive: Option<u16>,
 }
 
 impl Default for Limits {
@@ -82,6 +85,7 @@ impl Default for Limits {
             max_connections: None,
             topic_alias_maximum: 10,
             receive_maximum: u16::MAX,
+            max_keepalive: None,
         }
     }
 }
@@ -471,7 +475,7 @@ where
                 .await;
         }
 
-        let keepalive = connect_packet.keepalive;
+        let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
         let client_maximum_packet_size = connect_packet
             .properties

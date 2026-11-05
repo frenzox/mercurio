@@ -65,6 +65,10 @@ max_topic_alias = 10
 # QoS 2 messages an MQTT 5 client may have awaiting PUBREL at once
 receive_maximum = 65535
 
+# Longest keep-alive, in seconds, MQTT 5 clients may use; clients asking for
+# more, or for none, are told to use this instead
+# max_keepalive = 300
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"
