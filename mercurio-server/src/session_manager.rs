@@ -182,10 +182,13 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         drop(manager);
 
-        // Save session state to storage
+        // A session resumed from memory already holds its subscriptions; one
+        // loaded from storage gets them restored after this returns
+        let mut subscriptions = session.get_subscription_filters().await;
+        subscriptions.extend(subscriptions_to_restore.iter().cloned());
         let session_state = SessionState {
             client_id: client_id.clone(),
-            subscriptions: subscriptions_to_restore.clone(),
+            subscriptions,
             clean_start: false,
         };
         let _ = self.storage.save_session(&client_id, &session_state).await;
@@ -360,6 +363,10 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use mercurio_core::qos::QoS;
+    use mercurio_packets::{
+        subscribe::{SubscribePacket, SubscribePayload},
+        ControlPacket,
+    };
     use mercurio_storage::memory::MemoryStore;
 
     fn create_test_storage() -> Arc<MemoryStore> {
@@ -409,6 +416,42 @@ mod tests {
         assert!(state.connections.is_empty());
         assert!(storage.load_session("c").await.unwrap().is_none());
         assert!(storage.get_all_inflight("c").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resuming_in_memory_session_keeps_stored_subscriptions() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
+        let broker = crate::broker::Broker::new(storage.clone());
+
+        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let mut session = started.session;
+        session
+            .process_incoming(
+                ControlPacket::Subscribe(SubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: vec![SubscribePayload {
+                        topic_filter: "a".to_string(),
+                        subs_opt: Default::default(),
+                    }],
+                }),
+                &broker,
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .save_subscriptions("c", session.get_subscription_filters().await)
+            .await
+            .unwrap();
+        manager.end_connection(started.lease, None).await;
+
+        let resumed = manager.start_session(connect_packet("c")).await.unwrap();
+        assert!(resumed.resume);
+
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert_eq!(stored.subscriptions, vec!["a".to_string()]);
     }
 
     #[tokio::test]
