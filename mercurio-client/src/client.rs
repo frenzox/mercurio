@@ -4,7 +4,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use mercurio_core::codec::VariableByteInteger;
 use mercurio_core::properties::{SessionExpiryInterval, SubscriptionIdentifier};
-use mercurio_core::protocol::ProtocolVersion;
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
 use mercurio_packets::connack::ConnAckProperties;
@@ -21,7 +20,6 @@ use mercurio_packets::subscribe::{
 };
 use mercurio_packets::unsubscribe::{UnsubscribePacket, UnsubscribePayload};
 use mercurio_packets::ControlPacket;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, timeout};
@@ -60,101 +58,57 @@ pub struct MqttClient {
 
 impl MqttClient {
     /// Connect to an MQTT broker with the given options.
-    pub async fn connect(options: ConnectOptions) -> Result<Self> {
-        let addr = format!("{}:{}", options.host, options.port);
-        info!("Connecting to MQTT broker at {}", addr);
+    pub async fn connect(mut options: ConnectOptions) -> Result<Self> {
+        let (connection, session) = Self::open(&options).await?;
+        // Reconnecting must present the same identity to find the session
+        options.client_id = Some(session.client_id.clone());
+        let client_id = session.client_id.clone();
 
-        // Connect with timeout
-        let stream = timeout(
-            Duration::from_secs(options.connect_timeout_secs),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-
-        // Create channels for communication
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
+        tokio::spawn(Self::event_loop(
+            connection, session, command_rx, event_tx, options,
+        ));
 
-        if options.tls.enabled {
-            // TLS connection
-            info!("Establishing TLS connection");
-            let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
+        Ok(MqttClient {
+            command_tx,
+            event_rx: Mutex::new(event_rx),
+            client_id,
+        })
+    }
 
-            let tls_stream = timeout(
-                Duration::from_secs(options.connect_timeout_secs),
-                connector.connect(server_name, stream),
-            )
+    /// Opens the transport and performs the CONNECT handshake.
+    async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
+        let addr = format!("{}:{}", options.host, options.port);
+        info!("Connecting to MQTT broker at {}", addr);
+        let connect_timeout = Duration::from_secs(options.connect_timeout_secs);
+
+        let stream = timeout(connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
-            let mut connection = Connection::new_tls(tls_stream);
-            connection.set_protocol_version(options.protocol_version);
-
-            let (client_id, keep_alive, limits) =
-                Self::perform_connect(&mut connection, &options).await?;
-
-            tokio::spawn(async move {
-                if let Err(e) = Self::event_loop(
-                    connection,
-                    command_rx,
-                    event_tx,
-                    keep_alive,
-                    options.protocol_version,
-                    limits,
-                )
+        let mut connection = if options.tls.enabled {
+            info!("Establishing TLS connection");
+            let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
+            let tls_stream = timeout(connect_timeout, connector.connect(server_name, stream))
                 .await
-                {
-                    error!("Client event loop error: {}", e);
-                }
-            });
-
-            Ok(MqttClient {
-                command_tx,
-                event_rx: Mutex::new(event_rx),
-                client_id,
-            })
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
+            Connection::new(tls_stream, options.protocol_version)
         } else {
-            // Plain TCP connection
-            let mut connection = Connection::new(stream);
-            connection.set_protocol_version(options.protocol_version);
+            Connection::new(stream, options.protocol_version)
+        };
 
-            let (client_id, keep_alive, limits) =
-                Self::perform_connect(&mut connection, &options).await?;
-
-            tokio::spawn(async move {
-                if let Err(e) = Self::event_loop(
-                    connection,
-                    command_rx,
-                    event_tx,
-                    keep_alive,
-                    options.protocol_version,
-                    limits,
-                )
-                .await
-                {
-                    error!("Client event loop error: {}", e);
-                }
-            });
-
-            Ok(MqttClient {
-                command_tx,
-                event_rx: Mutex::new(event_rx),
-                client_id,
-            })
-        }
+        let session = Self::perform_connect(&mut connection, options).await?;
+        Ok((connection, session))
     }
 
     /// Perform the MQTT CONNECT handshake.
-    async fn perform_connect<S>(
-        connection: &mut Connection<S>,
+    async fn perform_connect(
+        connection: &mut Connection,
         options: &ConnectOptions,
-    ) -> Result<(String, u16, BrokerLimits)>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
+    ) -> Result<Session> {
         // Build CONNECT packet
         let connect_packet = Self::build_connect_packet(options);
         connection
@@ -212,7 +166,12 @@ impl MqttClient {
         );
 
         connection.set_max_packet_size(limits.maximum_packet_size);
-        Ok((client_id, keep_alive, limits))
+        Ok(Session {
+            client_id,
+            keep_alive,
+            limits,
+            session_present,
+        })
     }
 
     /// Build a CONNECT packet from options.
@@ -251,139 +210,62 @@ impl MqttClient {
         }
     }
 
-    /// The main event loop that handles incoming packets and outgoing commands.
-    async fn event_loop<S>(
-        connection: Connection<S>,
+    /// Runs the client until it disconnects for good: with reconnection
+    /// enabled, a lost connection is reopened and the session resumed.
+    async fn event_loop(
+        connection: Connection,
+        session: Session,
         mut command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
-        keep_alive: u16,
-        protocol_version: ProtocolVersion,
-        limits: BrokerLimits,
-    ) -> Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
+        options: ConnectOptions,
+    ) {
         let mut state = EventLoop {
             connection,
             event_tx,
-            reports_reasons: protocol_version.supports_reason_codes(),
+            reports_reasons: options.protocol_version.supports_reason_codes(),
             last_packet_id: 0,
+            next_seq: 0,
             outgoing: HashMap::new(),
             incoming_qos2: HashSet::new(),
             subscribes: HashMap::new(),
             unsubscribes: HashMap::new(),
-            limits,
+            limits: session.limits,
             waiting: VecDeque::new(),
         };
-
-        // Ping at half the keep-alive, so a PINGRESP has the other half to
-        // arrive; a keep-alive of 0 means no pings at all
-        let ping_interval =
-            (keep_alive > 0).then(|| Duration::from_millis(u64::from(keep_alive) * 500));
-        let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
-        ping_timer.tick().await; // Skip the first immediate tick
-        let mut awaiting_pingresp = false;
+        let mut keep_alive = session.keep_alive;
 
         loop {
-            tokio::select! {
-                // Handle incoming packets
-                maybe_packet = state.connection.read_packet() => {
-                    match maybe_packet {
-                        Ok(Some(ControlPacket::Disconnect(disconnect))) => {
-                            // The broker is closing the connection [MQTT-3.14.4-1]
-                            info!("Received DISCONNECT from server: {:?}", disconnect.reason);
-                            let properties = disconnect.properties.unwrap_or_default();
-                            let _ = state.event_tx.send(Event::Disconnected {
-                                reason: DisconnectReason::ServerInitiated {
-                                    reason: disconnect.reason,
-                                    reason_string: properties.reason_string.map(|r| r.value),
-                                    server_reference: properties.server_reference.map(|r| r.value),
-                                },
-                            }).await;
-                            break;
-                        }
-                        Ok(Some(packet)) => {
-                            if matches!(packet, ControlPacket::PingResp(_)) {
-                                awaiting_pingresp = false;
-                            }
-                            if let Err(e) = state.handle_incoming(packet).await {
-                                warn!("Error handling packet: {}", e);
-                            }
-                        }
-                        Ok(None) => {
-                            // Connection closed
-                            info!("Connection closed by server");
-                            let _ = state.event_tx.send(Event::Disconnected {
-                                reason: DisconnectReason::ConnectionClosed,
-                            }).await;
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Error reading packet: {}", e);
-                            let _ = state.event_tx.send(Event::Disconnected {
-                                reason: DisconnectReason::ConnectionLost,
-                            }).await;
-                            break;
-                        }
-                    }
-                }
+            let reason = state.run(&mut command_rx, keep_alive).await;
+            let reconnect = options
+                .reconnect_delay
+                .filter(|_| should_reconnect(&reason));
+            let _ = state.event_tx.send(Event::Disconnected { reason }).await;
+            let Some(delay) = reconnect else { break };
 
-                // Handle commands from the client API
-                Some(cmd) = command_rx.recv() => {
-                    match cmd {
-                        Command::Publish(request) => state.publish(request).await,
-                        Command::Subscribe { topics, subscription_id, response } => {
-                            state.subscribe(topics, subscription_id, response).await;
-                        }
-                        Command::Unsubscribe { topics, response } => {
-                            state.unsubscribe(topics, response).await;
-                        }
-                        Command::Disconnect { response } => {
-                            let result = Self::handle_disconnect(&mut state.connection).await;
-                            let _ = response.send(result);
-                            let _ = state.event_tx.send(Event::Disconnected {
-                                reason: DisconnectReason::ClientInitiated,
-                            }).await;
-                            break;
-                        }
-                    }
-                }
-
-                // Send PINGREQ for keep-alive
-                _ = ping_timer.tick(), if ping_interval.is_some() => {
-                    // The previous PINGREQ went unanswered: the broker or the
-                    // network is gone
-                    if awaiting_pingresp {
-                        warn!("No PINGRESP from the broker, closing the connection");
-                        let _ = state.event_tx.send(Event::Disconnected {
-                            reason: DisconnectReason::KeepAliveTimeout,
-                        }).await;
-                        break;
-                    }
-                    awaiting_pingresp = true;
-                    debug!("Sending PINGREQ");
-                    if let Err(e) = state.connection.write_packet(
-                        ControlPacket::PingReq(PingReqPacket {})
-                    ).await {
-                        error!("Failed to send PINGREQ: {}", e);
-                        let _ = state.event_tx.send(Event::Disconnected {
-                            reason: DisconnectReason::KeepAliveTimeout,
-                        }).await;
-                        break;
-                    }
-                }
-            }
+            // Requests the broker never answered can't be answered now
+            state.subscribes.clear();
+            state.unsubscribes.clear();
+            let Some((connection, session)) =
+                state.reconnect(&mut command_rx, &options, delay).await
+            else {
+                break;
+            };
+            state.connection = connection;
+            state.limits = session.limits;
+            keep_alive = session.keep_alive;
+            let _ = state
+                .event_tx
+                .send(Event::Reconnected {
+                    session_present: session.session_present,
+                })
+                .await;
+            state.resume(session.session_present).await;
         }
-
         // Dropping the state fails every request still waiting for the broker
-        Ok(())
     }
 
     /// Handle a disconnect command.
-    async fn handle_disconnect<S>(connection: &mut Connection<S>) -> Result<()>
-    where
-        S: AsyncRead + AsyncWrite + Unpin,
-    {
+    async fn handle_disconnect(connection: &mut Connection) -> Result<()> {
         let disconnect = DisconnectPacket {
             reason: ReasonCode::NormalDisconnection,
             properties: None,
@@ -509,18 +391,48 @@ impl MqttClient {
     }
 }
 
+/// What CONNACK settled for a connection.
+struct Session {
+    client_id: String,
+    keep_alive: u16,
+    limits: BrokerLimits,
+    session_present: bool,
+}
+
+/// Whether a connection that ended this way is worth reopening. A broker
+/// that handed the session to another connection or moved the client
+/// elsewhere doesn't want it back.
+fn should_reconnect(reason: &DisconnectReason) -> bool {
+    match reason {
+        DisconnectReason::ClientInitiated => false,
+        DisconnectReason::ServerInitiated { reason, .. } => !matches!(
+            reason,
+            ReasonCode::SessionTakenOver | ReasonCode::UseAnotherServer | ReasonCode::ServerMoved
+        ),
+        _ => true,
+    }
+}
+
 /// A QoS 1 or 2 message sent to the broker and not acknowledged yet.
 struct OutgoingPublish {
+    /// Kept to send again if the connection drops before the broker
+    /// acknowledges it
+    packet: PublishPacket,
+    /// PUBREC arrived, so only the PUBREL is left to (re)send
+    released: bool,
+    /// Messages are resent in the order they were first sent [MQTT-4.6.0-1]
+    seq: u64,
     response: oneshot::Sender<Result<()>>,
 }
 
-/// The state of one connection to the broker.
-struct EventLoop<S: AsyncRead + AsyncWrite + Unpin> {
-    connection: Connection<S>,
+/// The client's side of the session.
+struct EventLoop {
+    connection: Connection,
     event_tx: mpsc::Sender<Event>,
     /// MQTT 5 acknowledgements carry reason codes, MQTT 3.x ones don't
     reports_reasons: bool,
     last_packet_id: u16,
+    next_seq: u64,
     /// QoS 1 and 2 messages awaiting PUBACK or PUBCOMP
     outgoing: HashMap<u16, OutgoingPublish>,
     /// QoS 2 messages received and awaiting PUBREL
@@ -589,7 +501,192 @@ struct PendingSubscribe {
     response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
+impl EventLoop {
+    /// Serves one connection until it ends, returning why.
+    async fn run(
+        &mut self,
+        command_rx: &mut mpsc::Receiver<Command>,
+        keep_alive: u16,
+    ) -> DisconnectReason {
+        // Ping at half the keep-alive, so a PINGRESP has the other half to
+        // arrive; a keep-alive of 0 means no pings at all
+        let ping_interval =
+            (keep_alive > 0).then(|| Duration::from_millis(u64::from(keep_alive) * 500));
+        let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
+        ping_timer.tick().await; // Skip the first immediate tick
+        let mut awaiting_pingresp = false;
+
+        loop {
+            tokio::select! {
+                // Handle incoming packets
+                maybe_packet = self.connection.read_packet() => {
+                    match maybe_packet {
+                        Ok(Some(ControlPacket::Disconnect(disconnect))) => {
+                            // The broker is closing the connection [MQTT-3.14.4-1]
+                            info!("Received DISCONNECT from server: {:?}", disconnect.reason);
+                            let properties = disconnect.properties.unwrap_or_default();
+                            return DisconnectReason::ServerInitiated {
+                                reason: disconnect.reason,
+                                reason_string: properties.reason_string.map(|r| r.value),
+                                server_reference: properties.server_reference.map(|r| r.value),
+                            };
+                        }
+                        Ok(Some(packet)) => {
+                            if matches!(packet, ControlPacket::PingResp(_)) {
+                                awaiting_pingresp = false;
+                            }
+                            if let Err(e) = self.handle_incoming(packet).await {
+                                warn!("Error handling packet: {}", e);
+                            }
+                        }
+                        Ok(None) => {
+                            // Connection closed
+                            info!("Connection closed by server");
+                            return DisconnectReason::ConnectionClosed;
+                        }
+                        Err(e) => {
+                            error!("Error reading packet: {}", e);
+                            return DisconnectReason::ConnectionLost;
+                        }
+                    }
+                }
+
+                // Handle commands from the client API
+                Some(cmd) = command_rx.recv() => {
+                    match cmd {
+                        Command::Publish(request) => self.publish(request).await,
+                        Command::Subscribe { topics, subscription_id, response } => {
+                            self.subscribe(topics, subscription_id, response).await;
+                        }
+                        Command::Unsubscribe { topics, response } => {
+                            self.unsubscribe(topics, response).await;
+                        }
+                        Command::Disconnect { response } => {
+                            let result = MqttClient::handle_disconnect(&mut self.connection).await;
+                            let _ = response.send(result);
+                            return DisconnectReason::ClientInitiated;
+                        }
+                    }
+                }
+
+                // Send PINGREQ for keep-alive
+                _ = ping_timer.tick(), if ping_interval.is_some() => {
+                    // The previous PINGREQ went unanswered: the broker or the
+                    // network is gone
+                    if awaiting_pingresp {
+                        warn!("No PINGRESP from the broker, closing the connection");
+                        return DisconnectReason::KeepAliveTimeout;
+                    }
+                    awaiting_pingresp = true;
+                    debug!("Sending PINGREQ");
+                    if let Err(e) = self.connection.write_packet(
+                        ControlPacket::PingReq(PingReqPacket {})
+                    ).await {
+                        error!("Failed to send PINGREQ: {}", e);
+                        return DisconnectReason::KeepAliveTimeout;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits `delay` between attempts to reopen the connection. Meanwhile
+    /// QoS 1 and 2 publishes queue up, and other requests fail. Gives up
+    /// when the broker refuses the client or the application disconnects.
+    async fn reconnect(
+        &mut self,
+        command_rx: &mut mpsc::Receiver<Command>,
+        options: &ConnectOptions,
+        delay: Duration,
+    ) -> Option<(Connection, Session)> {
+        loop {
+            let wait = time::sleep(delay);
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    _ = &mut wait => break,
+                    command = command_rx.recv() => match command? {
+                        Command::Publish(request) if request.qos != QoS::AtMostOnce => {
+                            self.waiting.push_back(request);
+                        }
+                        Command::Publish(request) => {
+                            let _ = request.response.send(Err(ClientError::Disconnected));
+                        }
+                        Command::Subscribe { response, .. } => {
+                            let _ = response.send(Err(ClientError::Disconnected));
+                        }
+                        Command::Unsubscribe { response, .. } => {
+                            let _ = response.send(Err(ClientError::Disconnected));
+                        }
+                        Command::Disconnect { response } => {
+                            let _ = response.send(Ok(()));
+                            return None;
+                        }
+                    },
+                }
+            }
+
+            match MqttClient::open(options).await {
+                Ok(opened) => return Some(opened),
+                Err(e @ (ClientError::ConnectionRefused(_) | ClientError::Redirected { .. })) => {
+                    error!("Broker refused to reconnect: {}", e);
+                    return None;
+                }
+                Err(e) => warn!("Reconnecting failed: {}", e),
+            }
+        }
+    }
+
+    /// Picks up the exchanges the old connection left unfinished. If the
+    /// broker kept the session, unacknowledged messages are resent with DUP
+    /// and released ones get their PUBREL again [MQTT-4.4.0-1]. If it
+    /// didn't, they start over as new messages.
+    async fn resume(&mut self, session_present: bool) {
+        if !session_present {
+            self.incoming_qos2.clear();
+            // The broker received these; only the PUBCOMP went missing
+            let released: Vec<u16> = self
+                .outgoing
+                .iter()
+                .filter(|(_, o)| o.released)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in released {
+                self.complete_publish(id, ReasonCode::Success);
+            }
+        }
+
+        let mut pending: Vec<_> = self.outgoing.iter().collect();
+        pending.sort_by_key(|(_, o)| o.seq);
+        let packets: Vec<ControlPacket> = pending
+            .into_iter()
+            .map(|(id, o)| {
+                if o.released {
+                    ControlPacket::PubRel(PubRelPacket {
+                        packet_id: *id,
+                        reason: ReasonCode::Success,
+                        properties: None,
+                    })
+                } else {
+                    ControlPacket::Publish(PublishPacket {
+                        dup: session_present,
+                        ..o.packet.clone()
+                    })
+                }
+            })
+            .collect();
+        // ponytail: a broker that lowered Receive Maximum across the
+        // reconnect may see more in flight than it now allows
+        for packet in packets {
+            // A failed write ends this connection too, and the next
+            // reconnect resends again
+            if self.connection.write_packet(packet).await.is_err() {
+                return;
+            }
+        }
+        self.send_waiting().await;
+    }
+
     /// Allocates a packet identifier not used by any exchange in progress.
     /// Identifiers are never 0 [MQTT-2.2.1-3].
     fn next_packet_id(&mut self) -> Option<u16> {
@@ -677,7 +774,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
         };
         if let Err(e) = self
             .connection
-            .write_packet(ControlPacket::Publish(publish))
+            .write_packet(ControlPacket::Publish(publish.clone()))
             .await
         {
             let _ = response.send(Err(e));
@@ -686,8 +783,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
 
         match packet_id {
             Some(packet_id) => {
-                self.outgoing
-                    .insert(packet_id, OutgoingPublish { response });
+                self.next_seq += 1;
+                self.outgoing.insert(
+                    packet_id,
+                    OutgoingPublish {
+                        packet: publish,
+                        released: false,
+                        seq: self.next_seq,
+                        response,
+                    },
+                );
             }
             None => {
                 let _ = response.send(Ok(()));
@@ -830,10 +935,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
                 if rec.reason.get_code() >= 0x80 {
                     self.complete_publish(rec.packet_id, rec.reason);
                 } else {
-                    let reason = if self.outgoing.contains_key(&rec.packet_id) {
-                        ReasonCode::Success
-                    } else {
-                        self.unknown_packet_id()
+                    let reason = match self.outgoing.get_mut(&rec.packet_id) {
+                        Some(outgoing) => {
+                            outgoing.released = true;
+                            ReasonCode::Success
+                        }
+                        None => self.unknown_packet_id(),
                     };
                     self.connection
                         .write_packet(ControlPacket::PubRel(PubRelPacket {

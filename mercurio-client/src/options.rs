@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 use mercurio_core::properties::{
     ContentType, CorrelationData, MessageExpiryInterval, PayloadFormatIndicator, ResponseTopic,
@@ -151,6 +153,7 @@ pub struct ConnectOptions {
     pub(crate) protocol_version: ProtocolVersion,
     pub(crate) connect_timeout_secs: u64,
     pub(crate) tls: TlsOptions,
+    pub(crate) reconnect_delay: Option<Duration>,
 }
 
 impl ConnectOptions {
@@ -169,6 +172,7 @@ impl ConnectOptions {
             protocol_version: ProtocolVersion::V5,
             connect_timeout_secs: 30,
             tls: TlsOptions::default(),
+            reconnect_delay: None,
         }
     }
 
@@ -236,6 +240,14 @@ impl ConnectOptions {
     /// Set the MQTT protocol version to use.
     pub fn protocol_version(mut self, version: ProtocolVersion) -> Self {
         self.protocol_version = version;
+        self
+    }
+
+    /// Reconnect after losing the connection, waiting `delay` between
+    /// attempts. Combine with `clean_start(false)` and a session expiry so
+    /// the broker keeps subscriptions and messages in flight meanwhile.
+    pub fn reconnect(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = Some(delay);
         self
     }
 
