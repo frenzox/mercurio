@@ -189,10 +189,34 @@ pub trait InflightStore: Send + Sync {
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
 }
 
+/// Messages waiting for disconnected clients, kept so they survive a
+/// restart. Each message is identified by its sequence in the client's queue.
+#[async_trait]
+pub trait QueueStore: Send + Sync {
+    /// Whether stored queues outlive the process. Stores that don't are
+    /// never asked to keep a copy of the queues the broker already holds.
+    fn is_durable(&self) -> bool {
+        true
+    }
+
+    async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()>;
+
+    /// The client's queued messages, in sequence order.
+    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
+
+    async fn clear_queue(&self, client_id: &str) -> Result<()>;
+}
+
 /// Combined trait for full MQTT storage functionality.
 ///
 /// Implementations provide all storage capabilities needed by an MQTT broker.
-pub trait MqttStore: SessionStore + RetainedMessageStore + WillStore + InflightStore {}
+pub trait MqttStore:
+    SessionStore + RetainedMessageStore + WillStore + InflightStore + QueueStore
+{
+}
 
 /// Blanket implementation for any type implementing all storage traits.
-impl<T> MqttStore for T where T: SessionStore + RetainedMessageStore + WillStore + InflightStore {}
+impl<T> MqttStore for T where
+    T: SessionStore + RetainedMessageStore + WillStore + InflightStore + QueueStore
+{
+}
