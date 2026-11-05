@@ -181,7 +181,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     };
 
     let session_manager = server.session_manager_holder.session_manager();
-    for (client_id, will, due) in session_manager.restore_from_storage().await {
+    for (client_id, will, due) in session_manager.restore_from_storage(&server.broker).await {
         let broker = server.broker.clone();
         let session_manager = session_manager.clone();
         tokio::spawn(async move {

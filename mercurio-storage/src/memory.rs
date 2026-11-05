@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
-    InflightMessage, InflightStore, Result, RetainedMessageStore, SessionState, SessionStore,
-    StorageError, StoredWillMessage, WillStore,
+    InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
+    SessionStore, StorageError, StoredWillMessage, WillStore,
 };
 
 /// In-memory storage backend implementing all storage traits.
@@ -225,6 +225,27 @@ impl InflightStore for MemoryStore {
             .get(client_id)
             .map(|msgs| msgs.values().cloned().collect())
             .unwrap_or_default())
+    }
+}
+
+/// Everything in memory is lost on restart anyway, so queues are not
+/// copied.
+#[async_trait]
+impl QueueStore for MemoryStore {
+    fn is_durable(&self) -> bool {
+        false
+    }
+
+    async fn enqueue(&self, _client_id: &str, _sequence: u64, _message: &Message) -> Result<()> {
+        Ok(())
+    }
+
+    async fn load_queue(&self, _client_id: &str) -> Result<Vec<(u64, Message)>> {
+        Ok(Vec::new())
+    }
+
+    async fn clear_queue(&self, _client_id: &str) -> Result<()> {
+        Ok(())
     }
 }
 

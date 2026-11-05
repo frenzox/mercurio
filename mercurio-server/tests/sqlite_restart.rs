@@ -99,3 +99,76 @@ async fn sessions_and_retained_messages_survive_a_restart() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+async fn next_publish(stream: &mut TcpStream, buffer: &mut bytes::BytesMut) -> Option<Vec<u8>> {
+    use mercurio_core::protocol::ProtocolVersion;
+    use mercurio_packets::ControlPacket;
+
+    loop {
+        if ControlPacket::check(buffer).is_ok() {
+            let packet = ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap();
+            let ControlPacket::Publish(publish) = packet else {
+                continue;
+            };
+            return Some(publish.payload.unwrap().to_vec());
+        }
+        match timeout(Duration::from_millis(500), stream.read_buf(buffer)).await {
+            Ok(read) => assert_ne!(read.unwrap(), 0, "connection closed"),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// QoS 1 publish of `payload` to "q".
+async fn publish(publisher: &mut TcpStream, id: u8, payload: u8) {
+    publisher
+        .write_all(&[0x32, 0x07, 0x00, 0x01, b'q', 0x00, id, 0x00, payload])
+        .await
+        .unwrap();
+    let mut puback = [0u8; 4];
+    timeout(Duration::from_secs(2), publisher.read_exact(&mut puback))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn messages_for_offline_clients_survive_a_restart() {
+    let db = std::env::temp_dir().join(format!("mercurio-queue-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+
+    let (addr, stop) = start_broker(&db).await;
+    let (mut subscriber, _) = connect(addr, b's', true).await;
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'q', 0x01])
+        .await
+        .unwrap();
+    let mut suback = [0u8; 6];
+    subscriber.read_exact(&mut suback).await.unwrap();
+    drop(subscriber);
+    sleep(Duration::from_millis(100)).await;
+
+    let (mut publisher, _) = connect(addr, b'p', true).await;
+    for (id, payload) in [(1, b'1'), (2, b'2'), (3, b'3')] {
+        publish(&mut publisher, id, payload).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+    stop.send(()).unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    // After the restart the offline session still collects messages
+    let (addr, _stop) = start_broker(&db).await;
+    let (mut publisher, _) = connect(addr, b'p', true).await;
+    publish(&mut publisher, 1, b'4').await;
+
+    let (mut subscriber, resumed) = connect(addr, b's', false).await;
+    assert!(resumed);
+    let mut buffer = bytes::BytesMut::new();
+    let mut received = Vec::new();
+    while let Some(payload) = next_publish(&mut subscriber, &mut buffer).await {
+        received.extend(payload);
+    }
+    assert_eq!(received, b"1234");
+
+    let _ = std::fs::remove_file(&db);
+}

@@ -19,8 +19,8 @@ use mercurio_core::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
-    InflightMessage, InflightStore, Result, RetainedMessageStore, SessionState, SessionStore,
-    StorageError, StoredSubscription, StoredWillMessage, WillStore,
+    InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
+    SessionStore, StorageError, StoredSubscription, StoredWillMessage, WillStore,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -103,6 +103,19 @@ impl SqliteStore {
                 properties BLOB NOT NULL,
                 subscription_identifier INTEGER,
                 PRIMARY KEY (client_id, packet_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS queued_messages (
+                client_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                topic TEXT NOT NULL,
+                payload BLOB,
+                qos INTEGER NOT NULL,
+                retain INTEGER NOT NULL,
+                properties BLOB NOT NULL,
+                expires_at INTEGER,
+                subscription_identifier INTEGER,
+                PRIMARY KEY (client_id, sequence)
             );
 
             CREATE INDEX IF NOT EXISTS idx_inflight_client
@@ -603,6 +616,84 @@ impl InflightStore for SqliteStore {
     }
 }
 
+#[async_trait]
+impl QueueStore for SqliteStore {
+    async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()> {
+        let client_id = client_id.to_string();
+        let message = message.clone();
+
+        self.blocking(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO queued_messages
+                 (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
+                  subscription_identifier)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    client_id,
+                    sequence as i64,
+                    &*message.topic,
+                    message.payload.as_ref().map(|p| p.to_vec()),
+                    qos_to_int(message.qos),
+                    message.retain,
+                    encode_properties(&message.properties),
+                    message.expires_at.map(|t| t as i64),
+                    message.subscription_identifier
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence, topic, payload, qos, retain, properties, expires_at,
+                        subscription_identifier
+                 FROM queued_messages WHERE client_id = ?1 ORDER BY sequence",
+            )?;
+            let rows = stmt.query_map(params![client_id], |row| {
+                let topic: String = row.get(1)?;
+                let payload: Option<Vec<u8>> = row.get(2)?;
+                let message = Message {
+                    packet_id: None,
+                    topic: Arc::from(topic.as_str()),
+                    dup: false,
+                    qos: int_to_qos(row.get(3)?),
+                    retain: row.get(4)?,
+                    payload: payload.map(Bytes::from),
+                    properties: decode_properties(row.get(5)?)?,
+                    expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                    subscription_identifier: row.get(7)?,
+                };
+                Ok((row.get::<_, i64>(0)? as u64, message))
+            })?;
+
+            let mut queue = Vec::new();
+            for row in rows {
+                queue.push(row?);
+            }
+            Ok(queue)
+        })
+        .await
+    }
+
+    async fn clear_queue(&self, client_id: &str) -> Result<()> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM queued_messages WHERE client_id = ?1",
+                params![client_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +750,31 @@ mod tests {
             .unwrap();
 
         assert!(store.get_retained("t").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_queue_store() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut second = create_test_message("b", "2");
+        second.subscription_identifier = Some(4);
+        store.enqueue("c", 2, &second).await.unwrap();
+        store
+            .enqueue("c", 1, &create_test_message("a", "1"))
+            .await
+            .unwrap();
+        store
+            .enqueue("other", 1, &create_test_message("x", "x"))
+            .await
+            .unwrap();
+
+        let queue = store.load_queue("c").await.unwrap();
+        let topics: Vec<(u64, &str)> = queue.iter().map(|(s, m)| (*s, &*m.topic)).collect();
+        assert_eq!(topics, [(1, "a"), (2, "b")]);
+        assert_eq!(queue[1].1.subscription_identifier, Some(4));
+
+        store.clear_queue("c").await.unwrap();
+        assert!(store.load_queue("c").await.unwrap().is_empty());
+        assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
