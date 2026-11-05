@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mercurio_core::{message::Message, qos::QoS};
+use mercurio_core::{message::Message, qos::QoS, topic::topic_matches_filter};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
@@ -268,12 +268,11 @@ impl RetainedMessageStore for SqliteStore {
                 Ok((topic, payload, qos, dup))
             })?;
 
-            let filter_parts: Vec<&str> = filter.split('/').collect();
             let mut messages = Vec::new();
 
             for row in rows {
                 let (topic, payload, qos, dup) = row?;
-                if topic_matches_filter(&topic, &filter_parts) {
+                if topic_matches_filter(&topic, &filter) {
                     messages.push(Message {
                         packet_id: None,
                         topic: Arc::from(topic.as_str()),
@@ -468,33 +467,6 @@ impl InflightStore for SqliteStore {
         })
         .await
     }
-}
-
-/// Check if a topic matches a filter (with wildcard support).
-fn topic_matches_filter(topic: &str, filter_parts: &[&str]) -> bool {
-    let topic_parts: Vec<&str> = topic.split('/').collect();
-    let mut topic_idx = 0;
-    let mut filter_idx = 0;
-
-    while filter_idx < filter_parts.len() {
-        let filter_part = filter_parts[filter_idx];
-
-        if filter_part == "#" {
-            return true;
-        }
-
-        if topic_idx >= topic_parts.len() {
-            return false;
-        }
-
-        if filter_part != "+" && filter_part != topic_parts[topic_idx] {
-            return false;
-        }
-        topic_idx += 1;
-        filter_idx += 1;
-    }
-
-    topic_idx == topic_parts.len()
 }
 
 #[cfg(test)]

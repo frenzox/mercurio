@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use mercurio_core::message::Message;
+use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
     InflightMessage, InflightStore, Result, RetainedMessageStore, SessionState, SessionStore,
@@ -97,10 +97,9 @@ impl RetainedMessageStore for MemoryStore {
             .read()
             .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
 
-        let filter_parts: Vec<&str> = topic_filter.split('/').collect();
         let messages: Vec<Message> = retained
             .iter()
-            .filter(|(topic, _)| topic_matches_filter(topic, &filter_parts))
+            .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
             .map(|(_, msg)| {
                 let mut msg = msg.clone();
                 msg.retain = true; // Mark as retained when delivering
@@ -208,33 +207,6 @@ impl InflightStore for MemoryStore {
             .map(|msgs| msgs.values().cloned().collect())
             .unwrap_or_default())
     }
-}
-
-/// Check if a topic matches a filter (with wildcard support).
-fn topic_matches_filter(topic: &str, filter_parts: &[&str]) -> bool {
-    let topic_parts: Vec<&str> = topic.split('/').collect();
-    let mut topic_idx = 0;
-    let mut filter_idx = 0;
-
-    while filter_idx < filter_parts.len() {
-        let filter_part = filter_parts[filter_idx];
-
-        if filter_part == "#" {
-            return true;
-        }
-
-        if topic_idx >= topic_parts.len() {
-            return false;
-        }
-
-        if filter_part != "+" && filter_part != topic_parts[topic_idx] {
-            return false;
-        }
-        topic_idx += 1;
-        filter_idx += 1;
-    }
-
-    topic_idx == topic_parts.len()
 }
 
 #[cfg(test)]

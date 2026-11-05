@@ -111,6 +111,12 @@ impl<T: Clone> TopicTree<T> {
                 stack.push((child, depth + 1));
             }
 
+            // Wildcards at the first level never match topics starting with
+            // `$`, which are reserved for server use [MQTT-4.7.2-1]
+            if depth == 0 && topic.starts_with('$') {
+                continue;
+            }
+
             if let Some(child) = node.children.get("+") {
                 stack.push((child, depth + 1));
             }
@@ -174,6 +180,18 @@ mod tests {
         assert_eq!(matching(&tree, "sport/tennis/player1/ranking"), ["ranking"]);
         assert!(matching(&tree, "sport/tennis").is_empty());
         assert_eq!(matching(&tree, "sport/tennis/"), ["plus"]);
+    }
+
+    #[test]
+    fn test_dollar_topics_skip_leading_wildcards() {
+        let tree = TopicTree::new();
+        tree.subscribe("#", 1, "all");
+        tree.subscribe("+/monitor/clients", 2, "plus");
+        tree.subscribe("$SYS/#", 3, "sys");
+        tree.subscribe("$SYS/monitor/+", 4, "sys-plus");
+
+        assert_eq!(matching(&tree, "$SYS/monitor/clients"), ["sys", "sys-plus"]);
+        assert_eq!(matching(&tree, "a/monitor/clients"), ["all", "plus"]);
     }
 
     #[test]
