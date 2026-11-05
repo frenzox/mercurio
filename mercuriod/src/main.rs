@@ -8,7 +8,7 @@ use std::sync::Arc;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
-use mercurio_server::server::AuthConfig as ServerAuthConfig;
+use mercurio_server::server::{AuthConfig as ServerAuthConfig, ServerConfig};
 use mercurio_server::tls::TlsConfig;
 use tokio::{net::TcpListener, signal};
 use tracing::info;
@@ -159,8 +159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ServerAuthConfig::default()
     };
 
-    mercurio_server::server::run_with_tls(listener, tls_config, auth_config, signal::ctrl_c())
-        .await;
+    let server_config = ServerConfig {
+        tls: tls_config,
+        auth: auth_config,
+        ..Default::default()
+    };
+    mercurio_server::server::run_with_config(listener, server_config, signal::ctrl_c()).await;
 
     info!("Mercurio MQTT broker stopped");
 
