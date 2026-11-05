@@ -51,7 +51,10 @@ async fn new_connection_takes_over_client_id() {
     assert_eq!(session_present, 0x01);
 
     // The old connection is told why, then closed
-    assert_eq!(read(&mut old, 3).await, [0xe0, 0x01, 0x8e]);
+    assert_eq!(
+        common::disconnect_reason(&common::read_disconnect(&mut old).await),
+        0x8e
+    );
     assert_eq!(old.read(&mut [0u8; 1]).await.unwrap(), 0);
 
     // The resumed subscription now delivers to the new connection

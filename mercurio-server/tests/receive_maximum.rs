@@ -165,7 +165,8 @@ async fn client_exceeding_the_broker_receive_maximum_is_disconnected() {
         .expect("connection still open")
         .unwrap();
     // PUBREC for the first, then DISCONNECT, Receive Maximum exceeded
-    assert_eq!(received, [0x50, 0x02, 0x00, 0x01, 0xe0, 0x01, 0x93]);
+    assert_eq!(&received[..4], [0x50, 0x02, 0x00, 0x01]);
+    assert_eq!(common::disconnect_reason(&received[4..]), 0x93);
 }
 
 #[tokio::test]

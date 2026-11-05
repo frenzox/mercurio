@@ -12,16 +12,16 @@ use tracing::{debug, error, info, warn};
 use mercurio_core::{
     error::Error,
     message::Message,
-    properties::{AuthenticationData, AuthenticationMethod},
+    properties::{AuthenticationData, AuthenticationMethod, ReasonString},
     protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
-    connack::{ConnAckFlags, ConnAckPacket},
+    connack::{ConnAckFlags, ConnAckPacket, ConnAckProperties},
     connect::ConnectPacket,
-    disconnect::DisconnectPacket,
+    disconnect::{DisconnectPacket, DisconnectProperties},
     ControlPacket,
 };
 use mercurio_storage::{memory::MemoryStore, MqttStore};
@@ -348,7 +348,10 @@ impl<St: MqttStore + 'static> Listener<St> {
                         session_present: false,
                     },
                     reason_code: reason,
-                    properties: None,
+                    properties: Some(ConnAckProperties {
+                        reason_string: reason_string(reason, None),
+                        ..Default::default()
+                    }),
                 };
                 let _ = handler
                     .connection
@@ -470,6 +473,11 @@ where
 
         let keepalive = connect_packet.keepalive;
         let protocol_version = connect_packet.protocol_version;
+        let client_maximum_packet_size = connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.maximum_packet_size.as_ref())
+            .map(|m| m.value);
         let mut expiry = session_expiry(&connect_packet);
 
         let start_result = self.session_manager.start_session(connect_packet).await?;
@@ -521,7 +529,10 @@ where
                     .connection
                     .write_packet(ControlPacket::Disconnect(DisconnectPacket {
                         reason: *reason,
-                        properties: None,
+                        properties: Some(DisconnectProperties {
+                            reason_string: reason_string(*reason, client_maximum_packet_size),
+                            ..Default::default()
+                        }),
                     }))
                     .await;
             }
@@ -643,13 +654,24 @@ where
         connect_packet: &ConnectPacket,
         reason_code: ReasonCode,
     ) -> Result<()> {
+        let client_maximum = connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.maximum_packet_size.as_ref())
+            .map(|m| m.value);
         let connack = ConnAckPacket {
             protocol_version: connect_packet.protocol_version,
             flags: ConnAckFlags {
                 session_present: false,
             },
             reason_code,
-            properties: None,
+            properties: connect_packet
+                .protocol_version
+                .supports_properties()
+                .then(|| ConnAckProperties {
+                    reason_string: reason_string(reason_code, client_maximum),
+                    ..Default::default()
+                }),
         };
         let _ = self
             .connection
@@ -829,7 +851,13 @@ where
                             .connection
                             .write_packet(ControlPacket::Disconnect(DisconnectPacket {
                                 reason: ReasonCode::SessionTakenOver,
-                                properties: None,
+                                properties: Some(DisconnectProperties {
+                                    reason_string: reason_string(
+                                        ReasonCode::SessionTakenOver,
+                                        session.client_maximum_packet_size().await,
+                                    ),
+                                    ..Default::default()
+                                }),
                             }))
                             .await;
                     }
@@ -845,6 +873,18 @@ where
 
         Ok(())
     }
+}
+
+/// Explains `reason` to the client, unless the text would make the packet
+/// larger than the client accepts [MQTT-3.1.2-25].
+fn reason_string(
+    reason: ReasonCode,
+    client_maximum_packet_size: Option<u32>,
+) -> Option<ReasonString> {
+    let text = reason.to_string();
+    // Room for the rest of a CONNACK or DISCONNECT around the string
+    let fits = client_maximum_packet_size.is_none_or(|max| text.len() + 16 <= max as usize);
+    fits.then(|| ReasonString::new(text))
 }
 
 async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, client_id: &str) {

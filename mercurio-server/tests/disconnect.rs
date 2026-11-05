@@ -95,7 +95,10 @@ async fn disconnect_cannot_extend_zero_session_expiry() {
     client.write_all(&disconnect(0x00, Some(60))).await.unwrap();
 
     // Protocol error
-    assert_eq!(read(&mut client, 3).await, [0xe0, 0x01, 0x82]);
+    assert_eq!(
+        common::disconnect_reason(&common::read_disconnect(&mut client).await),
+        0x82
+    );
     wait_for_close(&mut client).await;
 
     let (_, resumed) = connect(addr, b'b', false, 0, false).await;

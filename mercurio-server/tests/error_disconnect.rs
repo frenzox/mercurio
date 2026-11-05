@@ -52,8 +52,20 @@ async fn protocol_violation_is_explained_before_closing() {
         .await
         .unwrap();
 
-    // DISCONNECT, Topic Name Invalid
-    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x90]);
+    // DISCONNECT, Topic Name Invalid, explained in the reason string
+    let disconnect = read_until_closed(&mut stream).await;
+    assert_eq!(common::disconnect_reason(&disconnect), 0x90);
+    let mut buffer = bytes::BytesMut::from(&disconnect[..]);
+    let Ok(mercurio_packets::ControlPacket::Disconnect(packet)) =
+        mercurio_packets::ControlPacket::parse_with_version(
+            &mut buffer,
+            mercurio_core::protocol::ProtocolVersion::V5,
+        )
+    else {
+        panic!("Expected DISCONNECT");
+    };
+    let reason_string = packet.properties.unwrap().reason_string.unwrap();
+    assert_eq!(reason_string.value, "Topic name invalid");
 }
 
 #[tokio::test]
@@ -67,7 +79,10 @@ async fn oversized_packet_is_explained_before_closing() {
         .unwrap();
 
     // DISCONNECT, Packet Too Large
-    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x95]);
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x95
+    );
 }
 
 #[tokio::test]
@@ -106,7 +121,10 @@ async fn keep_alive_timeout_is_explained_before_closing() {
     common::read_connack(&mut stream).await;
 
     // DISCONNECT, Keep Alive timeout
-    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x8d]);
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x8d
+    );
 }
 
 #[tokio::test]
@@ -122,7 +140,10 @@ async fn shutdown_is_announced_to_connected_clients() {
     stop.send(()).unwrap();
 
     // DISCONNECT, Server shutting down
-    assert_eq!(read_until_closed(&mut stream).await, [0xe0, 0x01, 0x8b]);
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x8b
+    );
     timeout(Duration::from_secs(2), server)
         .await
         .expect("server did not finish shutting down")
