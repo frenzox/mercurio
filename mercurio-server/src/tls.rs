@@ -1,10 +1,8 @@
 //! TLS support for the MQTT broker.
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -73,12 +71,9 @@ impl TlsConfig {
 
 /// Load certificates from a PEM file.
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, ServerError> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| ServerError::Tls(format!("Failed to open cert file '{}': {}", path, e)))?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| ServerError::Tls(format!("Failed to parse certs from '{}': {}", path, e)))?;
+    let certs = CertificateDer::pem_file_iter(path)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| ServerError::Tls(format!("Failed to read certs from '{}': {}", path, e)))?;
 
     if certs.is_empty() {
         return Err(ServerError::Tls(format!(
@@ -90,39 +85,11 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, ServerError> {
     Ok(certs)
 }
 
-/// Load a private key from a PEM file.
+/// Load the first private key, in PKCS#1, PKCS#8 or SEC1 format, from a PEM
+/// file.
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, ServerError> {
-    let file = File::open(Path::new(path))
-        .map_err(|e| ServerError::Tls(format!("Failed to open key file '{}': {}", path, e)))?;
-    let mut reader = BufReader::new(file);
-
-    // Try to read different key formats
-    loop {
-        match rustls_pemfile::read_one(&mut reader) {
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs1(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
-                return Ok(PrivateKeyDer::Pkcs8(key));
-            }
-            Ok(Some(rustls_pemfile::Item::Sec1Key(key))) => {
-                return Ok(PrivateKeyDer::Sec1(key));
-            }
-            Ok(Some(_)) => continue, // Skip other items (certs, etc.)
-            Ok(None) => break,
-            Err(e) => {
-                return Err(ServerError::Tls(format!(
-                    "Failed to parse key from '{}': {}",
-                    path, e
-                )));
-            }
-        }
-    }
-
-    Err(ServerError::Tls(format!(
-        "No private key found in '{}'",
-        path
-    )))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|e| ServerError::Tls(format!("Failed to read key from '{}': {}", path, e)))
 }
 
 #[cfg(test)]
