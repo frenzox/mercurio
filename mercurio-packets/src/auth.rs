@@ -84,14 +84,16 @@ const PACKET_TYPE: u8 = 0x0f;
 
 impl Encoder for AuthPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut remaining_len = 0;
+        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
+        let remaining_len = self.reason.encoded_size()
+            + properties_len.encoded_size()
+            + self.properties.encoded_size();
 
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += self.reason.encoded_size();
-        remaining_len += self.properties.encoded_size();
         VariableByteInteger(remaining_len as u32).encode(buffer);
 
         self.reason.encode(buffer);
+        properties_len.encode(buffer);
         self.properties.encode(buffer);
     }
 }
@@ -118,5 +120,29 @@ impl Decoder for AuthPacket {
         };
 
         Ok(AuthPacket { reason, properties })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn test_round_trip() {
+        let packet = AuthPacket {
+            reason: ReasonCode::ContinueAuthentication,
+            properties: AuthProperties {
+                auth_method: Some(AuthenticationMethod::new("SCRAM-SHA-256".into())),
+                auth_data: Some(AuthenticationData::new(Bytes::from_static(b"nonce"))),
+                ..Default::default()
+            },
+        };
+
+        let mut buffer = BytesMut::new();
+        packet.encode(&mut buffer);
+        assert_eq!(AuthPacket::decode(&mut buffer).unwrap(), packet);
+        assert!(buffer.is_empty());
     }
 }
