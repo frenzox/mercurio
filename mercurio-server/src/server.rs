@@ -36,6 +36,9 @@ use crate::{
 pub struct AuthConfig {
     /// Whether authentication is required.
     pub require_auth: bool,
+    /// With authentication required, still accept clients that send no
+    /// user name. Credentials that are sent are always checked.
+    pub allow_anonymous: bool,
     /// Optional credential validator for CONNECT username/password.
     pub credential_validator: Option<Arc<dyn CredentialValidator>>,
     /// Optional auth manager for MQTT 5.0 enhanced authentication.
@@ -339,6 +342,7 @@ where
                         false
                     }
                 }
+                (None, None) if self.auth_config.allow_anonymous => true,
                 _ => {
                     warn!("Authentication required but no credentials provided");
                     false
