@@ -59,6 +59,9 @@ max_queued_qos0_messages = 1000
 # Seconds a new connection has to complete TLS and send CONNECT
 connect_timeout = 10
 
+# Highest topic alias MQTT 5 clients may use (0 disables topic aliases)
+max_topic_alias = 10
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

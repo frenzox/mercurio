@@ -19,6 +19,7 @@ use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, MaximumPacketSize, MessageExpiryInterval, SubscriptionIdentifier,
+        TopicAliasMaximum,
     },
     qos::QoS,
     reason::ReasonCode,
@@ -47,6 +48,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     queue::{MessageQueue, QueueLimits, Subscriber},
+    server::Limits,
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
@@ -203,6 +205,10 @@ struct State {
     incoming_qos2: HashSet<u16>,
     /// Last packet identifier assigned to an outgoing QoS > 0 PUBLISH
     last_packet_id: u16,
+    /// Topic names the client registered under an alias on this connection
+    topic_aliases: HashMap<u16, String>,
+    /// Highest alias the client may use, as advertised in CONNACK
+    topic_alias_maximum: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Current authentication method name for ongoing re-authentication
@@ -244,6 +250,8 @@ impl Session {
                     next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
+                    topic_aliases: HashMap::new(),
+                    topic_alias_maximum: 0,
                     will_message,
                     auth_method: None,
                 }),
@@ -339,7 +347,7 @@ impl Session {
         connection: &mut Connection<S>,
         resume: bool,
         assigned_client_id: bool,
-        max_packet_size: usize,
+        limits: &Limits,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -348,7 +356,11 @@ impl Session {
         ack.flags.session_present = resume;
 
         let client_id = {
-            let session = self.shared.state.lock().await;
+            let mut session = self.shared.state.lock().await;
+
+            // Topic aliases only live as long as the connection [MQTT-3.3.2-7]
+            session.topic_aliases.clear();
+            session.topic_alias_maximum = limits.topic_alias_maximum;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
@@ -363,8 +375,9 @@ impl Session {
                     assigned_client_id: assigned_client_id
                         .then(|| AssignedClientIdentifier::new(session.client_id.clone())),
                     maximum_packet_size: Some(MaximumPacketSize::new(
-                        max_packet_size.try_into().unwrap_or(u32::MAX),
+                        limits.max_packet_size.try_into().unwrap_or(u32::MAX),
                     )),
+                    topic_alias_max: Some(TopicAliasMaximum::new(limits.topic_alias_maximum)),
                     ..Default::default()
                 });
             }
@@ -385,9 +398,32 @@ impl Session {
 
     async fn handle_publish<S: RetainedMessageStore>(
         &mut self,
-        packet: PublishPacket,
+        mut packet: PublishPacket,
         broker: &Broker<S>,
     ) -> Result<Option<ControlPacket>> {
+        let topic_alias = packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.topic_alias.as_ref())
+            .map(|alias| alias.value);
+        if let Some(alias) = topic_alias {
+            let mut session = self.shared.state.lock().await;
+            if alias == 0 || alias > session.topic_alias_maximum {
+                return Err(ReasonCode::TopicAliasInvalid.into());
+            }
+            // An empty topic name refers to the alias, a non-empty one sets it
+            if packet.topic_name.is_empty() {
+                match session.topic_aliases.get(&alias) {
+                    Some(topic) => packet.topic_name = topic.clone(),
+                    None => return Err(ReasonCode::ProtocolError.into()),
+                }
+            } else {
+                session
+                    .topic_aliases
+                    .insert(alias, packet.topic_name.clone());
+            }
+        }
+
         // Validate topic name (no wildcards, no null chars, etc.)
         if validate_publish_topic(&packet.topic_name).is_err() {
             return Err(ReasonCode::TopicNameInvalid.into());
@@ -1699,6 +1735,55 @@ mod tests {
                 ReasonCode::ProtocolError
             ))
         ));
+    }
+
+    fn aliased_publish(topic: &str, alias: u16) -> ControlPacket {
+        ControlPacket::Publish(PublishPacket {
+            topic_name: topic.into(),
+            properties: Some(PublishProperties {
+                topic_alias: Some(mercurio_core::properties::TopicAlias::new(alias)),
+                ..Default::default()
+            }),
+            payload: Some(Bytes::from("x")),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_topic_aliases_resolve_to_registered_topics() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        publisher.shared.state.lock().await.topic_alias_maximum = 5;
+        subscriber
+            .handle_subscribe(subscribe_packet("a/b", QoS::AtMostOnce), &broker)
+            .await
+            .unwrap();
+
+        for topic in ["a/b", ""] {
+            publisher
+                .process_incoming(aliased_publish(topic, 1), &broker, None)
+                .await
+                .unwrap();
+            let publish = next_publish(&mut subscriber).await;
+            assert_eq!(publish.topic_name, "a/b");
+            // The alias is not forwarded
+            assert!(publish.properties.unwrap().topic_alias.is_none());
+        }
+
+        for (topic, alias, reason) in [
+            ("a/b", 6, ReasonCode::TopicAliasInvalid),
+            ("a/b", 0, ReasonCode::TopicAliasInvalid),
+            ("", 2, ReasonCode::ProtocolError),
+        ] {
+            let result = publisher
+                .process_incoming(aliased_publish(topic, alias), &broker, None)
+                .await;
+            assert!(
+                matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
+                "alias {alias}"
+            );
+        }
     }
 
     #[tokio::test]

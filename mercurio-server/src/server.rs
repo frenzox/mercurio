@@ -57,6 +57,8 @@ pub struct Limits {
     pub queue: QueueLimits,
     /// Connections beyond this many are closed right after being accepted.
     pub max_connections: Option<usize>,
+    /// Highest topic alias MQTT 5 clients may use; 0 disables aliases.
+    pub topic_alias_maximum: u16,
 }
 
 impl Default for Limits {
@@ -66,6 +68,7 @@ impl Default for Limits {
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             queue: QueueLimits::default(),
             max_connections: None,
+            topic_alias_maximum: 10,
         }
     }
 }
@@ -381,7 +384,7 @@ where
                     &mut self.connection,
                     start_result.resume,
                     start_result.assigned_client_id,
-                    self.limits.max_packet_size,
+                    &self.limits,
                 )
                 .await?;
 
