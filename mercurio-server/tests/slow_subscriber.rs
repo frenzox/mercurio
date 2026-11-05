@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -20,8 +22,7 @@ async fn connect(addr: std::net::SocketAddr, client_id: u8) -> TcpStream {
         ])
         .await
         .unwrap();
-    let mut connack = [0u8; 5];
-    stream.read_exact(&mut connack).await.unwrap();
+    common::read_connack(&mut stream).await;
     stream
 }
 
