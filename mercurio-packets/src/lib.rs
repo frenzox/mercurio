@@ -467,6 +467,25 @@ mod robustness_tests {
     }
 
     #[test]
+    fn test_connect_request_information_properties() {
+        // CONNECT v5 with Request Response Information 1 and Request
+        // Problem Information 0
+        let wire = [
+            0x10, 0x12, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x04, 0x19,
+            0x01, 0x17, 0x00, 0x00, 0x01, b'c',
+        ];
+        let mut buffer = BytesMut::from(&wire[..]);
+        let Ok(ControlPacket::Connect(connect)) =
+            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5)
+        else {
+            panic!("Expected Connect");
+        };
+        let properties = connect.properties.unwrap();
+        assert_eq!(properties.request_response_information.unwrap().value, 1);
+        assert_eq!(properties.request_problem_information.unwrap().value, 0);
+    }
+
+    #[test]
     fn test_reserved_flags_are_malformed() {
         let malformed: [(&[u8], ProtocolVersion); 6] = [
             // PINGREQ with a reserved flag set
