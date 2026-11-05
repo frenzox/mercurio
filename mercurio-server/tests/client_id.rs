@@ -55,3 +55,11 @@ async fn clients_without_id_get_separate_sessions() {
     // Each one is told a different assigned client identifier
     assert_ne!(first, second);
 }
+
+#[tokio::test]
+async fn mqtt311_rejects_empty_id_without_clean_session() {
+    let addr = start_broker().await;
+
+    // Return code 0x02: identifier rejected
+    assert_eq!(connect_without_id(addr, 4).await, [0x00, 0x02]);
+}
