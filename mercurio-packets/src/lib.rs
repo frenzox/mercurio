@@ -224,6 +224,7 @@ impl ControlPacket {
             Publish(p) => p.encode_v3(buffer),
             Subscribe(p) => p.encode_v3(buffer),
             Unsubscribe(p) => p.encode_v3(buffer),
+            Disconnect(p) => p.encode_v3(buffer),
             p => p.encode(buffer),
         }
     }

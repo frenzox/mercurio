@@ -285,7 +285,7 @@ where
 
         let keepalive = connect_packet.keepalive;
         let protocol_version = connect_packet.protocol_version;
-        let expiry = session_expiry(&connect_packet);
+        let mut expiry = session_expiry(&connect_packet);
 
         let start_result = self.session_manager.start_session(connect_packet).await?;
         let mut session = start_result.session;
@@ -332,8 +332,14 @@ where
                 }
             }
 
-            self.handle_connection(&session, keepalive, &mut lease, protocol_version)
-                .await
+            self.handle_connection(
+                &session,
+                keepalive,
+                &mut lease,
+                protocol_version,
+                &mut expiry,
+            )
+            .await
         }
         .await;
 
@@ -377,6 +383,7 @@ where
         keepalive: u16,
         lease: &mut ConnectionLease,
         protocol_version: ProtocolVersion,
+        expiry: &mut Option<Duration>,
     ) -> Result<()> {
         let mut session = session.clone();
 
@@ -396,11 +403,36 @@ where
                             // Connection closed without DISCONNECT - abnormal
                             return Ok(());
                         }
-                        Some(ControlPacket::Disconnect(_)) => {
-                            // Clean disconnect - clear the will (in-memory and storage)
-                            session.clear_will().await;
-                            let client_id = session.get_client_id().await;
-                            let _ = self.session_manager.delete_will(&client_id).await;
+                        Some(ControlPacket::Disconnect(disconnect)) => {
+                            let new_interval = disconnect
+                                .properties
+                                .as_ref()
+                                .and_then(|p| p.session_expiry_interval.as_ref())
+                                .map(|p| p.value);
+
+                            if let Some(interval) = new_interval {
+                                // A session that was to end with the connection can't
+                                // be extended on the way out [MQTT-3.14.2-2]
+                                if *expiry == Some(Duration::ZERO) && interval != 0 {
+                                    let _ = self
+                                        .connection
+                                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                                            reason: ReasonCode::ProtocolError,
+                                            properties: None,
+                                        }))
+                                        .await;
+                                    return Err(ReasonCode::ProtocolError.into());
+                                }
+                                *expiry = (interval != u32::MAX)
+                                    .then(|| Duration::from_secs(interval.into()));
+                            }
+
+                            // Reason 0x04 asks for the will to be published anyway
+                            if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
+                                session.clear_will().await;
+                                let client_id = session.get_client_id().await;
+                                let _ = self.session_manager.delete_will(&client_id).await;
+                            }
                             return Ok(());
                         }
                         Some(packet) => packet,
