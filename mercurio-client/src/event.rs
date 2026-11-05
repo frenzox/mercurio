@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use mercurio_core::qos::QoS;
+use mercurio_core::{qos::QoS, reason::ReasonCode};
 
 /// Events received from the MQTT broker.
 #[derive(Debug, Clone)]
@@ -22,8 +22,16 @@ pub enum DisconnectReason {
     /// Client initiated disconnect.
     ClientInitiated,
 
-    /// Server initiated disconnect.
-    ServerInitiated,
+    /// The broker sent DISCONNECT, saying why.
+    ServerInitiated {
+        reason: ReasonCode,
+        reason_string: Option<String>,
+        /// Another server to use, when the broker is moving clients away
+        server_reference: Option<String>,
+    },
+
+    /// The broker closed the connection without saying why.
+    ConnectionClosed,
 
     /// Connection lost (network error).
     ConnectionLost,

@@ -169,7 +169,19 @@ impl MqttClient {
         let (session_present, client_id, keep_alive) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
-                    return Err(ClientError::ConnectionRefused(ack.reason_code));
+                    // A refusal may name the server to use instead
+                    let server_reference = ack
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.server_reference.as_ref())
+                        .map(|r| r.value.clone());
+                    return Err(match server_reference {
+                        Some(server_reference) => ClientError::Redirected {
+                            reason: ack.reason_code,
+                            server_reference,
+                        },
+                        None => ClientError::ConnectionRefused(ack.reason_code),
+                    });
                 }
                 let assigned_id = ack
                     .properties
@@ -265,6 +277,19 @@ impl MqttClient {
                 // Handle incoming packets
                 maybe_packet = state.connection.read_packet() => {
                     match maybe_packet {
+                        Ok(Some(ControlPacket::Disconnect(disconnect))) => {
+                            // The broker is closing the connection [MQTT-3.14.4-1]
+                            info!("Received DISCONNECT from server: {:?}", disconnect.reason);
+                            let properties = disconnect.properties.unwrap_or_default();
+                            let _ = state.event_tx.send(Event::Disconnected {
+                                reason: DisconnectReason::ServerInitiated {
+                                    reason: disconnect.reason,
+                                    reason_string: properties.reason_string.map(|r| r.value),
+                                    server_reference: properties.server_reference.map(|r| r.value),
+                                },
+                            }).await;
+                            break;
+                        }
                         Ok(Some(packet)) => {
                             if matches!(packet, ControlPacket::PingResp(_)) {
                                 awaiting_pingresp = false;
@@ -277,7 +302,7 @@ impl MqttClient {
                             // Connection closed
                             info!("Connection closed by server");
                             let _ = state.event_tx.send(Event::Disconnected {
-                                reason: DisconnectReason::ServerInitiated,
+                                reason: DisconnectReason::ConnectionClosed,
                             }).await;
                             break;
                         }
@@ -693,15 +718,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> EventLoop<S> {
                 }
             }
             ControlPacket::PingResp(_) => debug!("Received PINGRESP"),
-            ControlPacket::Disconnect(_) => {
-                info!("Received DISCONNECT from server");
-                let _ = self
-                    .event_tx
-                    .send(Event::Disconnected {
-                        reason: DisconnectReason::ServerInitiated,
-                    })
-                    .await;
-            }
             other => debug!("Received packet: {:?}", other),
         }
         Ok(())
