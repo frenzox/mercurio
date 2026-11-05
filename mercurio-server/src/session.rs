@@ -6,7 +6,7 @@ use tokio::{
     sync::{broadcast, Mutex},
 };
 use tokio_stream::{Stream, StreamExt, StreamMap};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 type Messages = Pin<Box<dyn Stream<Item = Message> + Send>>;
@@ -152,6 +152,8 @@ struct State {
     unacknowledged_messages: HashMap<u16, PublishPacket>,
     /// Maps packet_id -> PubRecPacket for O(1) lookup/removal
     pubrecs: HashMap<u16, PubRecPacket>,
+    /// Last packet identifier assigned to an outgoing QoS > 0 PUBLISH
+    last_packet_id: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Current authentication method name for ongoing re-authentication
@@ -183,6 +185,7 @@ impl Session {
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
                     pubrecs: HashMap::with_capacity(16),
+                    last_packet_id: 0,
                     will_message,
                     auth_method: None,
                 }),
@@ -604,36 +607,58 @@ impl Session {
     pub(crate) async fn process_outgoing(&mut self) -> Option<ControlPacket> {
         let mut session = self.shared.state.lock().await;
 
-        match session.subscriptions.next().await {
-            Some((_, message)) => {
-                let publish = PublishPacket {
-                    dup: message.dup,
-                    qos_level: message.qos,
-                    retain: message.retain,
-                    topic_name: message.topic.to_string(),
-                    packet_id: message.packet_id,
-                    properties: None,
-                    payload: message.payload,
-                };
+        loop {
+            let (_, message) = session.subscriptions.next().await?;
 
-                // Track for acknowledgment if QoS > 0
-                if let Some(packet_id) = publish.packet_id {
-                    match message.qos {
-                        QoS::AtMostOnce => {}
-                        QoS::AtLeastOnce | QoS::ExactlyOnce => {
-                            // O(1) insertion
-                            session
-                                .unacknowledged_messages
-                                .insert(packet_id, publish.clone());
-                        }
-                        QoS::Invalid => unreachable!(),
+            let packet_id = match message.qos {
+                QoS::AtMostOnce => None,
+                _ => match session.next_packet_id() {
+                    Some(id) => Some(id),
+                    None => {
+                        // ponytail: drops on exhaustion; enforce Receive Maximum to
+                        // apply backpressure instead
+                        warn!(
+                            "No free packet identifier for client `{}`, dropping message",
+                            session.client_id
+                        );
+                        continue;
                     }
-                }
+                },
+            };
 
-                Some(ControlPacket::Publish(publish))
+            let publish = PublishPacket {
+                dup: false,
+                qos_level: message.qos,
+                retain: message.retain,
+                topic_name: message.topic.to_string(),
+                packet_id,
+                properties: None,
+                payload: message.payload,
+            };
+
+            if let Some(packet_id) = packet_id {
+                session
+                    .unacknowledged_messages
+                    .insert(packet_id, publish.clone());
             }
-            None => None,
+
+            return Some(ControlPacket::Publish(publish));
         }
+    }
+}
+
+impl State {
+    /// Allocates the next packet identifier not currently in flight.
+    /// Identifiers are per session, so they can't be copied from the publisher.
+    fn next_packet_id(&mut self) -> Option<u16> {
+        for _ in 0..u16::MAX {
+            self.last_packet_id = self.last_packet_id.checked_add(1).unwrap_or(1);
+            let id = self.last_packet_id;
+            if !self.unacknowledged_messages.contains_key(&id) && !self.pubrecs.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
     }
 }
 
@@ -928,6 +953,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_publish(&mut session).await.qos_level, QoS::AtMostOnce);
+    }
+
+    #[tokio::test]
+    async fn test_outgoing_packet_ids_are_allocated_per_session() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        session
+            .handle_subscribe(subscribe_packet("p", QoS::ExactlyOnce), &broker)
+            .await
+            .unwrap();
+
+        // Two publishers reusing the same packet identifier
+        for _ in 0..2 {
+            broker
+                .publish("p", message("p", QoS::AtLeastOnce, Some(42), false))
+                .await
+                .unwrap();
+        }
+
+        let first = next_publish(&mut session).await.packet_id.unwrap();
+        let second = next_publish(&mut session).await.packet_id.unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+    }
+
+    #[test]
+    fn test_next_packet_id_skips_in_flight_and_wraps() {
+        let mut session = create_test_session();
+        let state = Arc::get_mut(&mut session.shared).unwrap().state.get_mut();
+
+        state.last_packet_id = u16::MAX - 1;
+        state
+            .unacknowledged_messages
+            .insert(u16::MAX, PublishPacket::default());
+        state
+            .unacknowledged_messages
+            .insert(1, PublishPacket::default());
+
+        assert_eq!(state.next_packet_id(), Some(2));
     }
 
     #[tokio::test]
