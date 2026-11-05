@@ -421,8 +421,13 @@ impl<St: MqttStore + 'static> Listener<St> {
             // to a Server, the first packet sent from the Client to
             // the Server MUST be a CONNECT packet.
             Ok(Ok(Some(ControlPacket::Connect(p)))) => {
-                if let Err(err) = handler.run(p).await {
-                    error!(cause = ?err, "Connection error");
+                match handler.run(p).await {
+                    // Closed by the broker's own shutdown
+                    Err(mercurio_core::error::Error::MQTTReasonCode(
+                        ReasonCode::ServerShuttingDown,
+                    )) => debug!("Connection closed for shutdown"),
+                    Err(err) => error!(cause = ?err, "Connection error"),
+                    Ok(()) => {}
                 }
             }
             Err(_) => warn!("No CONNECT received in time, closing connection"),
