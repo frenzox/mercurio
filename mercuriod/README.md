@@ -73,6 +73,11 @@ receive_maximum = 65535
 # Information; %c is replaced by the client id
 # response_information = "responses/%c"
 
+# Replace repeated topics with aliases for MQTT 5 clients that accept them,
+# saving bandwidth. Off by default because some client libraries announce
+# alias support they don't implement.
+# send_topic_aliases = true
+
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
 # [server.redirect]
