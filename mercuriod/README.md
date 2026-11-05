@@ -62,6 +62,9 @@ connect_timeout = 10
 # Highest topic alias MQTT 5 clients may use (0 disables topic aliases)
 max_topic_alias = 10
 
+# QoS 2 messages an MQTT 5 client may have awaiting PUBREL at once
+receive_maximum = 65535
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

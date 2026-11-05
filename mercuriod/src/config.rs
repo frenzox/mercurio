@@ -65,6 +65,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_topic_alias")]
     pub max_topic_alias: u16,
 
+    /// QoS 2 messages a client may have awaiting PUBREL at once
+    #[serde(default = "default_receive_maximum")]
+    pub receive_maximum: u16,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -81,6 +85,7 @@ impl Default for ServerConfig {
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
+            receive_maximum: default_receive_maximum(),
             tls: TlsServerConfig::default(),
         }
     }
@@ -136,6 +141,10 @@ fn default_max_topic_alias() -> u16 {
     Limits::default().topic_alias_maximum
 }
 
+fn default_receive_maximum() -> u16 {
+    Limits::default().receive_maximum
+}
+
 impl ServerConfig {
     pub fn limits(&self) -> Limits {
         Limits {
@@ -147,6 +156,7 @@ impl ServerConfig {
             },
             max_connections: Some(self.max_connections),
             topic_alias_maximum: self.max_topic_alias,
+            receive_maximum: self.receive_maximum,
         }
     }
 }
