@@ -263,8 +263,10 @@ impl Session {
         let mut session = self.shared.state.lock().await;
 
         for StoredSubscription { topic_filter, qos } in subscriptions {
-            let (rx, retained_messages) = broker.subscribe(&topic_filter).await?;
-            let stream = subscription_stream(rx, retained_messages, qos);
+            // Retained messages are only sent for a new SUBSCRIBE, not when an
+            // existing subscription is resumed [MQTT-3.3.1-9]
+            let (rx, _) = broker.subscribe(&topic_filter).await?;
+            let stream = subscription_stream(rx, Vec::new(), qos);
             session.subscriptions.insert(topic_filter.clone(), stream);
             session.granted_qos.insert(topic_filter, qos);
         }
