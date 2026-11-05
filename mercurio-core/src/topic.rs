@@ -26,6 +26,8 @@ pub enum TopicValidationError {
     InvalidSingleLevelWildcard,
     /// Multi-level wildcard (#) must be at end and occupy entire level.
     InvalidMultiLevelWildcard,
+    /// A `$share/` filter without a valid share name and topic filter.
+    InvalidSharedSubscription,
 }
 
 impl fmt::Display for TopicValidationError {
@@ -58,6 +60,12 @@ impl fmt::Display for TopicValidationError {
                 write!(
                     f,
                     "multi-level wildcard (#) must be at end and occupy entire level"
+                )
+            }
+            TopicValidationError::InvalidSharedSubscription => {
+                write!(
+                    f,
+                    "shared subscriptions must be $share/{{share name}}/{{topic filter}}"
                 )
             }
         }
@@ -122,6 +130,17 @@ pub fn validate_publish_topic(topic: &str) -> Result<(), TopicValidationError> {
 pub fn validate_subscribe_filter(filter: &str) -> Result<(), TopicValidationError> {
     validate_common(filter)?;
 
+    if filter.starts_with(SHARED_PREFIX) {
+        // The share name can't hold wildcards [MQTT-4.8.2-2], and the topic
+        // filter after it must be valid on its own
+        let (share_name, topic_filter) = parse_shared_subscription(filter)
+            .ok_or(TopicValidationError::InvalidSharedSubscription)?;
+        if share_name.is_empty() || share_name.contains(['+', '#']) {
+            return Err(TopicValidationError::InvalidSharedSubscription);
+        }
+        return validate_subscribe_filter(topic_filter);
+    }
+
     let levels: Vec<&str> = filter.split('/').collect();
 
     for (i, level) in levels.iter().enumerate() {
@@ -145,6 +164,14 @@ pub fn validate_subscribe_filter(filter: &str) -> Result<(), TopicValidationErro
     }
 
     Ok(())
+}
+
+const SHARED_PREFIX: &str = "$share/";
+
+/// Splits a shared subscription filter, `$share/{share name}/{topic filter}`,
+/// into its share name and topic filter. Returns None for other filters.
+pub fn parse_shared_subscription(filter: &str) -> Option<(&str, &str)> {
+    filter.strip_prefix(SHARED_PREFIX)?.split_once('/')
 }
 
 /// Common validation rules for both publish topics and subscribe filters.
@@ -191,6 +218,25 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shared_subscription_filters() {
+        assert_eq!(
+            parse_shared_subscription("$share/workers/jobs/#"),
+            Some(("workers", "jobs/#"))
+        );
+        assert_eq!(parse_shared_subscription("jobs/#"), None);
+
+        assert!(validate_subscribe_filter("$share/workers/jobs/#").is_ok());
+        for invalid in [
+            "$share/workers",
+            "$share//jobs",
+            "$share/w+/jobs",
+            "$share/w/",
+        ] {
+            assert!(validate_subscribe_filter(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn test_topic_matches_filter() {

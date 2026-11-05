@@ -23,7 +23,7 @@ use mercurio_core::{
     },
     qos::QoS,
     reason::ReasonCode,
-    topic::{validate_publish_topic, validate_subscribe_filter},
+    topic::{parse_shared_subscription, validate_publish_topic, validate_subscribe_filter},
     Result,
 };
 use mercurio_packets::{
@@ -584,6 +584,14 @@ impl Session {
             return Err(ReasonCode::ProtocolError.into());
         }
 
+        // A client can't opt out of its own messages on a shared subscription
+        // [MQTT-3.8.3-4]
+        if packet.payload.iter().any(|sub| {
+            sub.subs_opt.no_local && parse_shared_subscription(&sub.topic_filter).is_some()
+        }) {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+
         let mut session = self.shared.state.lock().await;
         // Pre-allocate payload vec based on subscription count
         let mut ack = SubAckPacket {
@@ -620,11 +628,14 @@ impl Session {
                 )
                 .await?;
 
-            let send_retained = match sub.subs_opt.retain_handling {
-                RetainHandling::SendRetained => true,
-                RetainHandling::SendRetainedIfNonExisting => !existed,
-                _ => false,
-            };
+            // Shared subscriptions are never sent retained messages
+            let shared = parse_shared_subscription(&sub.topic_filter).is_some();
+            let send_retained = !shared
+                && match sub.subs_opt.retain_handling {
+                    RetainHandling::SendRetained => true,
+                    RetainHandling::SendRetainedIfNonExisting => !existed,
+                    _ => false,
+                };
             if send_retained {
                 for message in retained_messages {
                     subscriber.deliver_retained(message);
@@ -1857,6 +1868,57 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_subscription_splits_messages_without_retained() {
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        broker
+            .publish("w", message("w", QoS::AtMostOnce, None, true))
+            .await
+            .unwrap();
+
+        let mut members = [create_test_session(), create_test_session()];
+        for member in &mut members {
+            member
+                .handle_subscribe(subscribe_packet("$share/g/w", QoS::AtMostOnce), &broker)
+                .await
+                .unwrap();
+            assert!(nothing_queued(member).await);
+        }
+
+        for _ in 0..4 {
+            broker
+                .publish("w", message("w", QoS::AtMostOnce, None, false))
+                .await
+                .unwrap();
+        }
+        for member in &mut members {
+            for _ in 0..2 {
+                assert_eq!(next_publish(member).await.topic_name, "w");
+            }
+            assert!(nothing_queued(member).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_local_on_shared_subscription_is_a_protocol_error() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let options = SubscriptionOptions {
+            no_local: true,
+            ..Default::default()
+        };
+        let result = session
+            .handle_subscribe(subscribe_with("$share/g/w", options), &broker)
+            .await;
+        assert!(matches!(
+            result,
+            Err(mercurio_core::error::Error::MQTTReasonCode(
+                ReasonCode::ProtocolError
+            ))
+        ));
     }
 
     #[tokio::test]

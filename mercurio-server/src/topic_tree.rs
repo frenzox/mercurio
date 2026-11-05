@@ -1,43 +1,85 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use smallvec::SmallVec;
+
+use mercurio_core::topic::parse_shared_subscription;
 
 #[derive(Debug)]
 struct TopicNode<T> {
     /// Subscribers whose filter ends at this node, keyed by subscriber id
     subscribers: HashMap<u64, T>,
+    /// Shared subscriptions ending at this node, by share name
+    shared: HashMap<String, ShareGroup<T>>,
     children: HashMap<String, TopicNode<T>>,
+}
+
+/// Subscribers sharing a subscription; each message goes to one of them.
+#[derive(Debug)]
+struct ShareGroup<T> {
+    members: Vec<(u64, T)>,
+    /// Round-robin position, advanced under the tree's read lock
+    next: AtomicUsize,
 }
 
 impl<T> TopicNode<T> {
     fn new() -> TopicNode<T> {
         TopicNode {
             subscribers: HashMap::new(),
+            shared: HashMap::new(),
             children: HashMap::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.subscribers.is_empty() && self.children.is_empty()
+        self.subscribers.is_empty() && self.shared.is_empty() && self.children.is_empty()
     }
 
     /// Removes the subscriber at the end of `levels`, pruning nodes left empty.
-    fn remove(&mut self, levels: &[&str], id: u64) -> bool {
+    fn remove(&mut self, levels: &[&str], id: u64, share_name: Option<&str>) -> bool {
         let Some((level, rest)) = levels.split_first() else {
-            return self.subscribers.remove(&id).is_some();
+            let Some(share_name) = share_name else {
+                return self.subscribers.remove(&id).is_some();
+            };
+            let Some(group) = self.shared.get_mut(share_name) else {
+                return false;
+            };
+            let before = group.members.len();
+            group.members.retain(|(member, _)| *member != id);
+            let removed = group.members.len() != before;
+            if group.members.is_empty() {
+                self.shared.remove(share_name);
+            }
+            return removed;
         };
 
         let Some(child) = self.children.get_mut(*level) else {
             return false;
         };
-        let removed = child.remove(rest, id);
+        let removed = child.remove(rest, id, share_name);
         if child.is_empty() {
             self.children.remove(*level);
         }
         removed
+    }
+
+    /// Adds every subscriber of this node to `matches`: all regular ones and
+    /// one member of each share group.
+    fn collect(&self, matches: &mut Vec<T>)
+    where
+        T: Clone,
+    {
+        matches.extend(self.subscribers.values().cloned());
+        for group in self.shared.values() {
+            let turn = group.next.fetch_add(1, Ordering::Relaxed);
+            let (_, member) = &group.members[turn % group.members.len()];
+            matches.push(member.clone());
+        }
     }
 }
 
@@ -62,8 +104,10 @@ impl<T: Clone> TopicTree<T> {
         }
     }
 
-    /// Adds or replaces the subscription of `id` to `filter`.
+    /// Adds or replaces the subscription of `id` to `filter`, which may be a
+    /// shared subscription (`$share/{share name}/{topic filter}`).
     pub fn subscribe(&self, filter: &str, id: u64, subscriber: T) {
+        let (share_name, filter) = split_shared(filter);
         let mut root = self.root.write().unwrap();
         let mut node = &mut *root;
 
@@ -74,13 +118,28 @@ impl<T: Clone> TopicTree<T> {
                 .or_insert_with(TopicNode::new);
         }
 
-        node.subscribers.insert(id, subscriber);
+        let Some(share_name) = share_name else {
+            node.subscribers.insert(id, subscriber);
+            return;
+        };
+        let group = node
+            .shared
+            .entry(share_name.to_string())
+            .or_insert_with(|| ShareGroup {
+                members: Vec::new(),
+                next: AtomicUsize::new(0),
+            });
+        match group.members.iter_mut().find(|(member, _)| *member == id) {
+            Some((_, existing)) => *existing = subscriber,
+            None => group.members.push((id, subscriber)),
+        }
     }
 
     /// Removes the subscription of `id` to `filter`. Returns whether it existed.
     pub fn unsubscribe(&self, filter: &str, id: u64) -> bool {
+        let (share_name, filter) = split_shared(filter);
         let levels: SmallVec<[&str; 8]> = filter.split('/').collect();
-        self.root.write().unwrap().remove(&levels, id)
+        self.root.write().unwrap().remove(&levels, id, share_name)
     }
 
     /// Returns the subscribers of every filter matching `topic`, once per
@@ -98,11 +157,11 @@ impl<T: Clone> TopicTree<T> {
 
         while let Some((node, depth)) = stack.pop() {
             if depth == target_depth {
-                matches.extend(node.subscribers.values().cloned());
+                node.collect(&mut matches);
 
                 // "a/#" also matches "a" itself
                 if let Some(wildcard) = node.children.get("#") {
-                    matches.extend(wildcard.subscribers.values().cloned());
+                    wildcard.collect(&mut matches);
                 }
                 continue;
             }
@@ -123,11 +182,20 @@ impl<T: Clone> TopicTree<T> {
 
             // Multi-level wildcard (#) matches the remainder of the topic
             if let Some(child) = node.children.get("#") {
-                matches.extend(child.subscribers.values().cloned());
+                child.collect(&mut matches);
             }
         }
 
         matches
+    }
+}
+
+/// The share name and topic filter of a shared subscription, or just the
+/// filter for a regular one.
+fn split_shared(filter: &str) -> (Option<&str>, &str) {
+    match parse_shared_subscription(filter) {
+        Some((share_name, filter)) => (Some(share_name), filter),
+        None => (None, filter),
     }
 }
 
@@ -192,6 +260,30 @@ mod tests {
 
         assert_eq!(matching(&tree, "$SYS/monitor/clients"), ["sys", "sys-plus"]);
         assert_eq!(matching(&tree, "a/monitor/clients"), ["all", "plus"]);
+    }
+
+    #[test]
+    fn test_shared_subscriptions_take_turns() {
+        let tree = TopicTree::new();
+        tree.subscribe("$share/g/jobs/+", 1, "one");
+        tree.subscribe("$share/g/jobs/+", 2, "two");
+        tree.subscribe("jobs/#", 3, "plain");
+
+        let mut shared = Vec::new();
+        for _ in 0..4 {
+            let matches = matching(&tree, "jobs/a");
+            assert!(matches.contains(&"plain"));
+            assert_eq!(matches.len(), 2);
+            shared.extend(matches.into_iter().filter(|m| *m != "plain"));
+        }
+        shared.sort();
+        assert_eq!(shared, ["one", "one", "two", "two"]);
+
+        assert!(tree.unsubscribe("$share/g/jobs/+", 1));
+        assert_eq!(matching(&tree, "jobs/a"), ["plain", "two"]);
+        assert!(tree.unsubscribe("$share/g/jobs/+", 2));
+        assert!(tree.unsubscribe("jobs/#", 3));
+        assert!(tree.root.read().unwrap().is_empty());
     }
 
     #[test]
