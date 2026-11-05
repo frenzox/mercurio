@@ -117,23 +117,22 @@ impl ControlPacket {
     /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
     /// if more data is needed.
     pub fn check(src: &mut BytesMut) -> crate::Result<()> {
-        let len = src.len();
+        if src.len() >= Self::frame_len(src)? {
+            Ok(())
+        } else {
+            Err(Error::PacketIncomplete)
+        }
+    }
 
-        // Need at least 2 bytes (1 byte fixed header + 1 byte remaining length)
-        if len < 2 {
+    /// Total size of the packet at the start of `src`, fixed header included.
+    /// Only needs the fixed header to be available.
+    pub fn frame_len(src: &[u8]) -> crate::Result<usize> {
+        let Some(mut remaining_bytes) = src.get(1..) else {
             return Err(Error::PacketIncomplete);
-        }
-
-        // Read remaining length from position 1 (skip fixed header byte)
-        let mut remaining_bytes = &src[1..];
+        };
         let remaining_len = VariableByteInteger::decode(&mut remaining_bytes)?;
-
-        // Check if we have enough data: fixed header (1) + remaining length size + payload
-        if (len - remaining_len.encoded_size() - 1) >= remaining_len.0 as usize {
-            return Ok(());
-        }
-
-        Err(Error::PacketIncomplete)
+        let header_len = src.len() - remaining_bytes.len();
+        Ok(header_len + remaining_len.0 as usize)
     }
 
     pub fn parse(src: &mut BytesMut) -> crate::Result<ControlPacket> {
@@ -147,12 +146,28 @@ impl ControlPacket {
         src: &mut BytesMut,
         version: ProtocolVersion,
     ) -> crate::Result<ControlPacket> {
-        use ControlPacket::*;
-
-        // Peek at the first byte to get packet type (don't consume)
-        if src.is_empty() {
+        let frame_len = Self::frame_len(src)?;
+        if src.len() < frame_len {
             return Err(Error::PacketIncomplete);
         }
+
+        // Decode from exactly this packet's bytes, so a malformed packet can't
+        // read into the next one. Running short within it is malformed.
+        let mut frame = src.split_to(frame_len);
+        let packet = Self::decode_frame(&mut frame, version).map_err(|e| match e {
+            Error::PacketIncomplete => ReasonCode::MalformedPacket.into(),
+            e => e,
+        })?;
+        if !frame.is_empty() {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+
+        Ok(packet)
+    }
+
+    fn decode_frame(src: &mut BytesMut, version: ProtocolVersion) -> crate::Result<ControlPacket> {
+        use ControlPacket::*;
+
         let packet_type: u8 = src[0] >> 4;
 
         let packet = match packet_type.try_into()? {
@@ -330,5 +345,146 @@ mod tests {
         };
         assert_eq!(unsubscribe.packet_id, 2);
         assert_eq!(unsubscribe.payload[0].topic_filter, "a/#");
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::*;
+
+    /// Valid packets of every type the broker or client may receive.
+    fn samples() -> Vec<Vec<u8>> {
+        vec![
+            // CONNECT v5 with will, username and password
+            vec![
+                0x10, 0x20, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0xc6, 0x00, 0x3c, 0x00, 0x00,
+                0x01, b'c', 0x05, 0x18, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, b'w', 0x00, 0x01, b'x',
+                0x00, 0x01, b'u', 0x00, 0x01, b'p',
+            ],
+            // CONNECT v3.1.1
+            vec![
+                0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x01,
+                b'c',
+            ],
+            // CONNACK v5
+            vec![0x20, 0x03, 0x00, 0x00, 0x00],
+            // PUBLISH QoS 1 v5 with a property
+            vec![
+                0x32, 0x0b, 0x00, 0x01, b't', 0x00, 0x01, 0x02, 0x01, 0x01, b'h', b'i', b'!',
+            ],
+            // PUBLISH QoS 0 v3
+            vec![0x30, 0x05, 0x00, 0x01, b't', b'h', b'i'],
+            // PUBACK, PUBREC, PUBREL, PUBCOMP with reason and properties
+            vec![0x40, 0x04, 0x00, 0x01, 0x10, 0x00],
+            vec![0x50, 0x04, 0x00, 0x01, 0x10, 0x00],
+            vec![0x62, 0x04, 0x00, 0x01, 0x92, 0x00],
+            vec![0x70, 0x04, 0x00, 0x01, 0x92, 0x00],
+            // SUBSCRIBE v5 and v3
+            vec![0x82, 0x08, 0x00, 0x01, 0x00, 0x00, 0x02, b'a', b'#', 0x01],
+            vec![0x82, 0x07, 0x00, 0x01, 0x00, 0x02, b'a', b'#', 0x01],
+            // SUBACK v5
+            vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x01],
+            // UNSUBSCRIBE v5 and v3
+            vec![0xa2, 0x06, 0x00, 0x01, 0x00, 0x00, 0x01, b'a'],
+            vec![0xa2, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'],
+            // UNSUBACK v5
+            vec![0xb0, 0x04, 0x00, 0x01, 0x00, 0x00],
+            // PINGREQ, PINGRESP
+            vec![0xc0, 0x00],
+            vec![0xd0, 0x00],
+            // DISCONNECT with session expiry
+            vec![0xe0, 0x07, 0x00, 0x05, 0x11, 0x00, 0x00, 0x00, 0x00],
+            // AUTH
+            vec![0xf0, 0x02, 0x18, 0x00],
+        ]
+    }
+
+    /// Parses `bytes` like a connection does; panics are the failure.
+    fn parse_all(bytes: &[u8]) {
+        for version in [ProtocolVersion::V5, ProtocolVersion::V3_1_1] {
+            let mut buffer = BytesMut::from(bytes);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                while ControlPacket::check(&mut buffer).is_ok() {
+                    if ControlPacket::parse_with_version(&mut buffer, version).is_err() {
+                        break;
+                    }
+                }
+            }));
+            assert!(
+                result.is_ok(),
+                "parser panicked on {:02x?} ({})",
+                bytes,
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_packets_parse_completely() {
+        let v3 = [1, 4, 10, 13];
+        let mut packets: Vec<(Vec<u8>, ProtocolVersion)> = samples()
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let version = if v3.contains(&i) {
+                    ProtocolVersion::V3_1_1
+                } else {
+                    ProtocolVersion::V5
+                };
+                (p, version)
+            })
+            .collect();
+        // Optional fields left out, as the spec allows
+        packets.extend([
+            (vec![0x40, 0x03, 0x00, 0x01, 0x10], ProtocolVersion::V5),
+            (vec![0x62, 0x03, 0x00, 0x01, 0x92], ProtocolVersion::V5),
+            (vec![0xe0, 0x00], ProtocolVersion::V5),
+            (vec![0xf0, 0x00], ProtocolVersion::V5),
+        ]);
+
+        for (bytes, version) in packets {
+            let mut buffer = BytesMut::from(&bytes[..]);
+            // Followed by another packet that must stay untouched
+            buffer.extend_from_slice(&[0xc0, 0x00]);
+            let result = ControlPacket::parse_with_version(&mut buffer, version);
+            assert!(result.is_ok(), "{:02x?}: {:?}", bytes, result);
+            assert_eq!(&buffer[..], &[0xc0, 0x00], "{:02x?}", bytes);
+        }
+    }
+
+    #[test]
+    fn test_mutated_packets_never_panic() {
+        for sample in samples() {
+            for len in 0..=sample.len() {
+                parse_all(&sample[..len]);
+            }
+            for i in 0..sample.len() {
+                for value in [0x00, 0x01, 0x7f, 0x80, 0xff, sample[i].wrapping_add(1)] {
+                    let mut mutated = sample.clone();
+                    mutated[i] = value;
+                    parse_all(&mutated);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_bytes_never_panic() {
+        // Small deterministic LCG so failures are reproducible without a dependency
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u8
+        };
+
+        for _ in 0..20_000 {
+            let len = 2 + next() as usize % 40;
+            let mut bytes: Vec<u8> = (0..len).map(|_| next()).collect();
+            // Keep the remaining length plausible so packets reach the decoders
+            bytes[1] = (len - 2) as u8 & 0x7f;
+            parse_all(&bytes);
+        }
     }
 }

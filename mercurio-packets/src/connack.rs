@@ -31,7 +31,7 @@ impl Encoder for ConnAckFlags {
 
 impl Decoder for ConnAckFlags {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let encoded = buffer.get_u8();
+        let encoded = u8::decode(buffer)?;
 
         if (0b1111_1110 & encoded) != 0 {
             return Err(ReasonCode::MalformedPacket.into());
@@ -279,7 +279,7 @@ impl ConnAckPacket {
         let _ = VariableByteInteger::decode(buffer)?; // Remaining length
 
         let flags = ConnAckFlags::decode(buffer)?;
-        let return_code = buffer.get_u8();
+        let return_code = u8::decode(buffer)?;
 
         // Map MQTT 3.x return code to reason code
         let reason_code = match return_code {
