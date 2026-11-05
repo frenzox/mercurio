@@ -25,7 +25,7 @@ use crate::{
     auth::{AuthManager, CredentialValidator},
     broker::Broker,
     connection::Connection,
-    session::Session,
+    session::{Session, WillMessage},
     session_manager::{ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     tls::TlsConfig,
@@ -346,10 +346,31 @@ where
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
         if let Some(will) = session.take_will().await {
-            self.publish_will(will, &session).await;
-            // Delete persisted will after publishing
-            let client_id = session.get_client_id().await;
-            let _ = self.session_manager.delete_will(&client_id).await;
+            // Published after the will delay or when the session ends, whichever
+            // comes first, unless the client reconnects before then [MQTT-3.1.3-9]
+            let delay = expiry.map_or(will.delay, |expiry| expiry.min(will.delay));
+            let generation = lease.generation;
+            let broker = self.broker.clone();
+            let session_manager = self.session_manager.clone();
+            let session = session.clone();
+
+            let publish = async move {
+                if !delay.is_zero() {
+                    time::sleep(delay).await;
+                    if session.generation().await != generation {
+                        return;
+                    }
+                }
+                let client_id = session.get_client_id().await;
+                publish_will(&broker, will, &client_id).await;
+                let _ = session_manager.delete_will(&client_id).await;
+            };
+
+            if delay.is_zero() {
+                publish.await;
+            } else {
+                tokio::spawn(publish);
+            }
         }
 
         self.session_manager.end_connection(lease, expiry).await;
@@ -553,26 +574,25 @@ where
 
         Ok(())
     }
+}
 
-    async fn publish_will(&self, will: crate::session::WillMessage, session: &Session) {
-        let client_id = session.get_client_id().await;
-        info!(
-            "Publishing will message for client `{}` on topic `{}`",
-            client_id, will.topic
-        );
+async fn publish_will(broker: &Broker<MemoryStore>, will: WillMessage, client_id: &str) {
+    info!(
+        "Publishing will message for client `{}` on topic `{}`",
+        client_id, will.topic
+    );
 
-        let topic: Arc<str> = Arc::from(will.topic.as_str());
-        let message = Message {
-            packet_id: None, // Will messages don't have packet IDs
-            topic: Arc::clone(&topic),
-            dup: false,
-            qos: will.qos,
-            retain: will.retain,
-            payload: Some(will.payload),
-        };
+    let topic: Arc<str> = Arc::from(will.topic.as_str());
+    let message = Message {
+        packet_id: None, // Will messages don't have packet IDs
+        topic: Arc::clone(&topic),
+        dup: false,
+        qos: will.qos,
+        retain: will.retain,
+        payload: Some(will.payload),
+    };
 
-        if let Err(e) = self.broker.publish(&topic, message).await {
-            error!("Failed to publish will message: {}", e);
-        }
+    if let Err(e) = broker.publish(&topic, message).await {
+        error!("Failed to publish will message: {}", e);
     }
 }

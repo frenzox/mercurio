@@ -59,7 +59,7 @@ struct ConnectionSlot {
 pub(crate) struct ConnectionLease {
     guard: OwnedMutexGuard<()>,
     client_id: String,
-    generation: u64,
+    pub generation: u64,
     /// Changes when a new connection takes over this client id
     pub takeover: watch::Receiver<bool>,
 }
@@ -123,6 +123,12 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
 
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
+
+        // Marks the previous connection's pending will as superseded, whether
+        // this connection resumes the session or replaces it
+        if let Some(existing) = manager.sessions.get(client_id) {
+            existing.session().set_generation(lease.generation).await;
+        }
         let mut resume = false;
         let mut subscriptions_to_restore = Vec::new();
         let mut will_to_restore = None;
@@ -182,6 +188,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
         };
 
         drop(manager);
+        session.set_generation(lease.generation).await;
 
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
