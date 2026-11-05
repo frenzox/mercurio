@@ -8,6 +8,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use crate::{
     codec::{Decoder, Encoder, VariableByteInteger},
     reason::ReasonCode,
+    topic::validate_publish_topic,
 };
 
 macro_rules! def_prop {
@@ -271,6 +272,8 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
         Property::TopicAlias(p) => p.value != 0,
         Property::ReceiveMaximum(p) => p.value != 0,
         Property::MaximumPacketSize(p) => p.value != 0,
+        // A Response Topic is a topic name, never a filter [MQTT-3.3.2-14]
+        Property::ResponseTopic(p) => validate_publish_topic(&p.value).is_ok(),
         _ => true,
     };
     if !valid {
@@ -333,6 +336,15 @@ mod tests {
                 "{bytes:02x?}"
             );
         }
+
+        // Response Topic "a/+"
+        assert!(matches!(
+            decode(&[0x08, 0x00, 0x03, b'a', b'/', b'+']),
+            Err(crate::error::Error::MQTTReasonCode(
+                ReasonCode::ProtocolError
+            ))
+        ));
+        assert!(decode(&[0x08, 0x00, 0x03, b'a', b'/', b'b']).is_ok());
 
         assert!(decode(&[0x01, 0x01]).is_ok());
         assert!(decode(&[0x25, 0x00]).is_ok());
