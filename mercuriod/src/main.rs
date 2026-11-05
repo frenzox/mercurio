@@ -10,6 +10,7 @@ use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::server::{AuthConfig as ServerAuthConfig, ServerConfig};
 use mercurio_server::tls::TlsConfig;
+use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -17,7 +18,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod config;
 mod credentials;
 
-use config::Config;
+use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 
 #[derive(Parser, Debug)]
@@ -167,7 +168,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         limits,
     };
-    mercurio_server::server::run_with_config(listener, server_config, signal::ctrl_c()).await;
+    match config.storage {
+        StorageConfig::Memory => {
+            mercurio_server::server::run_with_config(listener, server_config, signal::ctrl_c())
+                .await
+        }
+        StorageConfig::Sqlite { path } => {
+            info!("Using SQLite storage at {}", path);
+            let storage = Arc::new(SqliteStore::new(&path)?);
+            mercurio_server::server::run_with_storage(
+                listener,
+                server_config,
+                storage,
+                signal::ctrl_c(),
+            )
+            .await
+        }
+    }
 
     info!("Mercurio MQTT broker stopped");
 

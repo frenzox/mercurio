@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 mercurio-core = { path = "../mercurio-core" }
 mercurio-server = { path = "../mercurio-server" }
+mercurio-storage = { path = "../mercurio-storage", features = ["sqlite"] }
 
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }

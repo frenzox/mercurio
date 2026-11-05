@@ -18,6 +18,21 @@ pub struct Config {
 
     #[serde(default)]
     pub auth: AuthConfig,
+
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+/// Where the broker keeps sessions, retained messages, wills and in-flight
+/// messages.
+#[derive(Debug, Default, Deserialize)]
+#[serde(tag = "backend", rename_all = "lowercase")]
+pub enum StorageConfig {
+    /// Lost on restart
+    #[default]
+    Memory,
+    /// Kept in a SQLite database file
+    Sqlite { path: String },
 }
 
 impl Config {
