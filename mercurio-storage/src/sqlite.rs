@@ -327,6 +327,12 @@ impl RetainedMessageStore for SqliteStore {
         let filter = topic_filter.to_string();
 
         self.blocking(move |conn| {
+            // Expired messages are dropped for good, not just skipped
+            conn.execute(
+                "DELETE FROM retained_messages WHERE expires_at <= ?1",
+                params![unix_millis() as i64],
+            )?;
+
             let mut stmt = conn.prepare(
                 "SELECT topic, payload, qos, dup, properties, expires_at FROM retained_messages",
             )?;
@@ -344,9 +350,7 @@ impl RetainedMessageStore for SqliteStore {
 
             for row in rows {
                 let (topic, payload, qos, dup, properties, expires_at) = row?;
-                let expires_at = expires_at.map(|t| t as u64);
-                let expired = expires_at.is_some_and(|t| unix_millis() >= t);
-                if topic_matches_filter(&topic, &filter) && !expired {
+                if topic_matches_filter(&topic, &filter) {
                     messages.push(Message {
                         packet_id: None,
                         topic: Arc::from(topic.as_str()),
@@ -355,7 +359,7 @@ impl RetainedMessageStore for SqliteStore {
                         retain: true,
                         payload: payload.map(Bytes::from),
                         properties: decode_properties(properties),
-                        expires_at,
+                        expires_at: expires_at.map(|t| t as u64),
                         subscription_identifier: None,
                     });
                 }
@@ -758,6 +762,29 @@ mod tests {
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_expired_retained_messages_are_removed() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut expired = create_test_message("old", "x");
+        expired.expires_at = Some(1);
+        store.store_retained("old", Some(expired)).await.unwrap();
+        store
+            .store_retained("new", Some(create_test_message("new", "y")))
+            .await
+            .unwrap();
+
+        let retained = store.get_retained("#").await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(&*retained[0].topic, "new");
+        let count: i64 = store
+            .blocking(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM retained_messages", [], |r| r.get(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

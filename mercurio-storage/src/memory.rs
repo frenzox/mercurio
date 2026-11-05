@@ -92,16 +92,17 @@ impl RetainedMessageStore for MemoryStore {
     }
 
     async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
-        let retained = self
+        let mut retained = self
             .retained
-            .read()
+            .write()
             .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+
+        // Expired messages are dropped for good, not just skipped
+        retained.retain(|_, msg| !msg.is_expired());
 
         let messages: Vec<Message> = retained
             .iter()
-            // ponytail: expired messages are skipped, not removed, so they stay in
-            // memory until their topic gets a new retained message
-            .filter(|(topic, msg)| topic_matches_filter(topic, topic_filter) && !msg.is_expired())
+            .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
             .map(|(_, msg)| {
                 let mut msg = msg.clone();
                 msg.retain = true; // Mark as retained when delivering
@@ -359,6 +360,23 @@ mod tests {
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_expired_retained_messages_are_removed() {
+        let store = MemoryStore::new();
+        let mut expired = create_test_message("old", "x");
+        expired.expires_at = Some(1);
+        store.store_retained("old", Some(expired)).await.unwrap();
+        store
+            .store_retained("new", Some(create_test_message("new", "y")))
+            .await
+            .unwrap();
+
+        let retained = store.get_retained("#").await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(&*retained[0].topic, "new");
+        assert_eq!(store.retained.read().unwrap().len(), 1);
     }
 
     #[tokio::test]
