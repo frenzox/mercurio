@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Mutex,
+    sync::{watch, Mutex, OwnedMutexGuard},
 };
 use tracing::info;
 use uuid::Uuid;
@@ -42,6 +42,22 @@ struct Shared {
 
 struct State {
     sessions: HashMap<String, SessionDropGuard>,
+    connections: HashMap<String, ConnectionSlot>,
+}
+
+/// Tracks the network connection currently using a client id.
+struct ConnectionSlot {
+    /// Held by the active connection until it has fully shut down
+    lease: Arc<Mutex<()>>,
+    /// Tells the active connection that another one is taking over
+    takeover: watch::Sender<bool>,
+}
+
+/// Ownership of a client id for the lifetime of one connection.
+pub(crate) struct ConnectionLease {
+    _guard: OwnedMutexGuard<()>,
+    /// Changes when a new connection takes over this client id
+    pub takeover: watch::Receiver<bool>,
 }
 
 impl<S: SessionStore + WillStore + InflightStore> SessionManagerDropGuard<S> {
@@ -63,6 +79,8 @@ pub(crate) struct SessionStartResult {
     pub subscriptions_to_restore: Vec<String>,
     /// Will message restored from storage (if resuming and will was persisted).
     pub will_to_restore: Option<WillMessage>,
+    /// Must be held until the connection has finished, will message included.
+    pub lease: ConnectionLease,
     /// Inflight messages to retry (QoS 1/2 messages awaiting acknowledgment).
     pub inflight_to_retry: Vec<InflightMessage>,
 }
@@ -72,6 +90,7 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 sessions: HashMap::new(),
+                connections: HashMap::new(),
             }),
         });
 
@@ -92,6 +111,10 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
         if assigned_client_id {
             connect_packet.payload.client_id = Uuid::new_v4().hyphenated().to_string();
         }
+
+        let lease = self
+            .acquire_client_id(&connect_packet.payload.client_id)
+            .await;
 
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
@@ -179,8 +202,34 @@ impl<S: SessionStore + WillStore + InflightStore> SessionManager<S> {
             session,
             subscriptions_to_restore,
             will_to_restore,
+            lease,
             inflight_to_retry,
         })
+    }
+
+    /// Asks any connection already using `client_id` to close [MQTT-3.1.4-3]
+    /// and waits until it has, so the two never share session state.
+    async fn acquire_client_id(&self, client_id: &str) -> ConnectionLease {
+        let (takeover_tx, takeover) = watch::channel(false);
+
+        let lease = {
+            let mut manager = self.shared.state.lock().await;
+            let slot = manager
+                .connections
+                .entry(client_id.to_string())
+                .or_insert_with(|| ConnectionSlot {
+                    lease: Arc::new(Mutex::new(())),
+                    takeover: watch::channel(false).0,
+                });
+            slot.takeover.send_replace(true);
+            slot.takeover = takeover_tx;
+            Arc::clone(&slot.lease)
+        };
+
+        ConnectionLease {
+            _guard: lease.lock_owned().await,
+            takeover,
+        }
     }
 
     /// Update persisted session with current subscriptions.

@@ -9,10 +9,13 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use mercurio_core::{message::Message, qos::QoS, reason::ReasonCode, Result};
+use mercurio_core::{
+    message::Message, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode, Result,
+};
 use mercurio_packets::{
     connack::{ConnAckFlags, ConnAckPacket},
     connect::ConnectPacket,
+    disconnect::DisconnectPacket,
     publish::PublishPacket,
     ControlPacket,
 };
@@ -23,7 +26,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     session::Session,
-    session_manager::{SessionManager, SessionManagerDropGuard},
+    session_manager::{ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     tls::TlsConfig,
 };
@@ -266,12 +269,14 @@ where
 
         let keepalive = connect_packet.keepalive;
 
+        let protocol_version = connect_packet.protocol_version;
         let start_result = self
             .session_manager
             .start_session(&mut self.connection, connect_packet)
             .await?;
 
         let mut session = start_result.session;
+        let mut lease = start_result.lease;
 
         // Restore subscriptions if resuming a persisted session
         if !start_result.subscriptions_to_restore.is_empty() {
@@ -305,7 +310,9 @@ where
             }
         }
 
-        let result = self.handle_connection(&session, keepalive).await;
+        let result = self
+            .handle_connection(&session, keepalive, &mut lease, protocol_version)
+            .await;
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
@@ -339,7 +346,13 @@ where
         Ok(())
     }
 
-    async fn handle_connection(&mut self, session: &Session, keepalive: u16) -> Result<()> {
+    async fn handle_connection(
+        &mut self,
+        session: &Session,
+        keepalive: u16,
+        lease: &mut ConnectionLease,
+        protocol_version: ProtocolVersion,
+    ) -> Result<()> {
         let mut session = session.clone();
 
         // Keep-alive timeout is 1.5x the keepalive interval; 0 disables it
@@ -453,6 +466,24 @@ where
                     );
                     // Return normally to trigger abnormal disconnect handling
                     // (will message will be published)
+                    return Ok(());
+                }
+
+                // Another connection with the same client id replaces this one
+                Ok(()) = lease.takeover.changed() => {
+                    info!(
+                        "Client `{}` was taken over by a new connection",
+                        session.get_client_id().await
+                    );
+                    if protocol_version.supports_reason_codes() {
+                        let _ = self
+                            .connection
+                            .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                                reason: ReasonCode::SessionTakenOver,
+                                properties: None,
+                            }))
+                            .await;
+                    }
                     return Ok(());
                 }
 
