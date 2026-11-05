@@ -41,8 +41,8 @@ use mercurio_packets::{
 use crate::{
     auth::{AuthManager, AuthResult},
     broker::Broker,
-    connection::{Connection, MAX_PACKET_SIZE},
-    queue::{MessageQueue, Subscriber},
+    connection::Connection,
+    queue::{MessageQueue, QueueLimits, Subscriber},
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
@@ -160,9 +160,9 @@ struct State {
 }
 
 impl SessionDropGuard {
-    pub fn new(connect_packet: ConnectPacket) -> Self {
+    pub fn new(connect_packet: ConnectPacket, queue_limits: QueueLimits) -> Self {
         SessionDropGuard {
-            session: Session::new(connect_packet),
+            session: Session::with_queue_limits(connect_packet, queue_limits),
         }
     }
 
@@ -172,7 +172,12 @@ impl SessionDropGuard {
 }
 
 impl Session {
+    #[cfg(test)]
     pub fn new(connect_packet: ConnectPacket) -> Self {
+        Self::with_queue_limits(connect_packet, QueueLimits::default())
+    }
+
+    pub fn with_queue_limits(connect_packet: ConnectPacket, queue_limits: QueueLimits) -> Self {
         let client_id = connect_packet.payload.client_id.clone();
         let will_message = WillMessage::from_connect_packet(&connect_packet);
         Session {
@@ -192,7 +197,7 @@ impl Session {
                     will_message,
                     auth_method: None,
                 }),
-                queue: Arc::default(),
+                queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
             }),
         }
@@ -288,6 +293,7 @@ impl Session {
         connection: &mut Connection<S>,
         resume: bool,
         assigned_client_id: bool,
+        max_packet_size: usize,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -310,7 +316,9 @@ impl Session {
                 ack.properties = Some(ConnAckProperties {
                     assigned_client_id: assigned_client_id
                         .then(|| AssignedClientIdentifier::new(session.client_id.clone())),
-                    maximum_packet_size: Some(MaximumPacketSize::new(MAX_PACKET_SIZE as u32)),
+                    maximum_packet_size: Some(MaximumPacketSize::new(
+                        max_packet_size.try_into().unwrap_or(u32::MAX),
+                    )),
                     ..Default::default()
                 });
             }

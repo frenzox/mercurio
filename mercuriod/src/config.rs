@@ -1,6 +1,8 @@
 //! Configuration file handling for mercuriod.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
+
+use mercurio_server::{queue::QueueLimits, server::Limits};
 
 use serde::Deserialize;
 
@@ -43,6 +45,22 @@ pub struct ServerConfig {
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 
+    /// Largest packet accepted from a client, in bytes
+    #[serde(default = "default_max_packet_size")]
+    pub max_packet_size: usize,
+
+    /// Messages that may wait for one client before any are dropped
+    #[serde(default = "default_max_queued_messages")]
+    pub max_queued_messages: usize,
+
+    /// Queued messages beyond which QoS 0 messages are dropped
+    #[serde(default = "default_max_queued_qos0_messages")]
+    pub max_queued_qos0_messages: usize,
+
+    /// Seconds a new connection has to send CONNECT
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -54,6 +72,10 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             max_connections: default_max_connections(),
+            max_packet_size: default_max_packet_size(),
+            max_queued_messages: default_max_queued_messages(),
+            max_queued_qos0_messages: default_max_queued_qos0_messages(),
+            connect_timeout: default_connect_timeout(),
             tls: TlsServerConfig::default(),
         }
     }
@@ -87,6 +109,36 @@ fn default_port() -> u16 {
 
 fn default_max_connections() -> usize {
     10000
+}
+
+fn default_max_packet_size() -> usize {
+    Limits::default().max_packet_size
+}
+
+fn default_max_queued_messages() -> usize {
+    Limits::default().queue.max_messages
+}
+
+fn default_max_queued_qos0_messages() -> usize {
+    Limits::default().queue.max_qos0
+}
+
+fn default_connect_timeout() -> u64 {
+    Limits::default().connect_timeout.as_secs()
+}
+
+impl ServerConfig {
+    pub fn limits(&self) -> Limits {
+        Limits {
+            connect_timeout: Duration::from_secs(self.connect_timeout),
+            max_packet_size: self.max_packet_size,
+            queue: QueueLimits {
+                max_qos0: self.max_queued_qos0_messages,
+                max_messages: self.max_queued_messages,
+            },
+            max_connections: Some(self.max_connections),
+        }
+    }
 }
 
 /// Logging configuration.

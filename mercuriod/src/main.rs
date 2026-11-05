@@ -112,6 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
     // Build TLS configuration if enabled
+    let limits = config.server.limits();
+
     let tls_config = if config.server.tls.enabled {
         let cert_path = config
             .server
@@ -162,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_config = ServerConfig {
         tls: tls_config,
         auth: auth_config,
-        ..Default::default()
+        limits,
     };
     mercurio_server::server::run_with_config(listener, server_config, signal::ctrl_c()).await;
 

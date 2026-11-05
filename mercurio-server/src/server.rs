@@ -3,7 +3,7 @@ use std::{future::Future, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::broadcast,
+    sync::{broadcast, Semaphore},
     time::{self, Duration, Instant},
 };
 use tokio_rustls::TlsAcceptor;
@@ -23,7 +23,8 @@ use mercurio_storage::memory::MemoryStore;
 use crate::{
     auth::{AuthManager, CredentialValidator},
     broker::Broker,
-    connection::Connection,
+    connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
+    queue::QueueLimits,
     session::{Session, WillMessage},
     session_manager::{ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
@@ -47,12 +48,21 @@ pub struct Limits {
     /// How long a new connection may take to complete the TLS handshake and
     /// send CONNECT before it is closed.
     pub connect_timeout: Duration,
+    /// Largest packet accepted from a client, fixed header included.
+    pub max_packet_size: usize,
+    /// Messages waiting to be sent to one session.
+    pub queue: QueueLimits,
+    /// Connections beyond this many are closed right after being accepted.
+    pub max_connections: Option<usize>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
+            max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            queue: QueueLimits::default(),
+            max_connections: None,
         }
     }
 }
@@ -74,6 +84,8 @@ struct Listener {
     tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
     limits: Limits,
+    /// One permit per allowed concurrent connection, when limited
+    connection_slots: Option<Arc<Semaphore>>,
 }
 
 struct Handler<S>
@@ -129,7 +141,10 @@ pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdo
     let mut server = Listener {
         listener,
         broker: Broker::new(Arc::clone(&storage)),
-        session_manager_holder: SessionManagerDropGuard::new(storage),
+        session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
+        connection_slots: limits
+            .max_connections
+            .map(|max| Arc::new(Semaphore::new(max))),
         notify_shutdown,
         tls_acceptor,
         auth_config,
@@ -150,6 +165,18 @@ impl Listener {
             let socket = self.accept().await;
             let peer_addr = socket.peer_addr().ok();
 
+            // Held by the connection's task for as long as it runs
+            let slot = match &self.connection_slots {
+                Some(slots) => match Arc::clone(slots).try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        warn!("Connection limit reached, refusing {:?}", peer_addr);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
             info!("Got a connection: {:?}", peer_addr);
 
             let broker = self.broker.clone();
@@ -162,6 +189,7 @@ impl Listener {
                 // TLS connection
                 let acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     match time::timeout(limits.connect_timeout, acceptor.accept(socket)).await {
                         Ok(Ok(tls_stream)) => {
                             debug!("TLS handshake completed for {:?}", peer_addr);
@@ -186,6 +214,7 @@ impl Listener {
             } else {
                 // Plain TCP connection
                 tokio::spawn(async move {
+                    let _slot = slot;
                     let mut handler = Handler {
                         broker,
                         session_manager,
@@ -204,6 +233,10 @@ impl Listener {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        handler
+            .connection
+            .set_max_packet_size(handler.limits.max_packet_size);
+
         let first_packet = time::timeout(
             handler.limits.connect_timeout,
             handler.connection.read_packet(),
@@ -344,6 +377,7 @@ where
                     &mut self.connection,
                     start_result.resume,
                     start_result.assigned_client_id,
+                    self.limits.max_packet_size,
                 )
                 .await?;
 

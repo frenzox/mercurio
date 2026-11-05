@@ -14,7 +14,10 @@ use mercurio_storage::{
     StoredWillMessage, WillStore,
 };
 
-use crate::session::{Session, SessionDropGuard, WillMessage};
+use crate::{
+    queue::QueueLimits,
+    session::{Session, SessionDropGuard, WillMessage},
+};
 
 pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore + InflightStore> {
     session_manager: SessionManager<S>,
@@ -23,6 +26,7 @@ pub(crate) struct SessionManagerDropGuard<S: SessionStore + WillStore + Inflight
 pub(crate) struct SessionManager<S: SessionStore + WillStore + InflightStore> {
     shared: Arc<Shared>,
     storage: Arc<S>,
+    queue_limits: QueueLimits,
 }
 
 impl<S: SessionStore + WillStore + InflightStore> Clone for SessionManager<S> {
@@ -30,6 +34,7 @@ impl<S: SessionStore + WillStore + InflightStore> Clone for SessionManager<S> {
         SessionManager {
             shared: Arc::clone(&self.shared),
             storage: Arc::clone(&self.storage),
+            queue_limits: self.queue_limits,
         }
     }
 }
@@ -65,9 +70,9 @@ pub(crate) struct ConnectionLease {
 }
 
 impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManagerDropGuard<S> {
-    pub(crate) fn new(storage: Arc<S>) -> SessionManagerDropGuard<S> {
+    pub(crate) fn new(storage: Arc<S>, queue_limits: QueueLimits) -> SessionManagerDropGuard<S> {
         SessionManagerDropGuard {
-            session_manager: SessionManager::new(storage),
+            session_manager: SessionManager::with_queue_limits(storage, queue_limits),
         }
     }
 
@@ -94,7 +99,15 @@ pub(crate) struct SessionStartResult {
 }
 
 impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
+    #[cfg(test)]
     pub(crate) fn new(storage: Arc<S>) -> SessionManager<S> {
+        Self::with_queue_limits(storage, QueueLimits::default())
+    }
+
+    pub(crate) fn with_queue_limits(
+        storage: Arc<S>,
+        queue_limits: QueueLimits,
+    ) -> SessionManager<S> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 sessions: HashMap::new(),
@@ -103,7 +116,11 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
             }),
         });
 
-        SessionManager { shared, storage }
+        SessionManager {
+            shared,
+            storage,
+            queue_limits,
+        }
     }
 
     pub(crate) async fn start_session(
@@ -184,7 +201,7 @@ impl<S: SessionStore + WillStore + InflightStore + 'static> SessionManager<S> {
                 s
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                let new_session = SessionDropGuard::new(connect_packet);
+                let new_session = SessionDropGuard::new(connect_packet, self.queue_limits);
                 e.insert(new_session).session()
             }
         };

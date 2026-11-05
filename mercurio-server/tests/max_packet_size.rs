@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::ControlPacket;
-use mercurio_server::connection::MAX_PACKET_SIZE;
+use mercurio_server::server::Limits;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -43,7 +43,7 @@ async fn connack_advertises_maximum_packet_size() {
         panic!("Expected ConnAck");
     };
     let maximum = connack.properties.unwrap().maximum_packet_size.unwrap();
-    assert_eq!(maximum.value as usize, MAX_PACKET_SIZE);
+    assert_eq!(maximum.value as usize, Limits::default().max_packet_size);
 }
 
 #[tokio::test]
