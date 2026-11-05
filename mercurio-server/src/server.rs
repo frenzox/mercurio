@@ -10,7 +10,12 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use mercurio_core::{message::Message, qos::QoS, reason::ReasonCode, Result};
-use mercurio_packets::{connect::ConnectPacket, publish::PublishPacket, ControlPacket};
+use mercurio_packets::{
+    connack::{ConnAckFlags, ConnAckPacket},
+    connect::ConnectPacket,
+    publish::PublishPacket,
+    ControlPacket,
+};
 use mercurio_storage::{memory::MemoryStore, InflightMessage};
 
 use crate::{
@@ -242,22 +247,21 @@ where
             };
 
             if !authenticated {
-                use mercurio_packets::connack::{ConnAckFlags, ConnAckPacket};
-
-                let connack = ConnAckPacket {
-                    protocol_version: connect_packet.protocol_version,
-                    flags: ConnAckFlags {
-                        session_present: false,
-                    },
-                    reason_code: ReasonCode::BadUserNameOrPassword,
-                    properties: None,
-                };
-                let _ = self
-                    .connection
-                    .write_packet(ControlPacket::ConnAck(connack))
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::BadUserNameOrPassword)
                     .await;
-                return Ok(());
             }
+        }
+
+        // MQTT 3.x servers must reject a zero-length client id unless the
+        // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
+        if connect_packet.payload.client_id.is_empty()
+            && !connect_packet.flags.clean_start
+            && !connect_packet.protocol_version.supports_properties()
+        {
+            return self
+                .reject_connect(&connect_packet, ReasonCode::ClientIdentifierNotValid)
+                .await;
         }
 
         let keepalive = connect_packet.keepalive;
@@ -313,6 +317,26 @@ where
         }
 
         result
+    }
+
+    async fn reject_connect(
+        &mut self,
+        connect_packet: &ConnectPacket,
+        reason_code: ReasonCode,
+    ) -> Result<()> {
+        let connack = ConnAckPacket {
+            protocol_version: connect_packet.protocol_version,
+            flags: ConnAckFlags {
+                session_present: false,
+            },
+            reason_code,
+            properties: None,
+        };
+        let _ = self
+            .connection
+            .write_packet(ControlPacket::ConnAck(connack))
+            .await;
+        Ok(())
     }
 
     async fn handle_connection(&mut self, session: &Session, keepalive: u16) -> Result<()> {
