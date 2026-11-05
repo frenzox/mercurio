@@ -825,7 +825,12 @@ impl Session {
                     client_id: session.client_id.clone(),
                     username: session.verified_user.clone(),
                 };
-                if !authorizer.authorize(&identity, &sub.topic_filter, Access::Read) {
+                // The share group decides who gets each message, not which
+                // messages flow, so only the topic filter is checked, as
+                // mosquitto does
+                let filter = parse_shared_subscription(&sub.topic_filter)
+                    .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
+                if !authorizer.authorize(&identity, filter, Access::Read) {
                     warn!(
                         "Client `{}` may not subscribe to `{}`",
                         identity.client_id, sub.topic_filter

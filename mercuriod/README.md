@@ -168,7 +168,8 @@ The access is `read`, `write`, `readwrite` (the default) or `deny`.
 Anything not granted is denied, and `deny` overrides any grant. A
 subscription is allowed only if a rule covers its whole filter: a client
 granted `sensors/+/temperature` may subscribe to it, but not to
-`sensors/#`.
+`sensors/#`. Shared subscriptions are checked by their topic filter:
+`$share/group/sensors/+/temperature` needs the same grant.
 
 ### TLS
 

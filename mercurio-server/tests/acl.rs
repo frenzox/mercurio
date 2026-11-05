@@ -184,6 +184,19 @@ async fn topics_follow_the_acl() {
 }
 
 #[tokio::test]
+async fn shared_subscriptions_are_checked_by_their_topic_filter() {
+    let addr = start_broker(true).await;
+    let (mut reader, _) = Client::connect(addr, "reader", None, None).await;
+
+    // Granted QoS 0, as for public/# itself
+    assert_eq!(reader.subscribe("$share/g/public/#").await.get_code(), 0x00);
+    assert_eq!(
+        reader.subscribe("$share/g/alice/#").await,
+        ReasonCode::NotAuthorized
+    );
+}
+
+#[tokio::test]
 async fn will_topic_needs_write_access() {
     let addr = start_broker(true).await;
 
