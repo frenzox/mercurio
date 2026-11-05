@@ -15,6 +15,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# Writable /var/lib/mercurio for SQLite storage, despite ProtectSystem
+StateDirectory=mercurio
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

@@ -56,6 +56,15 @@ receive_maximum = 65535
 # server_reference = "broker2.example.com:1883"
 # permanent = false
 
+[server.tls]
+# Serve TLS on `port` (and on `websocket_port`) instead of plain TCP
+enabled = false
+# Certificate chain and private key, in PEM format
+# cert_path = "/etc/mercurio/server.crt"
+# key_path = "/etc/mercurio/server.key"
+# Require clients to present a certificate signed by this CA (mutual TLS)
+# ca_path = "/etc/mercurio/ca.crt"
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"
@@ -67,11 +76,14 @@ backend = "memory"
 # path = "/var/lib/mercurio/mercurio.db"
 
 [auth]
-# Enable authentication
+# Require clients to authenticate
 enabled = false
 
-# Allow anonymous connections (when auth is enabled)
+# Allow clients that send no user name (when auth is enabled)
 allow_anonymous = true
+
+# User names and Argon2 password hashes, managed with `mercuriod passwd`
+# password_file = "/etc/mercurio/passwd"
 
 # Restrict the topics each client may publish and subscribe to, using
 # mosquitto's acl_file format. Anything not granted is denied. User rules
