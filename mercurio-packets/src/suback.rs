@@ -196,7 +196,7 @@ impl SubAckPacket {
         let mut payload = Vec::new();
 
         while buffer.remaining() > next_packet {
-            let return_code = buffer.get_u8();
+            let return_code = u8::decode(buffer)?;
             let reason_code = match return_code {
                 0x00 => ReasonCode::GrantedQoS0,
                 0x01 => ReasonCode::GrantedQoS1,

@@ -122,7 +122,7 @@ impl Encoder for SubscriptionOptions {
 
 impl Decoder for SubscriptionOptions {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let opt = buffer.get_u8();
+        let opt = u8::decode(buffer)?;
 
         let qos: QoS = (opt & 0b0000_0011).into();
 

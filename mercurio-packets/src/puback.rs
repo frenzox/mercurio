@@ -120,7 +120,12 @@ impl Decoder for PubAckPacket {
         }
 
         let reason = ReasonCode::decode(buffer)?;
-        let properties = Some(PubAckProperties::decode(buffer)?);
+        // The property length is omitted when there are none [MQTT-3.4.2.2]
+        let properties = if remaining_len.0 > 3 {
+            Some(PubAckProperties::decode(buffer)?)
+        } else {
+            None
+        };
 
         Ok(PubAckPacket {
             packet_id,

@@ -104,9 +104,18 @@ impl Decoder for AuthPacket {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let _ = VariableByteInteger::decode(buffer)?; //Remaining length
-        let reason = ReasonCode::decode(buffer)?;
-        let properties = AuthProperties::decode(buffer)?;
+        let remaining_len = VariableByteInteger::decode(buffer)?;
+        // Both reason and properties may be omitted [MQTT-3.15.2-1]
+        let reason = if remaining_len.0 > 0 {
+            ReasonCode::decode(buffer)?
+        } else {
+            ReasonCode::Success
+        };
+        let properties = if remaining_len.0 > 1 {
+            AuthProperties::decode(buffer)?
+        } else {
+            AuthProperties::default()
+        };
 
         Ok(AuthPacket { reason, properties })
     }

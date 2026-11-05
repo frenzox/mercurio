@@ -181,7 +181,7 @@ impl Decoder for ReasonCode {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use ReasonCode::*;
 
-        let reason = match buffer.get_u8() {
+        let reason = match u8::decode(buffer)? {
             0x00 => Success,
             0x01 => GrantedQoS1,
             0x02 => GrantedQoS2,

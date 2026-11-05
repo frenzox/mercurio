@@ -43,29 +43,22 @@ fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
 }
 
 fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByteInteger> {
-    let mut multiplier = 1;
     let mut value: u32 = 0;
 
-    loop {
-        if encoded.has_remaining() {
-            let encoded_byte = encoded.get_u8();
-            value += (encoded_byte & 0b0111_1111) as u32 * multiplier;
-
-            if multiplier > (128 * 128 * 128) {
-                return Err(ReasonCode::MalformedPacket.into());
-            }
-
-            multiplier *= 128;
-
-            if (encoded_byte & 0b1000_0000) == 0 {
-                break;
-            }
-        } else {
+    // At most four bytes; a fifth continuation is malformed [MQTT-1.5.5-1]
+    for shift in [0, 7, 14, 21] {
+        if !encoded.has_remaining() {
             return Err(Error::PacketIncomplete);
+        }
+        let encoded_byte = encoded.get_u8();
+        value |= ((encoded_byte & 0b0111_1111) as u32) << shift;
+
+        if (encoded_byte & 0b1000_0000) == 0 {
+            return Ok(VariableByteInteger(value));
         }
     }
 
-    Ok(VariableByteInteger(value))
+    Err(ReasonCode::MalformedPacket.into())
 }
 
 #[derive(PartialEq, Eq, Debug, Default, Clone)]
