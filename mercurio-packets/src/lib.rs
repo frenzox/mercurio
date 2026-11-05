@@ -304,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn test_v3_subscribe_rejects_reserved_option_bits() {
+        // Same SUBSCRIBE as above but with the MQTT 5 No Local bit set
+        let wire = [0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'#', 0x05];
+        let mut buffer = BytesMut::from(&wire[..]);
+
+        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1_1).is_err());
+
+        // The same option byte is valid in MQTT 5, which adds a properties length
+        let wire = [
+            0x82, 0x09, 0x00, 0x01, 0x00, 0x00, 0x03, b'a', b'/', b'#', 0x05,
+        ];
+        let mut buffer = BytesMut::from(&wire[..]);
+        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+    }
+
+    #[test]
     fn test_v3_unsubscribe_decode() {
         // UNSUBSCRIBE packet id 2, "a/#"
         let wire = [0xa2, 0x07, 0x00, 0x02, 0x00, 0x03, b'a', b'/', b'#'];
