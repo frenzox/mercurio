@@ -10,3 +10,4 @@ pub mod session_manager;
 mod shutdown;
 pub mod tls;
 mod topic_tree;
+mod websocket;

@@ -113,6 +113,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&listen_addr).await?;
 
+    let websocket_listener = match config.server.websocket_port {
+        Some(port) => {
+            let websocket_addr = format!("{}:{}", config.server.host, port);
+            let websocket_listener = TcpListener::bind(&websocket_addr).await?;
+            info!("Serving MQTT over WebSocket on {}", websocket_addr);
+            Some(websocket_listener)
+        }
+        None => None,
+    };
+
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
     // Build TLS configuration if enabled
@@ -194,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         limits,
         policy,
+        websocket_listener,
     };
     match config.storage {
         StorageConfig::Memory => {

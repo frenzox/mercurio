@@ -43,6 +43,9 @@ host = "127.0.0.1"
 # Port to listen on (default MQTT port is 1883)
 port = 1883
 
+# Also serve MQTT over WebSocket (with TLS when it is enabled) on this port
+# websocket_port = 8080
+
 # Maximum number of concurrent connections
 max_connections = 10000
 
