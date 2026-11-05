@@ -33,6 +33,7 @@ use mercurio_packets::{
     pubrec::PubRecPacket,
     pubrel::PubRelPacket,
     suback::{SubAckPacket, SubAckPayload},
+    subscribe::RetainHandling,
     unsuback::{UnsubAckPacket, UnsubAckPayload},
     unsubscribe::UnsubscribePacket,
     ControlPacket,
@@ -178,7 +179,7 @@ struct State {
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     /// Topic filters subscribed to, with their granted QoS
-    granted_qos: HashMap<String, QoS>,
+    subscriptions: HashMap<String, StoredSubscription>,
     /// Where the subscriptions are registered, once there are any
     topics: Option<TopicTree<Subscriber>>,
     /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id, with
@@ -226,7 +227,7 @@ impl Session {
                     connect_packet,
                     generation: 0,
                     client_id,
-                    granted_qos: HashMap::new(),
+                    subscriptions: HashMap::new(),
                     topics: None,
                     // Pre-allocate with reasonable capacity for typical usage
                     unacknowledged_messages: HashMap::with_capacity(16),
@@ -289,17 +290,11 @@ impl Session {
         session.client_id.clone()
     }
 
-    /// Returns the subscriptions of this session with their granted QoS.
+    /// Returns the subscriptions of this session with their granted QoS and
+    /// options.
     pub(crate) async fn get_subscriptions(&self) -> Vec<StoredSubscription> {
         let session = self.shared.state.lock().await;
-        session
-            .granted_qos
-            .iter()
-            .map(|(topic_filter, qos)| StoredSubscription {
-                topic_filter: topic_filter.clone(),
-                qos: *qos,
-            })
-            .collect()
+        session.subscriptions.values().cloned().collect()
     }
 
     /// Restore subscriptions by re-subscribing to the broker.
@@ -312,17 +307,19 @@ impl Session {
         let mut session = self.shared.state.lock().await;
 
         session.topics = Some(broker.topics());
-        for StoredSubscription { topic_filter, qos } in subscriptions {
+        for subscription in subscriptions {
             // Retained messages are only sent for a new SUBSCRIBE, not when an
             // existing subscription is resumed [MQTT-3.3.1-9]
             broker
                 .subscribe(
-                    &topic_filter,
+                    &subscription.topic_filter,
                     self.shared.subscriber_id,
-                    self.subscriber(qos),
+                    self.subscriber(&subscription),
                 )
                 .await?;
-            session.granted_qos.insert(topic_filter, qos);
+            session
+                .subscriptions
+                .insert(subscription.topic_filter.clone(), subscription);
         }
 
         Ok(())
@@ -444,7 +441,9 @@ impl Session {
             properties,
         };
 
-        broker.publish(&topic, message).await?;
+        broker
+            .publish_from(&topic, message, Some(self.shared.subscriber_id))
+            .await?;
 
         response
     }
@@ -530,7 +529,14 @@ impl Session {
             }
 
             let granted_qos = sub.subs_opt.qos;
-            let subscriber = self.subscriber(granted_qos);
+            let subscription = StoredSubscription {
+                topic_filter: sub.topic_filter.clone(),
+                qos: granted_qos,
+                no_local: sub.subs_opt.no_local,
+                retain_as_published: sub.subs_opt.retain_as_pub,
+            };
+            let subscriber = self.subscriber(&subscription);
+            let existed = session.subscriptions.contains_key(&sub.topic_filter);
             let retained_messages = broker
                 .subscribe(
                     &sub.topic_filter,
@@ -538,8 +544,16 @@ impl Session {
                     subscriber.clone(),
                 )
                 .await?;
-            for message in retained_messages {
-                subscriber.deliver(message);
+
+            let send_retained = match sub.subs_opt.retain_handling {
+                RetainHandling::SendRetained => true,
+                RetainHandling::SendRetainedIfNonExisting => !existed,
+                _ => false,
+            };
+            if send_retained {
+                for message in retained_messages {
+                    subscriber.deliver_retained(message);
+                }
             }
             ack.payload.push(SubAckPayload {
                 reason_code: match granted_qos {
@@ -551,8 +565,8 @@ impl Session {
 
             session.topics = Some(broker.topics());
             session
-                .granted_qos
-                .insert(sub.topic_filter.to_string(), granted_qos);
+                .subscriptions
+                .insert(sub.topic_filter.clone(), subscription);
         }
 
         Ok(Some(ControlPacket::SubAck(ack)))
@@ -573,7 +587,7 @@ impl Session {
 
         for unsub in &packet.payload {
             broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
-            let reason_code = if session.granted_qos.remove(&unsub.topic_filter).is_some() {
+            let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -717,10 +731,13 @@ impl Session {
         }
     }
 
-    fn subscriber(&self, granted_qos: QoS) -> Subscriber {
+    fn subscriber(&self, subscription: &StoredSubscription) -> Subscriber {
         Subscriber {
             queue: Arc::clone(&self.shared.queue),
-            granted_qos,
+            session_id: self.shared.subscriber_id,
+            granted_qos: subscription.qos,
+            no_local: subscription.no_local,
+            retain_as_published: subscription.retain_as_published,
         }
     }
 
@@ -729,11 +746,11 @@ impl Session {
     pub(crate) async fn unsubscribe_all(&self) {
         let mut session = self.shared.state.lock().await;
         if let Some(topics) = session.topics.take() {
-            for topic_filter in session.granted_qos.keys() {
+            for topic_filter in session.subscriptions.keys() {
                 topics.unsubscribe(topic_filter, self.shared.subscriber_id);
             }
         }
-        session.granted_qos.clear();
+        session.subscriptions.clear();
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
@@ -904,7 +921,7 @@ mod tests {
     use mercurio_core::protocol::ProtocolVersion;
     use mercurio_packets::{
         connect::{ConnectFlags, ConnectPayload},
-        subscribe::{SubscribePayload, SubscriptionOptions},
+        subscribe::{RetainHandling, SubscribePayload, SubscriptionOptions},
         unsubscribe::UnsubscribePayload,
     };
     use mercurio_storage::memory::MemoryStore;
@@ -1418,10 +1435,7 @@ mod tests {
 
         assert_eq!(
             session.get_subscriptions().await,
-            vec![StoredSubscription {
-                topic_filter: "s".to_string(),
-                qos: QoS::AtLeastOnce,
-            }]
+            vec![StoredSubscription::new("s", QoS::AtLeastOnce)]
         );
     }
 
@@ -1431,13 +1445,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .restore_subscriptions(
-                vec![StoredSubscription {
-                    topic_filter: "r".to_string(),
-                    qos: QoS::AtMostOnce,
-                }],
-                &broker,
-            )
+            .restore_subscriptions(vec![StoredSubscription::new("r", QoS::AtMostOnce)], &broker)
             .await
             .unwrap();
         broker
@@ -1465,6 +1473,125 @@ mod tests {
         };
         let interval = publish.properties.unwrap().message_expiry_interval.unwrap();
         assert_eq!(interval.value, 5);
+    }
+
+    fn subscribe_with(
+        topic_filter: &str,
+        subs_opt: SubscriptionOptions,
+    ) -> mercurio_packets::subscribe::SubscribePacket {
+        mercurio_packets::subscribe::SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![SubscribePayload {
+                topic_filter: topic_filter.to_string(),
+                subs_opt,
+            }],
+        }
+    }
+
+    async fn nothing_queued(session: &Session) -> bool {
+        timeout(Duration::from_millis(50), session.next_outgoing())
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn test_no_local_skips_own_messages() {
+        let mut session = create_test_session();
+        let mut other = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let options = SubscriptionOptions {
+            no_local: true,
+            ..Default::default()
+        };
+        session
+            .handle_subscribe(subscribe_with("n", options), &broker)
+            .await
+            .unwrap();
+
+        let publish = ControlPacket::Publish(PublishPacket {
+            topic_name: "n".into(),
+            payload: Some(Bytes::from("x")),
+            ..Default::default()
+        });
+        session
+            .process_incoming(publish, &broker, None)
+            .await
+            .unwrap();
+        assert!(nothing_queued(&session).await);
+
+        let publish = ControlPacket::Publish(PublishPacket {
+            topic_name: "n".into(),
+            payload: Some(Bytes::from("x")),
+            ..Default::default()
+        });
+        other
+            .process_incoming(publish, &broker, None)
+            .await
+            .unwrap();
+        next_publish(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn test_retain_as_published_keeps_retain_flag() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+
+        let options = SubscriptionOptions {
+            retain_as_pub: true,
+            ..Default::default()
+        };
+        session
+            .handle_subscribe(subscribe_with("r", options), &broker)
+            .await
+            .unwrap();
+        broker
+            .publish("r", message("r", QoS::AtMostOnce, None, true))
+            .await
+            .unwrap();
+
+        assert!(next_publish(&mut session).await.retain);
+    }
+
+    #[tokio::test]
+    async fn test_retain_handling_options() {
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        broker
+            .publish("h", message("h", QoS::AtMostOnce, None, true))
+            .await
+            .unwrap();
+
+        let if_new = SubscriptionOptions {
+            retain_handling: RetainHandling::SendRetainedIfNonExisting,
+            ..Default::default()
+        };
+        let mut session = create_test_session();
+        session
+            .handle_subscribe(subscribe_with("h", if_new), &broker)
+            .await
+            .unwrap();
+        assert!(next_publish(&mut session).await.retain);
+        let if_new = SubscriptionOptions {
+            retain_handling: RetainHandling::SendRetainedIfNonExisting,
+            ..Default::default()
+        };
+        session
+            .handle_subscribe(subscribe_with("h", if_new), &broker)
+            .await
+            .unwrap();
+        assert!(nothing_queued(&session).await);
+
+        let never = SubscriptionOptions {
+            retain_handling: RetainHandling::DoNotSendRetained,
+            ..Default::default()
+        };
+        let mut session = create_test_session();
+        session
+            .handle_subscribe(subscribe_with("h", never), &broker)
+            .await
+            .unwrap();
+        assert!(nothing_queued(&session).await);
     }
 
     #[tokio::test]

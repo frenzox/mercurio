@@ -255,14 +255,8 @@ mod tests {
         let session = SessionState {
             client_id: "client1".to_string(),
             subscriptions: vec![
-                StoredSubscription {
-                    topic_filter: "topic/a".to_string(),
-                    qos: QoS::AtMostOnce,
-                },
-                StoredSubscription {
-                    topic_filter: "topic/b".to_string(),
-                    qos: QoS::AtLeastOnce,
-                },
+                StoredSubscription::new("topic/a", QoS::AtMostOnce),
+                StoredSubscription::new("topic/b", QoS::AtLeastOnce),
             ],
             clean_start: false,
         };

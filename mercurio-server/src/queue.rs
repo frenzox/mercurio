@@ -89,13 +89,37 @@ impl MessageQueue {
 #[derive(Clone)]
 pub(crate) struct Subscriber {
     pub queue: Arc<MessageQueue>,
+    /// The session the queue belongs to
+    pub session_id: u64,
     pub granted_qos: QoS,
+    pub no_local: bool,
+    pub retain_as_published: bool,
 }
 
 impl Subscriber {
+    /// Queues a newly published message, `origin` being the session that
+    /// published it.
+    pub(crate) fn deliver(&self, mut message: Message, origin: Option<u64>) {
+        // [MQTT-3.8.3-3]
+        if self.no_local && origin == Some(self.session_id) {
+            return;
+        }
+        // Forwarded messages carry RETAIN only when asked to keep it as
+        // published [MQTT-3.3.1-12]
+        if !self.retain_as_published {
+            message.retain = false;
+        }
+        self.queue_message(message);
+    }
+
+    /// Queues a retained message sent because of a new subscription.
+    pub(crate) fn deliver_retained(&self, message: Message) {
+        self.queue_message(message);
+    }
+
     /// Queues a message, downgraded to the QoS granted for the subscription
     /// [MQTT-3.8.4-8].
-    pub(crate) fn deliver(&self, mut message: Message) {
+    fn queue_message(&self, mut message: Message) {
         if (message.qos as u8) > (self.granted_qos as u8) {
             message.qos = self.granted_qos;
             if self.granted_qos == QoS::AtMostOnce {

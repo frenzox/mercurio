@@ -47,11 +47,27 @@ pub struct SessionState {
     pub clean_start: bool,
 }
 
-/// A subscription and the QoS granted for it.
+/// A subscription, the QoS granted for it and its MQTT 5 options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSubscription {
     pub topic_filter: String,
     pub qos: QoS,
+    /// Don't deliver messages published by the subscribing client itself
+    pub no_local: bool,
+    /// Keep the RETAIN flag of forwarded messages as published
+    pub retain_as_published: bool,
+}
+
+impl StoredSubscription {
+    /// A subscription without MQTT 5 options, as MQTT 3.x clients make.
+    pub fn new(topic_filter: impl Into<String>, qos: QoS) -> Self {
+        Self {
+            topic_filter: topic_filter.into(),
+            qos,
+            no_local: false,
+            retain_as_published: false,
+        }
+    }
 }
 
 /// Will message for persistence.
