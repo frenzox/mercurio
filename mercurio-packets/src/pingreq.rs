@@ -19,6 +19,19 @@ impl Encoder for PingReqPacket {
 impl Decoder for PingReqPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         buffer.advance(1);
+        VariableByteInteger::decode(buffer)?;
         Ok(Self {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_consumes_whole_packet() {
+        let mut buffer = BytesMut::from(&[0xc0, 0x00, 0xc0, 0x00][..]);
+        PingReqPacket::decode(&mut buffer).unwrap();
+        assert_eq!(buffer.len(), 2);
     }
 }
