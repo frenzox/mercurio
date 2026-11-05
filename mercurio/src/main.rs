@@ -60,22 +60,28 @@ enum Commands {
         #[arg(short = 'T', long)]
         print_topic: bool,
 
-        /// Will message topic (sent by broker if client disconnects unexpectedly)
-        #[arg(long)]
-        will_topic: Option<String>,
-
-        /// Will message payload
-        #[arg(long)]
-        will_message: Option<String>,
-
-        /// Will message QoS level (0, 1, or 2)
-        #[arg(long, default_value = "0")]
-        will_qos: u8,
-
-        /// Retain the will message on the broker
-        #[arg(long)]
-        will_retain: bool,
+        #[command(flatten)]
+        will: WillArgs,
     },
+}
+
+#[derive(clap::Args, Debug)]
+struct WillArgs {
+    /// Will message topic (sent by broker if client disconnects unexpectedly)
+    #[arg(long)]
+    will_topic: Option<String>,
+
+    /// Will message payload
+    #[arg(long)]
+    will_message: Option<String>,
+
+    /// Will message QoS level (0, 1, or 2)
+    #[arg(long, default_value = "0")]
+    will_qos: u8,
+
+    /// Retain the will message on the broker
+    #[arg(long)]
+    will_retain: bool,
 }
 
 #[tokio::main]
@@ -98,23 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             topic,
             qos,
             print_topic,
-            will_topic,
-            will_message,
-            will_qos,
-            will_retain,
+            will,
         } => {
             init_logging(connection.verbose);
-            run_subscribe(
-                connection,
-                topic,
-                qos,
-                print_topic,
-                will_topic,
-                will_message,
-                will_qos,
-                will_retain,
-            )
-            .await?;
+            run_subscribe(connection, topic, qos, print_topic, will).await?;
         }
     }
 
@@ -167,10 +160,7 @@ async fn run_subscribe(
     topics: Vec<String>,
     qos_level: u8,
     print_topic: bool,
-    will_topic: Option<String>,
-    will_message: Option<String>,
-    will_qos: u8,
-    will_retain: bool,
+    will: WillArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Parse QoS
     let qos = parse_qos(qos_level)?;
@@ -179,15 +169,14 @@ async fn run_subscribe(
     let mut options = connection.to_connect_options();
 
     // Configure will message if topic is provided
-    if let Some(topic) = will_topic {
-        let payload = will_message.unwrap_or_default();
-        let will = Will {
+    if let Some(topic) = will.will_topic {
+        let payload = will.will_message.unwrap_or_default();
+        options = options.will(Will {
             topic,
             payload: Bytes::from(payload),
-            qos: parse_qos(will_qos)?,
-            retain: will_retain,
-        };
-        options = options.will(will);
+            qos: parse_qos(will.will_qos)?,
+            retain: will.will_retain,
+        });
     }
 
     let client = MqttClient::connect(options).await?;

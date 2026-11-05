@@ -14,7 +14,6 @@ async fn connection_without_connect_is_closed() {
     let config = ServerConfig {
         limits: Limits {
             connect_timeout: Duration::from_millis(200),
-            ..Default::default()
         },
         ..Default::default()
     };

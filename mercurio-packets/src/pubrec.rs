@@ -103,7 +103,9 @@ impl Encoder for PubRecPacket {
     }
 
     fn encoded_size(&self) -> usize {
-        unimplemented!()
+        let mut buffer = BytesMut::new();
+        self.encode(&mut buffer);
+        buffer.len()
     }
 }
 
