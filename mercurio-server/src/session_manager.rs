@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::CONNECTIONS;
 use tokio::{
     sync::{watch, Mutex, OwnedMutexGuard},
     time::Duration,
@@ -519,7 +520,7 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
             return false;
         }
 
-        info!("Session for client `{}` ended", client_id);
+        info!(target: CONNECTIONS, "Session for client `{}` ended", client_id);
         if let Some(ended) = manager.sessions.remove(client_id) {
             ended.session().stop_queue_journal();
             ended.session().unsubscribe_all().await;

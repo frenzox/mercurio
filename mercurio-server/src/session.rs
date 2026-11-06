@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use crate::CONNECTIONS;
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -483,6 +484,7 @@ impl Session {
         };
 
         info!(
+            target: CONNECTIONS,
             "Client with id `{}` {} a session",
             client_id,
             if resume { "resumed" } else { "started" }

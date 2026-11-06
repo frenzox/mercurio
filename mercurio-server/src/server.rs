@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::error::ServerError;
+use crate::CONNECTIONS;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::{
@@ -642,7 +643,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             let slots = [slot, listener_slot];
 
-            info!("Got a connection: {:?}", peer_addr);
+            info!(target: CONNECTIONS, "Got a connection: {:?}", peer_addr);
 
             let parts = HandlerParts {
                 broker: self.broker.clone(),
