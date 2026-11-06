@@ -3,10 +3,8 @@
 //! plugin published to `$CONTROL/dynamic-security/v1`. The state is kept in
 //! a JSON file, saved after every change.
 //!
-//! The broker checks a single read access both when a client subscribes and
-//! when a message is delivered to it, so `subscribePattern`,
-//! `subscribeLiteral` and `publishClientReceive` ACLs all grant or deny that
-//! access. `publishClientSend` ACLs decide publishing.
+//! A client's roles are its own and those of its groups; clients without a
+//! user name get the roles of the anonymous group, when one is set.
 
 use std::{
     path::Path,
@@ -39,16 +37,37 @@ struct Data {
     clients: Vec<Client>,
     #[serde(default)]
     roles: Vec<Role>,
+    #[serde(default)]
+    groups: Vec<Group>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anonymous_group: Option<String>,
 }
 
-/// Access of clients no ACL decides for, anonymous ones included.
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Access of clients no ACL decides for, anonymous ones included; by
+/// default, as in mosquitto, only receiving is allowed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct DefaultAccess {
-    #[serde(default)]
     publish_client_send: bool,
-    #[serde(default)]
+    publish_client_receive: bool,
     subscribe: bool,
+}
+
+impl Default for DefaultAccess {
+    fn default() -> Self {
+        Self {
+            publish_client_send: false,
+            publish_client_receive: true,
+            subscribe: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Group {
+    groupname: String,
+    #[serde(default)]
+    roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +80,8 @@ struct Client {
     disabled: bool,
     #[serde(default)]
     roles: Vec<String>,
+    #[serde(default)]
+    groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,11 +112,12 @@ enum AclType {
 impl Acl {
     fn applies(&self, topic: &str, access: Access) -> bool {
         match (self.acltype, access) {
-            (AclType::PublishClientSend, Access::Write) => topic_matches_filter(topic, &self.topic),
-            (AclType::SubscribeLiteral, Access::Read) => topic == self.topic,
-            (AclType::PublishClientReceive | AclType::SubscribePattern, Access::Read) => {
+            (AclType::PublishClientSend, Access::Write)
+            | (AclType::PublishClientReceive, Access::Read)
+            | (AclType::SubscribePattern, Access::Subscribe) => {
                 topic_matches_filter(topic, &self.topic)
             }
+            (AclType::SubscribeLiteral, Access::Subscribe) => topic == self.topic,
             _ => false,
         }
     }
@@ -116,12 +138,44 @@ impl Data {
             .ok_or_else(|| "Role not found".to_string())
     }
 
+    fn group(&mut self, groupname: &str) -> Result<&mut Group, String> {
+        self.groups
+            .iter_mut()
+            .find(|g| g.groupname == groupname)
+            .ok_or_else(|| "Group not found".to_string())
+    }
+
+    /// The names of the roles of a client: its own, then its groups'.
+    fn roles_of(&self, username: Option<&str>) -> Vec<&str> {
+        let groups: Vec<&str> = match username {
+            Some(username) => {
+                let Some(client) = self.clients.iter().find(|c| c.username == username) else {
+                    return Vec::new();
+                };
+                let mut roles: Vec<&str> = client.roles.iter().map(String::as_str).collect();
+                let groups = client.groups.iter().map(String::as_str);
+                roles.extend(self.group_roles(groups));
+                return roles;
+            }
+            None => self.anonymous_group.as_deref().into_iter().collect(),
+        };
+        self.group_roles(groups.into_iter()).collect()
+    }
+
+    fn group_roles<'a>(
+        &'a self,
+        groups: impl Iterator<Item = &'a str>,
+    ) -> impl Iterator<Item = &'a str> {
+        groups
+            .filter_map(|name| self.groups.iter().find(|g| g.groupname == name))
+            .flat_map(|group| group.roles.iter().map(String::as_str))
+    }
+
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
-        let client = username.and_then(|u| self.clients.iter().find(|c| c.username == u));
-        let decision = client
+        let decision = self
+            .roles_of(username)
             .into_iter()
-            .flat_map(|client| &client.roles)
-            .filter_map(|rolename| self.roles.iter().find(|r| &r.rolename == rolename))
+            .filter_map(|rolename| self.roles.iter().find(|r| r.rolename == rolename))
             .flat_map(|role| &role.acls)
             .filter(|acl| acl.applies(topic, access))
             // The first of the highest priority wins
@@ -133,7 +187,8 @@ impl Data {
             Some(acl) => acl.allow,
             None => match access {
                 Access::Write => self.default_acl_access.publish_client_send,
-                Access::Read => self.default_acl_access.subscribe,
+                Access::Read => self.default_acl_access.publish_client_receive,
+                Access::Subscribe => self.default_acl_access.subscribe,
             },
         }
     }
@@ -153,9 +208,13 @@ impl Data {
                 if self.clients.iter().any(|c| c.username == username) {
                     return Err("Client already exists".to_string());
                 }
-                let roles = rolenames(args.get("roles"));
+                let roles = names(args.get("roles"), "rolename");
                 if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
                     return Err(format!("Role {missing} not found"));
+                }
+                let groups = names(args.get("groups"), "groupname");
+                if let Some(missing) = groups.iter().find(|g| self.group(g).is_err()) {
+                    return Err(format!("Group {missing} not found"));
                 }
                 let password = match args.get("password").and_then(Value::as_str) {
                     Some(password) => Some(hash_password(password)?),
@@ -166,6 +225,7 @@ impl Data {
                     password,
                     disabled: false,
                     roles,
+                    groups,
                 });
                 Ok((None, true))
             }
@@ -207,10 +267,16 @@ impl Data {
                     .iter()
                     .map(|r| json!({ "rolename": r }))
                     .collect();
+                let groups: Vec<Value> = client
+                    .groups
+                    .iter()
+                    .map(|g| json!({ "groupname": g }))
+                    .collect();
                 let data = json!({ "client": {
                     "username": client.username,
                     "disabled": client.disabled,
                     "roles": roles,
+                    "groups": groups,
                 }});
                 Ok((Some(data), false))
             }
@@ -239,7 +305,102 @@ impl Data {
                 for client in &mut self.clients {
                     client.roles.retain(|r| *r != rolename);
                 }
+                for group in &mut self.groups {
+                    group.roles.retain(|r| *r != rolename);
+                }
                 Ok((None, true))
+            }
+            "createGroup" => {
+                let groupname = text("groupname")?;
+                if self.groups.iter().any(|g| g.groupname == groupname) {
+                    return Err("Group already exists".to_string());
+                }
+                let roles = names(args.get("roles"), "rolename");
+                if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
+                    return Err(format!("Role {missing} not found"));
+                }
+                self.groups.push(Group { groupname, roles });
+                Ok((None, true))
+            }
+            "deleteGroup" => {
+                let groupname = text("groupname")?;
+                self.group(&groupname)?;
+                self.groups.retain(|g| g.groupname != groupname);
+                for client in &mut self.clients {
+                    client.groups.retain(|g| *g != groupname);
+                }
+                if self.anonymous_group.as_ref() == Some(&groupname) {
+                    self.anonymous_group = None;
+                }
+                Ok((None, true))
+            }
+            "addGroupRole" => {
+                let rolename = text("rolename")?;
+                self.role(&rolename)?;
+                let group = self.group(&text("groupname")?)?;
+                if !group.roles.contains(&rolename) {
+                    group.roles.push(rolename);
+                }
+                Ok((None, true))
+            }
+            "removeGroupRole" => {
+                let rolename = text("rolename")?;
+                self.group(&text("groupname")?)?
+                    .roles
+                    .retain(|r| *r != rolename);
+                Ok((None, true))
+            }
+            "addGroupClient" => {
+                let groupname = text("groupname")?;
+                self.group(&groupname)?;
+                let client = self.client(&text("username")?)?;
+                if !client.groups.contains(&groupname) {
+                    client.groups.push(groupname);
+                }
+                Ok((None, true))
+            }
+            "removeGroupClient" => {
+                let groupname = text("groupname")?;
+                self.client(&text("username")?)?
+                    .groups
+                    .retain(|g| *g != groupname);
+                Ok((None, true))
+            }
+            "getGroup" => {
+                let groupname = text("groupname")?;
+                let members: Vec<Value> = self
+                    .clients
+                    .iter()
+                    .filter(|c| c.groups.contains(&groupname))
+                    .map(|c| json!({ "username": c.username }))
+                    .collect();
+                let group = self.group(&groupname)?;
+                let roles: Vec<Value> = group
+                    .roles
+                    .iter()
+                    .map(|r| json!({ "rolename": r }))
+                    .collect();
+                let data = json!({ "group": {
+                    "groupname": group.groupname,
+                    "roles": roles,
+                    "clients": members,
+                }});
+                Ok((Some(data), false))
+            }
+            "listGroups" => {
+                let names: Vec<&str> = self.groups.iter().map(|g| g.groupname.as_str()).collect();
+                let data = json!({ "totalCount": names.len(), "groups": names });
+                Ok((Some(data), false))
+            }
+            "setAnonymousGroup" => {
+                let groupname = text("groupname")?;
+                self.group(&groupname)?;
+                self.anonymous_group = Some(groupname);
+                Ok((None, true))
+            }
+            "getAnonymousGroup" => {
+                let data = json!({ "group": { "groupname": self.anonymous_group } });
+                Ok((Some(data), false))
             }
             "addRoleACL" => {
                 let acl: Acl = serde_json::from_value(args.clone())
@@ -283,6 +444,9 @@ impl Data {
                         Some("publishClientSend") => {
                             &mut self.default_acl_access.publish_client_send
                         }
+                        Some("publishClientReceive") => {
+                            &mut self.default_acl_access.publish_client_receive
+                        }
                         Some("subscribe") => &mut self.default_acl_access.subscribe,
                         _ => return Err("Invalid/missing acltype".to_string()),
                     };
@@ -294,6 +458,7 @@ impl Data {
                 let access = self.default_acl_access;
                 let data = json!({ "acls": [
                     { "acltype": "publishClientSend", "allow": access.publish_client_send },
+                    { "acltype": "publishClientReceive", "allow": access.publish_client_receive },
                     { "acltype": "subscribe", "allow": access.subscribe },
                 ]});
                 Ok((Some(data), false))
@@ -303,13 +468,13 @@ impl Data {
     }
 }
 
-/// Role names given as `[{"rolename": ...}]`, as mosquitto does.
-fn rolenames(roles: Option<&Value>) -> Vec<String> {
-    roles
-        .and_then(Value::as_array)
+/// Names given as `[{"rolename": ...}]` or `[{"groupname": ...}]`, as
+/// mosquitto does.
+fn names(list: Option<&Value>, key: &str) -> Vec<String> {
+    list.and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|r| r.get("rolename").and_then(Value::as_str))
+        .filter_map(|r| r.get(key).and_then(Value::as_str))
         .map(str::to_string)
         .collect()
 }
@@ -349,21 +514,24 @@ impl DynamicSecurity {
             allow: true,
         };
         let data = Data {
-            default_acl_access: DefaultAccess::default(),
             clients: vec![Client {
                 username: admin.to_string(),
                 password: Some(hash_password(password)?),
                 disabled: false,
                 roles: vec!["admin".to_string()],
+                groups: Vec::new(),
             }],
             roles: vec![Role {
                 rolename: "admin".to_string(),
                 acls: vec![
                     acl(AclType::PublishClientSend, "$CONTROL/dynamic-security/#"),
                     acl(AclType::SubscribePattern, "$CONTROL/dynamic-security/#"),
+                    acl(AclType::PublishClientReceive, "$CONTROL/dynamic-security/#"),
                     acl(AclType::SubscribePattern, "$SYS/#"),
+                    acl(AclType::PublishClientReceive, "$SYS/#"),
                 ],
             }],
+            ..Default::default()
         };
         write(path, &data)
     }
@@ -558,8 +726,48 @@ mod tests {
         assert!(security.validate("s1", b"pw"));
         assert!(security.authorize(&s1, "sensors/t1", Access::Write));
         assert!(!security.authorize(&s1, "sensors/secret", Access::Write));
-        assert!(!security.authorize(&s1, "sensors/t1", Access::Read));
+        assert!(!security.authorize(&s1, "sensors/t1", Access::Subscribe));
         assert!(!security.authorize(&s1, COMMAND_TOPIC, Access::Write));
+
+        // Receiving is allowed by default, subscribing isn't
+        assert!(security.authorize(&s1, "anything", Access::Read));
+        assert!(!security.authorize(&s1, "anything", Access::Subscribe));
+
+        // Groups give their roles to members, and to anonymous clients when
+        // set as the anonymous group
+        let anonymous = ClientIdentity {
+            client_id: "a".to_string(),
+            username: None,
+        };
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "reader" },
+                { "command": "addRoleACL", "rolename": "reader", "acltype": "subscribePattern",
+                  "topic": "news/#", "allow": true },
+                { "command": "createGroup", "groupname": "readers",
+                  "roles": [{ "rolename": "reader" }] },
+                { "command": "addGroupClient", "groupname": "readers", "username": "s1" },
+                { "command": "setAnonymousGroup", "groupname": "readers" },
+                { "command": "getGroup", "groupname": "readers" },
+            ]),
+        );
+        assert!(
+            responses.iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+        assert_eq!(
+            responses[5]["data"]["group"]["clients"],
+            json!([{ "username": "s1" }])
+        );
+        assert!(security.authorize(&s1, "news/#", Access::Subscribe));
+        assert!(security.authorize(&anonymous, "news/today", Access::Subscribe));
+        run(
+            &security,
+            json!([{ "command": "deleteGroup", "groupname": "readers" }]),
+        );
+        assert!(!security.authorize(&s1, "news/#", Access::Subscribe));
+        assert!(!security.authorize(&anonymous, "news/today", Access::Subscribe));
 
         run(
             &security,
