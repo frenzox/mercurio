@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
     // Build TLS configuration if enabled
-    let limits = config.server.limits();
+    let limits = config.server.limits()?;
     let policy = ConnectPolicy {
         response_information: config.server.response_information.clone(),
         redirect: config.server.redirect.clone().map(|r| Redirect {

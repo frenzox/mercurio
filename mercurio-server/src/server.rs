@@ -20,6 +20,7 @@ use mercurio_core::{
     message::Message,
     properties::{AuthenticationData, AuthenticationMethod, ReasonString, ServerReference},
     protocol::ProtocolVersion,
+    qos::QoS,
     reason::ReasonCode,
     Result,
 };
@@ -86,6 +87,10 @@ pub struct Limits {
     /// Off by default: some client libraries announce support they don't
     /// actually have.
     pub send_topic_aliases: bool,
+    /// Highest QoS clients may publish and subscribe with
+    pub maximum_qos: QoS,
+    /// Whether clients may publish retained messages
+    pub retain_available: bool,
 }
 
 impl Default for Limits {
@@ -99,6 +104,8 @@ impl Default for Limits {
             receive_maximum: u16::MAX,
             max_keepalive: None,
             send_topic_aliases: false,
+            maximum_qos: QoS::ExactlyOnce,
+            retain_available: true,
         }
     }
 }
@@ -711,6 +718,10 @@ where
             }
         }
 
+        if let Some(reason) = self.refused_will(&connect_packet) {
+            return self.reject_connect(&connect_packet, reason).await;
+        }
+
         // MQTT 3.x servers must reject a zero-length client id unless the
         // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
         if connect_packet.payload.client_id.is_empty()
@@ -941,6 +952,22 @@ where
             .write_packet(ControlPacket::ConnAck(connack))
             .await;
         Ok(())
+    }
+
+    /// Why a will the broker can't honour is refused [MQTT-3.2.2-12]
+    /// [MQTT-3.2.2-13]
+    fn refused_will(&self, connect_packet: &ConnectPacket) -> Option<ReasonCode> {
+        let flags = &connect_packet.flags;
+        if !flags.will_flag {
+            return None;
+        }
+        if flags.will_qos as u8 > self.limits.maximum_qos as u8 {
+            return Some(ReasonCode::QoSNotSupported);
+        }
+        if flags.will_retain && !self.limits.retain_available {
+            return Some(ReasonCode::RetainNotSupported);
+        }
+        None
     }
 
     async fn reject_connect(

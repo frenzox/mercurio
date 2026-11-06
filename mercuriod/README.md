@@ -88,6 +88,13 @@ receive_maximum = 65535
 # alias support they don't implement.
 # send_topic_aliases = true
 
+# Highest QoS clients may publish and subscribe with; higher subscriptions
+# are downgraded, higher publishes cost the connection
+# max_qos = 2
+
+# Set to false to refuse retained messages
+# retain_available = true
+
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
 # [server.redirect]

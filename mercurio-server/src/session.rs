@@ -19,7 +19,7 @@ use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
-        MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
+        MaximumQoS, MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
         ServerKeepAlive, SharedSubscriptionAvailable, SubscriptionIdentifier,
         SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
         WildcardSubscriptionAvailable,
@@ -234,6 +234,9 @@ struct State {
     /// Aliases this connection assigned to topics sent to the client
     outgoing_aliases: HashMap<String, u16>,
     send_topic_aliases: bool,
+    /// Highest QoS the client may use, as advertised in CONNACK
+    maximum_qos: QoS,
+    retain_available: bool,
     /// QoS 2 messages the client may have awaiting PUBREL, as advertised
     receive_maximum: u16,
     /// Will message to be published on abnormal disconnect
@@ -289,6 +292,8 @@ impl Session {
                     topic_alias_maximum: 0,
                     outgoing_aliases: HashMap::new(),
                     send_topic_aliases: false,
+                    maximum_qos: QoS::ExactlyOnce,
+                    retain_available: true,
                     receive_maximum: u16::MAX,
                     will_message,
                     auth_exchange: None,
@@ -396,6 +401,8 @@ impl Session {
             session.topic_aliases.clear();
             session.outgoing_aliases.clear();
             session.send_topic_aliases = limits.send_topic_aliases;
+            session.maximum_qos = limits.maximum_qos;
+            session.retain_available = limits.retain_available;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
 
@@ -443,7 +450,10 @@ impl Session {
                     },
                     // Spelled out even where absence means the same, for
                     // clients and tools that inspect them
-                    retain_available: Some(RetainAvailable::new(true)),
+                    retain_available: Some(RetainAvailable::new(limits.retain_available)),
+                    // Absent means QoS 2; only 0 and 1 may be sent
+                    maximum_qos: (limits.maximum_qos != QoS::ExactlyOnce)
+                        .then(|| MaximumQoS::new(limits.maximum_qos as u8)),
                     wildcard_subscription_available: Some(WildcardSubscriptionAvailable::new(true)),
                     subscription_identifier_available: Some(SubscriptionIdentifierAvailable::new(
                         true,
@@ -493,6 +503,18 @@ impl Session {
                 session
                     .topic_aliases
                     .insert(alias, packet.topic_name.clone());
+            }
+        }
+
+        {
+            let session = self.shared.state.lock().await;
+            // [MQTT-3.2.2-11]
+            if packet.qos_level as u8 > session.maximum_qos as u8 {
+                return Err(ReasonCode::QoSNotSupported.into());
+            }
+            // [MQTT-3.2.2-14]
+            if packet.retain && !session.retain_available {
+                return Err(ReasonCode::RetainNotSupported.into());
             }
         }
 
@@ -842,7 +864,11 @@ impl Session {
                 }
             }
 
-            let granted_qos = sub.subs_opt.qos;
+            let granted_qos = if sub.subs_opt.qos as u8 > session.maximum_qos as u8 {
+                session.maximum_qos
+            } else {
+                sub.subs_opt.qos
+            };
             let subscription = StoredSubscription {
                 topic_filter: sub.topic_filter.clone(),
                 qos: granted_qos,

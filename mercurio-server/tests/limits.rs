@@ -194,3 +194,69 @@ async fn clients_are_redirected_when_configured() {
         [0x20, 0x02, 0x00, 0x03]
     );
 }
+
+#[tokio::test]
+async fn maximum_qos_is_advertised_and_enforced() {
+    let addr = start_broker(Limits {
+        maximum_qos: mercurio_core::qos::QoS::AtLeastOnce,
+        ..Default::default()
+    })
+    .await;
+
+    let (mut stream, connack) = connect(addr, b'q').await;
+    // Maximum QoS property (0x24) carrying 1
+    assert!(connack.windows(2).any(|w| w == [0x24, 0x01]));
+
+    // SUBSCRIBE to "t" asking for QoS 2 is granted QoS 1
+    stream
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x02])
+        .await
+        .unwrap();
+    let mut suback = [0u8; 6];
+    stream.read_exact(&mut suback).await.unwrap();
+    assert_eq!(suback, [0x90, 0x04, 0x00, 0x01, 0x00, 0x01]);
+
+    // A QoS 2 PUBLISH costs the connection: DISCONNECT, QoS Not Supported
+    stream
+        .write_all(&[0x34, 0x06, 0x00, 0x01, b't', 0x00, 0x01, 0x00])
+        .await
+        .unwrap();
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x9b
+    );
+}
+
+#[tokio::test]
+async fn unavailable_retain_is_advertised_and_enforced() {
+    let addr = start_broker(Limits {
+        retain_available: false,
+        ..Default::default()
+    })
+    .await;
+
+    let (mut stream, connack) = connect(addr, b'r').await;
+    // Retain Available property (0x25) carrying 0
+    assert!(connack.windows(2).any(|w| w == [0x25, 0x00]));
+
+    // A retained PUBLISH: DISCONNECT, Retain Not Supported
+    stream
+        .write_all(&[0x31, 0x04, 0x00, 0x01, b't', 0x00])
+        .await
+        .unwrap();
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x9a
+    );
+
+    // A retained will is refused in CONNACK
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x15, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x26, 0x00, 0x3c, 0x00, 0x00,
+            0x01, b'w', 0x00, 0x00, 0x01, b'x', 0x00, 0x01, b'y',
+        ])
+        .await
+        .unwrap();
+    assert_eq!(common::read_connack(&mut stream).await[3], 0x9a);
+}
