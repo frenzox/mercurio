@@ -66,6 +66,10 @@ max_queued_messages = 10000
 # Queued messages beyond which QoS 0 messages are dropped
 max_queued_qos0_messages = 1000
 
+# Payload bytes that may wait for one client before further messages are
+# dropped, whatever their QoS (unlimited by default)
+# max_queued_bytes = 104857600
+
 # Seconds a new connection has to complete TLS and send CONNECT
 connect_timeout = 10
 
