@@ -1,5 +1,6 @@
 use std::{future::Future, net::SocketAddr, sync::Arc};
 
+use crate::error::ServerError;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -239,24 +240,32 @@ where
 }
 
 /// Run the MQTT broker with plain TCP connections.
-pub async fn run(listener: TcpListener, shutdown: impl Future) {
+pub async fn run(
+    listener: TcpListener,
+    shutdown: impl Future,
+) -> std::result::Result<(), ServerError> {
     run_with_config(listener, ServerConfig::default(), shutdown).await
 }
 
 /// Run the MQTT broker with the given configuration, keeping its state in
 /// memory.
-pub async fn run_with_config(listener: TcpListener, config: ServerConfig, shutdown: impl Future) {
+pub async fn run_with_config(
+    listener: TcpListener,
+    config: ServerConfig,
+    shutdown: impl Future,
+) -> std::result::Result<(), ServerError> {
     run_with_storage(listener, config, Arc::new(MemoryStore::new()), shutdown).await
 }
 
 /// Run the MQTT broker with the given configuration, keeping sessions,
-/// retained messages, wills and in-flight messages in `storage`.
+/// retained messages, wills and in-flight messages in `storage`. Fails
+/// without serving anyone if the configuration can't be used.
 pub async fn run_with_storage<St: MqttStore + 'static>(
     listener: TcpListener,
     config: ServerConfig,
     storage: Arc<St>,
     shutdown: impl Future,
-) {
+) -> std::result::Result<(), ServerError> {
     let ServerConfig {
         tls: tls_config,
         auth: auth_config,
@@ -273,16 +282,11 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 
     // Build TLS acceptor if configured
     let tls_acceptor = match tls_config {
-        Some(config) => match config.build_acceptor() {
-            Ok(acceptor) => {
-                info!("TLS enabled");
-                Some(acceptor)
-            }
-            Err(e) => {
-                error!("Failed to configure TLS: {}", e);
-                return;
-            }
-        },
+        Some(config) => {
+            let acceptor = config.build_acceptor()?;
+            info!("TLS enabled");
+            Some(acceptor)
+        }
         None => {
             debug!("TLS not configured, using plain TCP");
             None
@@ -350,6 +354,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     {
         warn!("Connections still open after waiting to shut down");
     }
+    Ok(())
 }
 
 impl<St: MqttStore + 'static> Listener<St> {
