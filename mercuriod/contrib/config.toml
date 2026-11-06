@@ -64,6 +64,13 @@ enabled = false
 # key_path = "/etc/mercurio/server.key"
 # Require clients to present a certificate signed by this CA (mutual TLS)
 # ca_path = "/etc/mercurio/ca.crt"
+# Reject client certificates revoked in these CRLs (PEM); needs ca_path
+# crl_path = "/etc/mercurio/crl.pem"
+# Use the client certificate's Common Name as the user name, instead of
+# the user name and password the client sends; needs ca_path
+# identity_as_username = false
+# Oldest TLS version accepted: "1.2" or "1.3"
+# min_version = "1.2"
 
 [logging]
 # Log level: trace, debug, info, warn, error

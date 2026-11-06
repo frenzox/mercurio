@@ -5,7 +5,7 @@ use std::{path::Path, time::Duration};
 use mercurio_server::{
     queue::QueueLimits,
     server::{Limits, Transport},
-    tls::TlsConfig,
+    tls::{TlsConfig, TlsVersion},
 };
 
 use serde::Deserialize;
@@ -259,6 +259,26 @@ pub struct TlsServerConfig {
 
     /// Optional path to CA certificate for client authentication (mTLS)
     pub ca_path: Option<String>,
+
+    /// Revocation lists to check client certificates against
+    pub crl_path: Option<String>,
+
+    /// Oldest TLS version accepted: "1.2" or "1.3"
+    #[serde(default)]
+    pub min_version: MinTlsVersion,
+
+    /// Use the client certificate's Common Name as the user name
+    #[serde(default)]
+    pub identity_as_username: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub enum MinTlsVersion {
+    #[default]
+    #[serde(rename = "1.2")]
+    Tls12,
+    #[serde(rename = "1.3")]
+    Tls13,
 }
 
 impl TlsServerConfig {
@@ -279,6 +299,12 @@ impl TlsServerConfig {
         if let Some(ca_path) = &self.ca_path {
             tls = tls.with_client_auth(ca_path.clone());
         }
+        tls.crl_path = self.crl_path.clone();
+        tls.min_version = match self.min_version {
+            MinTlsVersion::Tls12 => TlsVersion::Tls12,
+            MinTlsVersion::Tls13 => TlsVersion::Tls13,
+        };
+        tls.identity_as_username = self.identity_as_username;
         Ok(Some(tls))
     }
 }

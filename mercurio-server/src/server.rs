@@ -42,7 +42,7 @@ use crate::{
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
-    tls::TlsConfig,
+    tls::{common_name, TlsConfig},
     websocket,
 };
 
@@ -183,15 +183,21 @@ struct Endpoint {
     listener: TcpListener,
     transport: Transport,
     tls_acceptor: Option<TlsAcceptor>,
+    identity_as_username: bool,
 }
 
 impl Endpoint {
     fn new(config: ListenerConfig) -> std::result::Result<Self, ServerError> {
+        let identity_as_username = config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.identity_as_username);
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             listener: config.listener,
             transport: config.transport,
             tls_acceptor,
+            identity_as_username,
         })
     }
 }
@@ -206,6 +212,9 @@ struct HandlerParts<St: MqttStore + 'static> {
     policy: Arc<ConnectPolicy>,
     limits: Limits,
     stats: Arc<Stats>,
+    /// The client certificate's Common Name, when it stands in for the
+    /// user name
+    cert_identity: Option<String>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -241,6 +250,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             policy: self.policy,
             limits: self.limits,
             stats: self.stats,
+            cert_identity: self.cert_identity,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -303,6 +313,7 @@ where
     policy: Arc<ConnectPolicy>,
     stats: Arc<Stats>,
     limits: Limits,
+    cert_identity: Option<String>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -456,6 +467,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 policy: Arc::clone(&self.policy),
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
+                cert_identity: None,
             };
             let (socket, endpoint) = match accepted {
                 Accepted::Tcp(socket, endpoint) => (socket, endpoint),
@@ -473,6 +485,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             let transport = self.endpoints[endpoint].transport;
             let tls_acceptor = self.endpoints[endpoint].tls_acceptor.clone();
+            let identity_as_username = self.endpoints[endpoint].identity_as_username;
 
             tokio::spawn(async move {
                 let _slot = slot;
@@ -482,6 +495,16 @@ impl<St: MqttStore + 'static> Listener<St> {
                 match time::timeout(parts.limits.connect_timeout, acceptor.accept(socket)).await {
                     Ok(Ok(tls_stream)) => {
                         debug!("TLS handshake completed for {:?}", peer_addr);
+                        let mut parts = parts;
+                        if identity_as_username {
+                            let certs = tls_stream.get_ref().1.peer_certificates();
+                            parts.cert_identity =
+                                certs.and_then(|c| c.first()).and_then(common_name);
+                            if parts.cert_identity.is_none() {
+                                warn!("No Common Name in the certificate of {:?}", peer_addr);
+                                return;
+                            }
+                        }
                         parts.serve(tls_stream, transport, peer_addr).await;
                     }
                     Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
@@ -631,7 +654,10 @@ where
 
         // MQTT 5 enhanced authentication replaces the user name and password
         // check when the client asks for it
-        if let Some(method) = authentication_method {
+        if let Some(identity) = self.cert_identity.clone() {
+            // Verified by the TLS handshake, in place of any credentials
+            verified_user = Some(identity);
+        } else if let Some(method) = authentication_method {
             match self.authenticate_enhanced(&connect_packet, &method).await? {
                 Some(username) => verified_user = username,
                 None => return Ok(()),
