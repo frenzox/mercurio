@@ -182,6 +182,9 @@ pub struct ListenerConfig {
     /// Replaces the broker's authentication and access control for the
     /// listener's clients.
     pub auth: Option<AuthConfig>,
+    /// Connections beyond this many on this listener are closed right after
+    /// being accepted, on top of the broker-wide limit.
+    pub max_connections: Option<usize>,
 }
 
 impl ListenerConfig {
@@ -195,6 +198,7 @@ impl ListenerConfig {
             proxy_protocol: false,
             mount_point: None,
             auth: None,
+            max_connections: None,
         }
     }
 }
@@ -257,6 +261,8 @@ pub enum Transport {
 struct Endpoint {
     listener: Socket,
     settings: EndpointSettings,
+    /// One permit per allowed concurrent connection, when limited
+    connection_slots: Option<Arc<Semaphore>>,
 }
 
 /// How the connections of a listener are served.
@@ -279,6 +285,9 @@ impl Endpoint {
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             listener: config.listener,
+            connection_slots: config
+                .max_connections
+                .map(|max| Arc::new(Semaphore::new(max))),
             settings: EndpointSettings {
                 transport: config.transport,
                 tls_acceptor,
@@ -309,14 +318,14 @@ struct HandlerParts<St: MqttStore + 'static> {
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
     /// Serves a connection accepted on a listener, after the PROXY header
-    /// and the TLS handshake if the listener has them. `_slot` is held for
+    /// and the TLS handshake if the listener has them. `_slots` are held for
     /// as long as it runs.
     async fn serve_accepted<S>(
         mut self,
         mut socket: S,
         settings: EndpointSettings,
         mut peer_addr: Option<SocketAddr>,
-        _slot: Option<OwnedSemaphorePermit>,
+        _slots: [Option<OwnedSemaphorePermit>; 2],
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -595,6 +604,12 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Tcp(socket, _) => socket.peer_addr().ok(),
                 _ => None,
             };
+            let endpoint = match &accepted {
+                Accepted::Tcp(_, endpoint) => Some(*endpoint),
+                #[cfg(unix)]
+                Accepted::Unix(_, endpoint) => Some(*endpoint),
+                Accepted::Local(_) => None,
+            };
 
             // Held by the connection's task for as long as it runs
             let slot = match &self.connection_slots {
@@ -607,6 +622,21 @@ impl<St: MqttStore + 'static> Listener<St> {
                 },
                 None => None,
             };
+            let listener_slots = endpoint.and_then(|i| self.endpoints[i].connection_slots.clone());
+            let listener_slot = match listener_slots {
+                Some(slots) => match slots.try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        warn!(
+                            "Listener connection limit reached, refusing {:?}",
+                            peer_addr
+                        );
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let slots = [slot, listener_slot];
 
             info!("Got a connection: {:?}", peer_addr);
 
@@ -625,12 +655,12 @@ impl<St: MqttStore + 'static> Listener<St> {
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
-                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slot));
+                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slots));
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
-                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slot));
+                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slots));
                 }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
@@ -638,7 +668,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         ..parts
                     };
                     tokio::spawn(async move {
-                        let _slot = slot;
+                        let _slots = slots;
                         parts.serve(stream, Transport::Mqtt, None).await;
                     });
                 }

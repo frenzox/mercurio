@@ -159,6 +159,12 @@ pub struct ListenerConfig {
     /// Prefixed to every topic this listener's clients use
     pub mount_point: Option<String>,
 
+    /// Concurrent connections allowed on this listener
+    pub max_connections: Option<usize>,
+
+    /// Only accept connections arriving on this network interface (Linux)
+    pub bind_interface: Option<String>,
+
     /// Authentication and access control for this listener's clients,
     /// replacing `[auth]`
     pub auth: Option<AuthConfig>,
@@ -243,6 +249,9 @@ pub struct ServerConfig {
     /// Port to listen on
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Only accept connections arriving on this network interface (Linux)
+    pub bind_interface: Option<String>,
 
     /// Also serve MQTT over WebSocket on this port
     pub websocket_port: Option<u16>,
@@ -332,6 +341,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            bind_interface: None,
             websocket_port: None,
             sys_interval: default_sys_interval(),
             max_connections: default_max_connections(),
