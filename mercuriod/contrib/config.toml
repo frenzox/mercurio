@@ -130,6 +130,13 @@ allow_anonymous = true
 # Create the file with `mercuriod dynsec-init -f <path>`.
 # dynamic_security = "/var/lib/mercurio/dynamic-security.json"
 
+# Or delegate checks to an HTTP service: a 2xx answer allows
+# [auth.http]
+# user_url = "http://auth.internal/mqtt/user"
+# acl_url = "http://auth.internal/mqtt/acl"
+# timeout_seconds = 5
+# cache_seconds = 30
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.

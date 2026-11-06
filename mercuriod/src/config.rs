@@ -526,6 +526,33 @@ pub struct AuthConfig {
     /// Path to the dynamic security state, managed over
     /// `$CONTROL/dynamic-security/v1`; replaces the password and ACL files
     pub dynamic_security: Option<String>,
+
+    /// Checks delegated to HTTP endpoints
+    pub http: Option<HttpAuthConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpAuthConfig {
+    /// Checks user names and passwords, in place of `password_file`
+    pub user_url: Option<String>,
+
+    /// Checks topic access, in place of `acl_file`
+    pub acl_url: Option<String>,
+
+    #[serde(default = "default_http_timeout")]
+    pub timeout_seconds: u64,
+
+    /// How long ACL answers are reused
+    #[serde(default = "default_http_cache")]
+    pub cache_seconds: u64,
+}
+
+fn default_http_timeout() -> u64 {
+    5
+}
+
+fn default_http_cache() -> u64 {
+    30
 }
 
 impl Default for AuthConfig {
@@ -536,6 +563,7 @@ impl Default for AuthConfig {
             password_file: None,
             acl_file: None,
             dynamic_security: None,
+            http: None,
         }
     }
 }
