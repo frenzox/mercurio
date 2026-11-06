@@ -2,6 +2,7 @@
 
 use std::{path::Path, time::Duration};
 
+use mercurio_core::qos::QoS;
 use mercurio_server::{
     queue::QueueLimits,
     server::{Limits, Transport},
@@ -215,6 +216,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub send_topic_aliases: bool,
 
+    /// Highest QoS clients may publish and subscribe with
+    #[serde(default = "default_max_qos")]
+    pub max_qos: u8,
+
+    /// Whether clients may publish retained messages
+    #[serde(default = "default_retain_available")]
+    pub retain_available: bool,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -238,6 +247,8 @@ impl Default for ServerConfig {
             response_information: None,
             redirect: None,
             send_topic_aliases: false,
+            max_qos: default_max_qos(),
+            retain_available: default_retain_available(),
             tls: TlsServerConfig::default(),
         }
     }
@@ -327,6 +338,14 @@ fn default_port() -> u16 {
     1883
 }
 
+fn default_max_qos() -> u8 {
+    2
+}
+
+fn default_retain_available() -> bool {
+    true
+}
+
 fn default_sys_interval() -> u64 {
     10
 }
@@ -360,8 +379,12 @@ fn default_receive_maximum() -> u16 {
 }
 
 impl ServerConfig {
-    pub fn limits(&self) -> Limits {
-        Limits {
+    pub fn limits(&self) -> Result<Limits, String> {
+        let maximum_qos = QoS::from(self.max_qos);
+        if maximum_qos == QoS::Invalid {
+            return Err(format!("max_qos must be 0, 1 or 2, not {}", self.max_qos));
+        }
+        Ok(Limits {
             connect_timeout: Duration::from_secs(self.connect_timeout),
             max_packet_size: self.max_packet_size,
             queue: QueueLimits {
@@ -373,7 +396,9 @@ impl ServerConfig {
             receive_maximum: self.receive_maximum,
             max_keepalive: self.max_keepalive,
             send_topic_aliases: self.send_topic_aliases,
-        }
+            maximum_qos,
+            retain_available: self.retain_available,
+        })
     }
 }
 
