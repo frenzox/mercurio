@@ -381,6 +381,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         connection.set_mount_point(self.mount_point);
+        connection.set_stats(Arc::clone(&self.stats));
         let mut handler = Handler {
             broker: self.broker,
             session_manager: self.session_manager,

@@ -421,6 +421,17 @@ impl RetainedMessageStore for SqliteStore {
         })
         .await
     }
+
+    async fn count_retained(&self) -> Result<usize> {
+        self.blocking(move |conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM retained_messages", [], |row| {
+                    row.get(0)
+                })?;
+            Ok(count as usize)
+        })
+        .await
+    }
 }
 
 #[async_trait]

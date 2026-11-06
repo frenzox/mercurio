@@ -140,6 +140,10 @@ pub trait RetainedMessageStore: Send + Sync {
 
     /// Clear all retained messages.
     async fn clear_all_retained(&self) -> Result<()>;
+
+    /// How many retained messages are stored, expired ones possibly
+    /// included until they are next looked up.
+    async fn count_retained(&self) -> Result<usize>;
 }
 
 /// Trait for will message storage.

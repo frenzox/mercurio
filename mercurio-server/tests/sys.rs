@@ -51,9 +51,9 @@ async fn statistics(addr: SocketAddr) -> HashMap<String, String> {
 
     let mut buffer = BytesMut::new();
     let mut values = HashMap::new();
-    // Every statistic is retained, so a new subscriber gets all seven
+    // Every statistic is retained, so a new subscriber gets them all
     timeout(Duration::from_secs(2), async {
-        while values.len() < 7 {
+        while values.len() < 28 {
             if ControlPacket::check(&mut buffer).is_ok() {
                 if let ControlPacket::Publish(publish) =
                     ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
@@ -91,6 +91,19 @@ async fn statistics_are_published_under_sys() {
     assert!(["1", "2"].contains(&values["$SYS/broker/clients/connected"].as_str()));
     assert!(values.contains_key("$SYS/broker/uptime"));
     assert!(values.contains_key("$SYS/broker/subscriptions/count"));
+    assert_eq!(values["$SYS/broker/clients/maximum"], "1");
+    assert_eq!(values["$SYS/broker/clients/expired"], "0");
+    // CONNECT and three 8 byte PUBLISH packets
+    assert_eq!(values["$SYS/broker/bytes/received"], "40");
+    // The statistics are retained messages themselves
+    let retained: usize = values["$SYS/broker/retained messages/count"]
+        .parse()
+        .unwrap();
+    assert!(retained >= 1, "{retained}");
+    let load: f64 = values["$SYS/broker/load/messages/received/1min"]
+        .parse()
+        .unwrap();
+    assert!(load > 0.0, "{load}");
 }
 
 #[tokio::test]
