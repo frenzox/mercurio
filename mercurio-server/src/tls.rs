@@ -23,9 +23,19 @@ pub struct TlsConfig {
     pub crl_path: Option<String>,
     /// Oldest TLS version accepted
     pub min_version: TlsVersion,
-    /// Use the Common Name of the client certificate as the client's user
-    /// name, in place of the user name and password; requires `ca_path`
-    pub identity_as_username: bool,
+    /// Take the client's user name from its certificate, in place of the
+    /// user name and password it sends; requires `ca_path`
+    pub username_from_certificate: Option<CertificateName>,
+}
+
+/// What part of a client certificate names the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateName {
+    /// The subject's Common Name, as mosquitto's `use_identity_as_username`
+    CommonName,
+    /// The whole subject in RFC 2253 form, such as `CN=alice,O=Example`, as
+    /// mosquitto's `use_subject_as_username`
+    Subject,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,7 +54,7 @@ impl TlsConfig {
             ca_path: None,
             crl_path: None,
             min_version: TlsVersion::default(),
-            identity_as_username: false,
+            username_from_certificate: None,
         }
     }
 
@@ -56,7 +66,9 @@ impl TlsConfig {
 
     /// Build a TLS acceptor from this configuration.
     pub fn build_acceptor(&self) -> Result<TlsAcceptor, ServerError> {
-        if self.ca_path.is_none() && (self.crl_path.is_some() || self.identity_as_username) {
+        let certificate_options =
+            self.crl_path.is_some() || self.username_from_certificate.is_some();
+        if self.ca_path.is_none() && certificate_options {
             return Err(ServerError::Tls(
                 "Revocation lists and certificate identities need a CA to verify clients with"
                     .to_string(),
@@ -129,11 +141,49 @@ fn load_crls(path: &str) -> Result<Vec<CertificateRevocationListDer<'static>>, S
         .map_err(|e| ServerError::Tls(format!("Failed to read CRLs from '{}': {}", path, e)))
 }
 
-/// The Common Name of a DER certificate's subject.
-pub(crate) fn common_name(cert: &CertificateDer<'_>) -> Option<String> {
+/// The name `part` of a DER certificate gives.
+pub(crate) fn certificate_name(cert: &CertificateDer<'_>, part: CertificateName) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert).ok()?;
-    let cn = cert.subject().iter_common_name().next()?;
-    cn.as_str().ok().map(str::to_string)
+    match part {
+        CertificateName::CommonName => {
+            let cn = cert.subject().iter_common_name().next()?;
+            cn.as_str().ok().map(str::to_string)
+        }
+        CertificateName::Subject => rfc2253(cert.subject()),
+    }
+}
+
+/// A distinguished name as RFC 2253 writes it: last component first,
+/// attributes by their short names, special characters escaped.
+fn rfc2253(name: &x509_parser::x509::X509Name<'_>) -> Option<String> {
+    let registry = x509_parser::objects::oid_registry();
+    let mut components = Vec::new();
+    for rdn in name.iter() {
+        let mut attributes = Vec::new();
+        for attribute in rdn.iter() {
+            let oid = attribute.attr_type();
+            let key = x509_parser::objects::oid2abbrev(oid, registry)
+                .map(str::to_string)
+                .unwrap_or_else(|_| oid.to_id_string());
+            attributes.push(format!("{key}={}", escape(attribute.as_str().ok()?)));
+        }
+        components.push(attributes.join("+"));
+    }
+    components.reverse();
+    Some(components.join(","))
+}
+
+fn escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for (i, c) in value.chars().enumerate() {
+        let leading = i == 0 && (c == ' ' || c == '#');
+        let trailing = i == value.chars().count() - 1 && c == ' ';
+        if leading || trailing || matches!(c, ',' | '+' | '"' | '\\' | '<' | '>' | ';') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 /// Load the first private key, in PKCS#1, PKCS#8 or SEC1 format, from a PEM
@@ -156,9 +206,17 @@ mod tests {
     }
 
     #[test]
+    fn test_rfc2253_escaping() {
+        assert_eq!(escape("Acme, Inc"), "Acme\\, Inc");
+        assert_eq!(escape(" #x+y "), "\\ #x\\+y\\ ");
+        assert_eq!(escape("#tag"), "\\#tag");
+        assert_eq!(escape("plain"), "plain");
+    }
+
+    #[test]
     fn test_client_certificate_options_need_a_ca() {
         let mut config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem");
-        config.identity_as_username = true;
+        config.username_from_certificate = Some(CertificateName::CommonName);
         let Err(ServerError::Tls(message)) = config.build_acceptor() else {
             panic!("accepted identity_as_username without a CA");
         };

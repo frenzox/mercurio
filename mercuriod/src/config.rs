@@ -6,7 +6,7 @@ use mercurio_core::qos::QoS;
 use mercurio_server::{
     queue::QueueLimits,
     server::{Limits, Transport},
-    tls::{TlsConfig, TlsVersion},
+    tls::{CertificateName, TlsConfig, TlsVersion},
 };
 
 use serde::Deserialize;
@@ -351,6 +351,10 @@ pub struct TlsServerConfig {
     /// Use the client certificate's Common Name as the user name
     #[serde(default)]
     pub identity_as_username: bool,
+
+    /// Use the client certificate's whole subject as the user name
+    #[serde(default)]
+    pub subject_as_username: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -385,7 +389,15 @@ impl TlsServerConfig {
             MinTlsVersion::Tls12 => TlsVersion::Tls12,
             MinTlsVersion::Tls13 => TlsVersion::Tls13,
         };
-        tls.identity_as_username = self.identity_as_username;
+        tls.username_from_certificate = match (self.identity_as_username, self.subject_as_username)
+        {
+            (false, false) => None,
+            (true, false) => Some(CertificateName::CommonName),
+            (false, true) => Some(CertificateName::Subject),
+            (true, true) => {
+                return Err("Set identity_as_username or subject_as_username, not both".to_string())
+            }
+        };
         Ok(Some(tls))
     }
 }

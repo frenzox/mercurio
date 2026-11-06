@@ -92,6 +92,8 @@ enabled = false
 # Use the client certificate's Common Name as the user name, instead of
 # the user name and password the client sends; needs ca_path
 # identity_as_username = false
+# Or the whole certificate subject, as in "CN=alice,O=Example,C=PT"
+# subject_as_username = false
 # Oldest TLS version accepted: "1.2" or "1.3"
 # min_version = "1.2"
 
