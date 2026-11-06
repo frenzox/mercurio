@@ -102,6 +102,13 @@ enabled = false
 # key_path = "/etc/mercurio/server.key"
 # Require clients to present a certificate signed by this CA (mutual TLS)
 # ca_path = "/etc/mercurio/ca.crt"
+# Reject client certificates revoked in these CRLs (PEM); needs ca_path
+# crl_path = "/etc/mercurio/crl.pem"
+# Use the client certificate's Common Name as the user name, instead of
+# the user name and password the client sends; needs ca_path
+# identity_as_username = false
+# Oldest TLS version accepted: "1.2" or "1.3"
+# min_version = "1.2"
 
 [logging]
 # Log level: trace, debug, info, warn, error
@@ -219,6 +226,11 @@ error and keeps the previous version. Other settings still need a restart.
 Set `enabled = true` under `[server.tls]` with a certificate and key to serve
 TLS on `port`, and on `websocket_port` when it is set. With `ca_path`, the
 broker also requires a client certificate signed by that CA.
+`crl_path` rejects revoked client certificates. With
+`identity_as_username`, the certificate's Common Name becomes the client's
+user name: it counts as authenticated, and `user` rules in `acl_file`
+apply to it. The user name and password in CONNECT are then ignored.
+`min_version = "1.3"` refuses TLS 1.2.
 
 ### WebSocket
 

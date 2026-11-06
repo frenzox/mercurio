@@ -26,6 +26,7 @@ uuid = { version = "1.2.2", features = ["v4"] }
 mercurio-core = { path = "../mercurio-core", default-features = false }
 mercurio-packets = { path = "../mercurio-packets", default-features = false }
 mercurio-storage = { path = "../mercurio-storage", default-features = false }
+x509-parser = "0.18"
 
 [dev-dependencies]
 mercurio-storage = { path = "../mercurio-storage", features = ["sqlite"] }
