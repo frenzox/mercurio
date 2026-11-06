@@ -558,6 +558,14 @@ pub struct LoggingConfig {
 
     /// Append logs to this file instead of writing them to standard output
     pub file: Option<String>,
+
+    /// Send logs to the local syslog daemon instead
+    #[serde(default)]
+    pub syslog: bool,
+
+    /// Log clients connecting and disconnecting
+    #[serde(default = "default_true")]
+    pub connection_messages: bool,
 }
 
 impl Default for LoggingConfig {
@@ -565,6 +573,8 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             file: None,
+            syslog: false,
+            connection_messages: true,
         }
     }
 }

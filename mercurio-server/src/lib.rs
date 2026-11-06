@@ -13,3 +13,7 @@ mod sys;
 pub mod tls;
 mod topic_tree;
 mod websocket;
+
+/// Tracing target of the messages logged when clients connect and
+/// disconnect, so they can be filtered out on busy brokers.
+pub const CONNECTIONS: &str = "mercurio::connections";

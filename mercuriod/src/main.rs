@@ -25,6 +25,8 @@ mod credentials;
 mod dynsec;
 mod http_auth;
 mod reload;
+#[cfg(unix)]
+mod syslog;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
@@ -128,9 +130,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.logging.level
     };
 
-    let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    match &config.logging.file {
-        Some(path) => {
+    let mut filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    if !config.logging.connection_messages {
+        filter = filter.add_directive(
+            format!("{}=off", mercurio_server::CONNECTIONS)
+                .parse()
+                .expect("valid directive"),
+        );
+    }
+    #[cfg(unix)]
+    let syslog = match config.logging.syslog {
+        true => Some(
+            syslog::Syslog::connect("/dev/log")
+                .map_err(|e| format!("Failed to connect to syslog at /dev/log: {}", e))?,
+        ),
+        false => None,
+    };
+    #[cfg(not(unix))]
+    let syslog: Option<std::io::Sink> = match config.logging.syslog {
+        true => return Err("syslog is only supported on Unix".into()),
+        false => None,
+    };
+    match (syslog, &config.logging.file) {
+        (Some(syslog), _) => fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(syslog)
+            .init(),
+        (None, Some(path)) => {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -142,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
         }
-        None => fmt().with_env_filter(filter).init(),
+        (None, None) => fmt().with_env_filter(filter).init(),
     }
 
     // Determine listen address (CLI overrides config)
