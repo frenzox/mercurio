@@ -260,3 +260,32 @@ async fn unavailable_retain_is_advertised_and_enforced() {
         .unwrap();
     assert_eq!(common::read_connack(&mut stream).await[3], 0x9a);
 }
+
+#[tokio::test]
+async fn persistent_mqtt3_sessions_expire_when_configured() {
+    let addr = start_broker(Limits {
+        persistent_client_expiration: Some(Duration::from_secs(1)),
+        ..Default::default()
+    })
+    .await;
+
+    // MQTT 3.1.1 CONNECT without clean session, client id "p"; returns
+    // whether the session was present
+    let connect = || async {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(&[
+                0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3c, 0x00, 0x01,
+                b'p',
+            ])
+            .await
+            .unwrap();
+        common::read_connack(&mut stream).await[2] == 1
+    };
+
+    assert!(!connect().await);
+    sleep(Duration::from_millis(100)).await;
+    assert!(connect().await, "session gone before it expired");
+    sleep(Duration::from_millis(1500)).await;
+    assert!(!connect().await, "session outlived its expiry");
+}

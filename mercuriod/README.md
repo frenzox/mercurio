@@ -102,6 +102,11 @@ receive_maximum = 65535
 # Only accept client ids starting with one of these
 # clientid_prefixes = ["sensor-", "auto-"]
 
+# Seconds the session of an MQTT 3.x client that connected without clean
+# session outlives its connection; forever when unset, as MQTT 3.x has no
+# session expiry of its own
+# persistent_client_expiration = 604800
+
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
 # [server.redirect]
