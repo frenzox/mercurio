@@ -41,6 +41,12 @@ pub struct ClientIdentity {
 pub trait Authorizer: Send + Sync {
     /// `topic` is a topic name, or a topic filter when subscribing.
     fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool;
+
+    /// Whether clients may publish to `$SYS` topics, which hold the broker's
+    /// own statistics and are refused to everyone else.
+    fn allows_sys_publish(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
