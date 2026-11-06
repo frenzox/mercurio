@@ -28,4 +28,5 @@ bytes = "1.12.1"
 sha2 = "0.11.1"
 base64 = "0.23.1"
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
-ureq = "3.5.1"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = "0.23.46"

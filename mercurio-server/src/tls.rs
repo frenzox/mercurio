@@ -69,7 +69,12 @@ impl TlsConfig {
             TlsVersion::Tls12 => rustls::DEFAULT_VERSIONS,
             TlsVersion::Tls13 => &[&rustls::version::TLS13],
         };
-        let config = ServerConfig::builder_with_protocol_versions(versions);
+        // Named rather than taken from the process default, which rustls
+        // can't pick when other crates enable a second provider
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .map_err(|e| ServerError::Tls(format!("Unsupported TLS versions: {}", e)))?;
 
         let config = if let Some(ref ca_path) = self.ca_path {
             // Enable client certificate authentication
