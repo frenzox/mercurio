@@ -224,6 +224,18 @@ pub struct ServerConfig {
     #[serde(default = "default_retain_available")]
     pub retain_available: bool,
 
+    /// Accept clients that leave their client id for the broker to assign
+    #[serde(default = "default_allow_zero_length_clientid")]
+    pub allow_zero_length_clientid: bool,
+
+    /// Starts the client ids the broker assigns
+    #[serde(default)]
+    pub auto_id_prefix: String,
+
+    /// Only accept client ids starting with one of these, when set
+    #[serde(default)]
+    pub clientid_prefixes: Vec<String>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -249,6 +261,9 @@ impl Default for ServerConfig {
             send_topic_aliases: false,
             max_qos: default_max_qos(),
             retain_available: default_retain_available(),
+            allow_zero_length_clientid: default_allow_zero_length_clientid(),
+            auto_id_prefix: String::new(),
+            clientid_prefixes: Vec::new(),
             tls: TlsServerConfig::default(),
         }
     }
@@ -343,6 +358,10 @@ fn default_max_qos() -> u8 {
 }
 
 fn default_retain_available() -> bool {
+    true
+}
+
+fn default_allow_zero_length_clientid() -> bool {
     true
 }
 

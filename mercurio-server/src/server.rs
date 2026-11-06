@@ -14,6 +14,7 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use mercurio_core::{
     error::Error,
@@ -273,6 +274,13 @@ pub struct ConnectPolicy {
     pub response_information: Option<String>,
     /// Send every client to another server instead of serving it.
     pub redirect: Option<Redirect>,
+    /// Refuse clients that leave their client id for the broker to assign.
+    pub require_client_id: bool,
+    /// Starts the client ids the broker assigns.
+    pub auto_id_prefix: String,
+    /// When not empty, only client ids starting with one of these are
+    /// accepted.
+    pub client_id_prefixes: Vec<String>,
 }
 
 /// Where clients are sent instead of being served.
@@ -641,7 +649,7 @@ where
     St: MqttStore + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    async fn run(&mut self, connect_packet: ConnectPacket) -> Result<()> {
+    async fn run(&mut self, mut connect_packet: ConnectPacket) -> Result<()> {
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
 
@@ -733,6 +741,38 @@ where
                 .await;
         }
 
+        let assigned_client_id = connect_packet.payload.client_id.is_empty();
+        if assigned_client_id && self.policy.require_client_id {
+            return self
+                .reject_connect(&connect_packet, ReasonCode::ClientIdentifierNotValid)
+                .await;
+        }
+        if assigned_client_id {
+            // Unique, so such clients never share a session entry
+            connect_packet.payload.client_id = format!(
+                "{}{}",
+                self.policy.auto_id_prefix,
+                Uuid::new_v4().hyphenated()
+            );
+        }
+        let prefixes = &self.policy.client_id_prefixes;
+        if !prefixes.is_empty()
+            && !prefixes.iter().any(|prefix| {
+                connect_packet
+                    .payload
+                    .client_id
+                    .starts_with(prefix.as_str())
+            })
+        {
+            warn!(
+                "Client id `{}` has none of the allowed prefixes",
+                connect_packet.payload.client_id
+            );
+            return self
+                .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                .await;
+        }
+
         let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
         let client_maximum_packet_size = connect_packet
@@ -742,7 +782,8 @@ where
             .map(|m| m.value);
         let mut expiry = session_expiry(&connect_packet);
 
-        let start_result = self.session_manager.start_session(connect_packet).await?;
+        let mut start_result = self.session_manager.start_session(connect_packet).await?;
+        start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
 
