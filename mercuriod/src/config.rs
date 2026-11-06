@@ -435,12 +435,16 @@ pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
     pub level: String,
+
+    /// Append logs to this file instead of writing them to standard output
+    pub file: Option<String>,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: default_log_level(),
+            file: None,
         }
     }
 }

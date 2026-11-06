@@ -106,7 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    match &config.logging.file {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("Failed to open log file {}: {}", path, e))?;
+            fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        None => fmt().with_env_filter(filter).init(),
+    }
 
     // Determine listen address (CLI overrides config)
     let listen_addr = cli

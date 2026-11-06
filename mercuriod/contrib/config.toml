@@ -92,8 +92,12 @@ enabled = false
 # min_version = "1.2"
 
 [logging]
-# Log level: trace, debug, info, warn, error
+# Log level: trace, debug, info, warn, error. Levels can also be set per
+# module, as in "info,mercurio_server::session=warn"
 level = "info"
+# Append logs to this file instead of standard output. Rotate it with
+# logrotate's copytruncate, as the file stays open
+# file = "/var/log/mercurio/mercuriod.log"
 
 [storage]
 # Where sessions, retained messages, wills and in-flight messages are kept:
