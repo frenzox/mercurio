@@ -38,6 +38,11 @@ list with the defaults, also available as
 [`contrib/config.toml`](contrib/config.toml):
 
 ```toml
+# Merge the *.toml files of this directory, in name order: their tables
+# extend this file's, their [[listeners]] and [[bridges]] are added, and
+# their other values replace this file's
+# include_dir = "/etc/mercurio/conf.d"
+
 [server]
 # Host address to bind to
 # Use 0.0.0.0 to listen on all interfaces
