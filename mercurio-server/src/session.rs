@@ -863,7 +863,7 @@ impl Session {
                 // mosquitto does
                 let filter = parse_shared_subscription(&sub.topic_filter)
                     .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
-                if !authorizer.authorize(&identity, filter, Access::Read) {
+                if !authorizer.authorize(&identity, filter, Access::Subscribe) {
                     warn!(
                         "Client `{}` may not subscribe to `{}`",
                         identity.client_id, sub.topic_filter

@@ -4,7 +4,7 @@
 //!
 //! - `user_url` receives `{"username", "password", "clientid"}`
 //! - `acl_url` receives `{"username", "clientid", "topic", "acc"}`, where
-//!   `acc` is 1 to read and 2 to write
+//!   `acc` is 1 to receive, 2 to publish and 4 to subscribe
 //!
 //! ACL answers are cached for `cache_seconds`, as every message is checked.
 
@@ -96,6 +96,7 @@ impl Authorizer for HttpAuth {
         let acc = match access {
             Access::Read => 1,
             Access::Write => 2,
+            Access::Subscribe => 4,
         };
         let key = (
             client.username.clone(),
