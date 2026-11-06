@@ -122,6 +122,10 @@ level = "info"
 # Append logs to this file instead of standard output. Rotate it with
 # logrotate's copytruncate, as the file stays open
 # file = "/var/log/mercurio/mercuriod.log"
+# Send logs to the local syslog daemon (/dev/log) instead
+# syslog = false
+# Log clients connecting and disconnecting; turn off on busy brokers
+# connection_messages = true
 
 [storage]
 # Where sessions, retained messages, wills and in-flight messages are kept:
