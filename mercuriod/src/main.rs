@@ -11,7 +11,8 @@ use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
 use mercurio_server::server::{
-    AuthConfig as ServerAuthConfig, ConnectPolicy, Redirect, ServerConfig,
+    AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, Redirect, ServerConfig,
+    Transport,
 };
 use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
@@ -159,6 +160,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // The WebSocket listener shares the main listener's TLS settings
+    let listeners = websocket_listener
+        .map(|listener| ListenerConfig {
+            listener,
+            transport: Transport::WebSocket,
+            tls: tls_config.clone(),
+        })
+        .into_iter()
+        .collect();
 
     let acl = match &config.auth.acl_file {
         Some(path) => {
@@ -202,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         limits,
         policy,
-        websocket_listener,
+        listeners,
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };

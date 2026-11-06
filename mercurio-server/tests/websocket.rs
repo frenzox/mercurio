@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::ControlPacket;
-use mercurio_server::server::ServerConfig;
+use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -27,7 +27,11 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
         websocket_listener.local_addr().unwrap(),
     );
     let config = ServerConfig {
-        websocket_listener: Some(websocket_listener),
+        listeners: vec![ListenerConfig {
+            listener: websocket_listener,
+            transport: Transport::WebSocket,
+            tls: None,
+        }],
         ..Default::default()
     };
     tokio::spawn(mercurio_server::server::run_with_config(

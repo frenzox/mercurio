@@ -1,4 +1,9 @@
-use std::{future::Future, net::SocketAddr, sync::Arc};
+use std::{
+    future::{poll_fn, Future},
+    net::SocketAddr,
+    sync::Arc,
+    task::Poll,
+};
 
 use crate::error::ServerError;
 use tokio::{
@@ -100,14 +105,13 @@ impl Default for Limits {
 
 /// Broker configuration.
 pub struct ServerConfig {
-    /// Serve TLS instead of plain TCP when set.
+    /// Serve TLS instead of plain TCP on the main listener when set.
     pub tls: Option<TlsConfig>,
     pub auth: AuthConfig,
     pub limits: Limits,
     pub policy: ConnectPolicy,
-    /// Also serve MQTT over WebSocket on this listener, with TLS if `tls` is
-    /// set.
-    pub websocket_listener: Option<TcpListener>,
+    /// Listeners to serve besides the main one.
+    pub listeners: Vec<ListenerConfig>,
     /// How often to publish statistics under `$SYS/broker/`; never if unset.
     pub sys_interval: Option<Duration>,
 }
@@ -119,17 +123,43 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             limits: Limits::default(),
             policy: ConnectPolicy::default(),
-            websocket_listener: None,
+            listeners: Vec::new(),
             sys_interval: Some(Duration::from_secs(10)),
         }
     }
 }
 
+/// A listener with its own transport and TLS settings.
+pub struct ListenerConfig {
+    pub listener: TcpListener,
+    pub transport: Transport,
+    /// Serve TLS instead of plain TCP when set.
+    pub tls: Option<TlsConfig>,
+}
+
 /// How MQTT is carried on a connection.
-#[derive(Debug, Clone, Copy)]
-enum Transport {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
     Mqtt,
     WebSocket,
+}
+
+/// A listener ready to accept connections.
+struct Endpoint {
+    listener: TcpListener,
+    transport: Transport,
+    tls_acceptor: Option<TlsAcceptor>,
+}
+
+impl Endpoint {
+    fn new(config: ListenerConfig) -> std::result::Result<Self, ServerError> {
+        let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
+        Ok(Self {
+            listener: config.listener,
+            transport: config.transport,
+            tls_acceptor,
+        })
+    }
 }
 
 /// Everything a connection handler needs besides its stream.
@@ -206,14 +236,15 @@ pub struct Redirect {
 }
 
 struct Listener<St: MqttStore + 'static> {
-    listener: TcpListener,
-    websocket_listener: Option<TcpListener>,
+    endpoints: Vec<Endpoint>,
+    /// Where the next accept starts looking, so a busy listener does not
+    /// starve the others
+    next_endpoint: usize,
     broker: Broker<St>,
     session_manager_holder: SessionManagerDropGuard<St>,
     notify_shutdown: broadcast::Sender<()>,
     /// Cloned into every connection handler; see `Handler::_shutdown_complete`
     shutdown_complete: mpsc::Sender<()>,
-    tls_acceptor: Option<TlsAcceptor>,
     auth_config: Arc<AuthConfig>,
     policy: Arc<ConnectPolicy>,
     stats: Arc<Stats>,
@@ -271,7 +302,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         auth: auth_config,
         limits,
         policy,
-        websocket_listener,
+        listeners,
         sys_interval,
     } = config;
     let stats = Arc::new(Stats::default());
@@ -280,24 +311,21 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
 
-    // Build TLS acceptor if configured
-    let tls_acceptor = match tls_config {
-        Some(config) => {
-            let acceptor = config.build_acceptor()?;
-            info!("TLS enabled");
-            Some(acceptor)
-        }
-        None => {
-            debug!("TLS not configured, using plain TCP");
-            None
-        }
+    let main = ListenerConfig {
+        listener,
+        transport: Transport::Mqtt,
+        tls: tls_config,
     };
+    let endpoints = std::iter::once(main)
+        .chain(listeners)
+        .map(Endpoint::new)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let auth_config = Arc::new(auth_config);
 
     let mut server = Listener {
-        listener,
-        websocket_listener,
+        endpoints,
+        next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
         connection_slots: limits
@@ -305,7 +333,6 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
             .map(|max| Arc::new(Semaphore::new(max))),
         notify_shutdown,
         shutdown_complete,
-        tls_acceptor,
         auth_config,
         policy,
         limits,
@@ -360,7 +387,8 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 impl<St: MqttStore + 'static> Listener<St> {
     async fn run(&mut self) {
         loop {
-            let (socket, transport) = self.accept().await;
+            let (socket, endpoint) = self.accept().await;
+            let transport = self.endpoints[endpoint].transport;
             let peer_addr = socket.peer_addr().ok();
 
             // Held by the connection's task for as long as it runs
@@ -387,7 +415,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
             };
-            let tls_acceptor = self.tls_acceptor.clone();
+            let tls_acceptor = self.endpoints[endpoint].tls_acceptor.clone();
 
             tokio::spawn(async move {
                 let _slot = slot;
@@ -482,23 +510,22 @@ impl<St: MqttStore + 'static> Listener<St> {
     /// Waits for the next connection. Errors such as running out of file
     /// descriptors are usually transient, so they are retried with a backoff
     /// rather than shutting the listener down.
-    async fn accept(&mut self) -> (TcpStream, Transport) {
+    async fn accept(&mut self) -> (TcpStream, usize) {
         let mut backoff = Duration::from_millis(10);
 
         loop {
-            let accepted = match &self.websocket_listener {
-                Some(websocket_listener) => tokio::select! {
-                    accepted = self.listener.accept() => accepted.map(|(s, _)| (s, Transport::Mqtt)),
-                    accepted = websocket_listener.accept() => {
-                        accepted.map(|(s, _)| (s, Transport::WebSocket))
+            let accepted = poll_fn(|cx| {
+                let count = self.endpoints.len();
+                for offset in 0..count {
+                    let index = (self.next_endpoint + offset) % count;
+                    if let Poll::Ready(accepted) = self.endpoints[index].listener.poll_accept(cx) {
+                        self.next_endpoint = (index + 1) % count;
+                        return Poll::Ready(accepted.map(|(socket, _)| (socket, index)));
                     }
-                },
-                None => self
-                    .listener
-                    .accept()
-                    .await
-                    .map(|(s, _)| (s, Transport::Mqtt)),
-            };
+                }
+                Poll::Pending
+            })
+            .await;
             match accepted {
                 Ok(accepted) => return accepted,
                 Err(err) => {
