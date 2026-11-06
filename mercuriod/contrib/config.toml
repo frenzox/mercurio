@@ -168,7 +168,7 @@ allow_anonymous = true
 # allow_anonymous = false
 # password_file = "/etc/mercurio/tenant1.passwd"
 
-# Bridges forward topics to and from another MQTT 5 broker
+# Bridges forward topics to and from another broker
 # [[bridges]]
 # name = "cloud"
 # host = "broker.example.com"
@@ -176,9 +176,18 @@ allow_anonymous = true
 # client_id = "mercurio-bridge-cloud"
 # username = "site1"
 # password = "secret"
+# Instead of host and port: brokers tried in turn when one is unreachable
+# addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]
+# "mqttv5" (default) or "mqttv311" for brokers without MQTT 5
+# protocol_version = "mqttv5"
+# Publish "1"/"0", retained, to $SYS/broker/connection/<client id>/state
+# notifications = true
 # [bridges.tls]
 # enabled = true
 # ca_path = "/etc/mercurio/cloud-ca.crt"
+# Client certificate, for brokers that require mutual TLS
+# cert_path = "/etc/mercurio/site1.crt"
+# key_path = "/etc/mercurio/site1.key"
 #
 # Each topic is forwarded "out" (the default), "in" or "both" ways.
 # `pattern` is matched below `local_prefix` here and `remote_prefix` there.

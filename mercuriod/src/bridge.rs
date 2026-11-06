@@ -1,24 +1,35 @@
 //! Bridges: forward topics between this broker and others.
 //!
-//! A bridge is a pair of MQTT 5 clients, one connected to this broker in
+//! A bridge is a pair of MQTT clients, one connected to this broker in
 //! process and one to the remote broker. Each forwards what it receives
 //! through the other. Subscriptions use No Local, so a message a bridge
 //! forwarded is never sent back to it, and loops can't form even when a
-//! topic goes both ways.
+//! topic goes both ways. MQTT 3.1.1 has no No Local, so with such a remote
+//! broker the copies it echoes back are recognised and dropped instead.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
-use mercurio_client::{ConnectOptions, Event, MqttClient, QoS, SubscriptionOptions};
+use bytes::Bytes;
+use mercurio_client::{
+    ConnectOptions, Event, MqttClient, ProtocolVersion, QoS, SubscriptionOptions,
+};
+use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::server::LocalConnector;
 use tracing::{error, info, warn};
 
-use crate::config::{BridgeConfig, Direction};
+use crate::config::{BridgeConfig, BridgeProtocol, Direction};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 // ponytail: fixed, so the remote broker keeps inbound messages through a
 // day of downtime; make it configurable if someone needs another value
 const REMOTE_SESSION_EXPIRY: u32 = 24 * 60 * 60;
+
+/// Messages sent to an MQTT 3.1.1 remote broker remembered to recognise its
+/// echo
+// ponytail: a fixed window; an identical message published on the remote
+// broker right after one was forwarded is taken for the echo and dropped
+const ECHO_WINDOW: usize = 1000;
 
 /// What one side subscribes to, and how the topics it receives are renamed
 /// for the other side.
@@ -77,86 +88,151 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<(), String> 
         .client_id
         .clone()
         .unwrap_or_else(|| format!("mercurio-bridge-{}", config.name));
+    let addresses = addresses(&config)?;
 
+    // Stays connected while the remote broker is unreachable, so messages
+    // to forward wait in its queue meanwhile
     let local_options = ConnectOptions::new("localhost", 0)
         .client_id(client_id.clone())
         .connector(move || local.connect());
 
-    let mut remote_options = ConnectOptions::new(config.host.clone(), config.port)
-        .client_id(client_id)
-        .clean_start(false)
-        .session_expiry(REMOTE_SESSION_EXPIRY)
-        .reconnect(RETRY_DELAY)
-        .tls(config.tls.enabled);
-    if let Some(ca_path) = &config.tls.ca_path {
-        remote_options = remote_options.ca_path(ca_path.clone());
-    }
-    if let Some(username) = &config.username {
-        remote_options = remote_options.username(username.clone());
-    }
-    if let Some(password) = &config.password {
-        remote_options = remote_options.password(password.clone());
-    }
+    let protocol_version = match config.protocol_version {
+        BridgeProtocol::Mqttv5 => ProtocolVersion::V5,
+        BridgeProtocol::Mqttv311 => ProtocolVersion::V3_1_1,
+    };
+    let remote_options = addresses
+        .into_iter()
+        .map(|(host, port)| {
+            let address = format!("{host}:{port}");
+            let mut options = ConnectOptions::new(host, port)
+                .client_id(client_id.clone())
+                .protocol_version(protocol_version)
+                .clean_start(false)
+                .session_expiry(REMOTE_SESSION_EXPIRY)
+                .tls(config.tls.enabled);
+            if let Some(ca_path) = &config.tls.ca_path {
+                options = options.ca_path(ca_path.clone());
+            }
+            if let (Some(cert), Some(key)) = (&config.tls.cert_path, &config.tls.key_path) {
+                options = options.client_cert(cert.clone(), key.clone());
+            }
+            if let Some(username) = &config.username {
+                options = options.username(username.clone());
+            }
+            if let Some(password) = &config.password {
+                options = options.password(password.clone());
+            }
+            (address, options)
+        })
+        .collect();
 
     let bridge = Bridge {
         name: config.name,
+        state_topic: config
+            .notifications
+            .then(|| format!("$SYS/broker/connection/{client_id}/state")),
+        echoes: (protocol_version == ProtocolVersion::V3_1_1).then(|| Mutex::new(VecDeque::new())),
         outbound,
         inbound,
     };
-    tokio::spawn(async move {
-        loop {
-            bridge.run(&local_options, &remote_options).await;
-            tokio::time::sleep(RETRY_DELAY).await;
-        }
-    });
+    tokio::spawn(bridge.run(local_options, remote_options));
     Ok(())
+}
+
+/// The remote brokers to try, in order.
+fn addresses(config: &BridgeConfig) -> Result<Vec<(String, u16)>, String> {
+    if config.addresses.is_empty() {
+        let host = config.host.clone().ok_or(format!(
+            "Bridge {}: needs `host` or `addresses`",
+            config.name
+        ))?;
+        return Ok(vec![(host, config.port)]);
+    }
+    config
+        .addresses
+        .iter()
+        .map(|address| {
+            let (host, port) = address
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse().ok()?)))
+                .ok_or(format!(
+                    "Bridge {}: `{address}` is not host:port",
+                    config.name
+                ))?;
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            Ok((host.to_string(), port))
+        })
+        .collect()
 }
 
 struct Bridge {
     name: String,
+    /// Where the bridge's state is published, `1` when connected
+    state_topic: Option<String>,
+    /// Recently forwarded messages, with an MQTT 3.1.1 remote broker
+    echoes: Option<Mutex<VecDeque<(String, Bytes)>>>,
     outbound: Vec<Route>,
     inbound: Vec<Route>,
 }
 
 impl Bridge {
-    /// Forwards messages until either side's connection is lost for good.
-    async fn run(&self, local_options: &ConnectOptions, remote_options: &ConnectOptions) {
-        let local = Arc::new(self.connect("local", local_options).await);
-        let remote = Arc::new(self.connect("remote", remote_options).await);
-        if !(self.subscribe(&local, &self.outbound).await
-            && self.subscribe(&remote, &self.inbound).await)
-        {
-            let _ = local.disconnect().await;
-            let _ = remote.disconnect().await;
+    /// Forwards messages through the remote brokers, trying them in turn,
+    /// until this broker stops.
+    async fn run(self, local_options: ConnectOptions, remotes: Vec<(String, ConnectOptions)>) {
+        let local = loop {
+            match MqttClient::connect(local_options.clone()).await {
+                Ok(local) => break local,
+                Err(e) => warn!("Bridge {}: connecting locally failed: {}", self.name, e),
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        };
+        if !self.subscribe(&local, &self.outbound).await {
             return;
         }
-        info!("Bridge {} connected", self.name);
 
-        tokio::select! {
-            _ = self.forward(&local, &remote, &self.outbound) => {}
-            _ = self.forward(&remote, &local, &self.inbound) => {}
-        }
-        error!("Bridge {} lost its connection, restarting", self.name);
-        let _ = local.disconnect().await;
-        let _ = remote.disconnect().await;
-    }
-
-    async fn connect(&self, side: &str, options: &ConnectOptions) -> MqttClient {
-        loop {
-            match MqttClient::connect(options.clone()).await {
-                Ok(client) => return client,
-                Err(e) => warn!(
-                    "Bridge {}: connecting to the {} broker failed, retrying in {:?}: {}",
-                    self.name, side, RETRY_DELAY, e
-                ),
+        for (address, options) in remotes.iter().cycle() {
+            let remote = match MqttClient::connect(options.clone()).await {
+                Ok(remote) => remote,
+                Err(e) => {
+                    warn!(
+                        "Bridge {}: connecting to {} failed, trying the next address in {:?}: {}",
+                        self.name, address, RETRY_DELAY, e
+                    );
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            if self.subscribe(&remote, &self.inbound).await {
+                info!("Bridge {} connected to {}", self.name, address);
+                self.notify(&local, "1").await;
+                let local_closed = tokio::select! {
+                    _ = self.forward(&local, &remote, &self.outbound, true) => true,
+                    _ = self.forward(&remote, &local, &self.inbound, false) => false,
+                };
+                if local_closed {
+                    // This broker is stopping
+                    let _ = remote.disconnect().await;
+                    return;
+                }
+                error!("Bridge {} lost its connection", self.name);
+                self.notify(&local, "0").await;
             }
+            let _ = remote.disconnect().await;
             tokio::time::sleep(RETRY_DELAY).await;
         }
     }
 
+    async fn notify(&self, local: &MqttClient, state: &'static str) {
+        if let Some(topic) = &self.state_topic {
+            let _ = local
+                .publish_with_retain(topic, state, QoS::AtLeastOnce, true)
+                .await;
+        }
+    }
+
     /// Subscribes to every route, each tagged with its index plus one as
-    /// subscription identifier, so `forward` knows which route a message
-    /// came through.
+    /// subscription identifier where the broker supports them, so `forward`
+    /// knows which route a message came through.
     async fn subscribe(&self, client: &MqttClient, routes: &[Route]) -> bool {
         for (index, route) in routes.iter().enumerate() {
             let options = SubscriptionOptions {
@@ -186,7 +262,9 @@ impl Bridge {
         true
     }
 
-    async fn forward(&self, from: &MqttClient, to: &MqttClient, routes: &[Route]) {
+    /// Forwards what `from` receives through `to` until `from` closes;
+    /// `outbound` when `to` is the remote broker.
+    async fn forward(&self, from: &MqttClient, to: &MqttClient, routes: &[Route], outbound: bool) {
         while let Some(event) = from.recv().await {
             match event {
                 Event::Message {
@@ -197,12 +275,32 @@ impl Bridge {
                     properties,
                     subscription_ids,
                 } => {
-                    let route = subscription_ids
-                        .first()
-                        .and_then(|id| routes.get((*id as usize).checked_sub(1)?));
+                    // MQTT 3.1.1 brokers send no subscription identifiers
+                    let route = match subscription_ids.first() {
+                        Some(id) => (*id as usize).checked_sub(1).and_then(|i| routes.get(i)),
+                        None => routes
+                            .iter()
+                            .find(|r| topic_matches_filter(&topic, &r.filter)),
+                    };
                     let Some(renamed) = route.and_then(|route| route.rename(&topic)) else {
                         continue;
                     };
+                    if let Some(echoes) = &self.echoes {
+                        let mut echoes = echoes.lock().unwrap();
+                        if outbound {
+                            if echoes.len() == ECHO_WINDOW {
+                                echoes.pop_front();
+                            }
+                            echoes.push_back((renamed.clone(), payload.clone()));
+                        } else if let Some(position) = echoes
+                            .iter()
+                            .position(|(t, p)| *t == topic && *p == payload)
+                        {
+                            // The remote broker sent back what was forwarded
+                            echoes.remove(position);
+                            continue;
+                        }
+                    }
                     let published = to
                         .publish_with_properties(&renamed, payload, qos, retain, properties)
                         .await;
@@ -210,12 +308,7 @@ impl Bridge {
                         warn!("Bridge {}: forwarding `{}` failed: {}", self.name, topic, e);
                     }
                 }
-                Event::Reconnected { session_present } => {
-                    info!("Bridge {} reconnected", self.name);
-                    if !session_present {
-                        self.subscribe(from, routes).await;
-                    }
-                }
+                Event::Reconnected { .. } => {}
                 Event::Disconnected { reason } => {
                     warn!("Bridge {} disconnected: {:?}", self.name, reason);
                 }
@@ -229,6 +322,26 @@ mod tests {
     use super::{routes, Route};
     use crate::config::Config;
     use mercurio_client::QoS;
+
+    #[test]
+    fn test_addresses_replace_host_and_port() {
+        let config: Config = toml::from_str(
+            r#"
+            [[bridges]]
+            name = "cloud"
+            addresses = ["a.example.com:8883", "[2001:db8::1]:1883"]
+            topics = []
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::addresses(&config.bridges[0]).unwrap(),
+            [
+                ("a.example.com".to_string(), 8883),
+                ("2001:db8::1".to_string(), 1883)
+            ]
+        );
+    }
 
     #[test]
     fn test_routes_follow_direction_and_prefixes() {

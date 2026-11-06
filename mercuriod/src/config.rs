@@ -42,10 +42,24 @@ pub struct BridgeConfig {
     /// Names the bridge in logs and in its default client id
     pub name: String,
 
-    pub host: String,
+    pub host: Option<String>,
 
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Remote brokers as `host:port`, tried in turn when one is unreachable;
+    /// replaces `host` and `port`
+    #[serde(default)]
+    pub addresses: Vec<String>,
+
+    /// MQTT version spoken to the remote broker
+    #[serde(default)]
+    pub protocol_version: BridgeProtocol,
+
+    /// Publish the bridge's state, retained, to
+    /// `$SYS/broker/connection/<client id>/state` on this broker
+    #[serde(default = "default_true")]
+    pub notifications: bool,
 
     /// Client id on the remote broker; `mercurio-bridge-{name}` by default
     pub client_id: Option<String>,
@@ -68,6 +82,22 @@ pub struct BridgeTlsConfig {
     /// CA certificate to verify the remote broker with, instead of the
     /// system's root certificates
     pub ca_path: Option<String>,
+
+    /// Client certificate and key (PEM) to authenticate with
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeProtocol {
+    #[default]
+    Mqttv5,
+    Mqttv311,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Topics forwarded through a bridge, as in mosquitto's `topic` option:

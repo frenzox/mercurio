@@ -206,7 +206,7 @@ allow_anonymous = true
 # allow_anonymous = false
 # password_file = "/etc/mercurio/tenant1.passwd"
 
-# Bridges forward topics to and from another MQTT 5 broker
+# Bridges forward topics to and from another broker
 # [[bridges]]
 # name = "cloud"
 # host = "broker.example.com"
@@ -214,9 +214,18 @@ allow_anonymous = true
 # client_id = "mercurio-bridge-cloud"
 # username = "site1"
 # password = "secret"
+# Instead of host and port: brokers tried in turn when one is unreachable
+# addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]
+# "mqttv5" (default) or "mqttv311" for brokers without MQTT 5
+# protocol_version = "mqttv5"
+# Publish "1"/"0", retained, to $SYS/broker/connection/<client id>/state
+# notifications = true
 # [bridges.tls]
 # enabled = true
 # ca_path = "/etc/mercurio/cloud-ca.crt"
+# Client certificate, for brokers that require mutual TLS
+# cert_path = "/etc/mercurio/site1.crt"
+# key_path = "/etc/mercurio/site1.key"
 #
 # Each topic is forwarded "out" (the default), "in" or "both" ways.
 # `pattern` is matched below `local_prefix` here and `remote_prefix` there.
@@ -361,11 +370,19 @@ topics on the way: with `local_prefix = "site/"` and
 `remote_prefix = "plant1/"`, `site/sensors/t1` here is
 `plant1/sensors/t1` there.
 
-The remote broker must support MQTT 5: bridges use No Local
-subscriptions so that forwarded messages never come back. The bridge
+With MQTT 5, bridges use No Local subscriptions so that forwarded
+messages never come back. MQTT 3.1.1 has no No Local, so with
+`protocol_version = "mqttv311"` the bridge recognises the copies the remote
+broker sends back and drops them; an identical message published on the
+remote broker just after one was forwarded is dropped too. With
+`addresses`, the bridge moves on to the next broker whenever it can't
+connect or loses the connection. With `notifications`, the bridge's state
+is published, retained, to `$SYS/broker/connection/<client id>/state`:
+`1` while connected, `0` otherwise. The bridge
 connects to this broker in-process, so authentication and `acl_file` don't
 apply to it. If the remote broker is unreachable, the bridge retries every
-five seconds. Its session there lasts a day, so messages for `in` topics
+five seconds, and messages to forward wait in the bridge's queue on this
+broker, up to `max_queued_messages`. Its session there lasts a day, so messages for `in` topics
 wait for the bridge across short outages.
 
 ### Persistence
