@@ -38,6 +38,7 @@ async fn unusable_tls_on_extra_listener_fails_startup() {
                 "/nonexistent/cert.pem",
                 "/nonexistent/key.pem",
             )),
+            proxy_protocol: false,
         }],
         ..Default::default()
     };
