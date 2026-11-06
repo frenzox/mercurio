@@ -55,6 +55,9 @@ struct QueueState {
     /// Payload bytes of `messages`
     bytes: usize,
     next_sequence: u64,
+    /// Messages dropped since the queue last had room, so a full queue is
+    /// logged once rather than for every message
+    dropped: u64,
     /// Where QoS 1 and 2 messages are recorded while the client is away
     journal: Option<UnboundedSender<JournalEvent>>,
 }
@@ -95,11 +98,21 @@ impl MessageQueue {
             .max_bytes
             .is_some_and(|max| state.bytes + size > max);
         if state.messages.len() >= limit || too_big {
-            warn!(
-                "Message queue full, dropping QoS {} message on `{}`",
-                message.qos as u8, message.topic
-            );
+            if state.dropped == 0 {
+                warn!(
+                    "Message queue full, dropping messages, starting with a QoS {} one on `{}`",
+                    message.qos as u8, message.topic
+                );
+            }
+            state.dropped += 1;
             return;
+        }
+        if state.dropped > 0 {
+            warn!(
+                "Message queue has room again after dropping {} messages",
+                state.dropped
+            );
+            state.dropped = 0;
         }
 
         let sequence = state.next_sequence;
@@ -292,6 +305,8 @@ mod tests {
         let state = queue.state.lock().unwrap();
         let qos: Vec<QoS> = state.messages.iter().map(|(_, m)| m.qos).collect();
         assert_eq!(qos, [QoS::AtMostOnce, QoS::AtMostOnce, QoS::AtLeastOnce]);
+        // The QoS 1 message fitting ended the first episode of drops
+        assert_eq!(state.dropped, 1);
     }
 
     #[tokio::test]
