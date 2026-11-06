@@ -92,6 +92,9 @@ pub struct Limits {
     pub maximum_qos: QoS,
     /// Whether clients may publish retained messages
     pub retain_available: bool,
+    /// How long the persistent session of an MQTT 3.x client outlives its
+    /// connection; forever if unset, as MQTT 3.x has no expiry of its own
+    pub persistent_client_expiration: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -107,6 +110,7 @@ impl Default for Limits {
             send_topic_aliases: false,
             maximum_qos: QoS::ExactlyOnce,
             retain_available: true,
+            persistent_client_expiration: None,
         }
     }
 }
@@ -781,6 +785,9 @@ where
             .and_then(|p| p.maximum_packet_size.as_ref())
             .map(|m| m.value);
         let mut expiry = session_expiry(&connect_packet);
+        if expiry.is_none() && !protocol_version.supports_properties() {
+            expiry = self.limits.persistent_client_expiration;
+        }
 
         let mut start_result = self.session_manager.start_session(connect_packet).await?;
         start_result.assigned_client_id |= assigned_client_id;

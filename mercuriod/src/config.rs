@@ -236,6 +236,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub clientid_prefixes: Vec<String>,
 
+    /// Seconds the persistent session of an MQTT 3.x client outlives its
+    /// connection; forever when unset
+    pub persistent_client_expiration: Option<u64>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -264,6 +268,7 @@ impl Default for ServerConfig {
             allow_zero_length_clientid: default_allow_zero_length_clientid(),
             auto_id_prefix: String::new(),
             clientid_prefixes: Vec::new(),
+            persistent_client_expiration: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -417,6 +422,9 @@ impl ServerConfig {
             send_topic_aliases: self.send_topic_aliases,
             maximum_qos,
             retain_available: self.retain_available,
+            persistent_client_expiration: self
+                .persistent_client_expiration
+                .map(Duration::from_secs),
         })
     }
 }
