@@ -16,6 +16,9 @@ pub struct QueueLimits {
     /// Any message is dropped once this many are queued, so a persistent
     /// session whose client never returns can't grow without bound.
     pub max_messages: usize,
+    /// Any message is dropped once the queued payloads take this many
+    /// bytes, when set.
+    pub max_bytes: Option<usize>,
 }
 
 impl Default for QueueLimits {
@@ -23,6 +26,7 @@ impl Default for QueueLimits {
         Self {
             max_qos0: 1000,
             max_messages: 10_000,
+            max_bytes: None,
         }
     }
 }
@@ -43,6 +47,8 @@ pub(crate) struct MessageQueue {
 struct QueueState {
     /// Messages with their sequence in this queue
     messages: VecDeque<(u64, Message)>,
+    /// Payload bytes of `messages`
+    bytes: usize,
     next_sequence: u64,
     /// Where QoS 1 and 2 messages are recorded while the client is away
     journal: Option<UnboundedSender<JournalEvent>>,
@@ -78,7 +84,12 @@ impl MessageQueue {
         } else {
             self.limits.max_messages
         };
-        if state.messages.len() >= limit {
+        let size = payload_size(&message);
+        let too_big = self
+            .limits
+            .max_bytes
+            .is_some_and(|max| state.bytes + size > max);
+        if state.messages.len() >= limit || too_big {
             warn!(
                 "Message queue full, dropping QoS {} message on `{}`",
                 message.qos as u8, message.topic
@@ -96,6 +107,7 @@ impl MessageQueue {
         {
             let _ = journal.send(JournalEvent::Enqueued(sequence, Box::new(message.clone())));
         }
+        state.bytes += size;
         state.messages.push_back((sequence, message));
         drop(state);
         self.notify.notify_one();
@@ -126,6 +138,7 @@ impl MessageQueue {
         let mut state = self.state.lock().unwrap();
         for (sequence, message) in messages {
             state.next_sequence = state.next_sequence.max(sequence + 1);
+            state.bytes += payload_size(&message);
             state.messages.push_back((sequence, message));
         }
         drop(state);
@@ -151,12 +164,17 @@ impl MessageQueue {
                     Some(0)
                 };
                 if let Some((_, message)) = position.and_then(|p| state.messages.remove(p)) {
+                    state.bytes -= payload_size(&message);
                     return message;
                 }
             }
             self.notify.notified().await;
         }
     }
+}
+
+fn payload_size(message: &Message) -> usize {
+    message.payload.as_ref().map_or(0, |p| p.len())
 }
 
 /// A session's subscription to one topic filter.
@@ -252,6 +270,7 @@ mod tests {
         let queue = MessageQueue::new(QueueLimits {
             max_qos0: 2,
             max_messages: 3,
+            max_bytes: None,
         });
         for _ in 0..2 {
             queue.push(message(QoS::AtMostOnce));
@@ -265,6 +284,25 @@ mod tests {
         let state = queue.state.lock().unwrap();
         let qos: Vec<QoS> = state.messages.iter().map(|(_, m)| m.qos).collect();
         assert_eq!(qos, [QoS::AtMostOnce, QoS::AtMostOnce, QoS::AtLeastOnce]);
+    }
+
+    #[tokio::test]
+    async fn test_byte_limit_counts_queued_payloads() {
+        // Room for two 7 byte payloads
+        let queue = MessageQueue::new(QueueLimits {
+            max_bytes: Some(15),
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            queue.push(message(QoS::AtLeastOnce));
+        }
+        assert_eq!(queue.state.lock().unwrap().messages.len(), 2);
+
+        // Sending one frees its bytes
+        queue.pop(false).await;
+        queue.push(message(QoS::AtLeastOnce));
+        assert_eq!(queue.state.lock().unwrap().messages.len(), 2);
+        assert_eq!(queue.state.lock().unwrap().bytes, 14);
     }
 
     #[tokio::test]

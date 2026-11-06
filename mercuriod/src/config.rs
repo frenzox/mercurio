@@ -197,6 +197,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_queued_qos0_messages")]
     pub max_queued_qos0_messages: usize,
 
+    /// Payload bytes that may wait for one client before further messages
+    /// are dropped; unlimited when unset
+    pub max_queued_bytes: Option<usize>,
+
     /// Seconds a new connection has to send CONNECT
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
@@ -264,6 +268,7 @@ impl Default for ServerConfig {
             max_packet_size: default_max_packet_size(),
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
+            max_queued_bytes: None,
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
@@ -422,6 +427,7 @@ impl ServerConfig {
             queue: QueueLimits {
                 max_qos0: self.max_queued_qos0_messages,
                 max_messages: self.max_queued_messages,
+                max_bytes: self.max_queued_bytes,
             },
             max_connections: Some(self.max_connections),
             topic_alias_maximum: self.max_topic_alias,
