@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{queue::Subscriber, topic_tree::TopicTree};
 use mercurio_core::{message::Message, Result};
@@ -91,11 +91,23 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        let subscribers = self.subscriptions.matching(topic);
-        for subscriber in &subscribers {
-            subscriber.deliver(message.clone(), origin);
+        let matches = self.subscriptions.matching(topic);
+        // A session with overlapping subscriptions gets one copy; shared
+        // subscriptions are delivered on their own
+        let mut by_session: HashMap<u64, Vec<Subscriber>> = HashMap::new();
+        for subscriber in &matches.regular {
+            by_session
+                .entry(subscriber.session_id)
+                .or_default()
+                .push(subscriber.clone());
         }
-        Ok(subscribers.len())
+        for subscriptions in by_session.values() {
+            Subscriber::deliver(subscriptions, message.clone(), origin);
+        }
+        for subscriber in &matches.shared {
+            Subscriber::deliver(std::slice::from_ref(subscriber), message.clone(), origin);
+        }
+        Ok(matches.len())
     }
 }
 
@@ -128,7 +140,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
@@ -191,7 +203,7 @@ mod tests {
             payload: Some(Bytes::new()), // Empty payload
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 

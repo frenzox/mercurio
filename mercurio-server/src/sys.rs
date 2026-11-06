@@ -107,7 +107,7 @@ async fn publish<St: MqttStore>(broker: &Broker<St>, name: &str, value: String) 
         payload: Some(Bytes::from(value)),
         properties: Default::default(),
         expires_at: None,
-        subscription_identifier: None,
+        subscription_identifiers: Vec::new(),
     };
     if let Err(e) = broker.publish(&topic, message).await {
         warn!("Failed to publish `{}`: {}", topic, e);

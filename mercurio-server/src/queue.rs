@@ -172,33 +172,51 @@ pub(crate) struct Subscriber {
 }
 
 impl Subscriber {
-    /// Queues a newly published message, `origin` being the session that
-    /// published it.
-    pub(crate) fn deliver(&self, mut message: Message, origin: Option<u64>) {
+    /// Queues one copy of a newly published message for `subscriptions`,
+    /// all of them one session's and matching the message, `origin` being
+    /// the session that published it. The copy has the highest QoS granted
+    /// [MQTT-3.3.4-2] and the identifiers of every subscription
+    /// [MQTT-3.3.4-4].
+    pub(crate) fn deliver(subscriptions: &[Subscriber], mut message: Message, origin: Option<u64>) {
         // [MQTT-3.8.3-3]
-        if self.no_local && origin == Some(self.session_id) {
+        let matching: Vec<&Subscriber> = subscriptions
+            .iter()
+            .filter(|s| !(s.no_local && origin == Some(s.session_id)))
+            .collect();
+        let Some(first) = matching.first() else {
             return;
-        }
+        };
         // Forwarded messages carry RETAIN only when asked to keep it as
         // published [MQTT-3.3.1-12]
-        if !self.retain_as_published {
+        if !matching.iter().any(|s| s.retain_as_published) {
             message.retain = false;
         }
-        self.queue_message(message);
+        let granted_qos = matching
+            .iter()
+            .map(|s| s.granted_qos)
+            .max_by_key(|qos| *qos as u8)
+            .unwrap_or(QoS::AtMostOnce);
+        let mut identifiers: Vec<u32> = matching
+            .iter()
+            .filter_map(|s| s.subscription_identifier)
+            .collect();
+        identifiers.sort_unstable();
+        identifiers.dedup();
+        first.queue_message(message, granted_qos, identifiers);
     }
 
     /// Queues a retained message sent because of a new subscription.
     pub(crate) fn deliver_retained(&self, message: Message) {
-        self.queue_message(message);
+        let identifiers = self.subscription_identifier.into_iter().collect();
+        self.queue_message(message, self.granted_qos, identifiers);
     }
 
-    /// Queues a message, downgraded to the QoS granted for the subscription
-    /// [MQTT-3.8.4-8].
-    fn queue_message(&self, mut message: Message) {
-        message.subscription_identifier = self.subscription_identifier;
-        if (message.qos as u8) > (self.granted_qos as u8) {
-            message.qos = self.granted_qos;
-            if self.granted_qos == QoS::AtMostOnce {
+    /// Queues a message, downgraded to the QoS granted [MQTT-3.8.4-8].
+    fn queue_message(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) {
+        message.subscription_identifiers = identifiers;
+        if (message.qos as u8) > (granted_qos as u8) {
+            message.qos = granted_qos;
+            if granted_qos == QoS::AtMostOnce {
                 message.packet_id = None;
             }
         }
@@ -225,7 +243,7 @@ mod tests {
             payload: Some(Bytes::from("payload")),
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
