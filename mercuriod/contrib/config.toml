@@ -125,6 +125,11 @@ allow_anonymous = true
 # matched as anonymous.
 # acl_file = "/etc/mercurio/acl"
 
+# Manage clients, roles and access at runtime instead, with the commands of
+# mosquitto's dynamic security plugin; replaces password_file and acl_file.
+# Create the file with `mercuriod dynsec-init -f <path>`.
+# dynamic_security = "/var/lib/mercurio/dynamic-security.json"
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.

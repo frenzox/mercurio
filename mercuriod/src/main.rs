@@ -22,10 +22,12 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod bridge;
 mod config;
 mod credentials;
+mod dynsec;
 mod reload;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
+use dynsec::DynamicSecurity;
 use reload::{Reload, Reloadable};
 
 #[derive(Parser, Debug)]
@@ -65,6 +67,16 @@ enum Commands {
         #[arg(short = 'd', long)]
         delete: bool,
     },
+    /// Create a dynamic security file with an administrator
+    DynsecInit {
+        /// Path of the file to create
+        #[arg(short = 'f', long)]
+        file: String,
+
+        /// User name of the administrator
+        #[arg(short = 'u', long, default_value = "admin")]
+        username: String,
+    },
 }
 
 #[tokio::main]
@@ -82,6 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 add_or_update_user(&file, &username)?;
             }
+            return Ok(());
+        }
+        Some(Commands::DynsecInit { file, username }) => {
+            let password = prompt_new_password(&username)?;
+            DynamicSecurity::init(&file, &username, &password)?;
+            eprintln!("Created `{}` with administrator `{}`", file, username);
             return Ok(());
         }
         None => {}
@@ -179,28 +197,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy_protocol: extra.proxy_protocol,
             mount_point: extra.mount_point.clone(),
             auth: match &extra.auth {
-                Some(auth) => Some(build_auth(auth, &mut reloadable)?),
+                Some(auth) => Some(build_auth(auth, &mut reloadable, None)?),
                 None => None,
             },
             ..ListenerConfig::new(listener, extra.protocol.into())
         });
     }
 
-    let auth_config = build_auth(&config.auth, &mut reloadable)?;
+    let (connector, local_listener) = LocalConnector::new();
+    let auth_config = build_auth(&config.auth, &mut reloadable, Some(&connector))?;
 
-    let local_listener = if config.bridges.is_empty() {
-        None
-    } else {
-        let (connector, local_listener) = LocalConnector::new();
-        for bridge in config.bridges {
-            info!(
-                "Bridging to {}:{} as {}",
-                bridge.host, bridge.port, bridge.name
-            );
-            bridge::spawn(bridge, connector.clone())?;
-        }
-        Some(local_listener)
-    };
+    for bridge in config.bridges {
+        info!(
+            "Bridging to {}:{} as {}",
+            bridge.host, bridge.port, bridge.name
+        );
+        bridge::spawn(bridge, connector.clone())?;
+    }
 
     let server_config = ServerConfig {
         tls: tls_config,
@@ -208,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         policy,
         listeners,
-        local_listener,
+        local_listener: Some(local_listener),
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };
@@ -289,7 +302,26 @@ async fn shutdown_signal() {
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
+    connector: Option<&LocalConnector>,
 ) -> Result<ServerAuthConfig, String> {
+    if let Some(path) = &config.dynamic_security {
+        if config.password_file.is_some() || config.acl_file.is_some() {
+            return Err("dynamic_security replaces password_file and acl_file".to_string());
+        }
+        let connector = connector.ok_or("dynamic_security is only supported in [auth]")?;
+        let security = Arc::new(DynamicSecurity::load(path)?);
+        info!("Loaded dynamic security from {}", path);
+        reloadable.push(security.clone());
+        Arc::clone(&security).serve(connector.clone());
+        return Ok(ServerAuthConfig {
+            require_auth: config.enabled,
+            allow_anonymous: config.allow_anonymous,
+            credential_validator: Some(security.clone()),
+            auth_manager: None,
+            authorizer: Some(security),
+        });
+    }
+
     let authorizer = match &config.acl_file {
         Some(path) => {
             let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
@@ -380,14 +412,7 @@ fn load_password_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std
 
 /// Add or update a user in the password file.
 fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let password = rpassword::prompt_password(format!("Password for `{}`: ", username))?;
-    if password.is_empty() {
-        return Err("Password cannot be empty".into());
-    }
-    let confirm = rpassword::prompt_password("Confirm password: ")?;
-    if password != confirm {
-        return Err("Passwords do not match".into());
-    }
+    let password = prompt_new_password(username)?;
 
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     let hash = Argon2::default()
@@ -401,6 +426,19 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
     Ok(())
+}
+
+/// Asks for a new password twice.
+fn prompt_new_password(username: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let password = rpassword::prompt_password(format!("Password for `{}`: ", username))?;
+    if password.is_empty() {
+        return Err("Password cannot be empty".into());
+    }
+    let confirm = rpassword::prompt_password("Confirm password: ")?;
+    if password != confirm {
+        return Err("Passwords do not match".into());
+    }
+    Ok(password)
 }
 
 /// Delete a user from the password file.

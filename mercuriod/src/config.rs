@@ -492,6 +492,10 @@ pub struct AuthConfig {
     /// Path to a mosquitto-style ACL file restricting which topics each
     /// client may publish and subscribe to
     pub acl_file: Option<String>,
+
+    /// Path to the dynamic security state, managed over
+    /// `$CONTROL/dynamic-security/v1`; replaces the password and ACL files
+    pub dynamic_security: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -501,6 +505,7 @@ impl Default for AuthConfig {
             allow_anonymous: default_allow_anonymous(),
             password_file: None,
             acl_file: None,
+            dynamic_security: None,
         }
     }
 }

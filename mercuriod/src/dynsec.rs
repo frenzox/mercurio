@@ -1,0 +1,575 @@
+//! Dynamic security: clients, roles and access control managed while the
+//! broker runs, with the JSON commands of mosquitto's dynamic security
+//! plugin published to `$CONTROL/dynamic-security/v1`. The state is kept in
+//! a JSON file, saved after every change.
+//!
+//! The broker checks a single read access both when a client subscribes and
+//! when a message is delivered to it, so `subscribePattern`,
+//! `subscribeLiteral` and `publishClientReceive` ACLs all grant or deny that
+//! access. `publishClientSend` ACLs decide publishing.
+
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use argon2::password_hash::SaltString;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+use mercurio_core::topic::topic_matches_filter;
+use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
+use mercurio_server::auth::CredentialValidator;
+use mercurio_server::server::LocalConnector;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tracing::{error, info, warn};
+
+use crate::reload::Reload;
+
+const COMMAND_TOPIC: &str = "$CONTROL/dynamic-security/v1";
+const RESPONSE_TOPIC: &str = "$CONTROL/dynamic-security/v1/response";
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Data {
+    #[serde(default)]
+    default_acl_access: DefaultAccess,
+    #[serde(default)]
+    clients: Vec<Client>,
+    #[serde(default)]
+    roles: Vec<Role>,
+}
+
+/// Access of clients no ACL decides for, anonymous ones included.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DefaultAccess {
+    #[serde(default)]
+    publish_client_send: bool,
+    #[serde(default)]
+    subscribe: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Client {
+    username: String,
+    /// Argon2 hash; a client without one can't log in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Role {
+    rolename: String,
+    #[serde(default)]
+    acls: Vec<Acl>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Acl {
+    acltype: AclType,
+    topic: String,
+    #[serde(default)]
+    priority: i64,
+    allow: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AclType {
+    PublishClientSend,
+    PublishClientReceive,
+    SubscribePattern,
+    SubscribeLiteral,
+}
+
+impl Acl {
+    fn applies(&self, topic: &str, access: Access) -> bool {
+        match (self.acltype, access) {
+            (AclType::PublishClientSend, Access::Write) => topic_matches_filter(topic, &self.topic),
+            (AclType::SubscribeLiteral, Access::Read) => topic == self.topic,
+            (AclType::PublishClientReceive | AclType::SubscribePattern, Access::Read) => {
+                topic_matches_filter(topic, &self.topic)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Data {
+    fn client(&mut self, username: &str) -> Result<&mut Client, String> {
+        self.clients
+            .iter_mut()
+            .find(|c| c.username == username)
+            .ok_or_else(|| "Client not found".to_string())
+    }
+
+    fn role(&mut self, rolename: &str) -> Result<&mut Role, String> {
+        self.roles
+            .iter_mut()
+            .find(|r| r.rolename == rolename)
+            .ok_or_else(|| "Role not found".to_string())
+    }
+
+    fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
+        let client = username.and_then(|u| self.clients.iter().find(|c| c.username == u));
+        let decision = client
+            .into_iter()
+            .flat_map(|client| &client.roles)
+            .filter_map(|rolename| self.roles.iter().find(|r| &r.rolename == rolename))
+            .flat_map(|role| &role.acls)
+            .filter(|acl| acl.applies(topic, access))
+            // The first of the highest priority wins
+            .fold(None::<&Acl>, |best, acl| match best {
+                Some(best) if best.priority >= acl.priority => Some(best),
+                _ => Some(acl),
+            });
+        match decision {
+            Some(acl) => acl.allow,
+            None => match access {
+                Access::Write => self.default_acl_access.publish_client_send,
+                Access::Read => self.default_acl_access.subscribe,
+            },
+        }
+    }
+
+    /// Applies one command. Returns its response data, if any, and whether
+    /// it changed anything.
+    fn apply(&mut self, command: &str, args: &Value) -> Result<(Option<Value>, bool), String> {
+        let text = |name: &str| {
+            args.get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("Invalid/missing {name}"))
+        };
+        match command {
+            "createClient" => {
+                let username = text("username")?;
+                if self.clients.iter().any(|c| c.username == username) {
+                    return Err("Client already exists".to_string());
+                }
+                let roles = rolenames(args.get("roles"));
+                if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
+                    return Err(format!("Role {missing} not found"));
+                }
+                let password = match args.get("password").and_then(Value::as_str) {
+                    Some(password) => Some(hash_password(password)?),
+                    None => None,
+                };
+                self.clients.push(Client {
+                    username,
+                    password,
+                    disabled: false,
+                    roles,
+                });
+                Ok((None, true))
+            }
+            "deleteClient" => {
+                let username = text("username")?;
+                self.client(&username)?;
+                self.clients.retain(|c| c.username != username);
+                Ok((None, true))
+            }
+            "setClientPassword" => {
+                let hash = hash_password(&text("password")?)?;
+                self.client(&text("username")?)?.password = Some(hash);
+                Ok((None, true))
+            }
+            "enableClient" | "disableClient" => {
+                self.client(&text("username")?)?.disabled = command == "disableClient";
+                Ok((None, true))
+            }
+            "addClientRole" => {
+                let rolename = text("rolename")?;
+                self.role(&rolename)?;
+                let client = self.client(&text("username")?)?;
+                if !client.roles.contains(&rolename) {
+                    client.roles.push(rolename);
+                }
+                Ok((None, true))
+            }
+            "removeClientRole" => {
+                let rolename = text("rolename")?;
+                self.client(&text("username")?)?
+                    .roles
+                    .retain(|r| *r != rolename);
+                Ok((None, true))
+            }
+            "getClient" => {
+                let client = self.client(&text("username")?)?;
+                let roles: Vec<Value> = client
+                    .roles
+                    .iter()
+                    .map(|r| json!({ "rolename": r }))
+                    .collect();
+                let data = json!({ "client": {
+                    "username": client.username,
+                    "disabled": client.disabled,
+                    "roles": roles,
+                }});
+                Ok((Some(data), false))
+            }
+            "listClients" => {
+                let names: Vec<&str> = self.clients.iter().map(|c| c.username.as_str()).collect();
+                let data = json!({ "totalCount": names.len(), "clients": names });
+                Ok((Some(data), false))
+            }
+            "createRole" => {
+                let rolename = text("rolename")?;
+                if self.roles.iter().any(|r| r.rolename == rolename) {
+                    return Err("Role already exists".to_string());
+                }
+                let acls = match args.get("acls") {
+                    Some(acls) => serde_json::from_value(acls.clone())
+                        .map_err(|e| format!("Invalid acls: {e}"))?,
+                    None => Vec::new(),
+                };
+                self.roles.push(Role { rolename, acls });
+                Ok((None, true))
+            }
+            "deleteRole" => {
+                let rolename = text("rolename")?;
+                self.role(&rolename)?;
+                self.roles.retain(|r| r.rolename != rolename);
+                for client in &mut self.clients {
+                    client.roles.retain(|r| *r != rolename);
+                }
+                Ok((None, true))
+            }
+            "addRoleACL" => {
+                let acl: Acl = serde_json::from_value(args.clone())
+                    .map_err(|e| format!("Invalid ACL: {e}"))?;
+                let role = self.role(&text("rolename")?)?;
+                role.acls
+                    .retain(|a| !(a.acltype == acl.acltype && a.topic == acl.topic));
+                role.acls.push(acl);
+                Ok((None, true))
+            }
+            "removeRoleACL" => {
+                let acltype: AclType = serde_json::from_value(args["acltype"].clone())
+                    .map_err(|_| "Invalid/missing acltype".to_string())?;
+                let topic = text("topic")?;
+                let role = self.role(&text("rolename")?)?;
+                let before = role.acls.len();
+                role.acls
+                    .retain(|a| !(a.acltype == acltype && a.topic == topic));
+                if role.acls.len() == before {
+                    return Err("ACL not found".to_string());
+                }
+                Ok((None, true))
+            }
+            "getRole" => {
+                let role = self.role(&text("rolename")?)?;
+                Ok((Some(json!({ "role": role })), false))
+            }
+            "listRoles" => {
+                let names: Vec<&str> = self.roles.iter().map(|r| r.rolename.as_str()).collect();
+                let data = json!({ "totalCount": names.len(), "roles": names });
+                Ok((Some(data), false))
+            }
+            "setDefaultACLAccess" => {
+                let acls = args
+                    .get("acls")
+                    .and_then(Value::as_array)
+                    .ok_or("Invalid/missing acls")?;
+                for acl in acls {
+                    let allow = acl.get("allow").and_then(Value::as_bool);
+                    let access = match acl.get("acltype").and_then(Value::as_str) {
+                        Some("publishClientSend") => {
+                            &mut self.default_acl_access.publish_client_send
+                        }
+                        Some("subscribe") => &mut self.default_acl_access.subscribe,
+                        _ => return Err("Invalid/missing acltype".to_string()),
+                    };
+                    *access = allow.ok_or("Invalid/missing allow")?;
+                }
+                Ok((None, true))
+            }
+            "getDefaultACLAccess" => {
+                let access = self.default_acl_access;
+                let data = json!({ "acls": [
+                    { "acltype": "publishClientSend", "allow": access.publish_client_send },
+                    { "acltype": "subscribe", "allow": access.subscribe },
+                ]});
+                Ok((Some(data), false))
+            }
+            _ => Err("Unknown command".to_string()),
+        }
+    }
+}
+
+/// Role names given as `[{"rolename": ...}]`, as mosquitto does.
+fn rolenames(roles: Option<&Value>) -> Vec<String> {
+    roles
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("rolename").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|e| format!("Failed to hash password: {e}"))
+}
+
+/// The dynamic security state, as authorizer and credential validator.
+pub struct DynamicSecurity {
+    path: String,
+    data: RwLock<Data>,
+}
+
+impl DynamicSecurity {
+    pub fn load(path: &str) -> Result<Self, String> {
+        Ok(Self {
+            path: path.to_string(),
+            data: RwLock::new(read(path)?),
+        })
+    }
+
+    /// Writes a new state file with an administrator client, `admin`, whose
+    /// role may send every command and read `$SYS`.
+    pub fn init(path: &str, admin: &str, password: &str) -> Result<(), String> {
+        if Path::new(path).exists() {
+            return Err(format!("{path} already exists"));
+        }
+        let acl = |acltype, topic: &str| Acl {
+            acltype,
+            topic: topic.to_string(),
+            priority: 0,
+            allow: true,
+        };
+        let data = Data {
+            default_acl_access: DefaultAccess::default(),
+            clients: vec![Client {
+                username: admin.to_string(),
+                password: Some(hash_password(password)?),
+                disabled: false,
+                roles: vec!["admin".to_string()],
+            }],
+            roles: vec![Role {
+                rolename: "admin".to_string(),
+                acls: vec![
+                    acl(AclType::PublishClientSend, "$CONTROL/dynamic-security/#"),
+                    acl(AclType::SubscribePattern, "$CONTROL/dynamic-security/#"),
+                    acl(AclType::SubscribePattern, "$SYS/#"),
+                ],
+            }],
+        };
+        write(path, &data)
+    }
+
+    /// Runs a batch of commands, `{"commands": [...]}`, and returns the
+    /// response batch. The file is saved once if any command changed the
+    /// state; if saving fails, the changes are undone.
+    fn handle(&self, request: &[u8]) -> Value {
+        let request: Value = match serde_json::from_slice(request) {
+            Ok(request) => request,
+            Err(e) => return json!({ "responses": [{ "error": format!("Invalid JSON: {e}") }] }),
+        };
+        let commands = request
+            .get("commands")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut data = self.data.write().unwrap();
+        let before = data.clone();
+        let mut changed = false;
+        let mut responses = Vec::new();
+        for args in &commands {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            let mut response = json!({ "command": command });
+            match data.apply(command, args) {
+                Ok((reply, change)) => {
+                    changed |= change;
+                    if let Some(reply) = reply {
+                        response["data"] = reply;
+                    }
+                }
+                Err(e) => response["error"] = Value::String(e),
+            }
+            if let Some(correlation) = args.get("correlationData") {
+                response["correlationData"] = correlation.clone();
+            }
+            responses.push(response);
+        }
+        if changed {
+            if let Err(e) = write(&self.path, &data) {
+                error!("Dynamic security: {e}");
+                *data = before;
+                responses = vec![json!({ "error": "Failed to save the changes" })];
+            }
+        }
+        json!({ "responses": responses })
+    }
+
+    /// Answers commands sent to `$CONTROL/dynamic-security/v1`, through an
+    /// in-process connection to the broker.
+    pub fn serve(self: Arc<Self>, connector: LocalConnector) {
+        let options = ConnectOptions::new("localhost", 0)
+            .client_id("mercurio-dynamic-security")
+            .connector(move || connector.connect());
+        tokio::spawn(async move {
+            let client = loop {
+                match MqttClient::connect(options.clone()).await {
+                    Ok(client) => break client,
+                    Err(e) => warn!("Dynamic security: connecting failed, retrying: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            if let Err(e) = client.subscribe(&[(COMMAND_TOPIC, QoS::AtLeastOnce)]).await {
+                return error!("Dynamic security: subscribing failed: {e}");
+            }
+            info!("Dynamic security listening on {COMMAND_TOPIC}");
+            while let Some(event) = client.recv().await {
+                if let Event::Message { payload, .. } = event {
+                    // Hashing passwords takes a while; keep it off the runtime
+                    let security = Arc::clone(&self);
+                    let handled = tokio::task::spawn_blocking(move || security.handle(&payload));
+                    let Ok(response) = handled.await else {
+                        continue;
+                    };
+                    let response = response.to_string();
+                    let published = client
+                        .publish(RESPONSE_TOPIC, response, QoS::AtLeastOnce)
+                        .await;
+                    if let Err(e) = published {
+                        warn!("Dynamic security: answering failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn read(path: &str) -> Result<Data, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read dynamic security file {path}: {e}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|e| format!("Invalid dynamic security file {path}: {e}"))
+}
+
+/// Replaces the file in one step, so a crash never leaves half of it.
+fn write(path: &str, data: &Data) -> Result<(), String> {
+    let temporary = format!("{path}.new");
+    let contents = serde_json::to_string_pretty(data).expect("serializable");
+    std::fs::write(&temporary, contents)
+        .and_then(|()| std::fs::rename(&temporary, path))
+        .map_err(|e| format!("Failed to write {path}: {e}"))
+}
+
+impl Authorizer for DynamicSecurity {
+    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
+        let data = self.data.read().unwrap();
+        data.authorize(client.username.as_deref(), topic, access)
+    }
+}
+
+impl CredentialValidator for DynamicSecurity {
+    fn validate(&self, username: &str, password: &[u8]) -> bool {
+        // Copied out so Argon2, which is slow on purpose, runs without the lock
+        let hash = {
+            let data = self.data.read().unwrap();
+            let client = data.clients.iter().find(|c| c.username == username);
+            match client
+                .filter(|c| !c.disabled)
+                .and_then(|c| c.password.clone())
+            {
+                Some(hash) => hash,
+                None => return false,
+            }
+        };
+        PasswordHash::new(&hash)
+            .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
+    }
+}
+
+impl Reload for DynamicSecurity {
+    fn reload(&self) -> Result<(), String> {
+        *self.data.write().unwrap() = read(&self.path)?;
+        Ok(())
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(username: &str) -> ClientIdentity {
+        ClientIdentity {
+            client_id: "c".to_string(),
+            username: Some(username.to_string()),
+        }
+    }
+
+    fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
+        let request = json!({ "commands": commands }).to_string();
+        let response = security.handle(request.as_bytes());
+        response["responses"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn test_commands_manage_clients_and_access() {
+        let path = std::env::temp_dir().join(format!("mercuriod-dynsec-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        assert!(security.validate("admin", b"secret"));
+        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "sensor" },
+                { "command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
+                  "topic": "sensors/#", "allow": true },
+                { "command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
+                  "topic": "sensors/secret", "priority": 1, "allow": false },
+                { "command": "createClient", "username": "s1", "password": "pw",
+                  "roles": [{ "rolename": "sensor" }], "correlationData": "42" },
+                { "command": "createClient", "username": "s1" },
+                { "command": "listClients" },
+            ]),
+        );
+        assert!(
+            responses[..4].iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+        assert_eq!(responses[3]["correlationData"], "42");
+        assert_eq!(responses[4]["error"], "Client already exists");
+        assert_eq!(responses[5]["data"]["clients"], json!(["admin", "s1"]));
+
+        let s1 = identity("s1");
+        assert!(security.validate("s1", b"pw"));
+        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
+        assert!(!security.authorize(&s1, "sensors/secret", Access::Write));
+        assert!(!security.authorize(&s1, "sensors/t1", Access::Read));
+        assert!(!security.authorize(&s1, COMMAND_TOPIC, Access::Write));
+
+        run(
+            &security,
+            json!([{ "command": "disableClient", "username": "s1" }]),
+        );
+        assert!(!security.validate("s1", b"pw"));
+
+        // Saved, so a reload or a restart keeps the changes
+        security.reload().unwrap();
+        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
+        std::fs::remove_file(path).unwrap();
+    }
+}
