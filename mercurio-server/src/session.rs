@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use mercurio_core::{
     codec::{Encoder, VariableByteInteger},
-    message::{unix_millis, Message, MessageProperties},
+    message::{unix_millis, Message, MessageOrigin, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
         MaximumQoS, MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
@@ -150,6 +150,19 @@ fn message_properties(properties: Option<&PublishProperties>) -> MessageProperti
 
 /// The PUBLISH properties forwarding a message's application properties,
 /// along with the identifiers of the subscriptions it was delivered through.
+/// Whether the client that published `message` may still publish to its
+/// topic. Messages from the broker itself, such as `$SYS` ones, always may.
+fn publisher_may_write(authorizer: Option<&dyn Authorizer>, message: &Message) -> bool {
+    let (Some(authorizer), Some(origin)) = (authorizer, &message.origin) else {
+        return true;
+    };
+    let publisher = ClientIdentity {
+        client_id: origin.client_id.clone(),
+        username: origin.username.clone(),
+    };
+    authorizer.authorize(&publisher, &message.topic, Access::Write)
+}
+
 fn publish_properties(
     properties: &MessageProperties,
     subscription_identifiers: &[u32],
@@ -237,6 +250,7 @@ struct State {
     /// Highest QoS the client may use, as advertised in CONNACK
     maximum_qos: QoS,
     retain_available: bool,
+    check_retain_source: bool,
     /// QoS 2 messages the client may have awaiting PUBREL, as advertised
     receive_maximum: u16,
     /// Will message to be published on abnormal disconnect
@@ -294,6 +308,7 @@ impl Session {
                     send_topic_aliases: false,
                     maximum_qos: QoS::ExactlyOnce,
                     retain_available: true,
+                    check_retain_source: false,
                     receive_maximum: u16::MAX,
                     will_message,
                     auth_exchange: None,
@@ -403,6 +418,7 @@ impl Session {
             session.send_topic_aliases = limits.send_topic_aliases;
             session.maximum_qos = limits.maximum_qos;
             session.retain_available = limits.retain_available;
+            session.check_retain_source = limits.check_retain_source;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
 
@@ -632,6 +648,18 @@ impl Session {
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
+        // Only retained messages are checked against their publisher later
+        let origin = match packet.retain {
+            true => {
+                let identity = self.identity().await;
+                Some(Arc::new(MessageOrigin {
+                    client_id: identity.client_id,
+                    username: identity.username,
+                }))
+            }
+            false => None,
+        };
+
         // Publish to broker - convert topic to Arc<str> for cheap cloning to subscribers
         let topic: Arc<str> = packet.topic_name.into();
         let properties = message_properties(packet.properties.as_ref());
@@ -645,6 +673,7 @@ impl Session {
             expires_at: Message::expiry_deadline(&properties),
             properties,
             subscription_identifiers: Vec::new(),
+            origin,
         };
 
         let subscribers = broker
@@ -907,6 +936,9 @@ impl Session {
                 };
             if send_retained {
                 for message in retained_messages {
+                    if session.check_retain_source && !publisher_may_write(authorizer, &message) {
+                        continue;
+                    }
                     subscriber.deliver_retained(message);
                 }
             }
@@ -1569,6 +1601,7 @@ mod tests {
             properties: Default::default(),
             expires_at: None,
             subscription_identifiers: Vec::new(),
+            origin: None,
         }
     }
 

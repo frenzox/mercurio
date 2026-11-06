@@ -45,6 +45,11 @@ max_queued_qos0_messages = 1000
 # with a lower one; goes beyond the MQTT specification
 # upgrade_outgoing_qos = false
 
+# Send a retained message to new subscribers only while the client that
+# published it may still publish to its topic, so access revoked in the ACL
+# also stops its retained messages
+# check_retain_source = false
+
 # Seconds a new connection has to complete TLS and send CONNECT
 connect_timeout = 10
 

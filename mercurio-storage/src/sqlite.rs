@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder},
-    message::{unix_millis, Message, MessageProperties},
+    message::{unix_millis, Message, MessageOrigin, MessageProperties},
     qos::QoS,
     topic::topic_matches_filter,
 };
@@ -79,7 +79,9 @@ impl SqliteStore {
                 qos INTEGER NOT NULL,
                 dup INTEGER NOT NULL,
                 properties BLOB NOT NULL,
-                expires_at INTEGER
+                expires_at INTEGER,
+                origin_client_id TEXT,
+                origin_username TEXT
             );
 
             CREATE TABLE IF NOT EXISTS will_messages (
@@ -123,6 +125,17 @@ impl SqliteStore {
                 ON inflight_messages(client_id);
             ",
         )?;
+
+        // Databases created before retained messages kept their publisher
+        let has_origin = conn
+            .prepare("SELECT origin_client_id FROM retained_messages LIMIT 0")
+            .is_ok();
+        if !has_origin {
+            conn.execute_batch(
+                "ALTER TABLE retained_messages ADD COLUMN origin_client_id TEXT;
+                 ALTER TABLE retained_messages ADD COLUMN origin_username TEXT;",
+            )?;
+        }
 
         Ok(())
     }
@@ -341,17 +354,21 @@ impl RetainedMessageStore for SqliteStore {
                     let payload = msg.payload.as_ref().map(|b| b.to_vec());
                     let properties = encode_properties(&msg.properties);
                     let expires_at = msg.expires_at.map(|t| t as i64);
+                    let origin = msg.origin.as_deref();
                     conn.execute(
                         "INSERT OR REPLACE INTO retained_messages
-                         (topic, payload, qos, dup, properties, expires_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                         (topic, payload, qos, dup, properties, expires_at,
+                          origin_client_id, origin_username)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
                             topic,
                             payload,
                             qos_to_int(msg.qos),
                             msg.dup,
                             properties,
-                            expires_at
+                            expires_at,
+                            origin.map(|o| &o.client_id),
+                            origin.and_then(|o| o.username.as_ref()),
                         ],
                     )?;
                 }
@@ -378,7 +395,9 @@ impl RetainedMessageStore for SqliteStore {
             )?;
 
             let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, dup, properties, expires_at FROM retained_messages",
+                "SELECT topic, payload, qos, dup, properties, expires_at,
+                        origin_client_id, origin_username
+                 FROM retained_messages",
             )?;
             let rows = stmt.query_map([], |row| {
                 let topic: String = row.get(0)?;
@@ -387,13 +406,21 @@ impl RetainedMessageStore for SqliteStore {
                 let dup: bool = row.get(3)?;
                 let properties: Vec<u8> = row.get(4)?;
                 let expires_at: Option<i64> = row.get(5)?;
-                Ok((topic, payload, qos, dup, properties, expires_at))
+                let origin_client_id: Option<String> = row.get(6)?;
+                let origin_username: Option<String> = row.get(7)?;
+                let origin = origin_client_id.map(|client_id| {
+                    Arc::new(MessageOrigin {
+                        client_id,
+                        username: origin_username,
+                    })
+                });
+                Ok((topic, payload, qos, dup, properties, expires_at, origin))
             })?;
 
             let mut messages = Vec::new();
 
             for row in rows {
-                let (topic, payload, qos, dup, properties, expires_at) = row?;
+                let (topic, payload, qos, dup, properties, expires_at, origin) = row?;
                 if topic_matches_filter(&topic, &filter) {
                     messages.push(Message {
                         packet_id: None,
@@ -405,6 +432,7 @@ impl RetainedMessageStore for SqliteStore {
                         properties: decode_properties(properties)?,
                         expires_at: expires_at.map(|t| t as u64),
                         subscription_identifiers: Vec::new(),
+                        origin,
                     });
                 }
             }
@@ -707,6 +735,7 @@ impl QueueStore for SqliteStore {
                     properties: decode_properties(row.get(5)?)?,
                     expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
                     subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
+                    origin: None,
                 };
                 Ok((row.get::<_, i64>(0)? as u64, message))
             })?;
@@ -749,7 +778,53 @@ mod tests {
             properties: Default::default(),
             expires_at: None,
             subscription_identifiers: Vec::new(),
+            origin: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_retained_keeps_its_origin() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut message = create_test_message("a/b", "payload");
+        message.origin = Some(Arc::new(MessageOrigin {
+            client_id: "c".into(),
+            username: Some("alice".into()),
+        }));
+        store.store_retained("a/b", Some(message)).await.unwrap();
+        store
+            .store_retained("a/c", Some(create_test_message("a/c", "x")))
+            .await
+            .unwrap();
+
+        let mut retained = store.get_retained("a/+").await.unwrap();
+        retained.sort_by(|a, b| a.topic.cmp(&b.topic));
+        let origin = retained[0].origin.as_deref().unwrap();
+        assert_eq!(origin.client_id, "c");
+        assert_eq!(origin.username.as_deref(), Some("alice"));
+        assert!(retained[1].origin.is_none());
+    }
+
+    #[test]
+    fn test_older_databases_gain_the_origin_columns() {
+        let path = std::env::temp_dir().join(format!("mercurio-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE retained_messages (
+                    topic TEXT PRIMARY KEY, payload BLOB, qos INTEGER NOT NULL,
+                    dup INTEGER NOT NULL, properties BLOB NOT NULL, expires_at INTEGER
+                );",
+            )
+            .unwrap();
+
+        let store = SqliteStore::new(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert!(conn
+            .prepare("SELECT origin_client_id, origin_username FROM retained_messages")
+            .is_ok());
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]

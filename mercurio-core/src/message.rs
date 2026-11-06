@@ -1,7 +1,7 @@
 //! MQTT message types for internal routing.
 
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -35,6 +35,16 @@ pub struct Message {
     pub expires_at: Option<u64>,
     /// Set per delivery: the identifiers of the subscriptions it matched
     pub subscription_identifiers: Vec<u32>,
+    /// The client that published it, when it came from a client
+    pub origin: Option<Arc<MessageOrigin>>,
+}
+
+/// Who published a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageOrigin {
+    pub client_id: String,
+    /// The user name the client verified, if any
+    pub username: Option<String>,
 }
 
 #[cfg(feature = "std")]
