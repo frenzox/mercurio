@@ -8,7 +8,7 @@ use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::ControlPacket;
 use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -146,4 +146,56 @@ async fn text_frames_close_the_connection() {
     })
     .await;
     assert!(next.is_ok(), "connection still open");
+}
+
+#[tokio::test]
+async fn websocket_listeners_serve_files_and_mqtt() {
+    let dir = std::env::temp_dir().join(format!("mercurio-http-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("index.html"), "<h1>hello</h1>").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = websocket_listener.local_addr().unwrap();
+    let config = ServerConfig {
+        listeners: vec![ListenerConfig {
+            http_dir: Some(dir.clone()),
+            ..ListenerConfig::new(websocket_listener, Transport::WebSocket)
+        }],
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let get = |target: &'static str| async move {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        response
+    };
+    let page = get("/").await;
+    assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
+    assert!(page.ends_with("<h1>hello</h1>"));
+    assert!(get("/../secret").await.starts_with("HTTP/1.1 404"));
+
+    // The same listener still speaks MQTT over WebSocket
+    let mut websocket = websocket_connect(addr).await;
+    let mut buffer = BytesMut::new();
+    websocket
+        .send(Message::Binary(Bytes::from_static(&CONNECT)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut websocket, &mut buffer).await,
+        ControlPacket::ConnAck(_)
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
 }

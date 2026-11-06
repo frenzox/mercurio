@@ -1,6 +1,7 @@
 use std::{
     future::{poll_fn, Future},
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     task::Poll,
 };
@@ -42,7 +43,7 @@ use crate::{
     auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
-    proxy,
+    http, proxy,
     queue::QueueLimits,
     session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
@@ -190,6 +191,9 @@ pub struct ListenerConfig {
     /// Connections beyond this many on this listener are closed right after
     /// being accepted, on top of the broker-wide limit.
     pub max_connections: Option<usize>,
+    /// On WebSocket listeners, answer plain HTTP requests with the files of
+    /// this directory.
+    pub http_dir: Option<PathBuf>,
 }
 
 impl ListenerConfig {
@@ -204,6 +208,7 @@ impl ListenerConfig {
             mount_point: None,
             auth: None,
             max_connections: None,
+            http_dir: None,
         }
     }
 }
@@ -279,6 +284,7 @@ struct EndpointSettings {
     proxy_protocol: bool,
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
+    http_dir: Option<Arc<PathBuf>>,
 }
 
 impl Endpoint {
@@ -300,6 +306,7 @@ impl Endpoint {
                 proxy_protocol: config.proxy_protocol,
                 mount_point: config.mount_point,
                 auth: config.auth.map(Arc::new),
+                http_dir: config.http_dir.map(Arc::new),
             },
         })
     }
@@ -319,6 +326,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// user name
     cert_identity: Option<String>,
     mount_point: Option<String>,
+    http_dir: Option<Arc<PathBuf>>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -347,6 +355,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
         let transport = settings.transport;
         self.mount_point = settings.mount_point;
+        self.http_dir = settings.http_dir;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
@@ -382,6 +391,20 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match transport {
             Transport::Mqtt => self.handle(Connection::new(stream)).await,
             Transport::WebSocket => {
+                let stream = match self.http_dir.clone() {
+                    Some(dir) => {
+                        let request = http::serve_or_upgrade(stream, &dir);
+                        match time::timeout(self.limits.connect_timeout, request).await {
+                            Ok(Ok(Some(upgrade))) => upgrade,
+                            Ok(Ok(None)) => return,
+                            Ok(Err(e)) => {
+                                return warn!("HTTP request from {:?} failed: {}", peer_addr, e)
+                            }
+                            Err(_) => return warn!("HTTP request from {:?} timed out", peer_addr),
+                        }
+                    }
+                    None => http::Rewind::new(stream, Vec::new()),
+                };
                 let handshake = websocket::accept(stream);
                 match time::timeout(self.limits.connect_timeout, handshake).await {
                     Ok(Ok(websocket)) => self.handle(Connection::new(websocket)).await,
@@ -656,6 +679,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
+                http_dir: None,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
