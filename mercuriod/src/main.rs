@@ -146,18 +146,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Determine listen address (CLI overrides config)
+    let interface = config.server.bind_interface.as_deref();
     let listen_addr = cli
         .listen
-        .unwrap_or_else(|| format!("{}:{}", config.server.host, config.server.port));
+        .unwrap_or_else(|| address(&config.server.host, config.server.port));
 
     info!("Starting Mercurio MQTT broker on {}", listen_addr);
 
-    let listener = TcpListener::bind(&listen_addr).await?;
+    let listener = bind_tcp(&listen_addr, interface).await?;
 
     let websocket_listener = match config.server.websocket_port {
         Some(port) => {
-            let websocket_addr = format!("{}:{}", config.server.host, port);
-            let websocket_listener = TcpListener::bind(&websocket_addr).await?;
+            let websocket_addr = address(&config.server.host, port);
+            let websocket_listener = bind_tcp(&websocket_addr, interface).await?;
             info!("Serving MQTT over WebSocket on {}", websocket_addr);
             Some(websocket_listener)
         }
@@ -201,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tls: extra.tls.build()?,
             proxy_protocol: extra.proxy_protocol,
             mount_point: extra.mount_point.clone(),
+            max_connections: extra.max_connections,
             auth: match &extra.auth {
                 Some(auth) => Some(build_auth(auth, &mut reloadable, None)?),
                 None => None,
@@ -258,14 +260,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `host:port`, with an IPv6 host in brackets.
+fn address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Listens on `addr`, only through `interface` when given.
+async fn bind_tcp(addr: &str, interface: Option<&str>) -> Result<TcpListener, String> {
+    let failed = |e: std::io::Error| format!("Failed to listen on {}: {}", addr, e);
+    let Some(interface) = interface else {
+        return TcpListener::bind(addr).await.map_err(failed);
+    };
+    let socket_addr = tokio::net::lookup_host(addr)
+        .await
+        .map_err(failed)?
+        .next()
+        .ok_or_else(|| format!("{addr} resolves to no address"))?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(socket_addr),
+        socket2::Type::STREAM,
+        None,
+    )
+    .map_err(failed)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    socket
+        .bind_device(Some(interface.as_bytes()))
+        .map_err(|e| format!("Failed to bind to interface {}: {}", interface, e))?;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    return Err(format!(
+        "bind_interface {interface} is only supported on Linux"
+    ));
+    socket.set_reuse_address(true).map_err(failed)?;
+    socket.set_nonblocking(true).map_err(failed)?;
+    socket.bind(&socket_addr.into()).map_err(failed)?;
+    socket.listen(1024).map_err(failed)?;
+    TcpListener::from_std(socket.into()).map_err(failed)
+}
+
 /// Binds an extra listener, returning it with its address for logs.
 async fn bind_listener(listener: &config::ListenerConfig) -> Result<(Socket, String), String> {
     match (listener.port, &listener.path) {
         (Some(port), None) => {
-            let addr = format!("{}:{}", listener.host, port);
-            let socket = TcpListener::bind(&addr)
-                .await
-                .map_err(|e| format!("Failed to listen on {}: {}", addr, e))?;
+            let addr = address(&listener.host, port);
+            let socket = bind_tcp(&addr, listener.bind_interface.as_deref()).await?;
             Ok((socket.into(), addr))
         }
         #[cfg(unix)]
@@ -500,4 +541,17 @@ fn write_password_file(
         writeln!(file, "{}:{}", username, hash)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address;
+
+    #[test]
+    fn test_ipv6_hosts_are_bracketed() {
+        assert_eq!(address("::", 1883), "[::]:1883");
+        assert_eq!(address("[::1]", 1883), "[::1]:1883");
+        assert_eq!(address("0.0.0.0", 1883), "0.0.0.0:1883");
+        assert_eq!(address("localhost", 1883), "localhost:1883");
+    }
 }

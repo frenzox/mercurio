@@ -13,6 +13,10 @@ host = "127.0.0.1"
 # Port to listen on (default MQTT port is 1883)
 port = 1883
 
+# Only accept connections arriving on this network interface (Linux only).
+# IPv6 hosts, such as "::", work as they are
+# bind_interface = "eth0"
+
 # Also serve MQTT over WebSocket (with TLS when it is enabled) on this port
 # websocket_port = 8080
 
@@ -162,6 +166,14 @@ allow_anonymous = true
 # Unix domain socket, for clients on the same machine
 # [[listeners]]
 # path = "/run/mercurio/mqtt.sock"
+#
+# Any TCP listener may also set max_connections, on top of the broker-wide
+# limit, and bind_interface
+# [[listeners]]
+# host = "0.0.0.0"
+# port = 8884
+# max_connections = 100
+# bind_interface = "eth1"
 #
 # Behind a load balancer that sends the PROXY protocol (v1 or v2), so logs
 # show the clients' own addresses
