@@ -90,6 +90,18 @@ impl MqttClient {
 
     /// Opens the transport and performs the CONNECT handshake.
     async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
+        if let Some(connector) = &options.connector {
+            let stream =
+                (connector.0)().map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+            let mut connection = Connection::new(
+                stream,
+                options.protocol_version,
+                options.maximum_packet_size,
+            );
+            let session = Self::perform_connect(&mut connection, options).await?;
+            return Ok((connection, session));
+        }
+
         let addr = format!("{}:{}", options.host, options.port);
         info!("Connecting to MQTT broker at {}", addr);
         let connect_timeout = Duration::from_secs(options.connect_timeout_secs);

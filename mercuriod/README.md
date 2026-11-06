@@ -142,6 +142,27 @@ allow_anonymous = true
 # [[listeners]]
 # port = 8080
 # protocol = "websocket"
+
+# Bridges forward topics to and from another MQTT 5 broker
+# [[bridges]]
+# name = "cloud"
+# host = "broker.example.com"
+# port = 8883
+# client_id = "mercurio-bridge-cloud"
+# username = "site1"
+# password = "secret"
+# [bridges.tls]
+# enabled = true
+# ca_path = "/etc/mercurio/cloud-ca.crt"
+#
+# Each topic is forwarded "out" (the default), "in" or "both" ways.
+# `pattern` is matched below `local_prefix` here and `remote_prefix` there.
+# [[bridges.topics]]
+# pattern = "sensors/#"
+# direction = "out"
+# qos = 1
+# local_prefix = ""
+# remote_prefix = "site1/"
 ```
 
 ### Authentication
@@ -212,6 +233,22 @@ Each `[[listeners]]` entry serves another port, with its own `protocol`
 setup keeps plain MQTT on localhost in `[server]` and adds a TLS listener on
 `0.0.0.0:8883`. All listeners share sessions, subscriptions and retained
 messages.
+
+### Bridges
+
+A `[[bridges]]` entry connects to another broker and forwards topics between
+the two, like mosquitto's bridges. Each `[[bridges.topics]]` entry
+forwards `pattern` `out`, `in` or `both` ways. The prefixes rename
+topics on the way: with `local_prefix = "site/"` and
+`remote_prefix = "plant1/"`, `site/sensors/t1` here is
+`plant1/sensors/t1` there.
+
+The remote broker must support MQTT 5: bridges use No Local
+subscriptions so that forwarded messages never come back. The bridge
+connects to this broker in-process, so authentication and `acl_file` don't
+apply to it. If the remote broker is unreachable, the bridge retries every
+five seconds. Its session there lasts a day, so messages for `in` topics
+wait for the bridge across short outages.
 
 ### Persistence
 

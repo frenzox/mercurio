@@ -11,14 +11,15 @@ use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
 use mercurio_server::server::{
-    AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, Redirect, ServerConfig,
-    Transport,
+    AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
+    ServerConfig, Transport,
 };
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod bridge;
 mod config;
 mod credentials;
 mod reload;
@@ -203,12 +204,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let local_listener = if config.bridges.is_empty() {
+        None
+    } else {
+        let (connector, local_listener) = LocalConnector::new();
+        for bridge in config.bridges {
+            info!(
+                "Bridging to {}:{} as {}",
+                bridge.host, bridge.port, bridge.name
+            );
+            bridge::spawn(bridge, connector.clone())?;
+        }
+        Some(local_listener)
+    };
+
     let server_config = ServerConfig {
         tls: tls_config,
         auth: auth_config,
         limits,
         policy,
         listeners,
+        local_listener,
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };

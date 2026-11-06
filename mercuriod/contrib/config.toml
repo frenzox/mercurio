@@ -104,3 +104,24 @@ allow_anonymous = true
 # [[listeners]]
 # port = 8080
 # protocol = "websocket"
+
+# Bridges forward topics to and from another MQTT 5 broker
+# [[bridges]]
+# name = "cloud"
+# host = "broker.example.com"
+# port = 8883
+# client_id = "mercurio-bridge-cloud"
+# username = "site1"
+# password = "secret"
+# [bridges.tls]
+# enabled = true
+# ca_path = "/etc/mercurio/cloud-ca.crt"
+#
+# Each topic is forwarded "out" (the default), "in" or "both" ways.
+# `pattern` is matched below `local_prefix` here and `remote_prefix` there.
+# [[bridges.topics]]
+# pattern = "sensors/#"
+# direction = "out"
+# qos = 1
+# local_prefix = ""
+# remote_prefix = "site1/"
