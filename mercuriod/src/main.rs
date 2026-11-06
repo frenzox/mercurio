@@ -160,10 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The WebSocket listener shares the main listener's TLS settings
     let mut listeners: Vec<_> = websocket_listener
         .map(|listener| ListenerConfig {
-            listener: listener.into(),
-            transport: Transport::WebSocket,
             tls: tls_config.clone(),
-            proxy_protocol: false,
+            ..ListenerConfig::new(listener, Transport::WebSocket)
         })
         .into_iter()
         .collect();
@@ -176,10 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             addr
         );
         listeners.push(ListenerConfig {
-            listener,
-            transport: extra.protocol.into(),
             tls: extra.tls.build()?,
             proxy_protocol: extra.proxy_protocol,
+            ..ListenerConfig::new(listener, extra.protocol.into())
         });
     }
 

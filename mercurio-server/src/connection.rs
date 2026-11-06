@@ -7,7 +7,10 @@ use tokio::{
     time,
 };
 
-use mercurio_core::{error::Error, protocol::ProtocolVersion, reason::ReasonCode, Result};
+use mercurio_core::{
+    error::Error, protocol::ProtocolVersion, reason::ReasonCode, topic::parse_shared_subscription,
+    Result,
+};
 use mercurio_packets::ControlPacket;
 
 /// Default capacity for read buffer (8KB)
@@ -37,6 +40,50 @@ where
     protocol_version: ProtocolVersion,
     max_packet_size: usize,
     connect_version: Option<ProtocolVersion>,
+    /// Prefixed to the topics the client uses, and removed from those it is
+    /// sent, so it only sees its part of the topic tree
+    mount_point: Option<String>,
+}
+
+/// Moves the topics a client sent under `mount_point`. Empty names are left
+/// alone: they refer to topic aliases, or are invalid and must stay so.
+fn mount(packet: &mut ControlPacket, mount_point: &str) {
+    let mounted = |topic: &mut String| {
+        if !topic.is_empty() {
+            topic.insert_str(0, mount_point);
+        }
+    };
+    let mounted_filter = |filter: &mut String| {
+        if !filter.starts_with("$share/") {
+            return mounted(filter);
+        }
+        // Inside a shared subscription only the topic filter is mounted;
+        // a malformed one is left for the session to refuse
+        if let Some((share_name, topic_filter)) = parse_shared_subscription(filter) {
+            if !topic_filter.is_empty() {
+                *filter = format!("$share/{share_name}/{mount_point}{topic_filter}");
+            }
+        }
+    };
+    match packet {
+        ControlPacket::Connect(connect) => {
+            if let Some(topic) = &mut connect.payload.will_topic {
+                mounted(topic);
+            }
+        }
+        ControlPacket::Publish(publish) => mounted(&mut publish.topic_name),
+        ControlPacket::Subscribe(subscribe) => {
+            for sub in &mut subscribe.payload {
+                mounted_filter(&mut sub.topic_filter);
+            }
+        }
+        ControlPacket::Unsubscribe(unsubscribe) => {
+            for unsub in &mut unsubscribe.payload {
+                mounted_filter(&mut unsub.topic_filter);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl<S> Connection<S>
@@ -52,7 +99,12 @@ where
             protocol_version: ProtocolVersion::V5,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             connect_version: None,
+            mount_point: None,
         }
+    }
+
+    pub fn set_mount_point(&mut self, mount_point: Option<String>) {
+        self.mount_point = mount_point;
     }
 
     pub fn set_max_packet_size(&mut self, max_packet_size: usize) {
@@ -65,8 +117,11 @@ where
 
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
-            if let Some(e) = self.parse_packet()? {
-                return Ok(Some(e));
+            if let Some(mut packet) = self.parse_packet()? {
+                if let Some(mount_point) = &self.mount_point {
+                    mount(&mut packet, mount_point);
+                }
+                return Ok(Some(packet));
             }
 
             if 0 == self.stream.read_buf(&mut self.read_buffer).await? {
@@ -79,9 +134,17 @@ where
         }
     }
 
-    pub async fn write_packet(&mut self, packet: ControlPacket) -> Result<()> {
+    pub async fn write_packet(&mut self, mut packet: ControlPacket) -> Result<()> {
         // Clear and reuse the write buffer instead of allocating a new one
         self.write_buffer.clear();
+
+        if let (Some(mount_point), ControlPacket::Publish(publish)) =
+            (&self.mount_point, &mut packet)
+        {
+            if let Some(topic) = publish.topic_name.strip_prefix(mount_point.as_str()) {
+                publish.topic_name = topic.to_string();
+            }
+        }
 
         packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
 

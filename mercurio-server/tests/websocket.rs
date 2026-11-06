@@ -27,12 +27,10 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
         websocket_listener.local_addr().unwrap(),
     );
     let config = ServerConfig {
-        listeners: vec![ListenerConfig {
-            listener: websocket_listener.into(),
-            transport: Transport::WebSocket,
-            tls: None,
-            proxy_protocol: false,
-        }],
+        listeners: vec![ListenerConfig::new(
+            websocket_listener,
+            Transport::WebSocket,
+        )],
         ..Default::default()
     };
     tokio::spawn(mercurio_server::server::run_with_config(

@@ -19,10 +19,8 @@ async fn proxied_connections_start_with_a_header() {
     let addr = proxied.local_addr().unwrap();
     let config = ServerConfig {
         listeners: vec![ListenerConfig {
-            listener: proxied.into(),
-            transport: Transport::Mqtt,
-            tls: None,
             proxy_protocol: true,
+            ..ListenerConfig::new(proxied, Transport::Mqtt)
         }],
         ..Default::default()
     };

@@ -14,12 +14,10 @@ async fn clients_connect_over_unix_sockets() {
     let path = std::env::temp_dir().join(format!("mercurio-test-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let config = ServerConfig {
-        listeners: vec![ListenerConfig {
-            listener: UnixListener::bind(&path).unwrap().into(),
-            transport: Transport::Mqtt,
-            tls: None,
-            proxy_protocol: false,
-        }],
+        listeners: vec![ListenerConfig::new(
+            UnixListener::bind(&path).unwrap(),
+            Transport::Mqtt,
+        )],
         ..Default::default()
     };
     tokio::spawn(mercurio_server::server::run_with_config(
