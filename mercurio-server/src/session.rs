@@ -531,6 +531,16 @@ impl Session {
                 .await;
         }
 
+        // $CONTROL topics administer the broker, so only an authorizer can
+        // let clients publish to them
+        let control = packet.topic_name == "$CONTROL" || packet.topic_name.starts_with("$CONTROL/");
+        if control && authorizer.is_none() {
+            warn!("Client publish to `{}` refused", packet.topic_name);
+            return self
+                .refuse_publish(&packet, ReasonCode::NotAuthorized)
+                .await;
+        }
+
         // Only the server sets subscription identifiers [MQTT-3.3.4-6]
         if packet
             .properties

@@ -224,6 +224,15 @@ impl LocalConnector {
     }
 }
 
+/// Lets trusted connections use every topic, `$CONTROL` ones included.
+struct AllowAll;
+
+impl Authorizer for AllowAll {
+    fn authorize(&self, _: &ClientIdentity, _: &str, _: Access) -> bool {
+        true
+    }
+}
+
 /// A connection waiting to be served, with the index of its endpoint.
 enum Accepted {
     Tcp(TcpStream, usize),
@@ -507,7 +516,10 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let mut server = Listener {
         endpoints,
         local_listener,
-        trusted_auth: Arc::default(),
+        trusted_auth: Arc::new(AuthConfig {
+            authorizer: Some(Arc::new(AllowAll)),
+            ..Default::default()
+        }),
         next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),

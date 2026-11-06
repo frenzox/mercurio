@@ -163,6 +163,11 @@ allow_anonymous = true
 # matched as anonymous.
 # acl_file = "/etc/mercurio/acl"
 
+# Manage clients, roles and access at runtime instead, with the commands of
+# mosquitto's dynamic security plugin; replaces password_file and acl_file.
+# Create the file with `mercuriod dynsec-init -f <path>`.
+# dynamic_security = "/var/lib/mercurio/dynamic-security.json"
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.
@@ -264,13 +269,51 @@ granted `sensors/+/temperature` may subscribe to it, but not to
 `sensors/#`. Shared subscriptions are checked by their topic filter:
 `$share/group/sensors/+/temperature` needs the same grant.
 
+### Dynamic security
+
+`dynamic_security` replaces `password_file` and `acl_file` with clients,
+roles and access rules that change while the broker runs, as with
+mosquitto's dynamic security plugin. Create the file with an administrator:
+
+```bash
+mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
+```
+
+The administrator sends commands, in the JSON format of mosquitto's
+plugin, to `$CONTROL/dynamic-security/v1`, and reads the answers on
+`$CONTROL/dynamic-security/v1/response`:
+
+```bash
+mosquitto_pub -u admin -P ... -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
+  {"command": "createRole", "rolename": "sensor"},
+  {"command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
+   "topic": "sensors/#", "allow": true},
+  {"command": "createClient", "username": "s1", "password": "...",
+   "roles": [{"rolename": "sensor"}]}
+]}'
+```
+
+Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
+`enableClient`, `disableClient`, `addClientRole`, `removeClientRole`,
+`getClient`, `listClients`, `createRole`, `deleteRole`, `addRoleACL`,
+`removeRoleACL`, `getRole`, `listRoles`, `setDefaultACLAccess` and
+`getDefaultACLAccess`. Groups are not supported. ACLs of type
+`publishClientSend` decide publishing. `subscribePattern`,
+`subscribeLiteral` and `publishClientReceive` all decide reading, which
+covers both subscribing and receiving. The highest `priority` wins.
+Changes are saved to the file at once.
+
+`$CONTROL` topics are only open to clients when access control grants
+them, so a broker without `acl_file` or `dynamic_security` refuses them.
+
 ### Reloading
 
-Send `SIGHUP` (`systemctl reload mercuriod`) to reread `password_file` and
-`acl_file` without dropping connections. New ACL rules apply to every later
-publish and subscribe, including those of connected clients. Password
-changes apply to later logins. If a file fails to load, the broker logs the
-error and keeps the previous version. Other settings still need a restart.
+Send `SIGHUP` (`systemctl reload mercuriod`) to reread `password_file`,
+`acl_file` and `dynamic_security` without dropping connections. New ACL
+rules apply to every later publish and subscribe, including those of
+connected clients. Password changes apply to later logins. If a file fails
+to load, the broker logs the error and keeps the previous version. Other
+settings still need a restart.
 
 ### TLS
 
