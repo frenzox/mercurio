@@ -83,8 +83,23 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // glibc gives each thread that allocates an arena of its own and keeps
+    // the memory freed there, so under load the broker's memory grew by
+    // tens of megabytes and stayed; two arenas keep it flat, with no
+    // measurable cost in throughput. Set before the runtime starts threads.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: called before any other thread exists
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // The HTTP auth client uses the process default provider

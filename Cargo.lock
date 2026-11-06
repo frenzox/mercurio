@@ -780,6 +780,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "libc",
  "mercurio-client",
  "mercurio-core",
  "mercurio-server",
