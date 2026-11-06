@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command-line client · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html" aria-current="page">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Command-line client</h1>
+<p class="lead"><code>mercurio pub</code> publishes a message, <code>mercurio sub</code> prints messages until interrupted. Both work with any MQTT broker.</p>
+
+<h2>Publishing</h2>
+<pre><span class="comment"># A message, at QoS 1</span>
+mercurio pub -t sensors/kitchen -m 21.5 -q 1
+
+<span class="comment"># From standard input</span>
+echo '{"temp": 21.5}' | mercurio pub -t sensors/kitchen --content-type application/json
+
+<span class="comment"># Retained, so new subscribers get it at once</span>
+mercurio pub -t status/door -m open -r
+
+<span class="comment"># An MQTT 5 request, with properties</span>
+mercurio pub -t requests/lamp -m on --response-topic replies/me \
+    --correlation-data 42 --user-property source=cli --message-expiry 60</pre>
+<table>
+<tr><th>Option</th><th>Meaning</th></tr>
+<tr><td><code>-t, --topic</code></td><td>Topic to publish to (required)</td></tr>
+<tr><td><code>-m, --message</code></td><td>Payload; read from standard input when absent</td></tr>
+<tr><td><code>-q, --qos</code></td><td>0, 1 or 2 (default 0)</td></tr>
+<tr><td><code>-r, --retain</code></td><td>Retain the message on the broker</td></tr>
+<tr><td><code>--content-type</code></td><td>Content type of the payload, such as a MIME type</td></tr>
+<tr><td><code>--response-topic</code></td><td>Topic a reply should be published to</td></tr>
+<tr><td><code>--correlation-data</code></td><td>Data that ties a reply to its request</td></tr>
+<tr><td><code>--message-expiry</code></td><td>Seconds the broker keeps the message for subscribers yet to get it</td></tr>
+<tr><td><code>--utf8</code></td><td>Mark the payload as UTF-8 text</td></tr>
+<tr><td><code>--user-property key=value</code></td><td>User property; may be repeated</td></tr>
+</table>
+
+<h2>Subscribing</h2>
+<pre><span class="comment"># Print payloads, with their topics</span>
+mercurio sub -t 'sensors/#' -T
+
+<span class="comment"># Several filters</span>
+mercurio sub -t 'sensors/#' -t 'alerts/#' -T
+
+<span class="comment"># A persistent subscriber that survives broker restarts and network loss</span>
+mercurio sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
+
+<span class="comment"># With a will, published if the subscriber disappears</span>
+mercurio sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-retain</pre>
+<table>
+<tr><th>Option</th><th>Meaning</th></tr>
+<tr><td><code>-t, --topic</code></td><td>Topic filter; may be repeated (required)</td></tr>
+<tr><td><code>-q, --qos</code></td><td>QoS of the subscriptions (default 0)</td></tr>
+<tr><td><code>-T, --print-topic</code></td><td>Print the topic before each message</td></tr>
+<tr><td><code>--no-local</code></td><td>Don't receive messages this client publishes itself</td></tr>
+<tr><td><code>--retain-as-published</code></td><td>Keep the retain flag messages were published with</td></tr>
+<tr><td><code>--retain-handling</code></td><td>Retained messages on subscribing: 0 always, 1 only for new subscriptions, 2 never</td></tr>
+<tr><td><code>--subscription-id</code></td><td>Identifier the broker attaches to messages matching these subscriptions</td></tr>
+<tr><td><code>--reconnect SECONDS</code></td><td>Reconnect after losing the connection, waiting this long between attempts</td></tr>
+<tr><td><code>--will-topic</code>, <code>--will-message</code></td><td>Will published by the broker if the client disconnects unexpectedly</td></tr>
+<tr><td><code>--will-qos</code>, <code>--will-retain</code>, <code>--will-delay</code></td><td>QoS, retain flag and delay (MQTT 5) of the will</td></tr>
+</table>
+
+<h2>Connection options</h2>
+<p>Both commands take these:</p>
+<table>
+<tr><th>Option</th><th>Meaning</th><th>Default</th></tr>
+<tr><td><code>-H, --host</code></td><td>Broker host name</td><td><code>localhost</code></td></tr>
+<tr><td><code>-p, --port</code></td><td>Broker port</td><td><code>1883</code></td></tr>
+<tr><td><code>-i, --client-id</code></td><td>Client id</td><td>generated</td></tr>
+<tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials</td><td></td></tr>
+<tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
+<tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
+<tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
+<tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code></td><td><code>5</code></td></tr>
+<tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
+<tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with</td><td>system roots</td></tr>
+<tr><td><code>--insecure</code></td><td>Skip certificate verification; for testing only</td><td></td></tr>
+<tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
+</table>
+<pre><span class="comment"># Over TLS, with credentials</span>
+mercurio sub -H broker.example.com -p 8883 --tls --cafile ca.crt -u alice -P secret -t '#'
+
+<span class="comment"># MQTT 3.1.1</span>
+mercurio pub -V 311 -t test -m hello</pre>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

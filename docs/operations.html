@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operations &amp; monitoring · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html" aria-current="page">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Operations &amp; monitoring</h1>
+<p class="lead">Persistence, queues and limits, statistics, and logs.</p>
+
+<h2 id="persistence">Persistence</h2>
+<pre>[storage]
+backend = "sqlite"
+path = "/var/lib/mercurio/mercurio.db"</pre>
+<p>With <code>backend = "memory"</code>, the default, everything is lost when the broker stops. With SQLite, the broker keeps:</p>
+<ul>
+<li>sessions and their subscriptions, with their expiry;</li>
+<li>retained messages, with the client that published them;</li>
+<li>wills, including those delayed with Will Delay Interval;</li>
+<li>messages queued for disconnected clients with persistent sessions, and messages in flight.</li>
+</ul>
+<p>After a restart, clients with persistent sessions resume where they left off: their queued messages are delivered, and unacknowledged ones are sent again. Sessions that expired while the broker was down are discarded, and their wills published.</p>
+
+<h2 id="queues">Queues and slow clients</h2>
+<p>Each session has its own queue, so a slow or offline client never makes others lose messages. When its queue is full, further messages for that client are dropped:</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Drops</th></tr>
+<tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>QoS 0 messages once this many messages are queued</td></tr>
+<tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>any message once this many are queued</td></tr>
+<tr><td><code>max_queued_bytes</code></td><td>unlimited</td><td>any message once the queued payloads take this many bytes</td></tr>
+</table>
+<p>QoS 0 messages, which their publisher accepted could be lost, go first. The broker logs one warning when a queue starts dropping and another, with the count, once it has room again.</p>
+<p>MQTT 3.x clients connecting without clean session keep their session forever. <code>persistent_client_expiration</code> bounds it, so devices that are reinstalled with a new client id don't leave sessions behind:</p>
+<pre>[server]
+persistent_client_expiration = 604800  <span class="comment"># one week</span></pre>
+
+<h2 id="limits">Protecting the broker</h2>
+<table>
+<tr><th>Option</th><th>Protects against</th></tr>
+<tr><td><code>max_connections</code>, per-listener <code>max_connections</code></td><td>Connection floods</td></tr>
+<tr><td><code>connect_timeout</code></td><td>Connections that never send CONNECT, or stall during TLS</td></tr>
+<tr><td><code>max_packet_size</code></td><td>Oversized packets; MQTT 5 clients are told the limit</td></tr>
+<tr><td><code>max_keepalive</code></td><td>Clients asking for very long or no keep-alive, which keeps dead connections around</td></tr>
+<tr><td><code>receive_maximum</code></td><td>Too many QoS 2 messages awaiting release</td></tr>
+<tr><td><code>max_qos</code>, <code>retain_available</code></td><td>Costly QoS 2 traffic, or retained messages you must not keep</td></tr>
+<tr><td><code>clientid_prefixes</code></td><td>Clients outside your naming scheme</td></tr>
+</table>
+
+<h2 id="sys">$SYS statistics</h2>
+<p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged.</p>
+<pre>mosquitto_sub -t '$SYS/broker/#' -v</pre>
+<table>
+<tr><th>Topic</th><th>Value</th></tr>
+<tr><td><code>version</code></td><td>Broker version</td></tr>
+<tr><td><code>uptime</code></td><td>Seconds since start</td></tr>
+<tr><td><code>clients/connected</code></td><td>Clients connected now</td></tr>
+<tr><td><code>clients/disconnected</code></td><td>Sessions kept for clients that are not connected</td></tr>
+<tr><td><code>clients/total</code></td><td>Sessions, connected or not</td></tr>
+<tr><td><code>clients/maximum</code></td><td>Most clients connected at once</td></tr>
+<tr><td><code>clients/expired</code></td><td>Sessions ended by their expiry</td></tr>
+<tr><td><code>messages/received</code>, <code>messages/sent</code></td><td>PUBLISH packets since start</td></tr>
+<tr><td><code>bytes/received</code>, <code>bytes/sent</code></td><td>Bytes since start</td></tr>
+<tr><td><code>retained messages/count</code></td><td>Retained messages stored</td></tr>
+<tr><td><code>subscriptions/count</code></td><td>Subscriptions</td></tr>
+<tr><td><code>load/messages/received/1min</code>, <code>5min</code>, <code>15min</code></td><td>Messages received per minute, averaged over 1, 5 and 15 minutes</td></tr>
+<tr><td><code>load/messages/sent/…</code>, <code>load/bytes/received/…</code>, <code>load/bytes/sent/…</code>, <code>load/connections/…</code></td><td>The same for messages sent, bytes and new connections</td></tr>
+<tr><td><code>connection/&lt;client id&gt;/state</code></td><td><code>1</code> or <code>0</code> for each <a href="bridges.html">bridge</a></td></tr>
+</table>
+<p>Clients may subscribe to <code>$SYS</code> topics, subject to ACLs, but never publish to them. Wildcards at the start of a filter, such as <code>#</code> or <code>+/broker</code>, don't match <code>$SYS</code> topics.</p>
+
+<h2 id="logging">Logging</h2>
+<pre>[logging]
+level = "info"
+<span class="comment"># file = "/var/log/mercurio/mercuriod.log"</span>
+<span class="comment"># syslog = true</span>
+<span class="comment"># connection_messages = false</span></pre>
+<ul>
+<li>Under systemd, standard output goes to the journal: <code>journalctl -u mercuriod -f</code>.</li>
+<li><code>file</code> appends to a file. Rotate it with logrotate's <code>copytruncate</code>, as the file stays open.</li>
+<li><code>syslog</code> sends each line to the local syslog daemon through <code>/dev/log</code>, with facility <code>daemon</code> and a severity from the level.</li>
+<li><code>connection_messages = false</code> drops the lines logged for every connection and disconnection, which dominate the log of a busy broker.</li>
+<li><code>level</code> can be set per module: <code>"info,mercurio_server::session=warn"</code>. <code>mercuriod -v</code> logs at debug level.</li>
+</ul>
+
+<h2 id="shutdown">Shutdown</h2>
+<p>On <code>SIGTERM</code> or Ctrl+C, every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close. With SQLite, persistent sessions and their queues are on disk, so a restart loses nothing a client was promised.</p>
+
+<h2 id="memory">Memory</h2>
+<p>On Linux with glibc, the daemon limits the allocator to two arenas. Under heavy load with many threads, glibc otherwise keeps the memory each thread freed, and the broker's memory grows and stays high; with two arenas it stays flat, at no measurable cost in throughput. Memory use is otherwise dominated by queued messages, which the queue limits above bound.</p>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

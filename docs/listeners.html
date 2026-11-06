@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Listeners &amp; transports · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html" aria-current="page">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Listeners &amp; transports</h1>
+<p class="lead">Serve MQTT over TCP, TLS, WebSocket and Unix sockets, from as many ports as you need, each with its own settings.</p>
+<p>Every listener shares the same broker: sessions, subscriptions and retained messages are common to all of them, so a client on the TLS port receives what a client on the WebSocket port publishes.</p>
+
+<h2 id="main">The main listener</h2>
+<p><code>[server]</code> defines the main listener, plain MQTT unless <code>[server.tls]</code> is enabled:</p>
+<pre>[server]
+host = "0.0.0.0"
+port = 1883</pre>
+<p>IPv6 addresses work as they are, such as <code>host = "::"</code>. On Linux, <code>bind_interface = "eth0"</code> restricts the listener to one network interface, whatever its address.</p>
+
+<h2 id="extra">Extra listeners</h2>
+<p>Each <code>[[listeners]]</code> entry adds a listener with its own protocol, TLS, limits and authentication. A common setup keeps plain MQTT on localhost for local services and serves TLS to the outside:</p>
+<pre>[server]
+host = "127.0.0.1"
+port = 1883
+
+[[listeners]]
+host = "0.0.0.0"
+port = 8883
+[listeners.tls]
+enabled = true
+cert_path = "/etc/mercurio/server.crt"
+key_path = "/etc/mercurio/server.key"</pre>
+
+<h2 id="websocket">WebSocket</h2>
+<p>For browsers and clients behind HTTP proxies. The broker uses the <code>mqtt</code> subprotocol and accepts any path.</p>
+<pre><span class="comment"># Next to the main listener, sharing its TLS settings</span>
+[server]
+websocket_port = 8080
+
+<span class="comment"># Or as a listener of its own</span>
+[[listeners]]
+host = "0.0.0.0"
+port = 8080
+protocol = "websocket"</pre>
+<p>From a browser, with MQTT.js:</p>
+<pre>const client = mqtt.connect("ws://broker.example.com:8080/mqtt");
+client.on("connect", () =&gt; client.subscribe("sensors/#"));
+client.on("message", (topic, payload) =&gt; console.log(topic, payload.toString()));</pre>
+
+<h3 id="http-dir">Serving a web page</h3>
+<p>A WebSocket listener can also serve static files, so a dashboard or test page needs no separate web server:</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8080
+protocol = "websocket"
+http_dir = "/var/www/mercurio"</pre>
+<p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. Paths leaving the directory are refused. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
+
+<h2 id="unix">Unix domain sockets</h2>
+<p>For clients on the same machine: no TCP overhead, and access restricted by file permissions.</p>
+<pre>[[listeners]]
+path = "/run/mercurio/mqtt.sock"</pre>
+<pre>mosquitto_pub --unix /run/mercurio/mqtt.sock -t local/test -m hi</pre>
+<p>A socket file left behind by a broker that did not stop cleanly is replaced at startup. Socket paths are limited to 107 bytes by the operating system.</p>
+
+<h2 id="proxy">Behind a load balancer</h2>
+<p>Behind HAProxy, NGINX or a cloud load balancer, every connection appears to come from the balancer. With <code>proxy_protocol</code>, the listener expects the PROXY protocol header, version 1 or 2, and takes the client's address from it:</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 1884
+proxy_protocol = true</pre>
+<pre><span class="comment"># haproxy.cfg</span>
+backend mqtt
+    mode tcp
+    server mercurio 10.0.0.5:1884 send-proxy-v2</pre>
+<p>Connections without a valid header are closed. TLS, when enabled on the listener, starts after the header.</p>
+
+<h2 id="mount-points">Mount points</h2>
+<p>A mount point gives a listener's clients their own part of the topic tree, for example one per tenant:</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 1885
+mount_point = "tenant1/"</pre>
+<p>A client on that listener publishing <code>sensors/t1</code> publishes <code>tenant1/sensors/t1</code>, and subscribing to <code>#</code> subscribes to <code>tenant1/#</code>. The messages it receives carry their topics without the prefix. Shared subscriptions are mounted too: <code>$share/g/jobs</code> becomes <code>$share/g/tenant1/jobs</code>. Clients of other listeners see the full topics.</p>
+<p>ACL rules see the full topic, mount point included.</p>
+
+<h2 id="auth">Per-listener authentication</h2>
+<p><code>[listeners.auth]</code> replaces <code>[auth]</code> for a listener's clients, with the same options except dynamic security. Here local services connect freely, while the public listener requires passwords and has its own ACL:</p>
+<pre>[server]
+host = "127.0.0.1"
+port = 1883
+
+[[listeners]]
+host = "0.0.0.0"
+port = 8883
+[listeners.tls]
+enabled = true
+cert_path = "/etc/mercurio/server.crt"
+key_path = "/etc/mercurio/server.key"
+[listeners.auth]
+enabled = true
+allow_anonymous = false
+password_file = "/etc/mercurio/public.passwd"
+acl_file = "/etc/mercurio/public.acl"</pre>
+<p>A listener's files are reloaded on <code>SIGHUP</code> like the main ones.</p>
+
+<h2 id="limits">Per-listener connection limits</h2>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8883
+max_connections = 500</pre>
+<p>Connections beyond the limit are closed right after being accepted. The broker-wide <code>[server] max_connections</code> still applies, and a flood on one listener can't use up the slots of another.</p>
+
+<h2 id="tenant">Example: a multi-tenant broker</h2>
+<pre><span class="comment"># /etc/mercurio/config.toml</span>
+include_dir = "/etc/mercurio/tenants"
+
+[server]
+host = "127.0.0.1"
+
+<span class="comment"># /etc/mercurio/tenants/acme.toml</span>
+[[listeners]]
+host = "0.0.0.0"
+port = 18831
+mount_point = "acme/"
+max_connections = 1000
+[listeners.auth]
+enabled = true
+allow_anonymous = false
+password_file = "/etc/mercurio/tenants/acme.passwd"</pre>
+<p>Each tenant gets a file with its own port, namespace, connection limit and users. An internal service on the localhost listener sees every tenant's topics under their prefixes.</p>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

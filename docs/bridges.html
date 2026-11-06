@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bridges · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html" aria-current="page">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Bridges</h1>
+<p class="lead">Forward topics between this broker and others: from an edge site to a central broker, from a cloud broker back to devices, or between data centres.</p>
+
+<h2>A first bridge</h2>
+<p>A site broker forwarding its sensor readings to a central broker, and receiving commands from it:</p>
+<pre>[[bridges]]
+name = "central"
+host = "central.example.com"
+port = 1883
+username = "site1"
+password = "secret"
+
+<span class="comment"># Readings go out</span>
+[[bridges.topics]]
+pattern = "sensors/#"
+direction = "out"
+qos = 1
+
+<span class="comment"># Commands come in</span>
+[[bridges.topics]]
+pattern = "commands/#"
+direction = "in"
+qos = 1</pre>
+<p>The bridge connects to the central broker as an MQTT client with the id <code>mercurio-bridge-central</code>. Messages published here on <code>sensors/#</code> are published there, and messages published there on <code>commands/#</code> are published here.</p>
+
+<h2>Topics and prefixes</h2>
+<p>Each <code>[[bridges.topics]]</code> entry forwards <code>pattern</code> <code>out</code> (the default), <code>in</code> or <code>both</code> ways. The prefixes place the pattern in each broker's topic tree, so topics are renamed on the way:</p>
+<pre>[[bridges.topics]]
+pattern = "sensors/#"
+direction = "out"
+local_prefix = "site/"
+remote_prefix = "plants/plant1/"</pre>
+<table>
+<tr><th>This broker</th><th>Remote broker</th></tr>
+<tr><td><code>site/sensors/t1</code></td><td><code>plants/plant1/sensors/t1</code></td></tr>
+</table>
+<p>With MQTT 5, retained messages keep their retain flag across the bridge, and properties such as user properties and response topics travel with the message. MQTT 3.1.1 carries neither; there, only the retained messages a broker sends when the bridge subscribes arrive as retained.</p>
+
+<h2>Both directions without loops</h2>
+<p>With <code>direction = "both"</code>, a message forwarded one way could come back the other. With MQTT 5, the bridge subscribes with No Local, so the brokers never send it its own messages. Each message arrives exactly once on each side.</p>
+
+<h2>MQTT 3.1.1 brokers</h2>
+<pre>[[bridges]]
+name = "legacy"
+host = "old-broker.example.com"
+protocol_version = "mqttv311"</pre>
+<p>MQTT 3.1.1 has no No Local, so a remote broker sends back the messages the bridge forwarded to it. The bridge remembers the last 1,000 messages it forwarded and drops those copies. An identical message published on the remote broker just after one was forwarded is dropped too.</p>
+
+<h2>Failover</h2>
+<pre>[[bridges]]
+name = "cloud"
+addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]</pre>
+<p>When a broker can't be reached or the connection is lost, the bridge waits five seconds and tries the next address, round and round.</p>
+
+<h2>TLS and client certificates</h2>
+<pre>[[bridges]]
+name = "cloud"
+host = "iot.example.com"
+port = 8883
+[bridges.tls]
+enabled = true
+<span class="comment"># Verify the remote broker with this CA instead of the system's roots</span>
+ca_path = "/etc/mercurio/cloud-ca.crt"
+<span class="comment"># Authenticate with a client certificate</span>
+cert_path = "/etc/mercurio/site1.crt"
+key_path = "/etc/mercurio/site1.key"</pre>
+
+<h2>Monitoring</h2>
+<p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while connected, <code>0</code> after losing the connection.</p>
+<pre>mosquitto_sub -t '$SYS/broker/connection/+/state' -v
+<span class="comment"># $SYS/broker/connection/mercurio-bridge-cloud/state 1</span></pre>
+
+<h2>When the remote broker is down</h2>
+<ul>
+<li>Messages to forward wait in the bridge's queue on this broker, up to <code>max_queued_messages</code>, and are sent once the bridge reconnects.</li>
+<li>The bridge's session on the remote broker lasts a day, so messages for <code>in</code> topics wait there across short outages.</li>
+<li>The bridge retries forever; the broker starts even if every remote broker is down.</li>
+</ul>
+
+<h2>Access control</h2>
+<p>The bridge connects to this broker in-process, so this broker's authentication and ACLs don't apply to it, and it may publish anywhere. On the remote broker, it is an ordinary client with the given credentials.</p>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>
