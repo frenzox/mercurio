@@ -21,9 +21,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod config;
 mod credentials;
+mod reload;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
+use reload::Reloadable;
 
 #[derive(Parser, Debug)]
 #[command(name = "mercuriod")]
@@ -158,28 +160,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let authorizer = match &config.auth.acl_file {
+    let acl = match &config.auth.acl_file {
         Some(path) => {
-            let contents = std::fs::read_to_string(path)
-                .map_err(|e| format!("Failed to read ACL file {}: {}", path, e))?;
-            let acl = AclFile::parse(&contents)
-                .map_err(|e| format!("Invalid ACL file {}: {}", path, e))?;
+            let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
             info!("Loaded topic access control from {}", path);
-            Some(Arc::new(acl) as Arc<dyn Authorizer>)
+            Some(acl)
         }
         None => None,
     };
+    let authorizer = acl.clone().map(|acl| acl as Arc<dyn Authorizer>);
 
+    let mut passwords = None;
     // Build authentication configuration
     let auth_config = if config.auth.enabled {
         let credential_validator = if let Some(ref password_file) = config.auth.password_file {
-            let credentials = load_password_file(password_file)?;
-            info!(
-                "Loaded {} credentials from password file",
-                credentials.len()
-            );
-            Some(Arc::new(HashedCredentialValidator::new(credentials))
-                as Arc<dyn mercurio_server::auth::CredentialValidator>)
+            let validator = Arc::new(Reloadable::load(password_file, load_credentials)?);
+            info!("Loaded credentials from {}", password_file);
+            passwords = Some(Arc::clone(&validator));
+            Some(validator as Arc<dyn mercurio_server::auth::CredentialValidator>)
         } else {
             None
         };
@@ -208,6 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };
+    #[cfg(unix)]
+    tokio::spawn(reload_on_sighup(acl, passwords));
+
     let result = match config.storage {
         StorageConfig::Memory => {
             mercurio_server::server::run_with_config(listener, server_config, shutdown_signal())
@@ -250,6 +251,45 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     let _ = signal::ctrl_c().await;
+}
+
+/// Rereads the ACL and password files on SIGHUP. ACL changes apply to every
+/// later publish and subscribe; password changes apply to later connections.
+#[cfg(unix)]
+async fn reload_on_sighup(
+    acl: Option<Arc<Reloadable<AclFile>>>,
+    passwords: Option<Arc<Reloadable<HashedCredentialValidator>>>,
+) {
+    let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
+        .expect("failed to listen for SIGHUP");
+    while hangup.recv().await.is_some() {
+        info!("Received SIGHUP, reloading");
+        if let Some(acl) = &acl {
+            reload_file(acl);
+        }
+        if let Some(passwords) = &passwords {
+            reload_file(passwords);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reload_file<T>(file: &Reloadable<T>) {
+    match file.reload() {
+        Ok(()) => info!("Reloaded {}", file.path()),
+        Err(e) => error!("Keeping the previous {}: {}", file.path(), e),
+    }
+}
+
+fn load_acl_file(path: &str) -> Result<AclFile, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read ACL file {}: {}", path, e))?;
+    AclFile::parse(&contents).map_err(|e| format!("Invalid ACL file {}: {}", path, e))
+}
+
+fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
+    let credentials = load_password_file(path).map_err(|e| e.to_string())?;
+    Ok(HashedCredentialValidator::new(credentials))
 }
 
 /// Load a password file with format: `username:hash` per line.

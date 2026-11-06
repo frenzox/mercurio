@@ -171,6 +171,14 @@ granted `sensors/+/temperature` may subscribe to it, but not to
 `sensors/#`. Shared subscriptions are checked by their topic filter:
 `$share/group/sensors/+/temperature` needs the same grant.
 
+### Reloading
+
+Send `SIGHUP` (`systemctl reload mercuriod`) to reread `password_file` and
+`acl_file` without dropping connections. New ACL rules apply to every later
+publish and subscribe, including those of connected clients. Password
+changes apply to later logins. If a file fails to load, the broker logs the
+error and keeps the previous version. Other settings still need a restart.
+
 ### TLS
 
 Set `enabled = true` under `[server.tls]` with a certificate and key to serve
