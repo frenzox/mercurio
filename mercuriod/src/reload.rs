@@ -41,6 +41,22 @@ impl<T> Reloadable<T> {
     }
 }
 
+/// Any reloadable file, whatever it holds.
+pub trait Reload: Send + Sync {
+    fn reload(&self) -> Result<(), String>;
+    fn path(&self) -> &str;
+}
+
+impl<T: Send + Sync> Reload for Reloadable<T> {
+    fn reload(&self) -> Result<(), String> {
+        Reloadable::reload(self)
+    }
+
+    fn path(&self) -> &str {
+        Reloadable::path(self)
+    }
+}
+
 impl<T: Authorizer> Authorizer for Reloadable<T> {
     fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
         self.get().authorize(client, topic, access)

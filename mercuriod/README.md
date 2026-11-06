@@ -188,6 +188,18 @@ allow_anonymous = true
 # host = "0.0.0.0"
 # port = 1884
 # proxy_protocol = true
+#
+# A tenant's listener: its clients only see topics under the mount point
+# and log in with their own password file. `[listeners.auth]` takes the
+# same settings as `[auth]` and replaces it for this listener.
+# [[listeners]]
+# host = "0.0.0.0"
+# port = 1885
+# mount_point = "tenant1/"
+# [listeners.auth]
+# enabled = true
+# allow_anonymous = false
+# password_file = "/etc/mercurio/tenant1.passwd"
 
 # Bridges forward topics to and from another MQTT 5 broker
 # [[bridges]]
@@ -284,6 +296,13 @@ Each `[[listeners]]` entry serves another port, with its own `protocol`
 setup keeps plain MQTT on localhost in `[server]` and adds a TLS listener on
 `0.0.0.0:8883`. All listeners share sessions, subscriptions and retained
 messages.
+
+`mount_point` puts a listener's clients in their own part of the topic
+tree: a client publishing `sensors/t1` on a listener mounted at
+`tenant1/` publishes `tenant1/sensors/t1`, and it is sent topics without
+the prefix. `[listeners.auth]` gives a listener its own authentication and
+`acl_file`, which `SIGHUP` reloads like the main ones. ACL rules see the
+full topic, mount point included.
 
 A listener with `path` instead of `port` serves a Unix domain socket, which
 local clients reach without TCP and which file permissions can restrict.

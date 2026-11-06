@@ -176,6 +176,27 @@ pub struct ListenerConfig {
     /// Expect every connection to start with a PROXY protocol header, as
     /// sent by load balancers, and take the client's address from it.
     pub proxy_protocol: bool,
+    /// Prefixed to every topic the listener's clients use, so they only see
+    /// their own part of the topic tree.
+    pub mount_point: Option<String>,
+    /// Replaces the broker's authentication and access control for the
+    /// listener's clients.
+    pub auth: Option<AuthConfig>,
+}
+
+impl ListenerConfig {
+    /// A listener without TLS, PROXY protocol, mount point or auth settings
+    /// of its own.
+    pub fn new(listener: impl Into<Socket>, transport: Transport) -> Self {
+        Self {
+            listener: listener.into(),
+            transport,
+            tls: None,
+            proxy_protocol: false,
+            mount_point: None,
+            auth: None,
+        }
+    }
 }
 
 /// Opens in-process connections to a broker, for parts of the same program
@@ -231,6 +252,8 @@ struct EndpointSettings {
     tls_acceptor: Option<TlsAcceptor>,
     identity_as_username: bool,
     proxy_protocol: bool,
+    mount_point: Option<String>,
+    auth: Option<Arc<AuthConfig>>,
 }
 
 impl Endpoint {
@@ -247,6 +270,8 @@ impl Endpoint {
                 tls_acceptor,
                 identity_as_username,
                 proxy_protocol: config.proxy_protocol,
+                mount_point: config.mount_point,
+                auth: config.auth.map(Arc::new),
             },
         })
     }
@@ -265,6 +290,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// The client certificate's Common Name, when it stands in for the
     /// user name
     cert_identity: Option<String>,
+    mount_point: Option<String>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -292,6 +318,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         let transport = settings.transport;
+        self.mount_point = settings.mount_point;
+        if let Some(auth) = settings.auth {
+            self.auth_config = auth;
+        }
         let Some(acceptor) = settings.tls_acceptor else {
             return self.serve(socket, transport, peer_addr).await;
         };
@@ -332,10 +362,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
     }
 
-    async fn handle<S>(self, connection: Connection<S>)
+    async fn handle<S>(self, mut connection: Connection<S>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        connection.set_mount_point(self.mount_point);
         let mut handler = Handler {
             broker: self.broker,
             session_manager: self.session_manager,
@@ -463,10 +494,8 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
 
     let main = ListenerConfig {
-        listener: listener.into(),
-        transport: Transport::Mqtt,
         tls: tls_config,
-        proxy_protocol: false,
+        ..ListenerConfig::new(listener, Transport::Mqtt)
     };
     let endpoints = std::iter::once(main)
         .chain(listeners)
@@ -571,6 +600,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
+                mount_point: None,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
