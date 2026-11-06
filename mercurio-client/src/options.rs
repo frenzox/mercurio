@@ -189,6 +189,10 @@ pub struct TlsOptions {
     pub ca_path: Option<String>,
     /// Skip server certificate verification (insecure, for testing only).
     pub danger_skip_verify: bool,
+    /// Client certificate chain (PEM) to authenticate with.
+    pub cert_path: Option<String>,
+    /// Private key (PEM) of the client certificate.
+    pub key_path: Option<String>,
 }
 
 /// Options for connecting to an MQTT broker.
@@ -252,6 +256,18 @@ impl ConnectOptions {
     /// Set custom CA certificate file path for TLS verification.
     pub fn ca_path(mut self, path: impl Into<String>) -> Self {
         self.tls.ca_path = Some(path.into());
+        self
+    }
+
+    /// Authenticate with a client certificate and its private key, both
+    /// PEM files.
+    pub fn client_cert(
+        mut self,
+        cert_path: impl Into<String>,
+        key_path: impl Into<String>,
+    ) -> Self {
+        self.tls.cert_path = Some(cert_path.into());
+        self.tls.key_path = Some(key_path.into());
         self
     }
 
