@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core" }
+mercurio-client = { path = "../mercurio-client" }
 mercurio-server = { path = "../mercurio-server" }
 mercurio-storage = { path = "../mercurio-storage", features = ["sqlite"] }
 

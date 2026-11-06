@@ -29,6 +29,75 @@ pub struct Config {
     /// Listeners served besides the one in `[server]`
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
+
+    /// Connections to other brokers that topics are forwarded through
+    #[serde(default)]
+    pub bridges: Vec<BridgeConfig>,
+}
+
+/// A connection to another broker, as an MQTT 5 client.
+#[derive(Debug, Deserialize)]
+pub struct BridgeConfig {
+    /// Names the bridge in logs and in its default client id
+    pub name: String,
+
+    pub host: String,
+
+    #[serde(default = "default_port")]
+    pub port: u16,
+
+    /// Client id on the remote broker; `mercurio-bridge-{name}` by default
+    pub client_id: Option<String>,
+
+    pub username: Option<String>,
+
+    pub password: Option<String>,
+
+    #[serde(default)]
+    pub tls: BridgeTlsConfig,
+
+    pub topics: Vec<BridgeTopic>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BridgeTlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// CA certificate to verify the remote broker with, instead of the
+    /// system's root certificates
+    pub ca_path: Option<String>,
+}
+
+/// Topics forwarded through a bridge, as in mosquitto's `topic` option:
+/// `pattern` is matched below `local_prefix` on this broker and below
+/// `remote_prefix` on the remote one.
+#[derive(Debug, Deserialize)]
+pub struct BridgeTopic {
+    pub pattern: String,
+
+    #[serde(default)]
+    pub direction: Direction,
+
+    #[serde(default)]
+    pub qos: u8,
+
+    #[serde(default)]
+    pub local_prefix: String,
+
+    #[serde(default)]
+    pub remote_prefix: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// From this broker to the remote one
+    #[default]
+    Out,
+    /// From the remote broker to this one
+    In,
+    Both,
 }
 
 /// An extra listener, with its own protocol and TLS settings.
