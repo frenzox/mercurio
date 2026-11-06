@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Installing &amp; running · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html" aria-current="page">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Installing &amp; running</h1>
+<p class="lead">Build the binaries, start the broker, and run it as a systemd service.</p>
+
+<h2>Building</h2>
+<p>Mercurio needs a recent stable Rust toolchain. From the repository root:</p>
+<pre><span class="comment"># Broker, command-line client and libraries</span>
+cargo build --release
+
+<span class="comment"># Only the broker</span>
+cargo build --release --package mercuriod
+
+<span class="comment"># Or install the binaries into ~/.cargo/bin</span>
+cargo install --path mercuriod
+cargo install --path mercurio</pre>
+<p>The binaries end up in <code>target/release/</code>: <code>mercuriod</code>, the broker, and <code>mercurio</code>, the command-line client.</p>
+
+<h2>Running the broker</h2>
+<pre>mercuriod [OPTIONS]
+mercuriod passwd -f &lt;FILE&gt; -u &lt;USER&gt; [-d]
+mercuriod dynsec-init -f &lt;FILE&gt; [-u &lt;USER&gt;]</pre>
+<table>
+<tr><th>Option</th><th>Meaning</th><th>Default</th></tr>
+<tr><td><code>-c, --config &lt;FILE&gt;</code></td><td>Configuration file</td><td><code>/etc/mercurio/config.toml</code></td></tr>
+<tr><td><code>-l, --listen &lt;ADDR&gt;</code></td><td>Override the main listen address, such as <code>0.0.0.0:1883</code></td><td>from the configuration</td></tr>
+<tr><td><code>-v, --verbose</code></td><td>Log at debug level</td><td></td></tr>
+</table>
+<p>Without a file at the default path, the broker starts with the defaults: plain MQTT on <code>127.0.0.1:1883</code>, no authentication, state in memory. A missing file at a path given with <code>-c</code> is an error.</p>
+<pre><span class="comment"># Defaults</span>
+mercuriod
+
+<span class="comment"># Custom configuration, listening on every interface</span>
+mercuriod -c ./config.toml -l 0.0.0.0:1883
+
+<span class="comment"># Debug logging</span>
+mercuriod -v</pre>
+
+<h3>Subcommands</h3>
+<table>
+<tr><th>Command</th><th>What it does</th></tr>
+<tr><td><code>mercuriod passwd -f FILE -u USER</code></td><td>Adds a user to a password file, or changes their password. Prompts for the password.</td></tr>
+<tr><td><code>mercuriod passwd -f FILE -u USER -d</code></td><td>Removes a user.</td></tr>
+<tr><td><code>mercuriod dynsec-init -f FILE [-u USER]</code></td><td>Creates a <a href="security.html#dynamic-security">dynamic security</a> file with an administrator, <code>admin</code> by default.</td></tr>
+</table>
+
+<h2>Signals</h2>
+<table>
+<tr><th>Signal</th><th>Effect</th></tr>
+<tr><td><code>SIGTERM</code>, Ctrl+C</td><td>Graceful shutdown: every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>.</td></tr>
+</table>
+<p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
+
+<h2>Running as a systemd service</h2>
+<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>. It runs the broker sandboxed, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>.</p>
+<pre><span class="comment"># Binary, configuration and unit</span>
+sudo cp target/release/mercuriod /usr/bin/
+sudo mkdir -p /etc/mercurio
+sudo cp mercuriod/contrib/config.toml /etc/mercurio/
+sudo cp mercuriod/contrib/mercuriod.service /etc/systemd/system/
+
+<span class="comment"># Start it now and at boot</span>
+sudo systemctl daemon-reload
+sudo systemctl enable --now mercuriod
+
+<span class="comment"># Status, logs, reload</span>
+sudo systemctl status mercuriod
+journalctl -u mercuriod -f
+sudo systemctl reload mercuriod</pre>
+<p>The sample configuration lists every option with its default. A minimal production configuration that keeps state on disk and requires passwords:</p>
+<pre>[server]
+host = "0.0.0.0"
+port = 1883
+
+[storage]
+backend = "sqlite"
+path = "/var/lib/mercurio/mercurio.db"
+
+[auth]
+enabled = true
+allow_anonymous = false
+password_file = "/etc/mercurio/passwd"</pre>
+<pre>sudo mercuriod passwd -f /etc/mercurio/passwd -u alice</pre>
+
+<h2>Next steps</h2>
+<ul>
+<li><a href="configuration.html">Configuration reference</a> for every option.</li>
+<li><a href="security.html">Authentication &amp; access</a> to lock the broker down.</li>
+<li><a href="listeners.html">Listeners</a> to add TLS or WebSocket.</li>
+</ul>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

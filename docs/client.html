@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust client library · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html" aria-current="page">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Rust client library</h1>
+<p class="lead"><code>mercurio-client</code> is an async MQTT client for Tokio, speaking MQTT 3.1, 3.1.1 and 5.0, with automatic reconnection.</p>
+
+<h2>Adding it</h2>
+<pre>[dependencies]
+mercurio-client = { git = "https://github.com/frenzox/mercurio" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }</pre>
+
+<h2>Connecting, publishing, subscribing</h2>
+<pre>use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let options = ConnectOptions::new("localhost", 1883).client_id("thermostat");
+    let client = MqttClient::connect(options).await?;
+
+    client.subscribe(&amp;[("sensors/+/temperature", QoS::AtLeastOnce)]).await?;
+    client.publish("sensors/hall/temperature", "20.5", QoS::AtLeastOnce).await?;
+
+    while let Some(event) = client.recv().await {
+        match event {
+            Event::Message { topic, payload, .. } =&gt; {
+                println!("{topic}: {}", String::from_utf8_lossy(&amp;payload));
+            }
+            Event::Disconnected { reason } =&gt; eprintln!("disconnected: {reason:?}"),
+            Event::Reconnected { .. } =&gt; eprintln!("reconnected"),
+        }
+    }
+    Ok(())
+}</pre>
+<ul>
+<li><code>publish</code> and <code>subscribe</code> resolve once the broker acknowledged them: PUBACK, PUBCOMP or SUBACK.</li>
+<li><code>recv</code> returns the next event, and <code>None</code> once the client is closed for good.</li>
+<li><code>MqttClient</code> methods take <code>&amp;self</code>, so one client can be shared between tasks behind an <code>Arc</code>.</li>
+</ul>
+
+<h2>Connection options</h2>
+<p><code>ConnectOptions</code> is a builder:</p>
+<table>
+<tr><th>Method</th><th>Meaning</th></tr>
+<tr><td><code>new(host, port)</code></td><td>Broker address</td></tr>
+<tr><td><code>client_id(id)</code></td><td>Client id; the broker assigns one when not set</td></tr>
+<tr><td><code>username(name)</code>, <code>password(bytes)</code></td><td>Credentials</td></tr>
+<tr><td><code>protocol_version(v)</code></td><td><code>ProtocolVersion::V5</code> (default), <code>V3_1_1</code> or <code>V3_1</code></td></tr>
+<tr><td><code>keep_alive(seconds)</code></td><td>Keep-alive, 60 by default</td></tr>
+<tr><td><code>clean_start(bool)</code>, <code>session_expiry(seconds)</code></td><td>Start a new session or resume one, and how long the broker keeps it</td></tr>
+<tr><td><code>will(Will)</code></td><td>Message the broker publishes if the client disappears</td></tr>
+<tr><td><code>reconnect(delay)</code></td><td>Reconnect automatically after losing the connection</td></tr>
+<tr><td><code>tls(true)</code>, <code>ca_path(path)</code></td><td>TLS, verified with the system's roots or the given CA</td></tr>
+<tr><td><code>client_cert(cert, key)</code></td><td>Authenticate with a client certificate</td></tr>
+<tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker</td></tr>
+<tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
+<tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
+<tr><td><code>connector(f)</code></td><td>Open the stream with <code>f</code> instead of TCP</td></tr>
+<tr><td><code>connect_timeout(seconds)</code></td><td>Longest wait for the connection, 30 by default</td></tr>
+</table>
+<p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own.</p>
+
+<h2>Persistent sessions and reconnection</h2>
+<pre>use std::time::Duration;
+use mercurio_client::{ConnectOptions, MqttClient, Will};
+
+let options = ConnectOptions::new("broker.example.com", 1883)
+    .client_id("monitor")
+    .clean_start(false)
+    .session_expiry(3600)
+    .reconnect(Duration::from_secs(5))
+    .will(Will::new("status/monitor", "offline").retain(true));
+let client = MqttClient::connect(options).await?;</pre>
+<p>When the connection drops, the client emits <code>Event::Disconnected</code>, retries every five seconds, and emits <code>Event::Reconnected { session_present }</code>. Messages not yet acknowledged are sent again. QoS 1 and 2 publishes made while disconnected wait and are sent after reconnecting; QoS 0 ones fail with <code>ClientError::Disconnected</code>. Without <code>session_present</code>, the broker forgot the session and the subscriptions have to be made again.</p>
+
+<h2>MQTT 5 properties</h2>
+<pre>use mercurio_client::{MessageProperties, QoS};
+
+let properties = MessageProperties {
+    content_type: Some("application/json".into()),
+    response_topic: Some("replies/thermostat".into()),
+    correlation_data: Some("42".into()),
+    message_expiry: Some(60),
+    user_properties: vec![("source".into(), "hall".into())],
+    ..Default::default()
+};
+client
+    .publish_with_properties("requests/lamp", r#"{"on":true}"#, QoS::AtLeastOnce, false, properties)
+    .await?;</pre>
+<p>Received messages carry their properties in <code>Event::Message { properties, .. }</code>, along with <code>qos</code>, <code>retain</code> and the <code>subscription_ids</code> they matched.</p>
+
+<h2>Subscription options</h2>
+<pre>use mercurio_client::{QoS, RetainHandling, SubscriptionOptions};
+
+let options = SubscriptionOptions {
+    qos: QoS::AtLeastOnce,
+    no_local: true,
+    retain_as_pub: true,
+    retain_handling: RetainHandling::DoNotSendRetained,
+};
+// Messages matching it carry subscription id 7
+let results = client.subscribe_with(&amp;[("chat/#", options)], Some(7)).await?;
+assert!(results[0].success);</pre>
+<p><code>unsubscribe(&amp;["chat/#"])</code> removes subscriptions; both return a result per filter with the broker's reason code.</p>
+
+<h2>TLS</h2>
+<pre>let options = ConnectOptions::new("iot.example.com", 8883)
+    .tls(true)
+    .ca_path("/etc/ssl/my-ca.pem")
+    .client_cert("/etc/device/cert.pem", "/etc/device/key.pem");</pre>
+
+<h2>Enhanced authentication</h2>
+<p>Implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>bytes::Bytes</code>, from the <code>bytes</code> crate:</p>
+<pre>use bytes::Bytes;
+use mercurio_client::Authenticator;
+
+struct Token(String);
+
+impl Authenticator for Token {
+    fn method(&amp;self) -&gt; String {
+        "TOKEN".into()
+    }
+
+    fn start(&amp;mut self) -&gt; Option&lt;Bytes&gt; {
+        Some(Bytes::from(self.0.clone()))
+    }
+
+    fn respond(&amp;mut self, _challenge: Option&lt;Bytes&gt;) -&gt; Result&lt;Option&lt;Bytes&gt;, String&gt; {
+        Err("TOKEN has no challenges".into())
+    }
+}
+
+let options = ConnectOptions::new("localhost", 1883).authenticator(Token("secret".into()));</pre>
+
+<h2>Errors and disconnections</h2>
+<p>Calls return <code>ClientError</code>, for example <code>ConnectionRefused(reason)</code>, <code>Redirected { server_reference, .. }</code>, <code>PublishRefused(reason)</code> when the broker refuses a QoS 1 or 2 publish, <code>Timeout</code>, <code>Tls(..)</code> or <code>Disconnected</code>. <code>Event::Disconnected</code> says why the connection ended with a <code>DisconnectReason</code>: closed by the client, by the broker with a reason code, lost, or timed out.</p>
+
+<h2>Examples in the repository</h2>
+<ul>
+<li><code>mercurio/</code>: the command-line client, built on this library.</li>
+<li><code>mercurio-client/examples/bench.rs</code>: a load generator with concurrent publishers and subscribers.</li>
+</ul>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Configuration reference · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html" aria-current="page">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Configuration reference</h1>
+<p class="lead">Every option of <code>mercuriod</code>'s TOML configuration file, with its default. Every option is optional.</p>
+<p>The broker reads <code>/etc/mercurio/config.toml</code>, or the file given with <code>-c</code>. A commented file with every option is provided as <code>mercuriod/contrib/config.toml</code>.</p>
+
+<h2 id="include-dir">Top level</h2>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>include_dir</code></td><td></td><td>Directory whose <code>*.toml</code> files are merged into this one, in name order. Their tables extend this file's, their arrays (<code>[[listeners]]</code>, <code>[[bridges]]</code>) are added to this file's, and their other values replace this file's.</td></tr>
+</table>
+<pre><span class="comment"># /etc/mercurio/config.toml</span>
+include_dir = "/etc/mercurio/conf.d"
+
+<span class="comment"># /etc/mercurio/conf.d/tenant1.toml adds a listener</span>
+[[listeners]]
+port = 1885
+mount_point = "tenant1/"</pre>
+
+<h2 id="server">[server]</h2>
+<h3>Main listener</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>host</code></td><td><code>"127.0.0.1"</code></td><td>Address to listen on. <code>"0.0.0.0"</code> for every IPv4 interface, <code>"::"</code> for IPv6.</td></tr>
+<tr><td><code>port</code></td><td><code>1883</code></td><td>Port of the main MQTT listener.</td></tr>
+<tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this network interface, such as <code>"eth0"</code>. Linux only.</td></tr>
+<tr><td><code>websocket_port</code></td><td></td><td>Also serve MQTT over WebSocket on this port, with the main listener's TLS settings.</td></tr>
+<tr><td><code>http_dir</code></td><td></td><td>Serve the files of this directory to plain HTTP requests on <code>websocket_port</code>.</td></tr>
+</table>
+
+<h3>Limits</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>max_connections</code></td><td><code>10000</code></td><td>Concurrent connections, across every listener. Further ones are closed right after being accepted.</td></tr>
+<tr><td><code>max_packet_size</code></td><td><code>1048576</code></td><td>Largest packet accepted from a client, in bytes. Announced to MQTT 5 clients.</td></tr>
+<tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has to complete TLS and send CONNECT.</td></tr>
+<tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>Messages that may wait for one client, any QoS, before further ones are dropped.</td></tr>
+<tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
+<tr><td><code>max_queued_bytes</code></td><td>unlimited</td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
+<tr><td><code>receive_maximum</code></td><td><code>65535</code></td><td>QoS 2 messages an MQTT 5 client may have awaiting PUBREL at once.</td></tr>
+<tr><td><code>max_topic_alias</code></td><td><code>10</code></td><td>Highest topic alias MQTT 5 clients may use; <code>0</code> disables aliases.</td></tr>
+<tr><td><code>max_keepalive</code></td><td></td><td>Longest keep-alive, in seconds, MQTT 5 clients may use. Clients asking for more, or for none, are told to use this one.</td></tr>
+<tr><td><code>max_qos</code></td><td><code>2</code></td><td>Highest QoS clients may use. Subscriptions above it are granted this QoS; publishing above it closes the connection.</td></tr>
+<tr><td><code>retain_available</code></td><td><code>true</code></td><td>With <code>false</code>, retained messages are refused, and so are wills that ask to be retained.</td></tr>
+</table>
+
+<h3>Client ids and sessions</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>allow_zero_length_clientid</code></td><td><code>true</code></td><td>Accept clients that send an empty client id and assign them one.</td></tr>
+<tr><td><code>auto_id_prefix</code></td><td><code>""</code></td><td>Prefix of the client ids the broker assigns.</td></tr>
+<tr><td><code>clientid_prefixes</code></td><td><code>[]</code></td><td>When not empty, only client ids starting with one of these are accepted; others are refused as not authorized.</td></tr>
+<tr><td><code>persistent_client_expiration</code></td><td>never</td><td>Seconds the session of an MQTT 3.x client connected without clean session outlives its connection. MQTT 5 clients choose their own expiry.</td></tr>
+</table>
+
+<h3>Delivery</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>upgrade_outgoing_qos</code></td><td><code>false</code></td><td>Send messages at the QoS of the subscription even when published with a lower one. Goes beyond the MQTT specification.</td></tr>
+<tr><td><code>check_retain_source</code></td><td><code>false</code></td><td>Send a retained message to new subscribers only while the client that published it may still publish to its topic.</td></tr>
+<tr><td><code>send_topic_aliases</code></td><td><code>false</code></td><td>Replace repeated topics with aliases for MQTT 5 clients that accept them. Off by default because some client libraries announce alias support they don't implement.</td></tr>
+<tr><td><code>response_information</code></td><td></td><td>Topic prefix given to MQTT 5 clients that request Response Information; <code>%c</code> is replaced by the client id, as in <code>"responses/%c"</code>.</td></tr>
+<tr><td><code>sys_interval</code></td><td><code>10</code></td><td>Seconds between updates of the <a href="operations.html#sys">$SYS statistics</a>; <code>0</code> disables them.</td></tr>
+</table>
+
+<h3 id="redirect">[server.redirect]</h3>
+<p>Sends every client to another server instead of serving it. MQTT 5 clients are told where to go; MQTT 3.x clients only learn that this server is unavailable.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>server_reference</code></td><td>required</td><td>Where to go, such as <code>"broker2.example.com:1883"</code>.</td></tr>
+<tr><td><code>permanent</code></td><td><code>false</code></td><td>Server Moved when true, Use Another Server otherwise.</td></tr>
+</table>
+
+<h3 id="tls">[server.tls]</h3>
+<p>TLS for the main listener, and for <code>websocket_port</code>. <code>[listeners.tls]</code> takes the same options. See <a href="security.html#tls">TLS</a>.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Serve TLS instead of plain TCP.</td></tr>
+<tr><td><code>cert_path</code></td><td></td><td>Certificate chain, PEM.</td></tr>
+<tr><td><code>key_path</code></td><td></td><td>Private key, PEM: PKCS#1, PKCS#8 or SEC1.</td></tr>
+<tr><td><code>ca_path</code></td><td></td><td>Require clients to present a certificate signed by this CA.</td></tr>
+<tr><td><code>crl_path</code></td><td></td><td>Refuse client certificates revoked in these CRLs, PEM. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>identity_as_username</code></td><td><code>false</code></td><td>Use the client certificate's Common Name as the user name. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>subject_as_username</code></td><td><code>false</code></td><td>Use the whole certificate subject as the user name, in RFC 2253 form. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>min_version</code></td><td><code>"1.2"</code></td><td>Oldest TLS version accepted: <code>"1.2"</code> or <code>"1.3"</code>.</td></tr>
+</table>
+
+<h2 id="logging">[logging]</h2>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>level</code></td><td><code>"info"</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, or per module, as in <code>"info,mercurio_server::session=warn"</code>.</td></tr>
+<tr><td><code>file</code></td><td></td><td>Append logs to this file instead of standard output.</td></tr>
+<tr><td><code>syslog</code></td><td><code>false</code></td><td>Send logs to the local syslog daemon through <code>/dev/log</code>.</td></tr>
+<tr><td><code>connection_messages</code></td><td><code>true</code></td><td>Log clients connecting and disconnecting.</td></tr>
+</table>
+
+<h2 id="storage">[storage]</h2>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>backend</code></td><td><code>"memory"</code></td><td><code>"memory"</code>, lost on restart, or <code>"sqlite"</code>.</td></tr>
+<tr><td><code>path</code></td><td></td><td>The SQLite database file, with <code>backend = "sqlite"</code>.</td></tr>
+</table>
+
+<h2 id="auth">[auth]</h2>
+<p>See <a href="security.html">Authentication &amp; access</a>. <code>[listeners.auth]</code> takes the same options.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate.</td></tr>
+<tr><td><code>allow_anonymous</code></td><td><code>true</code></td><td>With authentication enabled, still accept clients that send no user name.</td></tr>
+<tr><td><code>password_file</code></td><td></td><td>User names and password hashes.</td></tr>
+<tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>
+<tr><td><code>dynamic_security</code></td><td></td><td>Dynamic security state file; replaces <code>password_file</code> and <code>acl_file</code>. Only in <code>[auth]</code>.</td></tr>
+</table>
+<h3 id="auth-http">[auth.http]</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>user_url</code></td><td></td><td>Endpoint checking logins; replaces <code>password_file</code>.</td></tr>
+<tr><td><code>acl_url</code></td><td></td><td>Endpoint checking topic access; replaces <code>acl_file</code>.</td></tr>
+<tr><td><code>timeout_seconds</code></td><td><code>5</code></td><td>Longest wait for an answer; a timeout denies.</td></tr>
+<tr><td><code>cache_seconds</code></td><td><code>30</code></td><td>How long topic answers are reused.</td></tr>
+</table>
+
+<h2 id="listeners">[[listeners]]</h2>
+<p>Each entry adds a listener. See <a href="listeners.html">Listeners</a>.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>host</code></td><td><code>"127.0.0.1"</code></td><td>Address to listen on.</td></tr>
+<tr><td><code>port</code></td><td></td><td>TCP port. Either this or <code>path</code>.</td></tr>
+<tr><td><code>path</code></td><td></td><td>Unix domain socket. Either this or <code>port</code>.</td></tr>
+<tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
+<tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
+<tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
+<tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use.</td></tr>
+<tr><td><code>max_connections</code></td><td></td><td>Concurrent connections on this listener, on top of the broker-wide limit.</td></tr>
+<tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this interface. Linux only.</td></tr>
+<tr><td><code>[listeners.tls]</code></td><td></td><td>Same options as <code>[server.tls]</code>.</td></tr>
+<tr><td><code>[listeners.auth]</code></td><td></td><td>Same options as <code>[auth]</code>, except <code>dynamic_security</code>. Replaces <code>[auth]</code> for this listener.</td></tr>
+</table>
+
+<h2 id="bridges">[[bridges]]</h2>
+<p>Each entry connects to another broker. See <a href="bridges.html">Bridges</a>.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>name</code></td><td>required</td><td>Names the bridge in logs and in its default client id.</td></tr>
+<tr><td><code>host</code>, <code>port</code></td><td>port <code>1883</code></td><td>The remote broker.</td></tr>
+<tr><td><code>addresses</code></td><td></td><td>Remote brokers as <code>"host:port"</code>, tried in turn; replaces <code>host</code> and <code>port</code>.</td></tr>
+<tr><td><code>protocol_version</code></td><td><code>"mqttv5"</code></td><td><code>"mqttv5"</code> or <code>"mqttv311"</code>.</td></tr>
+<tr><td><code>client_id</code></td><td><code>"mercurio-bridge-&lt;name&gt;"</code></td><td>Client id on both brokers.</td></tr>
+<tr><td><code>username</code>, <code>password</code></td><td></td><td>Credentials for the remote broker.</td></tr>
+<tr><td><code>notifications</code></td><td><code>true</code></td><td>Publish the bridge's state, retained, to <code>$SYS/broker/connection/&lt;client id&gt;/state</code>.</td></tr>
+<tr><td><code>[bridges.tls]</code></td><td></td><td><code>enabled</code>, <code>ca_path</code>, and <code>cert_path</code> with <code>key_path</code> for mutual TLS.</td></tr>
+</table>
+<h3>[[bridges.topics]]</h3>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>pattern</code></td><td>required</td><td>Topic filter to forward.</td></tr>
+<tr><td><code>direction</code></td><td><code>"out"</code></td><td><code>"out"</code> to the remote broker, <code>"in"</code> from it, or <code>"both"</code>.</td></tr>
+<tr><td><code>qos</code></td><td><code>0</code></td><td>QoS of the bridge's subscriptions.</td></tr>
+<tr><td><code>local_prefix</code></td><td><code>""</code></td><td>Where <code>pattern</code> sits on this broker.</td></tr>
+<tr><td><code>remote_prefix</code></td><td><code>""</code></td><td>Where <code>pattern</code> sits on the remote broker.</td></tr>
+</table>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html" aria-current="page">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Mercurio</h1>
+<p class="lead">An MQTT broker, client library and command-line client written in Rust on top of Tokio. It speaks MQTT 3.1, 3.1.1 and 5.0, and reads mosquitto's password and ACL files, so existing setups move over with little change.</p>
+
+<h2>What's in the box</h2>
+<table>
+<tr><th>Component</th><th>What it is</th></tr>
+<tr><td><code>mercuriod</code></td><td>The broker daemon. Configured with a TOML file, runs as a systemd service.</td></tr>
+<tr><td><code>mercurio</code></td><td>Command-line client: <code>mercurio pub</code> and <code>mercurio sub</code>.</td></tr>
+<tr><td><code>mercurio-client</code></td><td>Async Rust client library.</td></tr>
+<tr><td><code>mercurio-server</code></td><td>The broker as a library, to embed in your own program or extend with custom authentication.</td></tr>
+<tr><td><code>mercurio-storage</code></td><td>Storage for sessions, retained messages, wills and queued messages, in memory or SQLite.</td></tr>
+<tr><td><code>mercurio-core</code>, <code>mercurio-packets</code></td><td>Shared types and the encoding of every MQTT packet, for all three protocol versions.</td></tr>
+</table>
+
+<h2>Quick start</h2>
+<p>Build everything, start the broker with its defaults (plain MQTT on <code>127.0.0.1:1883</code>, state in memory), and exchange a message:</p>
+<pre>cargo build --release
+
+./target/release/mercuriod
+
+<span class="comment"># In a second terminal</span>
+./target/release/mercurio sub -t 'sensors/#' -T
+
+<span class="comment"># In a third</span>
+./target/release/mercurio pub -t sensors/kitchen -m 21.5 -q 1</pre>
+<p>The subscriber prints <code>sensors/kitchen 21.5</code>. Any MQTT client works with the broker, mosquitto's included:</p>
+<pre>mosquitto_sub -V mqttv5 -t 'sensors/#' -v</pre>
+
+<h2>Features</h2>
+<h3>Protocol</h3>
+<ul>
+<li>MQTT 3.1, 3.1.1 and 5.0, QoS 0, 1 and 2 in both directions, with retransmission on reconnect.</li>
+<li>Persistent sessions with session expiry, retained messages, wills and will delay.</li>
+<li>Shared subscriptions (<code>$share/group/filter</code>), subscription identifiers, No Local, Retain As Published, Retain Handling.</li>
+<li>Message expiry, content type, response topic, correlation data and user properties.</li>
+<li>Flow control: Receive Maximum, Maximum Packet Size, topic aliases in both directions.</li>
+<li>MQTT 5 enhanced authentication and re-authentication, server redirection, Server Keep Alive, Response Information.</li>
+</ul>
+<h3>Broker</h3>
+<ul>
+<li>Any number of listeners: TCP, TLS, WebSocket, Unix sockets, with the PROXY protocol, mount points and their own authentication.</li>
+<li>Authentication with password files (Argon2 or mosquitto's hashes), client certificates, an HTTP service, or dynamic security managed at runtime.</li>
+<li>Topic access control in mosquitto's <code>acl_file</code> format.</li>
+<li>Bridges to other brokers, MQTT 5 or 3.1.1, with failover and mutual TLS.</li>
+<li>State in memory or SQLite, so persistent sessions survive restarts.</li>
+<li><code>$SYS</code> statistics with mosquitto's names, logging to file or syslog.</li>
+<li>Configuration reloads on <code>SIGHUP</code>, graceful shutdown on <code>SIGTERM</code>.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<div class="cards">
+<a href="install.html"><strong>Installing &amp; running</strong>Build, run as a service, signals.</a>
+<a href="configuration.html"><strong>Configuration reference</strong>Every option of the TOML file.</a>
+<a href="security.html"><strong>Authentication &amp; access</strong>Passwords, ACLs, TLS, dynamic security.</a>
+<a href="listeners.html"><strong>Listeners</strong>TLS, WebSocket, Unix sockets, mount points.</a>
+<a href="bridges.html"><strong>Bridges</strong>Forward topics to and from other brokers.</a>
+<a href="operations.html"><strong>Operations</strong>Persistence, limits, statistics, logs.</a>
+<a href="client.html"><strong>Rust client library</strong>Connect, publish and subscribe from Rust.</a>
+<a href="migrating.html"><strong>Migrating from mosquitto</strong>Option by option.</a>
+</div>
+
+<h2>Performance</h2>
+<p>Measured on one 16-core machine with the load generator in <code>mercurio-client/examples/bench.rs</code>, against mosquitto 2.0.18 under the same load:</p>
+<table>
+<tr><th>Scenario</th><th>Mercurio</th><th>mosquitto</th></tr>
+<tr><td>QoS 0, 10 publishers to 1 subscriber</td><td>271k msg/s</td><td>108k msg/s</td></tr>
+<tr><td>QoS 1, 10 publishers to 1 subscriber</td><td>94k msg/s</td><td>28k msg/s</td></tr>
+<tr><td>QoS 0, 1 publisher to 50 subscribers</td><td>1.1M deliveries/s</td><td>110k deliveries/s</td></tr>
+<tr><td>QoS 1 round trip at 1,000 msg/s, p50 / p99</td><td>139 / 245 µs</td><td>249 / 573 µs</td></tr>
+</table>
+<p>mosquitto runs on one thread, while Mercurio uses every core, which accounts for much of the difference. Run the scenarios on your own hardware with:</p>
+<pre>cargo run --release --example bench -- &lt;port&gt; [fan-in-qos0|fan-in-qos1|fan-out|latency]</pre>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

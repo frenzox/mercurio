@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Migrating from mosquitto · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html" aria-current="page">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Migrating from mosquitto</h1>
+<p class="lead">Mercurio reads mosquitto's password and ACL files as they are and publishes the same <code>$SYS</code> topics. This page maps each mosquitto option to its Mercurio equivalent.</p>
+
+<h2>Step by step</h2>
+<ol>
+<li>Point <code>password_file</code> and <code>acl_file</code> at your existing files. Hashes written by <code>mosquitto_passwd</code>, <code>$7$</code> and <code>$6$</code>, are recognised.</li>
+<li>Translate <code>mosquitto.conf</code> into TOML with the table below.</li>
+<li>Start <code>mercuriod</code> on another port, point a few clients at it, then move the rest.</li>
+</ol>
+<p>Retained messages and persistent sessions are not imported from mosquitto's database; clients with persistent sessions start new ones, and retained messages need to be published again.</p>
+
+<h2>A typical configuration</h2>
+<table>
+<tr><th>mosquitto.conf</th><th>config.toml</th></tr>
+<tr><td><pre>listener 1883 127.0.0.1
+
+listener 8883
+certfile /etc/mosquitto/server.crt
+keyfile /etc/mosquitto/server.key
+
+allow_anonymous false
+password_file /etc/mosquitto/passwd
+acl_file /etc/mosquitto/acl
+
+persistence true
+persistence_location /var/lib/mosquitto/</pre></td>
+<td><pre>[server]
+host = "127.0.0.1"
+port = 1883
+
+[[listeners]]
+host = "0.0.0.0"
+port = 8883
+[listeners.tls]
+enabled = true
+cert_path = "/etc/mosquitto/server.crt"
+key_path = "/etc/mosquitto/server.key"
+
+[auth]
+enabled = true
+allow_anonymous = false
+password_file = "/etc/mosquitto/passwd"
+acl_file = "/etc/mosquitto/acl"
+
+[storage]
+backend = "sqlite"
+path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
+</table>
+<p>In mosquitto 2, <code>per_listener_settings</code> decides whether authentication is global or per listener. In Mercurio, <code>[auth]</code> applies everywhere, and a listener with its own <code>[listeners.auth]</code> uses that instead.</p>
+
+<h2>Option mapping</h2>
+<h3>Listeners</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio</th></tr>
+<tr><td><code>listener PORT [ADDRESS]</code></td><td><code>[server] port</code>/<code>host</code>, or a <code>[[listeners]]</code> entry</td></tr>
+<tr><td><code>listener 0 /path/to/socket</code></td><td><code>[[listeners]] path</code></td></tr>
+<tr><td><code>protocol websockets</code></td><td><code>protocol = "websocket"</code>, or <code>[server] websocket_port</code></td></tr>
+<tr><td><code>http_dir</code></td><td><code>http_dir</code></td></tr>
+<tr><td><code>bind_interface</code></td><td><code>bind_interface</code></td></tr>
+<tr><td><code>socket_domain</code></td><td>the address in <code>host</code>, such as <code>"::"</code></td></tr>
+<tr><td><code>mount_point</code></td><td><code>mount_point</code></td></tr>
+<tr><td><code>max_connections</code></td><td><code>[server] max_connections</code>, and per listener</td></tr>
+<tr><td><code>enable_proxy_protocol</code></td><td><code>proxy_protocol = true</code></td></tr>
+</table>
+<h3>TLS</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio, in <code>[server.tls]</code> or <code>[listeners.tls]</code></th></tr>
+<tr><td><code>certfile</code>, <code>keyfile</code></td><td><code>cert_path</code>, <code>key_path</code>, with <code>enabled = true</code></td></tr>
+<tr><td><code>cafile</code> with <code>require_certificate true</code></td><td><code>ca_path</code></td></tr>
+<tr><td><code>crlfile</code></td><td><code>crl_path</code></td></tr>
+<tr><td><code>use_identity_as_username</code></td><td><code>identity_as_username</code></td></tr>
+<tr><td><code>use_subject_as_username</code></td><td><code>subject_as_username</code></td></tr>
+<tr><td><code>tls_version tlsv1.3</code></td><td><code>min_version = "1.3"</code></td></tr>
+<tr><td><code>psk_hint</code>, <code>psk_file</code></td><td>not supported</td></tr>
+</table>
+<h3>Security</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio</th></tr>
+<tr><td><code>allow_anonymous</code></td><td><code>[auth] enabled = true</code> with <code>allow_anonymous</code></td></tr>
+<tr><td><code>password_file</code>, <code>acl_file</code></td><td>the same, in <code>[auth]</code></td></tr>
+<tr><td>dynamic security plugin</td><td><code>[auth] dynamic_security</code>, with the same commands; create the file with <code>mercuriod dynsec-init</code></td></tr>
+<tr><td>mosquitto-go-auth HTTP backend</td><td><code>[auth.http]</code></td></tr>
+<tr><td><code>check_retain_source</code></td><td><code>check_retain_source</code></td></tr>
+<tr><td><code>allow_zero_length_clientid</code>, <code>auto_id_prefix</code>, <code>clientid_prefixes</code></td><td>the same, in <code>[server]</code></td></tr>
+</table>
+<h3>Limits and behaviour</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio, in <code>[server]</code></th></tr>
+<tr><td><code>max_queued_messages</code>, <code>max_queued_bytes</code></td><td><code>max_queued_messages</code>, <code>max_queued_bytes</code>; also <code>max_queued_qos0_messages</code></td></tr>
+<tr><td><code>max_packet_size</code>, <code>message_size_limit</code></td><td><code>max_packet_size</code></td></tr>
+<tr><td><code>max_keepalive</code></td><td><code>max_keepalive</code></td></tr>
+<tr><td><code>max_qos</code>, <code>retain_available</code></td><td>the same</td></tr>
+<tr><td><code>max_inflight_messages</code></td><td><code>receive_maximum</code>, for QoS 2 from clients; clients announce their own Receive Maximum</td></tr>
+<tr><td><code>upgrade_outgoing_qos</code></td><td><code>upgrade_outgoing_qos</code></td></tr>
+<tr><td><code>persistent_client_expiration 1w</code></td><td><code>persistent_client_expiration = 604800</code>, in seconds</td></tr>
+<tr><td><code>sys_interval</code></td><td><code>sys_interval</code></td></tr>
+<tr><td><code>persistence</code>, <code>persistence_location</code></td><td><code>[storage] backend = "sqlite"</code>, <code>path</code>; written as changes happen</td></tr>
+<tr><td><code>include_dir</code></td><td><code>include_dir</code>, with <code>*.toml</code> files</td></tr>
+</table>
+<h3>Logging</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio, in <code>[logging]</code></th></tr>
+<tr><td><code>log_dest stdout</code></td><td>the default</td></tr>
+<tr><td><code>log_dest file PATH</code></td><td><code>file = "PATH"</code></td></tr>
+<tr><td><code>log_dest syslog</code></td><td><code>syslog = true</code></td></tr>
+<tr><td><code>log_type</code></td><td><code>level</code>, per module if needed</td></tr>
+<tr><td><code>connection_messages</code></td><td><code>connection_messages</code></td></tr>
+</table>
+<h3>Bridges</h3>
+<table>
+<tr><th>mosquitto</th><th>Mercurio, in <code>[[bridges]]</code></th></tr>
+<tr><td><code>connection NAME</code></td><td><code>name</code></td></tr>
+<tr><td><code>address host:port [host:port …]</code></td><td><code>host</code>/<code>port</code>, or <code>addresses</code></td></tr>
+<tr><td><code>topic PATTERN DIRECTION QOS LOCAL REMOTE</code></td><td>a <code>[[bridges.topics]]</code> entry: <code>pattern</code>, <code>direction</code>, <code>qos</code>, <code>local_prefix</code>, <code>remote_prefix</code></td></tr>
+<tr><td><code>bridge_protocol_version mqttv311</code></td><td><code>protocol_version = "mqttv311"</code></td></tr>
+<tr><td><code>remote_clientid</code>, <code>remote_username</code>, <code>remote_password</code></td><td><code>client_id</code>, <code>username</code>, <code>password</code></td></tr>
+<tr><td><code>bridge_cafile</code>, <code>bridge_certfile</code>, <code>bridge_keyfile</code></td><td><code>[bridges.tls]</code> <code>ca_path</code>, <code>cert_path</code>, <code>key_path</code></td></tr>
+<tr><td><code>notifications</code></td><td><code>notifications</code>; the state goes to this broker only</td></tr>
+</table>
+
+<h2>Differences to know</h2>
+<ul>
+<li>A bridge's local side is trusted: this broker's ACLs don't restrict what it forwards in.</li>
+<li>Bridges to MQTT 3.1.1 brokers drop the remote broker's echo of what they forwarded, without mosquitto's <code>try_private</code> extension; see <a href="bridges.html">Bridges</a>.</li>
+<li>Over HTTP authentication, <code>clientid</code> is empty in login requests.</li>
+<li>Dynamic security has no client or group priorities for roles; the ACL priority decides.</li>
+</ul>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

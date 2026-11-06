@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedding the broker · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html" aria-current="page">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Embedding the broker</h1>
+<p class="lead"><code>mercurio-server</code> is the broker as a library: run it inside your own program, with your own authentication, access control and storage.</p>
+
+<h2>Adding it</h2>
+<pre>[dependencies]
+mercurio-server = { git = "https://github.com/frenzox/mercurio" }
+mercurio-storage = { git = "https://github.com/frenzox/mercurio", features = ["sqlite"] }
+tokio = { version = "1", features = ["full"] }</pre>
+
+<h2>Running a broker</h2>
+<pre>use mercurio_server::server::{run_with_config, ServerConfig};
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let listener = TcpListener::bind("0.0.0.0:1883").await?;
+    run_with_config(listener, ServerConfig::default(), tokio::signal::ctrl_c()).await?;
+    Ok(())
+}</pre>
+<p>The broker runs until the future given last completes, then shuts down gracefully. Three entry points exist:</p>
+<table>
+<tr><th>Function</th><th>Use</th></tr>
+<tr><td><code>run(listener, shutdown)</code></td><td>Defaults, state in memory</td></tr>
+<tr><td><code>run_with_config(listener, config, shutdown)</code></td><td>Your configuration, state in memory</td></tr>
+<tr><td><code>run_with_storage(listener, config, storage, shutdown)</code></td><td>Your configuration and storage</td></tr>
+</table>
+<p>They fail without serving anyone if the configuration can't be used, such as an unreadable TLS certificate.</p>
+
+<h2>Configuration</h2>
+<p><code>ServerConfig</code> mirrors the daemon's configuration file:</p>
+<table>
+<tr><th>Field</th><th>Holds</th></tr>
+<tr><td><code>tls</code></td><td><code>Option&lt;TlsConfig&gt;</code> for the main listener</td></tr>
+<tr><td><code>auth</code></td><td><code>AuthConfig</code>: whether authentication is required, the credential validator, enhanced authentication methods and the authorizer</td></tr>
+<tr><td><code>limits</code></td><td><code>Limits</code>: connection, packet, queue and QoS limits</td></tr>
+<tr><td><code>policy</code></td><td><code>ConnectPolicy</code>: client id rules, redirection, response information</td></tr>
+<tr><td><code>listeners</code></td><td>Extra <code>ListenerConfig</code>s: TCP or Unix sockets, MQTT or WebSocket, with their own TLS, mount point, auth and limits</td></tr>
+<tr><td><code>local_listener</code></td><td>In-process connections, see <a href="#local">below</a></td></tr>
+<tr><td><code>sys_interval</code></td><td>How often <code>$SYS</code> statistics are published</td></tr>
+</table>
+<pre>use mercurio_server::{
+    server::{ListenerConfig, ServerConfig, Transport},
+    tls::TlsConfig,
+};
+use tokio::net::TcpListener;
+
+let config = ServerConfig {
+    listeners: vec![ListenerConfig {
+        tls: Some(TlsConfig::new("server.crt", "server.key")),
+        ..ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt)
+    }],
+    ..Default::default()
+};</pre>
+
+<h2 id="auth">Authentication and access control</h2>
+<p>Two traits cover most needs. A <code>CredentialValidator</code> checks user names and passwords; an <code>Authorizer</code> decides topic access:</p>
+<pre>use std::sync::Arc;
+
+use mercurio_server::{
+    acl::{Access, Authorizer, ClientIdentity},
+    auth::CredentialValidator,
+    server::{AuthConfig, ServerConfig},
+};
+
+struct Users;
+
+impl CredentialValidator for Users {
+    fn validate(&amp;self, username: &amp;str, password: &amp;[u8]) -&gt; bool {
+        // Look the user up in your database
+        username == "alice" &amp;&amp; password == b"secret"
+    }
+}
+
+struct OwnTopics;
+
+impl Authorizer for OwnTopics {
+    fn authorize(&amp;self, client: &amp;ClientIdentity, topic: &amp;str, access: Access) -&gt; bool {
+        let Some(user) = &amp;client.username else {
+            return access == Access::Read;
+        };
+        topic.starts_with(&amp;format!("users/{user}/"))
+    }
+}
+
+let config = ServerConfig {
+    auth: AuthConfig {
+        require_auth: true,
+        allow_anonymous: false,
+        credential_validator: Some(Arc::new(Users)),
+        authorizer: Some(Arc::new(OwnTopics)),
+        ..Default::default()
+    },
+    ..Default::default()
+};</pre>
+<ul>
+<li><code>Access</code> is <code>Write</code> to publish, <code>Subscribe</code> to subscribe, with the topic filter, and <code>Read</code> to receive a message.</li>
+<li><code>ClientIdentity::username</code> is only set for users the broker verified.</li>
+<li>The traits are synchronous and called for every message, so keep them fast; cache answers that need I/O.</li>
+<li><code>acl::AclFile::parse</code> reads mosquitto's ACL format, if you want that from your own code.</li>
+</ul>
+
+<h3>Enhanced authentication</h3>
+<p>MQTT 5 enhanced authentication methods implement <code>AuthMethod</code>, which starts an <code>AuthExchange</code> per client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. Register them with an <code>AuthManager</code>:</p>
+<pre>use std::{collections::HashMap, sync::Arc};
+
+use mercurio_server::{
+    auth::{AuthManager, PlainAuth},
+    server::AuthConfig,
+};
+
+let mut methods = AuthManager::new();
+methods.register(Box::new(PlainAuth::new(HashMap::from([(
+    "alice".to_string(),
+    "secret".to_string(),
+)]))));
+let auth = AuthConfig {
+    require_auth: true,
+    auth_manager: Some(Arc::new(methods)),
+    ..Default::default()
+};</pre>
+
+<h2>Storage</h2>
+<pre>use std::sync::Arc;
+
+use mercurio_server::server::{run_with_storage, ServerConfig};
+use mercurio_storage::sqlite::SqliteStore;
+
+let storage = Arc::new(SqliteStore::new("/var/lib/myapp/mqtt.db")?);
+run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;</pre>
+<p>Any type implementing the storage traits of <code>mercurio-storage</code> (sessions, retained messages, wills, in-flight messages and queues) can replace SQLite.</p>
+
+<h2 id="local">In-process clients</h2>
+<p>A <code>LocalConnector</code> opens connections to the broker in memory, without TCP. Combined with <code>mercurio-client</code>'s <code>connector</code> option, it lets your program publish and subscribe on its own broker. These connections are trusted: authentication and access control don't apply to them.</p>
+<pre>use mercurio_client::{ConnectOptions, MqttClient, QoS};
+use mercurio_server::server::{run_with_config, LocalConnector, ServerConfig};
+
+let (connector, local_listener) = LocalConnector::new();
+let config = ServerConfig {
+    local_listener: Some(local_listener),
+    ..Default::default()
+};
+tokio::spawn(run_with_config(listener, config, std::future::pending::&lt;()&gt;()));
+
+let options = ConnectOptions::new("localhost", 0)
+    .client_id("internal")
+    .connector(move || connector.connect());
+let client = MqttClient::connect(options).await?;
+client.publish("app/started", "1", QoS::AtLeastOnce).await?;</pre>
+<p>The daemon's bridges and dynamic security work this way.</p>
+
+<h2>Logs</h2>
+<p>The broker logs through <code>tracing</code>. Install any subscriber, such as <code>tracing_subscriber::fmt().init()</code>. Connection and disconnection messages use the target <code>mercurio_server::CONNECTIONS</code>, so they can be filtered alone.</p>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>
