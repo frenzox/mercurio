@@ -147,5 +147,6 @@ async fn shutdown_is_announced_to_connected_clients() {
     timeout(Duration::from_secs(2), server)
         .await
         .expect("server did not finish shutting down")
+        .unwrap()
         .unwrap();
 }
