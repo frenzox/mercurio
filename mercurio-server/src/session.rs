@@ -524,7 +524,8 @@ impl Session {
         }
 
         // $SYS topics carry the broker's own statistics
-        if packet.topic_name == "$SYS" || packet.topic_name.starts_with("$SYS/") {
+        let sys = packet.topic_name == "$SYS" || packet.topic_name.starts_with("$SYS/");
+        if sys && !authorizer.is_some_and(|a| a.allows_sys_publish()) {
             warn!("Client publish to `{}` refused", packet.topic_name);
             return self
                 .refuse_publish(&packet, ReasonCode::NotAuthorized)

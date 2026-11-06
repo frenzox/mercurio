@@ -224,11 +224,16 @@ impl LocalConnector {
     }
 }
 
-/// Lets trusted connections use every topic, `$CONTROL` ones included.
+/// Lets trusted connections use every topic, `$CONTROL` and `$SYS` ones
+/// included.
 struct AllowAll;
 
 impl Authorizer for AllowAll {
     fn authorize(&self, _: &ClientIdentity, _: &str, _: Access) -> bool {
+        true
+    }
+
+    fn allows_sys_publish(&self) -> bool {
         true
     }
 }

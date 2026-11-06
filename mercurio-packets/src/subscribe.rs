@@ -235,8 +235,15 @@ impl SubscribePacket {
         if with_properties {
             VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
+            self.payload.encode(buffer);
+        } else {
+            // MQTT 3.x only has the QoS; the other option bits are reserved
+            // and must be zero [MQTT-3.8.3-4]
+            for sub in &self.payload {
+                sub.topic_filter.encode(buffer);
+                (sub.subs_opt.qos as u8).encode(buffer);
+            }
         }
-        self.payload.encode(buffer);
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
@@ -288,6 +295,29 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use crate::subscribe::*;
+
+    #[test]
+    fn test_v3_encoding_keeps_only_the_qos() {
+        let packet = SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![SubscribePayload {
+                topic_filter: "t".to_string(),
+                subs_opt: SubscriptionOptions {
+                    qos: QoS::AtLeastOnce,
+                    no_local: true,
+                    retain_as_pub: true,
+                    retain_handling: RetainHandling::DoNotSendRetained,
+                },
+            }],
+        };
+        let mut encoded = BytesMut::new();
+        packet.encode_v3(&mut encoded);
+        assert_eq!(
+            &encoded[..],
+            [0x82, 0x06, 0x00, 0x01, 0x00, 0x01, b't', 0x01]
+        );
+    }
 
     #[test]
     fn test_subscribe_packet_encode_decode() {

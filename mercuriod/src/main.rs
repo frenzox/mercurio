@@ -208,10 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_config = build_auth(&config.auth, &mut reloadable, Some(&connector))?;
 
     for bridge in config.bridges {
-        info!(
-            "Bridging to {}:{} as {}",
-            bridge.host, bridge.port, bridge.name
-        );
+        info!("Starting bridge {}", bridge.name);
         bridge::spawn(bridge, connector.clone())?;
     }
 

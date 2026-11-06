@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
 
@@ -18,12 +18,11 @@ pub fn build_tls_connector(
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| ClientError::Tls(format!("Invalid server name: {}", host)))?;
 
-    let config = if options.danger_skip_verify {
+    let builder = if options.danger_skip_verify {
         // WARNING: This disables all certificate verification - only for testing!
         ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth()
     } else if let Some(ref ca_path) = options.ca_path {
         // Use custom CA certificate
         let ca_certs = load_certs(ca_path)?;
@@ -33,16 +32,29 @@ pub fn build_tls_connector(
                 .add(cert)
                 .map_err(|e| ClientError::Tls(format!("Failed to add CA cert: {}", e)))?;
         }
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        ClientConfig::builder().with_root_certificates(root_store)
     } else {
         // Use system root certificates
         let root_store =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        ClientConfig::builder().with_root_certificates(root_store)
+    };
+
+    let config = match (&options.cert_path, &options.key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
+                ClientError::Tls(format!("Failed to read key from '{}': {}", key_path, e))
+            })?;
+            builder
+                .with_client_auth_cert(load_certs(cert_path)?, key)
+                .map_err(|e| ClientError::Tls(format!("Invalid client certificate: {}", e)))?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(ClientError::Tls(
+                "A client certificate needs both a certificate and a key".to_string(),
+            ))
+        }
     };
 
     Ok((TlsConnector::from(Arc::new(config)), server_name))
