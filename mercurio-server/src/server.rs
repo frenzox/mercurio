@@ -7,7 +7,7 @@ use std::{
 
 use crate::error::ServerError;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, DuplexStream},
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, Semaphore},
     time::{self, Duration, Instant},
@@ -112,6 +112,8 @@ pub struct ServerConfig {
     pub policy: ConnectPolicy,
     /// Listeners to serve besides the main one.
     pub listeners: Vec<ListenerConfig>,
+    /// Accept in-process connections from the paired `LocalConnector`.
+    pub local_listener: Option<LocalListener>,
     /// How often to publish statistics under `$SYS/broker/`; never if unset.
     pub sys_interval: Option<Duration>,
 }
@@ -124,6 +126,7 @@ impl Default for ServerConfig {
             limits: Limits::default(),
             policy: ConnectPolicy::default(),
             listeners: Vec::new(),
+            local_listener: None,
             sys_interval: Some(Duration::from_secs(10)),
         }
     }
@@ -135,6 +138,37 @@ pub struct ListenerConfig {
     pub transport: Transport,
     /// Serve TLS instead of plain TCP when set.
     pub tls: Option<TlsConfig>,
+}
+
+/// Opens in-process connections to a broker, for parts of the same program
+/// such as bridges. These connections skip authentication and access
+/// control.
+#[derive(Clone)]
+pub struct LocalConnector(mpsc::UnboundedSender<DuplexStream>);
+
+/// The broker's end of a `LocalConnector`, given in `ServerConfig`.
+pub struct LocalListener(mpsc::UnboundedReceiver<DuplexStream>);
+
+impl LocalConnector {
+    pub fn new() -> (LocalConnector, LocalListener) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (LocalConnector(tx), LocalListener(rx))
+    }
+
+    /// A new connection to the broker, which fails once the broker stopped.
+    pub fn connect(&self) -> std::io::Result<DuplexStream> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        self.0.send(server).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "broker stopped")
+        })?;
+        Ok(client)
+    }
+}
+
+/// A connection waiting to be served.
+enum Accepted {
+    Tcp(TcpStream, usize),
+    Local(DuplexStream),
 }
 
 /// How MQTT is carried on a connection.
@@ -237,6 +271,9 @@ pub struct Redirect {
 
 struct Listener<St: MqttStore + 'static> {
     endpoints: Vec<Endpoint>,
+    local_listener: Option<LocalListener>,
+    /// Given to local connections instead of `auth_config`
+    trusted_auth: Arc<AuthConfig>,
     /// Where the next accept starts looking, so a busy listener does not
     /// starve the others
     next_endpoint: usize,
@@ -303,6 +340,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         limits,
         policy,
         listeners,
+        local_listener,
         sys_interval,
     } = config;
     let stats = Arc::new(Stats::default());
@@ -325,6 +363,8 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 
     let mut server = Listener {
         endpoints,
+        local_listener,
+        trusted_auth: Arc::default(),
         next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
@@ -387,9 +427,11 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
 impl<St: MqttStore + 'static> Listener<St> {
     async fn run(&mut self) {
         loop {
-            let (socket, endpoint) = self.accept().await;
-            let transport = self.endpoints[endpoint].transport;
-            let peer_addr = socket.peer_addr().ok();
+            let accepted = self.accept().await;
+            let peer_addr = match &accepted {
+                Accepted::Tcp(socket, _) => socket.peer_addr().ok(),
+                Accepted::Local(_) => None,
+            };
 
             // Held by the connection's task for as long as it runs
             let slot = match &self.connection_slots {
@@ -415,6 +457,21 @@ impl<St: MqttStore + 'static> Listener<St> {
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
             };
+            let (socket, endpoint) = match accepted {
+                Accepted::Tcp(socket, endpoint) => (socket, endpoint),
+                Accepted::Local(stream) => {
+                    let parts = HandlerParts {
+                        auth_config: Arc::clone(&self.trusted_auth),
+                        ..parts
+                    };
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        parts.serve(stream, Transport::Mqtt, None).await;
+                    });
+                    continue;
+                }
+            };
+            let transport = self.endpoints[endpoint].transport;
             let tls_acceptor = self.endpoints[endpoint].tls_acceptor.clone();
 
             tokio::spawn(async move {
@@ -510,17 +567,24 @@ impl<St: MqttStore + 'static> Listener<St> {
     /// Waits for the next connection. Errors such as running out of file
     /// descriptors are usually transient, so they are retried with a backoff
     /// rather than shutting the listener down.
-    async fn accept(&mut self) -> (TcpStream, usize) {
+    async fn accept(&mut self) -> Accepted {
         let mut backoff = Duration::from_millis(10);
 
         loop {
             let accepted = poll_fn(|cx| {
+                if let Some(LocalListener(local)) = &mut self.local_listener {
+                    if let Poll::Ready(Some(stream)) = local.poll_recv(cx) {
+                        return Poll::Ready(Ok(Accepted::Local(stream)));
+                    }
+                }
                 let count = self.endpoints.len();
                 for offset in 0..count {
                     let index = (self.next_endpoint + offset) % count;
                     if let Poll::Ready(accepted) = self.endpoints[index].listener.poll_accept(cx) {
                         self.next_endpoint = (index + 1) % count;
-                        return Poll::Ready(accepted.map(|(socket, _)| (socket, index)));
+                        return Poll::Ready(
+                            accepted.map(|(socket, _)| Accepted::Tcp(socket, index)),
+                        );
                     }
                 }
                 Poll::Pending

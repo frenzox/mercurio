@@ -209,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits,
         policy,
         listeners,
+        local_listener: None,
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };
