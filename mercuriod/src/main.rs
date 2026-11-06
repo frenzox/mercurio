@@ -213,6 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listeners: Vec<_> = websocket_listener
         .map(|listener| ListenerConfig {
             tls: tls_config.clone(),
+            http_dir: config.server.http_dir.clone().map(Into::into),
             ..ListenerConfig::new(listener, Transport::WebSocket)
         })
         .into_iter()
@@ -231,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             proxy_protocol: extra.proxy_protocol,
             mount_point: extra.mount_point.clone(),
             max_connections: extra.max_connections,
+            http_dir: extra.http_dir.clone().map(Into::into),
             auth: match &extra.auth {
                 Some(auth) => Some(build_auth(auth, &mut reloadable, None)?),
                 None => None,

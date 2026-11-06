@@ -20,6 +20,10 @@ port = 1883
 # Also serve MQTT over WebSocket (with TLS when it is enabled) on this port
 # websocket_port = 8080
 
+# Serve the files of this directory to plain HTTP requests on websocket_port,
+# such as a browser client's page; [[listeners]] take it too
+# http_dir = "/var/www/mercurio"
+
 # Seconds between updates of the broker statistics published under
 # $SYS/broker/ (0 disables them)
 sys_interval = 10
