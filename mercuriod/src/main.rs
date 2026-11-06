@@ -11,9 +11,9 @@ use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
 use mercurio_server::server::{
-    AuthConfig as ServerAuthConfig, ConnectPolicy, Redirect, ServerConfig,
+    AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, Redirect, ServerConfig,
+    Transport,
 };
-use mercurio_server::tls::TlsConfig;
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
@@ -138,27 +138,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
 
-    let tls_config = if config.server.tls.enabled {
-        let cert_path = config
-            .server
-            .tls
-            .cert_path
-            .ok_or("TLS enabled but cert_path not specified in configuration")?;
-        let key_path = config
-            .server
-            .tls
-            .key_path
-            .ok_or("TLS enabled but key_path not specified in configuration")?;
-
-        let mut tls = TlsConfig::new(cert_path, key_path);
-        if let Some(ca_path) = config.server.tls.ca_path {
-            tls = tls.with_client_auth(ca_path);
-        }
-
-        Some(tls)
-    } else {
-        None
-    };
+    let tls_config = config.server.tls.build()?;
+    // The WebSocket listener shares the main listener's TLS settings
+    let mut listeners: Vec<_> = websocket_listener
+        .map(|listener| ListenerConfig {
+            listener,
+            transport: Transport::WebSocket,
+            tls: tls_config.clone(),
+        })
+        .into_iter()
+        .collect();
+    for extra in &config.listeners {
+        let addr = format!("{}:{}", extra.host, extra.port);
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("Failed to listen on {}: {}", addr, e))?;
+        info!(
+            "Serving {:?}{} on {}",
+            extra.protocol,
+            if extra.tls.enabled { " with TLS" } else { "" },
+            addr
+        );
+        listeners.push(ListenerConfig {
+            listener,
+            transport: extra.protocol.into(),
+            tls: extra.tls.build()?,
+        });
+    }
 
     let acl = match &config.auth.acl_file {
         Some(path) => {
@@ -202,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         limits,
         policy,
-        websocket_listener,
+        listeners,
         sys_interval: (config.server.sys_interval > 0)
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };

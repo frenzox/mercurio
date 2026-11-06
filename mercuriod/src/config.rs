@@ -2,7 +2,11 @@
 
 use std::{path::Path, time::Duration};
 
-use mercurio_server::{queue::QueueLimits, server::Limits};
+use mercurio_server::{
+    queue::QueueLimits,
+    server::{Limits, Transport},
+    tls::TlsConfig,
+};
 
 use serde::Deserialize;
 
@@ -21,6 +25,42 @@ pub struct Config {
 
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Listeners served besides the one in `[server]`
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
+}
+
+/// An extra listener, with its own protocol and TLS settings.
+#[derive(Debug, Deserialize)]
+pub struct ListenerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+
+    pub port: u16,
+
+    #[serde(default)]
+    pub protocol: Protocol,
+
+    #[serde(default)]
+    pub tls: TlsServerConfig,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Mqtt,
+    Websocket,
+}
+
+impl From<Protocol> for Transport {
+    fn from(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Mqtt => Transport::Mqtt,
+            Protocol::Websocket => Transport::WebSocket,
+        }
+    }
 }
 
 /// Where the broker keeps sessions, retained messages, wills and in-flight
@@ -152,6 +192,28 @@ pub struct TlsServerConfig {
     pub ca_path: Option<String>,
 }
 
+impl TlsServerConfig {
+    /// The TLS settings to serve with, or `None` when TLS is disabled.
+    pub fn build(&self) -> Result<Option<TlsConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let cert_path = self
+            .cert_path
+            .clone()
+            .ok_or("TLS enabled but cert_path not specified in configuration")?;
+        let key_path = self
+            .key_path
+            .clone()
+            .ok_or("TLS enabled but key_path not specified in configuration")?;
+        let mut tls = TlsConfig::new(cert_path, key_path);
+        if let Some(ca_path) = &self.ca_path {
+            tls = tls.with_client_auth(ca_path.clone());
+        }
+        Ok(Some(tls))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RedirectConfig {
     /// The server clients should use, such as `broker2.example.com:1883`
@@ -273,4 +335,39 @@ impl Default for AuthConfig {
 
 fn default_allow_anonymous() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, Protocol};
+
+    #[test]
+    fn test_parse_listeners() {
+        let config: Config = toml::from_str(
+            r#"
+            [[listeners]]
+            port = 8883
+            [listeners.tls]
+            enabled = true
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [[listeners]]
+            host = "0.0.0.0"
+            port = 8080
+            protocol = "websocket"
+            "#,
+        )
+        .unwrap();
+
+        let [tls, websocket] = &config.listeners[..] else {
+            panic!("expected two listeners");
+        };
+        assert_eq!((tls.host.as_str(), tls.port), ("127.0.0.1", 8883));
+        assert!(matches!(tls.protocol, Protocol::Mqtt));
+        assert!(tls.tls.build().unwrap().is_some());
+        assert_eq!((websocket.host.as_str(), websocket.port), ("0.0.0.0", 8080));
+        assert!(matches!(websocket.protocol, Protocol::Websocket));
+        assert!(websocket.tls.build().unwrap().is_none());
+    }
 }

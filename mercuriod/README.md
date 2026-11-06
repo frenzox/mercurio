@@ -128,6 +128,20 @@ allow_anonymous = true
 # only apply to user names verified by authentication; other clients are
 # matched as anonymous.
 # acl_file = "/etc/mercurio/acl"
+
+# Extra listeners, each with its own protocol ("mqtt" or "websocket") and
+# TLS settings. `host` defaults to 127.0.0.1.
+# [[listeners]]
+# host = "0.0.0.0"
+# port = 8883
+# [listeners.tls]
+# enabled = true
+# cert_path = "/etc/mercurio/server.crt"
+# key_path = "/etc/mercurio/server.key"
+#
+# [[listeners]]
+# port = 8080
+# protocol = "websocket"
 ```
 
 ### Authentication
@@ -190,6 +204,14 @@ broker also requires a client certificate signed by that CA.
 `websocket_port` serves MQTT over WebSocket, using the `mqtt` subprotocol,
 for browsers and clients behind HTTP proxies. Its sessions, retained
 messages and subscriptions are shared with the TCP listener.
+
+### Listeners
+
+Each `[[listeners]]` entry serves another port, with its own `protocol`
+(`mqtt` or `websocket`) and its own `[listeners.tls]` settings. A typical
+setup keeps plain MQTT on localhost in `[server]` and adds a TLS listener on
+`0.0.0.0:8883`. All listeners share sessions, subscriptions and retained
+messages.
 
 ### Persistence
 
