@@ -122,6 +122,13 @@ pub struct ListenerConfig {
     /// Connections start with a PROXY protocol header from a load balancer
     #[serde(default)]
     pub proxy_protocol: bool,
+
+    /// Prefixed to every topic this listener's clients use
+    pub mount_point: Option<String>,
+
+    /// Authentication and access control for this listener's clients,
+    /// replacing `[auth]`
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]

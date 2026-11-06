@@ -150,6 +150,18 @@ allow_anonymous = true
 # host = "0.0.0.0"
 # port = 1884
 # proxy_protocol = true
+#
+# A tenant's listener: its clients only see topics under the mount point
+# and log in with their own password file. `[listeners.auth]` takes the
+# same settings as `[auth]` and replaces it for this listener.
+# [[listeners]]
+# host = "0.0.0.0"
+# port = 1885
+# mount_point = "tenant1/"
+# [listeners.auth]
+# enabled = true
+# allow_anonymous = false
+# password_file = "/etc/mercurio/tenant1.passwd"
 
 # Bridges forward topics to and from another MQTT 5 broker
 # [[bridges]]

@@ -26,7 +26,7 @@ mod reload;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
-use reload::Reloadable;
+use reload::{Reload, Reloadable};
 
 #[derive(Parser, Debug)]
 #[command(name = "mercuriod")]
@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .into_iter()
         .collect();
+    let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
     for extra in &config.listeners {
         let (listener, addr) = bind_listener(extra).await?;
         info!(
@@ -176,46 +177,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listeners.push(ListenerConfig {
             tls: extra.tls.build()?,
             proxy_protocol: extra.proxy_protocol,
+            mount_point: extra.mount_point.clone(),
+            auth: match &extra.auth {
+                Some(auth) => Some(build_auth(auth, &mut reloadable)?),
+                None => None,
+            },
             ..ListenerConfig::new(listener, extra.protocol.into())
         });
     }
 
-    let acl = match &config.auth.acl_file {
-        Some(path) => {
-            let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
-            info!("Loaded topic access control from {}", path);
-            Some(acl)
-        }
-        None => None,
-    };
-    let authorizer = acl.clone().map(|acl| acl as Arc<dyn Authorizer>);
-
-    let mut passwords = None;
-    // Build authentication configuration
-    let auth_config = if config.auth.enabled {
-        let credential_validator = if let Some(ref password_file) = config.auth.password_file {
-            let validator = Arc::new(Reloadable::load(password_file, load_credentials)?);
-            info!("Loaded credentials from {}", password_file);
-            passwords = Some(Arc::clone(&validator));
-            Some(validator as Arc<dyn mercurio_server::auth::CredentialValidator>)
-        } else {
-            None
-        };
-
-        info!("Authentication enabled");
-        ServerAuthConfig {
-            require_auth: true,
-            allow_anonymous: config.auth.allow_anonymous,
-            credential_validator,
-            auth_manager: None,
-            authorizer,
-        }
-    } else {
-        ServerAuthConfig {
-            authorizer,
-            ..Default::default()
-        }
-    };
+    let auth_config = build_auth(&config.auth, &mut reloadable)?;
 
     let local_listener = if config.bridges.is_empty() {
         None
@@ -242,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .then(|| Duration::from_secs(config.server.sys_interval)),
     };
     #[cfg(unix)]
-    tokio::spawn(reload_on_sighup(acl, passwords));
+    tokio::spawn(reload_on_sighup(reloadable));
 
     let result = match config.storage {
         StorageConfig::Memory => {
@@ -313,31 +284,60 @@ async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
 }
 
+/// The authentication and access control of `config`, adding the files
+/// it loads to `reloadable`.
+fn build_auth(
+    config: &config::AuthConfig,
+    reloadable: &mut Vec<Arc<dyn Reload>>,
+) -> Result<ServerAuthConfig, String> {
+    let authorizer = match &config.acl_file {
+        Some(path) => {
+            let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
+            info!("Loaded topic access control from {}", path);
+            reloadable.push(acl.clone());
+            Some(acl as Arc<dyn Authorizer>)
+        }
+        None => None,
+    };
+    if !config.enabled {
+        return Ok(ServerAuthConfig {
+            authorizer,
+            ..Default::default()
+        });
+    }
+
+    let credential_validator = match &config.password_file {
+        Some(path) => {
+            let validator = Arc::new(Reloadable::load(path, load_credentials)?);
+            info!("Loaded credentials from {}", path);
+            reloadable.push(validator.clone());
+            Some(validator as Arc<dyn mercurio_server::auth::CredentialValidator>)
+        }
+        None => None,
+    };
+    Ok(ServerAuthConfig {
+        require_auth: true,
+        allow_anonymous: config.allow_anonymous,
+        credential_validator,
+        auth_manager: None,
+        authorizer,
+    })
+}
+
 /// Rereads the ACL and password files on SIGHUP. ACL changes apply to every
 /// later publish and subscribe; password changes apply to later connections.
 #[cfg(unix)]
-async fn reload_on_sighup(
-    acl: Option<Arc<Reloadable<AclFile>>>,
-    passwords: Option<Arc<Reloadable<HashedCredentialValidator>>>,
-) {
+async fn reload_on_sighup(files: Vec<Arc<dyn Reload>>) {
     let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
         .expect("failed to listen for SIGHUP");
     while hangup.recv().await.is_some() {
         info!("Received SIGHUP, reloading");
-        if let Some(acl) = &acl {
-            reload_file(acl);
+        for file in &files {
+            match file.reload() {
+                Ok(()) => info!("Reloaded {}", file.path()),
+                Err(e) => error!("Keeping the previous {}: {}", file.path(), e),
+            }
         }
-        if let Some(passwords) = &passwords {
-            reload_file(passwords);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn reload_file<T>(file: &Reloadable<T>) {
-    match file.reload() {
-        Ok(()) => info!("Reloaded {}", file.path()),
-        Err(e) => error!("Keeping the previous {}: {}", file.path(), e),
     }
 }
 
