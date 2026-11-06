@@ -41,6 +41,10 @@ max_queued_qos0_messages = 1000
 # dropped, whatever their QoS (unlimited by default)
 # max_queued_bytes = 104857600
 
+# Send messages at the QoS of the subscription even when they were published
+# with a lower one; goes beyond the MQTT specification
+# upgrade_outgoing_qos = false
+
 # Seconds a new connection has to complete TLS and send CONNECT
 connect_timeout = 10
 
