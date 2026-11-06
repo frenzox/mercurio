@@ -28,7 +28,7 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
     );
     let config = ServerConfig {
         listeners: vec![ListenerConfig {
-            listener: websocket_listener,
+            listener: websocket_listener.into(),
             transport: Transport::WebSocket,
             tls: None,
         }],

@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
-    ServerConfig, Transport,
+    ServerConfig, Socket, Transport,
 };
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{net::TcpListener, signal};
@@ -160,17 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The WebSocket listener shares the main listener's TLS settings
     let mut listeners: Vec<_> = websocket_listener
         .map(|listener| ListenerConfig {
-            listener,
+            listener: listener.into(),
             transport: Transport::WebSocket,
             tls: tls_config.clone(),
         })
         .into_iter()
         .collect();
     for extra in &config.listeners {
-        let addr = format!("{}:{}", extra.host, extra.port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("Failed to listen on {}: {}", addr, e))?;
+        let (listener, addr) = bind_listener(extra).await?;
         info!(
             "Serving {:?}{} on {}",
             extra.protocol,
@@ -274,6 +271,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// Binds an extra listener, returning it with its address for logs.
+async fn bind_listener(listener: &config::ListenerConfig) -> Result<(Socket, String), String> {
+    match (listener.port, &listener.path) {
+        (Some(port), None) => {
+            let addr = format!("{}:{}", listener.host, port);
+            let socket = TcpListener::bind(&addr)
+                .await
+                .map_err(|e| format!("Failed to listen on {}: {}", addr, e))?;
+            Ok((socket.into(), addr))
+        }
+        #[cfg(unix)]
+        (None, Some(path)) => {
+            use std::os::unix::fs::FileTypeExt;
+            // Left behind by a broker that did not stop cleanly
+            if std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+                let _ = std::fs::remove_file(path);
+            }
+            let socket = tokio::net::UnixListener::bind(path)
+                .map_err(|e| format!("Failed to listen on {}: {}", path, e))?;
+            Ok((socket.into(), path.clone()))
+        }
+        _ => Err("Each [[listeners]] entry needs either `port` or `path`".to_string()),
+    }
 }
 
 /// Resolves on Ctrl+C or, on Unix, SIGTERM: what service managers and

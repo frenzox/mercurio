@@ -107,7 +107,11 @@ pub struct ListenerConfig {
     #[serde(default = "default_host")]
     pub host: String,
 
-    pub port: u16,
+    /// TCP port to listen on; either this or `path`
+    pub port: Option<u16>,
+
+    /// Unix domain socket to listen on; either this or `port`
+    pub path: Option<String>,
 
     #[serde(default)]
     pub protocol: Protocol,
@@ -514,10 +518,13 @@ mod tests {
         let [tls, websocket] = &config.listeners[..] else {
             panic!("expected two listeners");
         };
-        assert_eq!((tls.host.as_str(), tls.port), ("127.0.0.1", 8883));
+        assert_eq!((tls.host.as_str(), tls.port), ("127.0.0.1", Some(8883)));
         assert!(matches!(tls.protocol, Protocol::Mqtt));
         assert!(tls.tls.build().unwrap().is_some());
-        assert_eq!((websocket.host.as_str(), websocket.port), ("0.0.0.0", 8080));
+        assert_eq!(
+            (websocket.host.as_str(), websocket.port),
+            ("0.0.0.0", Some(8080))
+        );
         assert!(matches!(websocket.protocol, Protocol::Websocket));
         assert!(websocket.tls.build().unwrap().is_none());
     }

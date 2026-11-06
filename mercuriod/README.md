@@ -160,7 +160,8 @@ allow_anonymous = true
 # acl_file = "/etc/mercurio/acl"
 
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
-# TLS settings. `host` defaults to 127.0.0.1.
+# TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
+# socket `path`.
 # [[listeners]]
 # host = "0.0.0.0"
 # port = 8883
@@ -172,6 +173,10 @@ allow_anonymous = true
 # [[listeners]]
 # port = 8080
 # protocol = "websocket"
+#
+# Unix domain socket, for clients on the same machine
+# [[listeners]]
+# path = "/run/mercurio/mqtt.sock"
 
 # Bridges forward topics to and from another MQTT 5 broker
 # [[bridges]]
@@ -268,6 +273,11 @@ Each `[[listeners]]` entry serves another port, with its own `protocol`
 setup keeps plain MQTT on localhost in `[server]` and adds a TLS listener on
 `0.0.0.0:8883`. All listeners share sessions, subscriptions and retained
 messages.
+
+A listener with `path` instead of `port` serves a Unix domain socket, which
+local clients reach without TCP and which file permissions can restrict.
+A socket file left behind by a broker that did not stop cleanly is
+replaced.
 
 ### Bridges
 

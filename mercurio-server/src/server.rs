@@ -6,10 +6,12 @@ use std::{
 };
 
 use crate::error::ServerError;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream},
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, Semaphore},
+    sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore},
     time::{self, Duration, Instant},
 };
 use tokio_rustls::TlsAcceptor;
@@ -144,9 +146,29 @@ impl Default for ServerConfig {
     }
 }
 
+/// A socket to accept connections on.
+pub enum Socket {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
+}
+
+impl From<TcpListener> for Socket {
+    fn from(listener: TcpListener) -> Self {
+        Socket::Tcp(listener)
+    }
+}
+
+#[cfg(unix)]
+impl From<UnixListener> for Socket {
+    fn from(listener: UnixListener) -> Self {
+        Socket::Unix(listener)
+    }
+}
+
 /// A listener with its own transport and TLS settings.
 pub struct ListenerConfig {
-    pub listener: TcpListener,
+    pub listener: Socket,
     pub transport: Transport,
     /// Serve TLS instead of plain TCP when set.
     pub tls: Option<TlsConfig>,
@@ -177,9 +199,11 @@ impl LocalConnector {
     }
 }
 
-/// A connection waiting to be served.
+/// A connection waiting to be served, with the index of its endpoint.
 enum Accepted {
     Tcp(TcpStream, usize),
+    #[cfg(unix)]
+    Unix(UnixStream, usize),
     Local(DuplexStream),
 }
 
@@ -192,7 +216,13 @@ pub enum Transport {
 
 /// A listener ready to accept connections.
 struct Endpoint {
-    listener: TcpListener,
+    listener: Socket,
+    settings: EndpointSettings,
+}
+
+/// How the connections of a listener are served.
+#[derive(Clone)]
+struct EndpointSettings {
     transport: Transport,
     tls_acceptor: Option<TlsAcceptor>,
     identity_as_username: bool,
@@ -207,9 +237,11 @@ impl Endpoint {
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             listener: config.listener,
-            transport: config.transport,
-            tls_acceptor,
-            identity_as_username,
+            settings: EndpointSettings {
+                transport: config.transport,
+                tls_acceptor,
+                identity_as_username,
+            },
         })
     }
 }
@@ -230,6 +262,39 @@ struct HandlerParts<St: MqttStore + 'static> {
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
+    /// Serves a connection accepted on a listener, after the TLS handshake
+    /// if the listener has TLS. `_slot` is held for as long as it runs.
+    async fn serve_accepted<S>(
+        mut self,
+        socket: S,
+        settings: EndpointSettings,
+        peer_addr: Option<SocketAddr>,
+        _slot: Option<OwnedSemaphorePermit>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let transport = settings.transport;
+        let Some(acceptor) = settings.tls_acceptor else {
+            return self.serve(socket, transport, peer_addr).await;
+        };
+        match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
+            Ok(Ok(tls_stream)) => {
+                debug!("TLS handshake completed for {:?}", peer_addr);
+                if settings.identity_as_username {
+                    let certs = tls_stream.get_ref().1.peer_certificates();
+                    self.cert_identity = certs.and_then(|c| c.first()).and_then(common_name);
+                    if self.cert_identity.is_none() {
+                        warn!("No Common Name in the certificate of {:?}", peer_addr);
+                        return;
+                    }
+                }
+                self.serve(tls_stream, transport, peer_addr).await;
+            }
+            Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
+            Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
+        }
+    }
+
     /// Serves one client on `stream`, after the WebSocket handshake if it
     /// came in on the WebSocket listener.
     async fn serve<S>(self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
@@ -380,7 +445,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
 
     let main = ListenerConfig {
-        listener,
+        listener: listener.into(),
         transport: Transport::Mqtt,
         tls: tls_config,
     };
@@ -460,7 +525,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             let accepted = self.accept().await;
             let peer_addr = match &accepted {
                 Accepted::Tcp(socket, _) => socket.peer_addr().ok(),
-                Accepted::Local(_) => None,
+                _ => None,
             };
 
             // Held by the connection's task for as long as it runs
@@ -488,8 +553,16 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
             };
-            let (socket, endpoint) = match accepted {
-                Accepted::Tcp(socket, endpoint) => (socket, endpoint),
+            match accepted {
+                Accepted::Tcp(socket, endpoint) => {
+                    let settings = self.endpoints[endpoint].settings.clone();
+                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slot));
+                }
+                #[cfg(unix)]
+                Accepted::Unix(socket, endpoint) => {
+                    let settings = self.endpoints[endpoint].settings.clone();
+                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slot));
+                }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
                         auth_config: Arc::clone(&self.trusted_auth),
@@ -499,37 +572,8 @@ impl<St: MqttStore + 'static> Listener<St> {
                         let _slot = slot;
                         parts.serve(stream, Transport::Mqtt, None).await;
                     });
-                    continue;
                 }
-            };
-            let transport = self.endpoints[endpoint].transport;
-            let tls_acceptor = self.endpoints[endpoint].tls_acceptor.clone();
-            let identity_as_username = self.endpoints[endpoint].identity_as_username;
-
-            tokio::spawn(async move {
-                let _slot = slot;
-                let Some(acceptor) = tls_acceptor else {
-                    return parts.serve(socket, transport, peer_addr).await;
-                };
-                match time::timeout(parts.limits.connect_timeout, acceptor.accept(socket)).await {
-                    Ok(Ok(tls_stream)) => {
-                        debug!("TLS handshake completed for {:?}", peer_addr);
-                        let mut parts = parts;
-                        if identity_as_username {
-                            let certs = tls_stream.get_ref().1.peer_certificates();
-                            parts.cert_identity =
-                                certs.and_then(|c| c.first()).and_then(common_name);
-                            if parts.cert_identity.is_none() {
-                                warn!("No Common Name in the certificate of {:?}", peer_addr);
-                                return;
-                            }
-                        }
-                        parts.serve(tls_stream, transport, peer_addr).await;
-                    }
-                    Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
-                    Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
-                }
-            });
+            }
         }
     }
 
@@ -622,11 +666,18 @@ impl<St: MqttStore + 'static> Listener<St> {
                 let count = self.endpoints.len();
                 for offset in 0..count {
                     let index = (self.next_endpoint + offset) % count;
-                    if let Poll::Ready(accepted) = self.endpoints[index].listener.poll_accept(cx) {
+                    let polled = match &self.endpoints[index].listener {
+                        Socket::Tcp(listener) => listener
+                            .poll_accept(cx)
+                            .map_ok(|(socket, _)| Accepted::Tcp(socket, index)),
+                        #[cfg(unix)]
+                        Socket::Unix(listener) => listener
+                            .poll_accept(cx)
+                            .map_ok(|(socket, _)| Accepted::Unix(socket, index)),
+                    };
+                    if polled.is_ready() {
                         self.next_endpoint = (index + 1) % count;
-                        return Poll::Ready(
-                            accepted.map(|(socket, _)| Accepted::Tcp(socket, index)),
-                        );
+                        return polled;
                     }
                 }
                 Poll::Pending
