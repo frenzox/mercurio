@@ -315,11 +315,15 @@ Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
 `enableClient`, `disableClient`, `addClientRole`, `removeClientRole`,
 `getClient`, `listClients`, `createRole`, `deleteRole`, `addRoleACL`,
 `removeRoleACL`, `getRole`, `listRoles`, `setDefaultACLAccess` and
-`getDefaultACLAccess`. Groups are not supported. ACLs of type
-`publishClientSend` decide publishing. `subscribePattern`,
-`subscribeLiteral` and `publishClientReceive` all decide reading, which
-covers both subscribing and receiving. The highest `priority` wins.
-Changes are saved to the file at once.
+`getDefaultACLAccess`, and for groups `createGroup`, `deleteGroup`,
+`addGroupRole`, `removeGroupRole`, `addGroupClient`, `removeGroupClient`,
+`getGroup`, `listGroups`, `setAnonymousGroup` and `getAnonymousGroup`. A
+client has its own roles and those of its groups; clients without a user
+name get those of the anonymous group. ACLs of type `publishClientSend`
+decide publishing, `publishClientReceive` receiving, and
+`subscribePattern` and `subscribeLiteral` subscribing. The highest
+`priority` wins. Without a matching ACL, only receiving is allowed, unless
+`setDefaultACLAccess` changes it. Changes are saved to the file at once.
 
 `$CONTROL` topics are only open to clients when access control grants
 them, so a broker without `acl_file` or `dynamic_security` refuses them.
@@ -331,7 +335,7 @@ HTTP backend does. For each login, the broker POSTs
 `{"username", "password", "clientid"}` to `user_url`; `clientid` is
 always empty. For each topic check, it POSTs
 `{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
-read and 2 to write. A 2xx status allows; anything else, a timeout
+receive, 2 to publish and 4 to subscribe. A 2xx status allows; anything else, a timeout
 included, denies. Topic answers are reused for `cache_seconds`, since
 every message is checked. `user_url` replaces `password_file` and
 `acl_url` replaces `acl_file`.

@@ -210,7 +210,10 @@ mod tests {
             load.update(tick * 100, interval);
         }
         let values: Vec<(String, String)> = load.values().collect();
-        assert_eq!(values[0], ("load/messages/received/1min".into(), "600.00".into()));
+        assert_eq!(
+            values[0],
+            ("load/messages/received/1min".into(), "600.00".into())
+        );
         // After an hour, the 15 minute average covered 1 - e^-4 of the way
         let fifteen: f64 = values[2].1.parse().unwrap();
         assert!((588.0..590.0).contains(&fifteen), "{fifteen}");

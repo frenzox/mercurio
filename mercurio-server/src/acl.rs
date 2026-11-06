@@ -24,10 +24,12 @@ use mercurio_core::topic::topic_matches_filter;
 /// What a client wants to do with a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// Receive messages from it, or subscribe to it
+    /// Receive a message published to it
     Read,
     /// Publish to it
     Write,
+    /// Subscribe to it, `topic` being a topic filter
+    Subscribe,
 }
 
 /// Who is asking for access.
@@ -61,7 +63,9 @@ impl Grant {
     fn allows(self, access: Access) -> bool {
         matches!(
             (self, access),
-            (Grant::ReadWrite, _) | (Grant::Read, Access::Read) | (Grant::Write, Access::Write)
+            (Grant::ReadWrite, _)
+                | (Grant::Read, Access::Read | Access::Subscribe)
+                | (Grant::Write, Access::Write)
         )
     }
 }
@@ -239,11 +243,11 @@ mod tests {
         let acl = AclFile::parse(ACL).unwrap();
         let alice = client("c", Some("alice"));
 
-        assert!(acl.authorize(&alice, "alice/#", Access::Read));
-        assert!(acl.authorize(&alice, "sensors/+/temperature", Access::Read));
+        assert!(acl.authorize(&alice, "alice/#", Access::Subscribe));
+        assert!(acl.authorize(&alice, "sensors/+/temperature", Access::Subscribe));
         // Would also match topics no rule grants
-        assert!(!acl.authorize(&alice, "#", Access::Read));
-        assert!(!acl.authorize(&alice, "sensors/#", Access::Read));
+        assert!(!acl.authorize(&alice, "#", Access::Subscribe));
+        assert!(!acl.authorize(&alice, "sensors/#", Access::Subscribe));
     }
 
     #[test]
