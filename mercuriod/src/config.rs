@@ -34,6 +34,9 @@ pub struct Config {
     /// Connections to other brokers that topics are forwarded through
     #[serde(default)]
     pub bridges: Vec<BridgeConfig>,
+
+    /// Directory of extra `*.toml` files merged into this configuration
+    pub include_dir: Option<String>,
 }
 
 /// A connection to another broker, as an MQTT 5 client.
@@ -191,11 +194,41 @@ pub enum StorageConfig {
 }
 
 impl Config {
-    /// Load configuration from a TOML file.
+    /// Load configuration from a TOML file, and from the `*.toml` files of
+    /// its `include_dir`, in name order. Their tables are merged into the
+    /// file's, their arrays, such as `[[listeners]]`, appended, and their
+    /// other values replace the file's.
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+        let mut table = read_table(path)?;
+        if let Some(dir) = table.get("include_dir").and_then(|d| d.as_str()) {
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .map_err(|e| format!("Failed to read include_dir {dir}: {e}"))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+                .collect();
+            files.sort();
+            for file in files {
+                merge(&mut table, read_table(&file)?);
+            }
+        }
+        Ok(Config::deserialize(table)?)
+    }
+}
+
+fn read_table(path: &Path) -> Result<toml::Table, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    toml::from_str(&content).map_err(|e| format!("{}: {e}", path.display()).into())
+}
+
+fn merge(into: &mut toml::Table, from: toml::Table) {
+    for (key, value) in from {
+        match (into.get_mut(&key), value) {
+            (Some(toml::Value::Table(into)), toml::Value::Table(from)) => merge(into, from),
+            (Some(toml::Value::Array(into)), toml::Value::Array(from)) => into.extend(from),
+            (_, value) => {
+                into.insert(key, value);
+            }
+        }
     }
 }
 
@@ -607,6 +640,36 @@ mod tests {
         .unwrap();
         let tls = config.server.tls.build().unwrap().unwrap();
         assert!(tls.build_acceptor().is_ok());
+    }
+
+    #[test]
+    fn test_include_dir_merges_files_in_order() {
+        let dir = std::env::temp_dir().join(format!("mercuriod-include-{}", std::process::id()));
+        let conf_d = dir.join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let main = dir.join("main.toml");
+        std::fs::write(
+            &main,
+            format!(
+                "include_dir = \"{}\"\n[server]\nport = 1\nmax_qos = 1\n[[listeners]]\nport = 2\n",
+                conf_d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            conf_d.join("a.toml"),
+            "[server]\nport = 3\n[[listeners]]\nport = 4\n",
+        )
+        .unwrap();
+        std::fs::write(conf_d.join("b.toml"), "[server]\nport = 5\n").unwrap();
+        std::fs::write(conf_d.join("ignored.txt"), "not toml").unwrap();
+
+        let config = Config::from_file(&main).unwrap();
+        assert_eq!(config.server.port, 5);
+        assert_eq!(config.server.max_qos, 1);
+        let ports: Vec<_> = config.listeners.iter().map(|l| l.port).collect();
+        assert_eq!(ports, [Some(2), Some(4)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
