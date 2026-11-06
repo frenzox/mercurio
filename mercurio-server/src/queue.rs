@@ -19,6 +19,10 @@ pub struct QueueLimits {
     /// Any message is dropped once the queued payloads take this many
     /// bytes, when set.
     pub max_bytes: Option<usize>,
+    /// Send messages at the QoS granted to the subscription even when they
+    /// were published with a lower one, as mosquitto's
+    /// `upgrade_outgoing_qos`. Outside the MQTT specification.
+    pub upgrade_qos: bool,
 }
 
 impl Default for QueueLimits {
@@ -27,6 +31,7 @@ impl Default for QueueLimits {
             max_qos0: 1000,
             max_messages: 10_000,
             max_bytes: None,
+            upgrade_qos: false,
         }
     }
 }
@@ -232,7 +237,9 @@ impl Subscriber {
     /// Queues a message, downgraded to the QoS granted [MQTT-3.8.4-8].
     fn queue_message(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) {
         message.subscription_identifiers = identifiers;
-        if (message.qos as u8) > (granted_qos as u8) {
+        if self.queue.limits.upgrade_qos {
+            message.qos = granted_qos;
+        } else if (message.qos as u8) > (granted_qos as u8) {
             message.qos = granted_qos;
             if granted_qos == QoS::AtMostOnce {
                 message.packet_id = None;
@@ -270,7 +277,7 @@ mod tests {
         let queue = MessageQueue::new(QueueLimits {
             max_qos0: 2,
             max_messages: 3,
-            max_bytes: None,
+            ..Default::default()
         });
         for _ in 0..2 {
             queue.push(message(QoS::AtMostOnce));
@@ -303,6 +310,26 @@ mod tests {
         queue.push(message(QoS::AtLeastOnce));
         assert_eq!(queue.state.lock().unwrap().messages.len(), 2);
         assert_eq!(queue.state.lock().unwrap().bytes, 14);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_sends_at_the_granted_qos() {
+        for (upgrade, expected) in [(false, QoS::AtMostOnce), (true, QoS::ExactlyOnce)] {
+            let queue = Arc::new(MessageQueue::new(QueueLimits {
+                upgrade_qos: upgrade,
+                ..Default::default()
+            }));
+            let subscriber = Subscriber {
+                queue: Arc::clone(&queue),
+                session_id: 1,
+                granted_qos: QoS::ExactlyOnce,
+                no_local: false,
+                retain_as_published: false,
+                subscription_identifier: None,
+            };
+            Subscriber::deliver(&[subscriber], message(QoS::AtMostOnce), None);
+            assert_eq!(queue.pop(false).await.qos, expected);
+        }
     }
 
     #[tokio::test]

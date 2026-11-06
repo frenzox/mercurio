@@ -280,6 +280,11 @@ pub struct ServerConfig {
     /// are dropped; unlimited when unset
     pub max_queued_bytes: Option<usize>,
 
+    /// Send messages at the QoS of the subscription even when published
+    /// with a lower one
+    #[serde(default)]
+    pub upgrade_outgoing_qos: bool,
+
     /// Seconds a new connection has to send CONNECT
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
@@ -349,6 +354,7 @@ impl Default for ServerConfig {
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: None,
+            upgrade_outgoing_qos: false,
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
@@ -520,6 +526,7 @@ impl ServerConfig {
                 max_qos0: self.max_queued_qos0_messages,
                 max_messages: self.max_queued_messages,
                 max_bytes: self.max_queued_bytes,
+                upgrade_qos: self.upgrade_outgoing_qos,
             },
             max_connections: Some(self.max_connections),
             topic_alias_maximum: self.max_topic_alias,
