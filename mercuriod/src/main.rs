@@ -85,6 +85,9 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // The HTTP auth client uses the process default provider
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     match cli.command {
         Some(Commands::Passwd {
             file,

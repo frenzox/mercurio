@@ -20,7 +20,7 @@ pub fn build_tls_connector(
 
     let builder = if options.danger_skip_verify {
         // WARNING: This disables all certificate verification - only for testing!
-        ClientConfig::builder()
+        config_builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
     } else if let Some(ref ca_path) = options.ca_path {
@@ -32,12 +32,12 @@ pub fn build_tls_connector(
                 .add(cert)
                 .map_err(|e| ClientError::Tls(format!("Failed to add CA cert: {}", e)))?;
         }
-        ClientConfig::builder().with_root_certificates(root_store)
+        config_builder().with_root_certificates(root_store)
     } else {
         // Use system root certificates
         let root_store =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        ClientConfig::builder().with_root_certificates(root_store)
+        config_builder().with_root_certificates(root_store)
     };
 
     let config = match (&options.cert_path, &options.key_path) {
@@ -58,6 +58,14 @@ pub fn build_tls_connector(
     };
 
     Ok((TlsConnector::from(Arc::new(config)), server_name))
+}
+
+/// Named rather than taken from the process default, which rustls can't
+/// pick when other crates enable a second provider.
+fn config_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("the provider supports the default protocol versions")
 }
 
 /// Load certificates from a PEM file.

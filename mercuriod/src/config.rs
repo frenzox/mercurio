@@ -577,6 +577,27 @@ mod tests {
     use super::{Config, Protocol};
 
     #[test]
+    fn test_tls_acceptor_builds_with_every_dependency_linked() {
+        // Two rustls crypto providers enabled by dependencies once made
+        // building any TLS acceptor panic
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mercurio-server/tests/fixtures"
+        );
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [server.tls]
+            enabled = true
+            cert_path = "{fixtures}/cert.pem"
+            key_path = "{fixtures}/key.pem"
+            "#
+        ))
+        .unwrap();
+        let tls = config.server.tls.build().unwrap().unwrap();
+        assert!(tls.build_acceptor().is_ok());
+    }
+
+    #[test]
     fn test_parse_listeners() {
         let config: Config = toml::from_str(
             r#"
