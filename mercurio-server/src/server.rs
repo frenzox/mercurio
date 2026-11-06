@@ -47,7 +47,7 @@ use crate::{
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
-    tls::{common_name, TlsConfig},
+    tls::{certificate_name, CertificateName, TlsConfig},
     websocket,
 };
 
@@ -264,7 +264,7 @@ struct Endpoint {
 struct EndpointSettings {
     transport: Transport,
     tls_acceptor: Option<TlsAcceptor>,
-    identity_as_username: bool,
+    username_from_certificate: Option<CertificateName>,
     proxy_protocol: bool,
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
@@ -272,17 +272,17 @@ struct EndpointSettings {
 
 impl Endpoint {
     fn new(config: ListenerConfig) -> std::result::Result<Self, ServerError> {
-        let identity_as_username = config
+        let username_from_certificate = config
             .tls
             .as_ref()
-            .is_some_and(|tls| tls.identity_as_username);
+            .and_then(|tls| tls.username_from_certificate);
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             listener: config.listener,
             settings: EndpointSettings {
                 transport: config.transport,
                 tls_acceptor,
-                identity_as_username,
+                username_from_certificate,
                 proxy_protocol: config.proxy_protocol,
                 mount_point: config.mount_point,
                 auth: config.auth.map(Arc::new),
@@ -342,9 +342,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
                 debug!("TLS handshake completed for {:?}", peer_addr);
-                if settings.identity_as_username {
+                if let Some(part) = settings.username_from_certificate {
                     let certs = tls_stream.get_ref().1.peer_certificates();
-                    self.cert_identity = certs.and_then(|c| c.first()).and_then(common_name);
+                    self.cert_identity = certs
+                        .and_then(|c| c.first())
+                        .and_then(|cert| certificate_name(cert, part));
                     if self.cert_identity.is_none() {
                         warn!("No Common Name in the certificate of {:?}", peer_addr);
                         return;

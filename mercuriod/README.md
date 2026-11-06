@@ -130,6 +130,8 @@ enabled = false
 # Use the client certificate's Common Name as the user name, instead of
 # the user name and password the client sends; needs ca_path
 # identity_as_username = false
+# Or the whole certificate subject, as in "CN=alice,O=Example,C=PT"
+# subject_as_username = false
 # Oldest TLS version accepted: "1.2" or "1.3"
 # min_version = "1.2"
 
@@ -358,6 +360,9 @@ broker also requires a client certificate signed by that CA.
 `identity_as_username`, the certificate's Common Name becomes the client's
 user name: it counts as authenticated, and `user` rules in `acl_file`
 apply to it. The user name and password in CONNECT are then ignored.
+`subject_as_username` uses the whole subject instead, written as RFC 2253
+does and as mosquitto's `use_subject_as_username` gives it:
+`CN=alice,O=Example,C=PT`.
 `min_version = "1.3"` refuses TLS 1.2.
 
 ### WebSocket
