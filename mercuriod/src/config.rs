@@ -162,6 +162,10 @@ pub struct ListenerConfig {
     /// Concurrent connections allowed on this listener
     pub max_connections: Option<usize>,
 
+    /// With `protocol = "websocket"`, serve the files of this directory to
+    /// plain HTTP requests
+    pub http_dir: Option<String>,
+
     /// Only accept connections arriving on this network interface (Linux)
     pub bind_interface: Option<String>,
 
@@ -255,6 +259,10 @@ pub struct ServerConfig {
 
     /// Also serve MQTT over WebSocket on this port
     pub websocket_port: Option<u16>,
+
+    /// Serve the files of this directory to plain HTTP requests on
+    /// `websocket_port`
+    pub http_dir: Option<String>,
 
     /// Seconds between updates of the $SYS statistics; 0 disables them
     #[serde(default = "default_sys_interval")]
@@ -353,6 +361,7 @@ impl Default for ServerConfig {
             port: default_port(),
             bind_interface: None,
             websocket_port: None,
+            http_dir: None,
             sys_interval: default_sys_interval(),
             max_connections: default_max_connections(),
             max_packet_size: default_max_packet_size(),
