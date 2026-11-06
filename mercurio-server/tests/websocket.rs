@@ -31,6 +31,7 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
             listener: websocket_listener.into(),
             transport: Transport::WebSocket,
             tls: None,
+            proxy_protocol: false,
         }],
         ..Default::default()
     };

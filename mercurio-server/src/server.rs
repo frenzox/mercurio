@@ -41,6 +41,7 @@ use crate::{
     auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
     connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
+    proxy,
     queue::QueueLimits,
     session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
@@ -172,6 +173,9 @@ pub struct ListenerConfig {
     pub transport: Transport,
     /// Serve TLS instead of plain TCP when set.
     pub tls: Option<TlsConfig>,
+    /// Expect every connection to start with a PROXY protocol header, as
+    /// sent by load balancers, and take the client's address from it.
+    pub proxy_protocol: bool,
 }
 
 /// Opens in-process connections to a broker, for parts of the same program
@@ -226,6 +230,7 @@ struct EndpointSettings {
     transport: Transport,
     tls_acceptor: Option<TlsAcceptor>,
     identity_as_username: bool,
+    proxy_protocol: bool,
 }
 
 impl Endpoint {
@@ -241,6 +246,7 @@ impl Endpoint {
                 transport: config.transport,
                 tls_acceptor,
                 identity_as_username,
+                proxy_protocol: config.proxy_protocol,
             },
         })
     }
@@ -262,17 +268,29 @@ struct HandlerParts<St: MqttStore + 'static> {
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
-    /// Serves a connection accepted on a listener, after the TLS handshake
-    /// if the listener has TLS. `_slot` is held for as long as it runs.
+    /// Serves a connection accepted on a listener, after the PROXY header
+    /// and the TLS handshake if the listener has them. `_slot` is held for
+    /// as long as it runs.
     async fn serve_accepted<S>(
         mut self,
-        socket: S,
+        mut socket: S,
         settings: EndpointSettings,
-        peer_addr: Option<SocketAddr>,
+        mut peer_addr: Option<SocketAddr>,
         _slot: Option<OwnedSemaphorePermit>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        if settings.proxy_protocol {
+            let header = proxy::read_header(&mut socket);
+            match time::timeout(self.limits.connect_timeout, header).await {
+                Ok(Ok(source)) => {
+                    debug!("{:?} is proxying {:?}", peer_addr, source);
+                    peer_addr = source.or(peer_addr);
+                }
+                Ok(Err(e)) => return warn!("Bad PROXY header from {:?}: {}", peer_addr, e),
+                Err(_) => return warn!("No PROXY header from {:?} in time", peer_addr),
+            }
+        }
         let transport = settings.transport;
         let Some(acceptor) = settings.tls_acceptor else {
             return self.serve(socket, transport, peer_addr).await;
@@ -448,6 +466,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         listener: listener.into(),
         transport: Transport::Mqtt,
         tls: tls_config,
+        proxy_protocol: false,
     };
     let endpoints = std::iter::once(main)
         .chain(listeners)

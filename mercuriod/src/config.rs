@@ -118,6 +118,10 @@ pub struct ListenerConfig {
 
     #[serde(default)]
     pub tls: TlsServerConfig,
+
+    /// Connections start with a PROXY protocol header from a load balancer
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]

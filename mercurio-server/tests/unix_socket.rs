@@ -18,6 +18,7 @@ async fn clients_connect_over_unix_sockets() {
             listener: UnixListener::bind(&path).unwrap().into(),
             transport: Transport::Mqtt,
             tls: None,
+            proxy_protocol: false,
         }],
         ..Default::default()
     };

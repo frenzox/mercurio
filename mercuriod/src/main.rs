@@ -163,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listener: listener.into(),
             transport: Transport::WebSocket,
             tls: tls_config.clone(),
+            proxy_protocol: false,
         })
         .into_iter()
         .collect();
@@ -178,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listener,
             transport: extra.protocol.into(),
             tls: extra.tls.build()?,
+            proxy_protocol: extra.proxy_protocol,
         });
     }
 

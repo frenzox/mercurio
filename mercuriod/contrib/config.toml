@@ -139,6 +139,13 @@ allow_anonymous = true
 # Unix domain socket, for clients on the same machine
 # [[listeners]]
 # path = "/run/mercurio/mqtt.sock"
+#
+# Behind a load balancer that sends the PROXY protocol (v1 or v2), so logs
+# show the clients' own addresses
+# [[listeners]]
+# host = "0.0.0.0"
+# port = 1884
+# proxy_protocol = true
 
 # Bridges forward topics to and from another MQTT 5 broker
 # [[bridges]]

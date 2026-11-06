@@ -3,6 +3,7 @@ pub mod auth;
 mod broker;
 pub mod connection;
 pub mod error;
+mod proxy;
 pub mod queue;
 pub mod server;
 mod session;
