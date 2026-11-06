@@ -137,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_reference: r.server_reference,
             permanent: r.permanent,
         }),
+        require_client_id: !config.server.allow_zero_length_clientid,
+        auto_id_prefix: config.server.auto_id_prefix.clone(),
+        client_id_prefixes: config.server.clientid_prefixes.clone(),
     };
 
     let tls_config = config.server.tls.build()?;

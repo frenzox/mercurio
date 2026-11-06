@@ -57,6 +57,13 @@ receive_maximum = 65535
 # Set to false to refuse retained messages
 # retain_available = true
 
+# Accept clients that send an empty client id, assigning them one
+# allow_zero_length_clientid = true
+# Prefix of the client ids the broker assigns
+# auto_id_prefix = "auto-"
+# Only accept client ids starting with one of these
+# clientid_prefixes = ["sensor-", "auto-"]
+
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
 # [server.redirect]

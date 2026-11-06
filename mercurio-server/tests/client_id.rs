@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
+use mercurio_server::server::{ConnectPolicy, ServerConfig};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -7,10 +9,19 @@ use tokio::{
 };
 
 async fn start_broker() -> SocketAddr {
+    start_broker_with(ConnectPolicy::default()).await
+}
+
+async fn start_broker_with(policy: ConnectPolicy) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
+    let config = ServerConfig {
+        policy,
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
         listener,
+        config,
         std::future::pending::<()>(),
     ));
     addr
@@ -19,13 +30,20 @@ async fn start_broker() -> SocketAddr {
 /// Sends a CONNECT with an empty client id and no clean start, returning the
 /// CONNACK variable header.
 async fn connect_without_id(addr: SocketAddr, level: u8) -> Vec<u8> {
+    connect_with_id(addr, level, b"").await
+}
+
+/// Sends a CONNECT with `client_id` and no clean start, returning the CONNACK
+/// variable header.
+async fn connect_with_id(addr: SocketAddr, level: u8, client_id: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut connect = vec![0x10, 0x00, 0x00, 0x04, b'M', b'Q', b'T', b'T', level, 0x00];
     connect.extend_from_slice(&[0x00, 0x3c]);
     if level == 5 {
         connect.push(0x00);
     }
-    connect.extend_from_slice(&[0x00, 0x00]);
+    connect.extend_from_slice(&[0x00, client_id.len() as u8]);
+    connect.extend_from_slice(client_id);
     connect[1] = (connect.len() - 2) as u8;
     stream.write_all(&connect).await.unwrap();
 
@@ -62,4 +80,44 @@ async fn mqtt311_rejects_empty_id_without_clean_session() {
 
     // Return code 0x02: identifier rejected
     assert_eq!(connect_without_id(addr, 4).await, [0x00, 0x02]);
+}
+
+#[tokio::test]
+async fn assigned_ids_use_the_prefix_and_prefixes_are_enforced() {
+    let addr = start_broker_with(ConnectPolicy {
+        auto_id_prefix: "auto-".to_string(),
+        client_id_prefixes: vec!["auto-".to_string(), "dev-".to_string()],
+        ..Default::default()
+    })
+    .await;
+
+    let assigned = connect_without_id(addr, 5).await;
+    assert_eq!(&assigned[..2], &[0x00, 0x00]);
+    assert!(
+        assigned.windows(5).any(|w| w == b"auto-"),
+        "{assigned:02x?}"
+    );
+
+    assert_eq!(
+        &connect_with_id(addr, 5, b"dev-1").await[..2],
+        &[0x00, 0x00]
+    );
+    // Not Authorized
+    assert_eq!(
+        &connect_with_id(addr, 5, b"other").await[..2],
+        &[0x00, 0x87]
+    );
+}
+
+#[tokio::test]
+async fn required_client_ids_refuse_empty_ones() {
+    let addr = start_broker_with(ConnectPolicy {
+        require_client_id: true,
+        ..Default::default()
+    })
+    .await;
+
+    // Client Identifier Not Valid
+    assert_eq!(&connect_without_id(addr, 5).await[..2], &[0x00, 0x85]);
+    assert_eq!(&connect_with_id(addr, 5, b"c").await[..2], &[0x00, 0x00]);
 }
