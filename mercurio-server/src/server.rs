@@ -98,6 +98,9 @@ pub struct Limits {
     /// How long the persistent session of an MQTT 3.x client outlives its
     /// connection; forever if unset, as MQTT 3.x has no expiry of its own
     pub persistent_client_expiration: Option<Duration>,
+    /// Send a retained message to new subscribers only while the client
+    /// that published it may still publish to its topic.
+    pub check_retain_source: bool,
 }
 
 impl Default for Limits {
@@ -114,6 +117,7 @@ impl Default for Limits {
             maximum_qos: QoS::ExactlyOnce,
             retain_available: true,
             persistent_client_expiration: None,
+            check_retain_source: false,
         }
     }
 }
@@ -1428,6 +1432,7 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
         expires_at: Message::expiry_deadline(&will.properties),
         properties: will.properties,
         subscription_identifiers: Vec::new(),
+        origin: None,
     };
 
     if let Err(e) = broker.publish(&topic, message).await {

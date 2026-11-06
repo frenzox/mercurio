@@ -285,6 +285,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub upgrade_outgoing_qos: bool,
 
+    /// Send retained messages only while their publisher may still publish
+    /// to their topic
+    #[serde(default)]
+    pub check_retain_source: bool,
+
     /// Seconds a new connection has to send CONNECT
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
@@ -355,6 +360,7 @@ impl Default for ServerConfig {
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: None,
             upgrade_outgoing_qos: false,
+            check_retain_source: false,
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
@@ -538,6 +544,7 @@ impl ServerConfig {
             persistent_client_expiration: self
                 .persistent_client_expiration
                 .map(Duration::from_secs),
+            check_retain_source: self.check_retain_source,
         })
     }
 }

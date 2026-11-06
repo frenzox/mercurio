@@ -276,6 +276,7 @@ mod tests {
             properties: Default::default(),
             expires_at: None,
             subscription_identifiers: Vec::new(),
+            origin: None,
         }
     }
 
