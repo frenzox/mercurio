@@ -25,3 +25,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = "1.0.154"
 bytes = "1.12.1"
+sha2 = "0.11.1"
+base64 = "0.23.1"
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }

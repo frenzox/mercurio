@@ -244,6 +244,8 @@ password from `password_file`, unless `allow_anonymous` lets clients that
 send no user name in. Credentials that are sent are always checked.
 
 The password file holds one `user:hash` line per user, with Argon2 hashes.
+Files written by `mosquitto_passwd` work too: their `$7$` (PBKDF2-SHA512)
+and `$6$` (SHA-512) hashes are recognised.
 Manage it with:
 
 ```bash
