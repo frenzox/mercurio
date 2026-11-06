@@ -10,6 +10,9 @@ use mercurio_core::properties::{
 use mercurio_core::{protocol::ProtocolVersion, qos::QoS};
 use mercurio_packets::connect::WillProperties;
 use mercurio_packets::publish::PublishProperties;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::connection::Stream;
 
 /// MQTT 5 properties of an application message. MQTT 3.x ignores them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,6 +169,16 @@ impl fmt::Debug for SharedAuthenticator {
     }
 }
 
+/// Opens the stream to the broker in place of TCP and TLS.
+#[derive(Clone)]
+pub(crate) struct Connector(pub Arc<dyn Fn() -> std::io::Result<Box<dyn Stream>> + Send + Sync>);
+
+impl fmt::Debug for Connector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Connector")
+    }
+}
+
 /// TLS configuration for client connections.
 #[derive(Debug, Clone, Default)]
 pub struct TlsOptions {
@@ -200,6 +213,7 @@ pub struct ConnectOptions {
     pub(crate) request_response_information: bool,
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
+    pub(crate) connector: Option<Connector>,
 }
 
 impl ConnectOptions {
@@ -225,6 +239,7 @@ impl ConnectOptions {
             request_response_information: false,
             request_problem_information: true,
             authenticator: None,
+            connector: None,
         }
     }
 
@@ -343,6 +358,19 @@ impl ConnectOptions {
     /// Authenticate with an MQTT 5 enhanced authentication method.
     pub fn authenticator(mut self, authenticator: impl Authenticator + 'static) -> Self {
         self.authenticator = Some(SharedAuthenticator(Arc::new(Mutex::new(authenticator))));
+        self
+    }
+
+    /// Open the stream to the broker with `connect`, on every connection
+    /// and reconnection, instead of connecting to the host and port.
+    pub fn connector<S, F>(mut self, connect: F) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: Fn() -> std::io::Result<S> + Send + Sync + 'static,
+    {
+        self.connector = Some(Connector(Arc::new(move || {
+            connect().map(|stream| Box::new(stream) as Box<dyn Stream>)
+        })));
         self
     }
 
