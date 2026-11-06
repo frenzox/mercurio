@@ -120,3 +120,27 @@ async fn listeners_can_require_their_own_authentication() {
     // Bad User Name or Password
     assert_eq!(connect(secured, b'b').await.1, 0x86);
 }
+
+#[tokio::test]
+async fn listeners_can_limit_their_connections() {
+    let (main, limited) = start_broker(|listener| ListenerConfig {
+        max_connections: Some(1),
+        ..listener
+    })
+    .await;
+
+    let (_first, reason) = connect(limited, b'1').await;
+    assert_eq!(reason, 0x00);
+
+    // The second is closed unanswered
+    let mut second = TcpStream::connect(limited).await.unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(2), second.read_to_end(&mut received))
+        .await
+        .expect("connection still open")
+        .unwrap();
+    assert!(received.is_empty());
+
+    // while the broker's other listeners are unaffected
+    assert_eq!(connect(main, b'2').await.1, 0x00);
+}
