@@ -651,7 +651,7 @@ mod tests {
                     sequence: 0,
                     released: false,
                     properties: Default::default(),
-                    subscription_identifier: None,
+                    subscription_identifiers: Vec::new(),
                 },
             )
             .await
@@ -776,7 +776,7 @@ mod tests {
                         sequence,
                         released,
                         properties: Default::default(),
-                        subscription_identifier: None,
+                        subscription_identifiers: Vec::new(),
                     },
                 )
                 .await
@@ -909,7 +909,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
 
         // Store inflight message
@@ -959,7 +959,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
         let inflight2 = InflightMessage {
             packet_id: 2,
@@ -970,7 +970,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
         storage
             .store_inflight("client1", 1, &inflight1)
@@ -1021,7 +1021,7 @@ mod tests {
             sequence: 0,
             released: false,
             properties: Default::default(),
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         };
         storage
             .store_inflight("client1", 1, &inflight)
@@ -1066,7 +1066,7 @@ mod tests {
                 sequence: i.into(),
                 released: false,
                 properties: Default::default(),
-                subscription_identifier: None,
+                subscription_identifiers: Vec::new(),
             };
             manager
                 .store_inflight("client1", i, &inflight)

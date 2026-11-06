@@ -16,7 +16,8 @@ use mercurio_core::{
     qos::QoS,
     topic::topic_matches_filter,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Null, ToSqlOutput, ValueRef};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
     InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
@@ -101,7 +102,7 @@ impl SqliteStore {
                 sequence INTEGER NOT NULL,
                 released INTEGER NOT NULL,
                 properties BLOB NOT NULL,
-                subscription_identifier INTEGER,
+                subscription_identifiers TEXT,
                 PRIMARY KEY (client_id, packet_id)
             );
 
@@ -114,7 +115,7 @@ impl SqliteStore {
                 retain INTEGER NOT NULL,
                 properties BLOB NOT NULL,
                 expires_at INTEGER,
-                subscription_identifier INTEGER,
+                subscription_identifiers TEXT,
                 PRIMARY KEY (client_id, sequence)
             );
 
@@ -199,6 +200,34 @@ fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\0")
+}
+
+/// The subscription identifiers of a stored message, as comma-separated
+/// text, or no value when there are none.
+struct Identifiers(Vec<u32>);
+
+impl ToSql for Identifiers {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        if self.0.is_empty() {
+            return Ok(ToSqlOutput::from(Null));
+        }
+        let text: Vec<String> = self.0.iter().map(u32::to_string).collect();
+        Ok(ToSqlOutput::from(text.join(",")))
+    }
+}
+
+impl FromSql for Identifiers {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value {
+            ValueRef::Null => Ok(Identifiers(Vec::new())),
+            ValueRef::Text(text) => std::str::from_utf8(text)
+                .ok()
+                .and_then(|text| text.split(',').map(|id| id.parse().ok()).collect())
+                .map(Identifiers)
+                .ok_or(FromSqlError::InvalidType),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
 }
 
 fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
@@ -375,7 +404,7 @@ impl RetainedMessageStore for SqliteStore {
                         payload: payload.map(Bytes::from),
                         properties: decode_properties(properties)?,
                         expires_at: expires_at.map(|t| t as u64),
-                        subscription_identifier: None,
+                        subscription_identifiers: Vec::new(),
                     });
                 }
             }
@@ -477,13 +506,13 @@ impl InflightStore for SqliteStore {
         let sequence = message.sequence as i64;
         let released = message.released;
         let properties = encode_properties(&message.properties);
-        let subscription_identifier = message.subscription_identifier;
+        let subscription_identifiers = Identifiers(message.subscription_identifiers.clone());
 
         self.blocking(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
                  (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-                  subscription_identifier)
+                  subscription_identifiers)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     client_id,
@@ -495,7 +524,7 @@ impl InflightStore for SqliteStore {
                     sequence,
                     released,
                     properties,
-                    subscription_identifier
+                    subscription_identifiers
                 ],
             )?;
             Ok(())
@@ -513,7 +542,7 @@ impl InflightStore for SqliteStore {
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT topic, payload, qos, dup, sequence, released, properties,
-                 subscription_identifier
+                 subscription_identifiers
                  FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
             )?;
 
@@ -526,7 +555,7 @@ impl InflightStore for SqliteStore {
                     let sequence: i64 = row.get(4)?;
                     let released: bool = row.get(5)?;
                     let properties: Vec<u8> = row.get(6)?;
-                    let subscription_identifier: Option<u32> = row.get(7)?;
+                    let Identifiers(subscription_identifiers) = row.get(7)?;
                     Ok(InflightMessage {
                         packet_id,
                         topic,
@@ -536,7 +565,7 @@ impl InflightStore for SqliteStore {
                         sequence: sequence as u64,
                         released,
                         properties: decode_properties(properties)?,
-                        subscription_identifier,
+                        subscription_identifiers,
                     })
                 })
                 .optional()?;
@@ -579,7 +608,7 @@ impl InflightStore for SqliteStore {
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT packet_id, topic, payload, qos, dup, sequence, released, properties,
-                 subscription_identifier
+                 subscription_identifiers
                  FROM inflight_messages WHERE client_id = ?1",
             )?;
 
@@ -592,7 +621,7 @@ impl InflightStore for SqliteStore {
                 let sequence: i64 = row.get(5)?;
                 let released: bool = row.get(6)?;
                 let properties: Vec<u8> = row.get(7)?;
-                let subscription_identifier: Option<u32> = row.get(8)?;
+                let Identifiers(subscription_identifiers) = row.get(8)?;
                 Ok(InflightMessage {
                     packet_id,
                     topic,
@@ -602,7 +631,7 @@ impl InflightStore for SqliteStore {
                     sequence: sequence as u64,
                     released,
                     properties: decode_properties(properties)?,
-                    subscription_identifier,
+                    subscription_identifiers,
                 })
             })?;
 
@@ -626,7 +655,7 @@ impl QueueStore for SqliteStore {
             conn.execute(
                 "INSERT OR REPLACE INTO queued_messages
                  (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
-                  subscription_identifier)
+                  subscription_identifiers)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     client_id,
@@ -637,7 +666,7 @@ impl QueueStore for SqliteStore {
                     message.retain,
                     encode_properties(&message.properties),
                     message.expires_at.map(|t| t as i64),
-                    message.subscription_identifier
+                    Identifiers(message.subscription_identifiers.clone())
                 ],
             )?;
             Ok(())
@@ -651,7 +680,7 @@ impl QueueStore for SqliteStore {
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT sequence, topic, payload, qos, retain, properties, expires_at,
-                        subscription_identifier
+                        subscription_identifiers
                  FROM queued_messages WHERE client_id = ?1 ORDER BY sequence",
             )?;
             let rows = stmt.query_map(params![client_id], |row| {
@@ -666,7 +695,7 @@ impl QueueStore for SqliteStore {
                     payload: payload.map(Bytes::from),
                     properties: decode_properties(row.get(5)?)?,
                     expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
-                    subscription_identifier: row.get(7)?,
+                    subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
                 };
                 Ok((row.get::<_, i64>(0)? as u64, message))
             })?;
@@ -708,7 +737,7 @@ mod tests {
             payload: Some(Bytes::from(payload.to_string())),
             properties: Default::default(),
             expires_at: None,
-            subscription_identifier: None,
+            subscription_identifiers: Vec::new(),
         }
     }
 
@@ -756,7 +785,7 @@ mod tests {
     async fn test_queue_store() {
         let store = SqliteStore::in_memory().unwrap();
         let mut second = create_test_message("b", "2");
-        second.subscription_identifier = Some(4);
+        second.subscription_identifiers = vec![4, 268_435_455];
         store.enqueue("c", 2, &second).await.unwrap();
         store
             .enqueue("c", 1, &create_test_message("a", "1"))
@@ -770,7 +799,8 @@ mod tests {
         let queue = store.load_queue("c").await.unwrap();
         let topics: Vec<(u64, &str)> = queue.iter().map(|(s, m)| (*s, &*m.topic)).collect();
         assert_eq!(topics, [(1, "a"), (2, "b")]);
-        assert_eq!(queue[1].1.subscription_identifier, Some(4));
+        assert_eq!(queue[1].1.subscription_identifiers, [4, 268_435_455]);
+        assert!(queue[0].1.subscription_identifiers.is_empty());
 
         store.clear_queue("c").await.unwrap();
         assert!(store.load_queue("c").await.unwrap().is_empty());
@@ -879,14 +909,14 @@ mod tests {
             sequence: 7,
             released: false,
             properties: Default::default(),
-            subscription_identifier: Some(3),
+            subscription_identifiers: vec![3],
         };
 
         store.store_inflight("client1", 1, &msg).await.unwrap();
 
         let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
         assert_eq!(loaded.sequence, 7);
-        assert_eq!(loaded.subscription_identifier, Some(3));
+        assert_eq!(loaded.subscription_identifiers, [3]);
         assert!(!loaded.released);
 
         store.release_inflight("client1", 1).await.unwrap();

@@ -1085,7 +1085,7 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
         payload: Some(will.payload),
         expires_at: Message::expiry_deadline(&will.properties),
         properties: will.properties,
-        subscription_identifier: None,
+        subscription_identifiers: Vec::new(),
     };
 
     if let Err(e) = broker.publish(&topic, message).await {
