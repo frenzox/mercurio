@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{
@@ -12,6 +12,8 @@ use mercurio_core::{
     Result,
 };
 use mercurio_packets::ControlPacket;
+
+use crate::sys::Stats;
 
 /// Default capacity for read buffer (8KB)
 const READ_BUFFER_CAPACITY: usize = 8192;
@@ -43,6 +45,8 @@ where
     /// Prefixed to the topics the client uses, and removed from those it is
     /// sent, so it only sees its part of the topic tree
     mount_point: Option<String>,
+    /// Where the bytes read and written are counted
+    stats: Option<Arc<Stats>>,
 }
 
 /// Moves the topics a client sent under `mount_point`. Empty names are left
@@ -100,7 +104,12 @@ where
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             connect_version: None,
             mount_point: None,
+            stats: None,
         }
+    }
+
+    pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
+        self.stats = Some(stats);
     }
 
     pub fn set_mount_point(&mut self, mount_point: Option<String>) {
@@ -124,7 +133,11 @@ where
                 return Ok(Some(packet));
             }
 
-            if 0 == self.stream.read_buf(&mut self.read_buffer).await? {
+            let read = self.stream.read_buf(&mut self.read_buffer).await?;
+            if let Some(stats) = &self.stats {
+                Stats::add_n(&stats.bytes_received, read as u64);
+            }
+            if read == 0 {
                 if self.read_buffer.is_empty() {
                     return Ok(None);
                 } else {
@@ -150,6 +163,9 @@ where
 
         self.stream.write_all(&self.write_buffer).await?;
         self.stream.flush().await?;
+        if let Some(stats) = &self.stats {
+            Stats::add_n(&stats.bytes_sent, self.write_buffer.len() as u64);
+        }
 
         Ok(())
     }

@@ -398,8 +398,13 @@ restart.
 ### Statistics
 
 Every `sys_interval` seconds the broker publishes retained statistics under
-`$SYS/broker/`: `version`, `uptime`, `clients/connected`, `clients/total`,
-`messages/received`, `messages/sent` and `subscriptions/count`. Clients
+`$SYS/broker/`, with mosquitto's names: `version`, `uptime`,
+`clients/connected`, `clients/disconnected`, `clients/total`,
+`clients/maximum`, `clients/expired`, `messages/received`,
+`messages/sent`, `bytes/received`, `bytes/sent`,
+`retained messages/count` and `subscriptions/count`, and the 1, 5 and 15
+minute averages per minute of messages, bytes and connections under
+`load/`, such as `load/messages/received/1min`. Clients
 may subscribe to them, but not publish to `$SYS` topics.
 
 ## Running

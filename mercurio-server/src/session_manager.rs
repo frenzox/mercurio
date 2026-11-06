@@ -49,6 +49,8 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore> Clone for Session
 
 struct Shared {
     state: Mutex<State>,
+    /// Sessions ended by their expiry
+    expired: std::sync::atomic::AtomicU64,
 }
 
 struct State {
@@ -125,6 +127,7 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
                 next_generation: 0,
                 restored_wills: HashSet::new(),
             }),
+            expired: Default::default(),
         });
 
         SessionManager {
@@ -348,7 +351,12 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            manager.end_session(&client_id, generation).await;
+            if manager.end_session(&client_id, generation).await {
+                manager
+                    .shared
+                    .expired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         });
     }
 
@@ -473,6 +481,13 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
     }
 
     /// How many sessions the broker holds, connected or not.
+    /// How many sessions ended by their expiry.
+    pub(crate) fn expired_count(&self) -> u64 {
+        self.shared
+            .expired
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) async fn session_count(&self) -> usize {
         self.shared.state.lock().await.sessions.len()
     }
@@ -490,7 +505,7 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
 
     /// Discards the session of `client_id` unless a connection newer than
     /// `generation` has used it since.
-    async fn end_session(&self, client_id: &str, generation: u64) {
+    async fn end_session(&self, client_id: &str, generation: u64) -> bool {
         let mut manager = self.shared.state.lock().await;
         let connected_since = manager
             .connections
@@ -501,7 +516,7 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
             None => false,
         };
         if connected_since || resumed_since {
-            return;
+            return false;
         }
 
         info!("Session for client `{}` ended", client_id);
@@ -510,6 +525,7 @@ impl<S: SessionStore + WillStore + InflightStore + QueueStore + 'static> Session
             ended.session().unsubscribe_all().await;
         }
         self.discard_stored(client_id).await;
+        true
     }
 
     /// Removes everything persisted for `client_id`.

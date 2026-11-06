@@ -121,6 +121,14 @@ impl RetainedMessageStore for MemoryStore {
         retained.clear();
         Ok(())
     }
+
+    async fn count_retained(&self) -> Result<usize> {
+        let retained = self
+            .retained
+            .read()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        Ok(retained.len())
+    }
 }
 
 #[async_trait]

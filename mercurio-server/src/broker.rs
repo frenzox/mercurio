@@ -54,6 +54,11 @@ impl<S: RetainedMessageStore> Broker<S> {
     }
 
     /// Handle to the subscriptions, for removing them without a broker.
+    /// How many retained messages are stored; 0 if the storage fails.
+    pub(crate) async fn retained_count(&self) -> usize {
+        self.storage.count_retained().await.unwrap_or(0)
+    }
+
     pub(crate) fn topics(&self) -> TopicTree<Subscriber> {
         self.subscriptions.clone()
     }
