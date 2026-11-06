@@ -23,11 +23,13 @@ mod bridge;
 mod config;
 mod credentials;
 mod dynsec;
+mod http_auth;
 mod reload;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 use dynsec::DynamicSecurity;
+use http_auth::HttpAuth;
 use reload::{Reload, Reloadable};
 
 #[derive(Parser, Debug)]
@@ -319,7 +321,30 @@ fn build_auth(
         });
     }
 
+    // The HTTP endpoints, each with the check it replaces
+    let (mut http_users, mut http_acl) = (None, None);
+    if let Some(http) = &config.http {
+        let auth = Arc::new(HttpAuth::new(
+            http.user_url.clone(),
+            http.acl_url.clone(),
+            Duration::from_secs(http.timeout_seconds),
+            Duration::from_secs(http.cache_seconds),
+        ));
+        if http.user_url.is_some() {
+            http_users = Some(Arc::clone(&auth));
+        }
+        if http.acl_url.is_some() {
+            http_acl = Some(auth);
+        }
+    }
+    if (http_users.is_some() && config.password_file.is_some())
+        || (http_acl.is_some() && config.acl_file.is_some())
+    {
+        return Err("[auth.http] URLs replace password_file and acl_file".to_string());
+    }
+
     let authorizer = match &config.acl_file {
+        _ if http_acl.is_some() => http_acl.map(|http| http as Arc<dyn Authorizer>),
         Some(path) => {
             let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
             info!("Loaded topic access control from {}", path);
@@ -336,6 +361,9 @@ fn build_auth(
     }
 
     let credential_validator = match &config.password_file {
+        _ if http_users.is_some() => {
+            http_users.map(|http| http as Arc<dyn mercurio_server::auth::CredentialValidator>)
+        }
         Some(path) => {
             let validator = Arc::new(Reloadable::load(path, load_credentials)?);
             info!("Loaded credentials from {}", path);

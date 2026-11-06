@@ -168,6 +168,13 @@ allow_anonymous = true
 # Create the file with `mercuriod dynsec-init -f <path>`.
 # dynamic_security = "/var/lib/mercurio/dynamic-security.json"
 
+# Or delegate checks to an HTTP service: a 2xx answer allows
+# [auth.http]
+# user_url = "http://auth.internal/mqtt/user"
+# acl_url = "http://auth.internal/mqtt/acl"
+# timeout_seconds = 5
+# cache_seconds = 30
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.
@@ -316,6 +323,18 @@ Changes are saved to the file at once.
 
 `$CONTROL` topics are only open to clients when access control grants
 them, so a broker without `acl_file` or `dynamic_security` refuses them.
+
+### HTTP authentication
+
+`[auth.http]` delegates checks to an HTTP service, as mosquitto-go-auth's
+HTTP backend does. For each login, the broker POSTs
+`{"username", "password", "clientid"}` to `user_url`; `clientid` is
+always empty. For each topic check, it POSTs
+`{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
+read and 2 to write. A 2xx status allows; anything else, a timeout
+included, denies. Topic answers are reused for `cache_seconds`, since
+every message is checked. `user_url` replaces `password_file` and
+`acl_url` replaces `acl_file`.
 
 ### Reloading
 
