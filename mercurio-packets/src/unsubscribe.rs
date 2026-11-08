@@ -15,7 +15,7 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
-    user_property: Option<Vec<UserProperty>>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for UnsubscribeProperties {
