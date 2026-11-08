@@ -235,14 +235,18 @@ pub trait Plugin: Send + Sync + 'static {
 }
 
 /// Runs a hook within `limit`. None, logged, if it ran out of time or
-/// panicked. A hook that is ready at once, like most access checks, never
-/// touches the timer.
-pub(crate) async fn guarded<T>(
+/// panicked, whether making its future or polling it. A hook that is ready
+/// at once, like most access checks, never touches the timer.
+pub(crate) async fn guarded<'a, T>(
     plugin: &str,
     hook: &str,
     limit: Duration,
-    future: BoxFuture<'_, T>,
+    call: impl FnOnce() -> BoxFuture<'a, T>,
 ) -> Option<T> {
+    let Ok(future) = std::panic::catch_unwind(AssertUnwindSafe(call)) else {
+        error!("Plugin `{plugin}` panicked in {hook}");
+        return None;
+    };
     let mut future = AssertUnwindSafe(future).catch_unwind();
     let result = match (&mut future).now_or_never() {
         Some(result) => result,
@@ -303,8 +307,11 @@ impl Chain {
         credentials: &Credentials<'_>,
     ) -> Decision {
         for plugin in self.plugins.iter() {
-            let hook = plugin.authenticate(client, credentials);
-            match guarded(plugin.name(), "authenticate", self.timeout, hook).await {
+            match guarded(plugin.name(), "authenticate", self.timeout, || {
+                plugin.authenticate(client, credentials)
+            })
+            .await
+            {
                 Some(Decision::Defer) => continue,
                 Some(decision) => return decision,
                 None => return Decision::Deny,
@@ -314,9 +321,14 @@ impl Chain {
     }
 
     pub(crate) fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
-        self.plugins
-            .iter()
-            .find_map(|plugin| plugin.begin_auth(method))
+        self.plugins.iter().find_map(|plugin| {
+            std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(method))).unwrap_or_else(
+                |_| {
+                    error!("Plugin `{}` panicked in begin_auth", plugin.name());
+                    None
+                },
+            )
+        })
     }
 
     pub(crate) async fn step(
@@ -324,10 +336,11 @@ impl Chain {
         exchange: &mut dyn AuthExchange,
         data: Option<&Bytes>,
     ) -> AuthResult {
-        let hook = exchange.step(data);
-        guarded("enhanced authentication", "step", self.timeout, hook)
-            .await
-            .unwrap_or(AuthResult::Failed(ReasonCode::NotAuthorized))
+        guarded("enhanced authentication", "step", self.timeout, || {
+            exchange.step(data)
+        })
+        .await
+        .unwrap_or(AuthResult::Failed(ReasonCode::NotAuthorized))
     }
 
     pub(crate) async fn authorize(
@@ -340,8 +353,11 @@ impl Chain {
             return Decision::Allow;
         }
         for plugin in self.plugins.iter() {
-            let hook = plugin.authorize(client, topic, access);
-            match guarded(plugin.name(), "authorize", self.timeout, hook).await {
+            match guarded(plugin.name(), "authorize", self.timeout, || {
+                plugin.authorize(client, topic, access)
+            })
+            .await
+            {
                 Some(Decision::Defer) => continue,
                 Some(decision) => return decision,
                 None => return Decision::Deny,
@@ -360,8 +376,11 @@ impl Chain {
         message: &mut PluginMessage,
     ) -> MessageAction {
         for plugin in self.plugins.iter() {
-            let hook = plugin.on_message(client, message);
-            match guarded(plugin.name(), "on_message", self.timeout, hook).await {
+            match guarded(plugin.name(), "on_message", self.timeout, || {
+                plugin.on_message(client, message)
+            })
+            .await
+            {
                 Some(MessageAction::Continue) => continue,
                 Some(MessageAction::Drop) | None => return MessageAction::Drop,
             }
@@ -384,7 +403,10 @@ impl Chain {
             tokio::spawn(async move {
                 while let Some(event) = receiver.recv().await {
                     for plugin in plugins.iter() {
-                        guarded(plugin.name(), "on_event", timeout, plugin.on_event(&event)).await;
+                        guarded(plugin.name(), "on_event", timeout, || {
+                            plugin.on_event(&event)
+                        })
+                        .await;
                     }
                 }
             });
@@ -402,11 +424,12 @@ impl Chain {
         let rest = topic.strip_prefix("$CONTROL/")?;
         let (name, path) = rest.split_once('/').unwrap_or((rest, ""));
         let plugin = self.plugins.iter().find(|p| p.name() == name)?;
-        let hook = plugin.on_control(client, path, payload);
         Some(
-            guarded(plugin.name(), "on_control", self.timeout, hook)
-                .await
-                .flatten(),
+            guarded(plugin.name(), "on_control", self.timeout, || {
+                plugin.on_control(client, path, payload)
+            })
+            .await
+            .flatten(),
         )
     }
 }
@@ -551,6 +574,85 @@ mod tests {
             panics.on_message(&client(), &mut message()).await,
             MessageAction::Drop
         );
+    }
+
+    /// Panics while making its futures, before any of them is polled.
+    struct PanicsAtOnce;
+
+    impl Plugin for PanicsAtOnce {
+        fn name(&self) -> &str {
+            "panics-at-once"
+        }
+
+        fn begin_auth(&self, _: &str) -> Option<Box<dyn AuthExchange>> {
+            panic!("broken plugin")
+        }
+
+        fn authorize<'a>(
+            &'a self,
+            _: &'a ClientInfo,
+            _: &'a str,
+            _: Access,
+        ) -> BoxFuture<'a, Decision> {
+            panic!("broken plugin")
+        }
+
+        fn on_event<'a>(&'a self, _: &'a Event) -> BoxFuture<'a, ()> {
+            panic!("broken plugin")
+        }
+    }
+
+    /// Counts the events it hears.
+    #[derive(Default)]
+    struct Counter(std::sync::atomic::AtomicUsize);
+
+    impl Plugin for Counter {
+        fn name(&self) -> &str {
+            "counter"
+        }
+
+        fn on_event<'a>(&'a self, _: &'a Event) -> BoxFuture<'a, ()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ready(())
+        }
+    }
+
+    impl Counter {
+        async fn wait_for(&self, count: usize) -> usize {
+            for _ in 0..200 {
+                if self.0.load(std::sync::atomic::Ordering::Relaxed) >= count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn expired(client_id: &str) -> Event {
+        Event::SessionExpired {
+            client_id: client_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_hook_panicking_before_its_future_denies() {
+        let panics = chain(vec![Arc::new(PanicsAtOnce), fixed("b", Decision::Allow)]);
+        assert_eq!(
+            panics.authorize(&client(), "t", Access::Read).await,
+            Decision::Deny
+        );
+        assert!(panics.begin_auth("PLAIN").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_panicking_event_hook_doesnt_stop_later_events() {
+        let counter = Arc::new(Counter::default());
+        let chain = chain(vec![Arc::new(PanicsAtOnce), counter.clone()]);
+        chain.emit(expired("a"));
+        assert_eq!(counter.wait_for(1).await, 1);
+        chain.emit(expired("b"));
+        assert_eq!(counter.wait_for(2).await, 2);
     }
 
     #[tokio::test]

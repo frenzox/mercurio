@@ -808,7 +808,10 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
                     _ = stop.recv() => break,
                 }
                 for plugin in &plugins {
-                    guarded(plugin.name(), "on_tick", plugin_timeout, plugin.on_tick()).await;
+                    guarded(plugin.name(), "on_tick", plugin_timeout, || {
+                        plugin.on_tick()
+                    })
+                    .await;
                 }
             }
         });
