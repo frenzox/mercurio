@@ -299,9 +299,8 @@ impl Session {
                     client_id,
                     subscriptions: HashMap::new(),
                     topics: None,
-                    // Pre-allocate with reasonable capacity for typical usage
-                    unacknowledged_messages: HashMap::with_capacity(16),
-                    pubrecs: HashMap::with_capacity(16),
+                    unacknowledged_messages: HashMap::new(),
+                    pubrecs: HashMap::new(),
                     next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,

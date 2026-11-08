@@ -15,8 +15,14 @@ use mercurio_packets::ControlPacket;
 
 use crate::sys::Stats;
 
-/// Default capacity for read buffer (8KB)
-const READ_BUFFER_CAPACITY: usize = 8192;
+/// Initial capacity of the read buffer, which grows for larger packets.
+/// Kept small, as most connections are idle or exchange small packets, and
+/// every connection holds one.
+const READ_BUFFER_CAPACITY: usize = 1024;
+
+/// Capacity of the buffer collecting writes before they go out; larger
+/// writes bypass it.
+const WRITE_BUFFER_SIZE: usize = 2048;
 
 /// Default capacity for write buffer (512 bytes - typical packet size)
 const WRITE_BUFFER_CAPACITY: usize = 512;
@@ -97,7 +103,7 @@ where
     /// Speaks MQTT over `stream`: plain TCP, TLS or a WebSocket.
     pub fn new(stream: S) -> Connection<S> {
         Connection {
-            stream: BufWriter::new(stream),
+            stream: BufWriter::with_capacity(WRITE_BUFFER_SIZE, stream),
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
             protocol_version: ProtocolVersion::V5,

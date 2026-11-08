@@ -372,9 +372,12 @@ mod tests {
 
         let mut recorded = Vec::new();
         while let Ok(event) = events.try_recv() {
-            recorded.push(match event {
-                Op::Write(Write::Enqueue(sequence, m), _) => format!("{sequence}:{}", m.qos as u8),
-                Op::Write(Write::ClearQueue, _) => "clear".to_string(),
+            let Op::Write(write, _) = event else {
+                continue;
+            };
+            recorded.push(match *write {
+                Write::Enqueue(sequence, m) => format!("{sequence}:{}", m.qos as u8),
+                Write::ClearQueue => "clear".to_string(),
                 _ => "other".to_string(),
             });
         }

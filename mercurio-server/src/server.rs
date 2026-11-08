@@ -361,8 +361,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
+        // Boxed, so each connection holds the state of its own path, plain
+        // or TLS, not that of the largest
         let Some(acceptor) = settings.tls_acceptor else {
-            return self.serve(socket, transport, peer_addr).await;
+            return Box::pin(self.serve(socket, transport, peer_addr)).await;
         };
         match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
@@ -377,7 +379,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         return;
                     }
                 }
-                self.serve(tls_stream, transport, peer_addr).await;
+                Box::pin(self.serve(tls_stream, transport, peer_addr)).await;
             }
             Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
             Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
@@ -391,7 +393,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         match transport {
-            Transport::Mqtt => self.handle(Connection::new(stream)).await,
+            Transport::Mqtt => Box::pin(self.handle(Connection::new(stream))).await,
             Transport::WebSocket => {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
@@ -411,7 +413,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // needs one larger than the largest packet
                 let handshake = websocket::accept(stream, self.limits.max_packet_size);
                 match time::timeout(self.limits.connect_timeout, handshake).await {
-                    Ok(Ok(websocket)) => self.handle(Connection::new(websocket)).await,
+                    Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
                     Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
                 }
