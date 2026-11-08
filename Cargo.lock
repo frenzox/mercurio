@@ -824,7 +824,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mercurio-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "mercurio-core",
@@ -841,14 +841,14 @@ dependencies = [
 
 [[package]]
 name = "mercurio-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "mercurio-packets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "mercurio-core",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "mercuriod"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -1228,7 +1228,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "recado"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",

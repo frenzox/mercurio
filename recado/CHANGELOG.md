@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/frenzox/mercurio/compare/recado-v0.1.0...recado-v0.1.1) - 2026-11-08
+
+### Other
+
+- add a changelog to every crate
+
 ## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/recado-v0.1.0) - 2026-11-08
 
 ### Added

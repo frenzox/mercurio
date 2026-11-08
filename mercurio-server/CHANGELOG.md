@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.1.0...mercurio-server-v0.2.0) - 2026-11-08
+
+### Added
+
+- *(server)* store each client's state in the background, in order
+
+### Fixed
+
+- [**breaking**] drop the std feature from crates that always need std
+
+### Other
+
+- add a changelog to every crate
+
 ## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/mercurio-server-v0.1.0) - 2026-11-08
 
 ### Added

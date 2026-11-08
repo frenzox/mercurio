@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "MQTT client library for the Mercurio MQTT implementation"
 license = "MIT OR Apache-2.0"
@@ -10,8 +10,8 @@ keywords = ["mqtt", "mqtt5", "client", "iot", "tokio"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
-mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
-mercurio-packets = { path = "../mercurio-packets", version = "0.1.0" }
+mercurio-core = { path = "../mercurio-core", version = "0.1.1" }
+mercurio-packets = { path = "../mercurio-packets", version = "0.1.1" }
 
 bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
