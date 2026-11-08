@@ -3,6 +3,8 @@
 //! This crate provides traits for persistent storage of MQTT broker state,
 //! allowing different storage backends (in-memory, SQLite, Redis, etc.).
 
+#[cfg(feature = "sqlite")]
+mod encoding;
 pub mod memory;
 
 #[cfg(feature = "sqlite")]

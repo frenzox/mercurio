@@ -9,19 +9,21 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use mercurio_core::{
-    codec::{Decoder, Encoder},
+    codec::Decoder,
     message::{unix_millis, Message, MessageOrigin, MessageProperties},
-    qos::QoS,
     topic::topic_matches_filter,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Null, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
+    encoding::{
+        decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
+    },
     InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
-    SessionStore, StorageError, StoredSubscription, StoredWillMessage, WillStore,
+    SessionStore, StorageError, StoredWillMessage, WillStore,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -158,61 +160,12 @@ impl SqliteStore {
     }
 }
 
-fn qos_to_int(qos: QoS) -> i32 {
-    match qos {
-        QoS::AtMostOnce => 0,
-        QoS::AtLeastOnce => 1,
-        QoS::ExactlyOnce => 2,
-        QoS::Invalid => -1,
-    }
-}
-
-fn int_to_qos(val: i32) -> QoS {
-    match val {
-        0 => QoS::AtMostOnce,
-        1 => QoS::AtLeastOnce,
-        2 => QoS::ExactlyOnce,
-        _ => QoS::Invalid,
-    }
-}
-
-fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
-    let mut buffer = BytesMut::new();
-    properties.encode(&mut buffer);
-    buffer.to_vec()
-}
-
 /// Fails like any other unreadable column if the stored properties can't
 /// be decoded, rather than delivering the message without them.
 fn decode_properties(encoded: Vec<u8>) -> rusqlite::Result<MessageProperties> {
     MessageProperties::decode(&mut Bytes::from(encoded)).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
     })
-}
-
-/// Stores each subscription as three digits (QoS, No Local, Retain As
-/// Published), the subscription identifier if any, `:` and the topic
-/// filter. Subscriptions are separated by NUL: the only character a topic
-/// filter cannot contain.
-fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> String {
-    subscriptions
-        .iter()
-        .map(|s| {
-            let identifier = s
-                .subscription_identifier
-                .map(|id| id.to_string())
-                .unwrap_or_default();
-            format!(
-                "{}{}{}{}:{}",
-                s.qos as u8,
-                s.no_local as u8,
-                s.retain_as_published as u8,
-                identifier,
-                s.topic_filter
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\0")
 }
 
 /// The subscription identifiers of a stored message, as comma-separated
@@ -241,24 +194,6 @@ impl FromSql for Identifiers {
             _ => Err(FromSqlError::InvalidType),
         }
     }
-}
-
-fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
-    encoded
-        .split('\0')
-        .filter_map(|s| {
-            let (flags, rest) = s.split_at_checked(3)?;
-            let (identifier, topic_filter) = rest.split_once(':')?;
-            let flags: Vec<u8> = flags.bytes().map(|b| b.wrapping_sub(b'0')).collect();
-            Some(StoredSubscription {
-                topic_filter: topic_filter.to_string(),
-                qos: flags[0].into(),
-                no_local: flags[1] == 1,
-                retain_as_published: flags[2] == 1,
-                subscription_identifier: identifier.parse().ok(),
-            })
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -765,7 +700,10 @@ impl QueueStore for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use mercurio_core::qos::QoS;
+
     use super::*;
+    use crate::StoredSubscription;
 
     fn create_test_message(topic: &str, payload: &str) -> Message {
         Message {
