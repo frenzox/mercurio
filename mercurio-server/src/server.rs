@@ -55,7 +55,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http,
-    plugin::{AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
+    plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
     proxy,
     session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
@@ -179,6 +179,8 @@ pub struct ServerConfig {
     /// Longest a plugin hook may take; one that takes longer denies, or
     /// drops the message.
     pub plugin_timeout: Duration,
+    /// How often plugins' `on_tick` runs.
+    pub plugin_tick_interval: Duration,
 }
 
 impl Default for ServerConfig {
@@ -193,6 +195,7 @@ impl Default for ServerConfig {
             sys_interval: Some(Duration::from_secs(10)),
             plugins: Vec::new(),
             plugin_timeout: Duration::from_secs(5),
+            plugin_tick_interval: Duration::from_secs(1),
         }
     }
 }
@@ -749,6 +752,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         sys_interval,
         plugins,
         plugin_timeout,
+        plugin_tick_interval,
     } = config;
     let stats = Arc::new(Stats::default());
     let policy = Arc::new(policy);
@@ -791,6 +795,23 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     };
 
     let session_manager = server.session_manager_holder.session_manager();
+    if !all_plugins.is_empty() {
+        let mut ticks = time::interval(plugin_tick_interval);
+        ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut stop = server.notify_shutdown.subscribe();
+        let plugins = all_plugins.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.recv() => break,
+                }
+                for plugin in &plugins {
+                    guarded(plugin.name(), "on_tick", plugin_timeout, plugin.on_tick()).await;
+                }
+            }
+        });
+    }
     session_manager.set_expiry_chain(Chain::new(all_plugins, plugin_timeout));
     if let Some(interval) = sys_interval {
         sys::spawn_publisher(

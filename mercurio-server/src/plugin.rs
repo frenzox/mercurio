@@ -379,7 +379,6 @@ impl Chain {
         let _ = sender.send(event);
     }
 
-    #[allow(dead_code)] // used from Task 6
     pub(crate) async fn control(
         &self,
         client: &ClientInfo,

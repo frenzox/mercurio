@@ -244,3 +244,75 @@ async fn lifecycle_events_reach_plugins() {
         ]
     );
 }
+
+/// Answers `$CONTROL/echo/...` with the payload, upper-cased, and counts ticks.
+#[derive(Default)]
+struct Echo(std::sync::atomic::AtomicU32);
+
+impl Plugin for Echo {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a str,
+        _: mercurio_server::plugin::Access,
+    ) -> BoxFuture<'a, mercurio_server::plugin::Decision> {
+        ready(mercurio_server::plugin::Decision::Allow)
+    }
+
+    fn on_control<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        path: &'a str,
+        payload: Bytes,
+    ) -> BoxFuture<'a, Option<Bytes>> {
+        assert_eq!(path, "v1");
+        ready(Some(Bytes::from(payload.to_ascii_uppercase())))
+    }
+
+    fn on_tick(&self) -> BoxFuture<'_, ()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn control_requests_are_answered_and_not_routed() {
+    let addr = start_broker(vec![Arc::new(Echo::default())]).await;
+    // A separate listener, so the PUBACK and the response can't race on one
+    // connection
+    let mut listener = Client::connect(addr, "listener").await;
+    listener.subscribe("$CONTROL/echo/#").await;
+    let mut admin = Client::connect(addr, "admin").await;
+
+    assert_eq!(
+        admin.publish("$CONTROL/echo/v1", b"ping").await,
+        ReasonCode::Success
+    );
+    let Some(ControlPacket::Publish(answer)) = listener.receive().await else {
+        panic!("Expected the response");
+    };
+    assert_eq!(answer.topic_name, "$CONTROL/echo/v1/response");
+    assert_eq!(answer.payload.as_deref(), Some(&b"PING"[..]));
+    // The request itself wasn't sent to subscribers
+    assert!(listener.receive().await.is_none());
+}
+
+#[tokio::test]
+async fn plugins_tick() {
+    let echo = Arc::new(Echo::default());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = vec![echo.clone()];
+    config.plugin_tick_interval = Duration::from_millis(20);
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(echo.0.load(std::sync::atomic::Ordering::Relaxed) >= 3);
+}

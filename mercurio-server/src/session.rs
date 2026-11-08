@@ -762,6 +762,30 @@ impl Session {
             hooked_properties = Some(message.properties);
         }
 
+        if packet.topic_name.starts_with("$CONTROL/") {
+            let identity = self.identity().await;
+            let payload = packet.payload.clone().unwrap_or_default();
+            if let Some(answer) = chain.control(&identity, &packet.topic_name, payload).await {
+                if let Some(answer) = answer {
+                    let topic: Arc<str> = format!("{}/response", packet.topic_name).into();
+                    let reply = Message {
+                        packet_id: None,
+                        topic: Arc::clone(&topic),
+                        dup: false,
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        payload: Some(answer),
+                        properties: MessageProperties::default(),
+                        expires_at: None,
+                        subscription_identifiers: Vec::new(),
+                        origin: None,
+                    };
+                    broker.publish_from(&topic, reply, None).await?;
+                }
+                return response;
+            }
+        }
+
         // Only retained messages are checked against their publisher later
         let origin = match packet.retain {
             true => {
