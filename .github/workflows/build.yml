@@ -29,6 +29,18 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # The workspace build lends crates each other's features; release-plz and
+  # crates.io build each crate on its own
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - name: Check each crate with each feature
+        run: cargo hack check --workspace --each-feature --no-dev-deps
+
   test:
     runs-on: ubuntu-latest
     services:

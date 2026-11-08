@@ -30,7 +30,6 @@ batch in one transaction.
 
 ## Features
 
-- `std` (default): standard library support.
 - `sqlite`: the SQLite store, with schema migrations applied on open.
 - `postgres`: the PostgreSQL store, for PostgreSQL 12 or later, which
   creates and updates its tables on connect.

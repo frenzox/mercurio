@@ -10,8 +10,6 @@ keywords = ["mqtt", "broker", "sqlite", "postgres", "persistence"]
 categories = ["network-programming", "database"]
 
 [features]
-default = ["std"]
-std = ["mercurio-core/std"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
 postgres = [
     "dep:tokio",
@@ -24,7 +22,7 @@ postgres = [
 ]
 
 [dependencies]
-mercurio-core = { path = "../mercurio-core", version = "0.1.0", default-features = false }
+mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
 async-trait = "0.1"
 bytes = "1"
 thiserror = "2"
