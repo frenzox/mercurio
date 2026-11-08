@@ -1,3 +1,6 @@
+//! UNSUBSCRIBE, a client's request to stop receiving some topic filters'
+//! messages (section 3.10).
+
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec, vec::Vec};
 

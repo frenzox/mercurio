@@ -1,3 +1,6 @@
+//! DISCONNECT, the end of a connection, sent by the client or, in MQTT 5,
+//! the server, with a reason (section 3.14).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -12,9 +15,12 @@ use mercurio_core::{
 
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
+    /// Replaces the session expiry from CONNECT. Sent by the client only
+    /// [MQTT-3.14.2-2].
     pub session_expiry_interval: Option<SessionExpiryInterval>,
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
+    /// Another server the client may use (section 4.11).
     pub server_reference: Option<ServerReference>,
 }
 
@@ -76,6 +82,8 @@ impl Decoder for DisconnectProperties {
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
+    /// Decodes as `NormalDisconnection` when left out or 0x00. Not encoded in
+    /// MQTT 3.x, see [`Self::encode_v3`].
     pub reason: ReasonCode,
     pub properties: Option<DisconnectProperties>,
 }

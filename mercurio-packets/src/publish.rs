@@ -1,3 +1,5 @@
+//! PUBLISH, an application message, in either direction (section 3.3).
+
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec, vec::Vec};
 
@@ -12,9 +14,15 @@ use mercurio_core::{
 };
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
+/// MQTT 5 only.
 pub struct PublishProperties {
+    /// 1 means the payload is UTF-8 text. Absent or 0 means unspecified
+    /// bytes.
     pub payload_format_indicator: Option<PayloadFormatIndicator>,
+    /// Lifetime of the message in seconds. Absent means it doesn't expire.
     pub message_expiry_interval: Option<MessageExpiryInterval>,
+    /// Number that stands for the topic name on this connection, which then
+    /// may be empty (section 3.3.2.3.4).
     pub topic_alias: Option<TopicAlias>,
     pub response_topic: Option<ResponseTopic>,
     pub correlation_data: Option<CorrelationData>,
@@ -93,12 +101,20 @@ impl Decoder for PublishProperties {
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct PublishPacket {
+    /// Set on a resend of a QoS 1 or 2 message. Never set at QoS 0
+    /// [MQTT-3.3.1-2].
     pub dup: bool,
     pub qos_level: QoS,
+    /// From a client, store the message as the topic's retained message, or
+    /// clear it if the payload is empty. From the server, see
+    /// `SubscriptionOptions::retain_as_pub`.
     pub retain: bool,
+    /// May be empty when `PublishProperties::topic_alias` is set.
     pub topic_name: String,
+    /// Set at QoS 1 and 2, `None` at QoS 0.
     pub packet_id: Option<u16>,
     pub properties: Option<PublishProperties>,
+    /// `None` encodes as an empty payload. Decoding always gives `Some`.
     pub payload: Option<Bytes>,
 }
 

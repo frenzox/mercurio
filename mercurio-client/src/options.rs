@@ -21,11 +21,13 @@ pub struct MessageProperties {
     pub payload_is_utf8: bool,
     /// Seconds the broker keeps the message for subscribers yet to get it
     pub message_expiry: Option<u32>,
+    /// Describes the payload, such as a MIME type; free-form
     pub content_type: Option<String>,
     /// Where a request's reply should be published
     pub response_topic: Option<String>,
     /// Matches a reply to its request
     pub correlation_data: Option<Bytes>,
+    /// Name and value pairs, delivered as published; a name may repeat
     pub user_properties: Vec<(String, String)>,
 }
 
@@ -98,6 +100,8 @@ impl Will {
 }
 
 impl Will {
+    /// A will publishing `payload` on `topic`: QoS 0, not retained, and
+    /// without delay, until set otherwise.
     pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         Self {
             topic: topic.into(),

@@ -18,7 +18,8 @@ pub enum Event {
         subscription_ids: Vec<u32>,
     },
 
-    /// The client was disconnected from the broker.
+    /// The connection ended. With reconnection on, the client tries again
+    /// and reports `Reconnected`; otherwise no more events follow.
     Disconnected { reason: DisconnectReason },
 
     /// The client reconnected after losing the connection. Without
@@ -36,6 +37,7 @@ pub enum DisconnectReason {
     /// The broker sent DISCONNECT, saying why.
     ServerInitiated {
         reason: ReasonCode,
+        /// A human-readable explanation, when the broker sent one
         reason_string: Option<String>,
         /// Another server to use, when the broker is moving clients away
         server_reference: Option<String>,
@@ -58,6 +60,7 @@ pub enum DisconnectReason {
 #[derive(Debug, Clone)]
 pub struct SubscribeResult {
     pub topic: String,
+    /// The QoS the broker granted, which may be lower than requested
     pub qos: QoS,
     pub success: bool,
     /// Why the broker refused, when it did

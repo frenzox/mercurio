@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 pub mod acl;
 pub mod auth;
 mod broker;

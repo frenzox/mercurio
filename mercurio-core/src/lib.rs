@@ -1,13 +1,4 @@
-//! Core types and traits for the Mercurio MQTT implementation.
-//!
-//! This crate provides the fundamental building blocks for MQTT packet encoding/decoding
-//! and is designed to be `no_std` compatible when the `std` feature is disabled.
-//!
-//! ## Features
-//!
-//! - `std` (enabled by default): Enables standard library support including `std::io::Error`.
-//!   When disabled, the crate is `no_std` compatible and requires the `alloc` crate.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]

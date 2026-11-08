@@ -28,6 +28,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Documentation
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The oldest Rust the crates declare they build with, rust-version
   msrv:

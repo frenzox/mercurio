@@ -1,3 +1,5 @@
+//! PINGREQ, sent by a client to keep an idle connection alive (section 3.12).
+
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};

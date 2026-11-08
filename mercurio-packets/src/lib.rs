@@ -1,8 +1,4 @@
-//! MQTT packet encoding and decoding for all MQTT versions.
-//!
-//! This crate provides packet types for MQTT 3.1, 3.1.1, and 5.0 and is
-//! `no_std` compatible when the `std` feature is disabled.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
@@ -45,6 +41,7 @@ use crate::{
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug)]
+/// Any MQTT control packet, as decoded from or encoded to the wire.
 pub enum ControlPacket {
     Connect(ConnectPacket),
     ConnAck(ConnAckPacket),
@@ -64,6 +61,8 @@ pub enum ControlPacket {
 }
 
 #[repr(C)]
+/// The packet type, the high four bits of the first byte of the fixed
+/// header (section 2.1.2).
 pub enum PacketType {
     Connect = 0x01,
     ConnAck,
@@ -150,6 +149,9 @@ impl ControlPacket {
         Ok(header_len + remaining_len.0 as usize)
     }
 
+    /// Same as [`Self::parse_with_version`] with MQTT 5.0. Several packets
+    /// have a different shape in MQTT 3.x, so this misreads them on a 3.x
+    /// connection.
     pub fn parse(src: &mut BytesMut) -> crate::Result<ControlPacket> {
         // Default to MQTT 5.0 parsing
         Self::parse_with_version(src, ProtocolVersion::V5)
@@ -157,6 +159,12 @@ impl ControlPacket {
 
     /// Parse a control packet with version-specific decoding.
     /// Use this when the protocol version is known (e.g., after CONNECT).
+    ///
+    /// Removes the packet from `src` and leaves any bytes after it. Returns
+    /// `Error::PacketIncomplete`, with `src` untouched, until the whole
+    /// packet is there. A packet that is malformed, or that doesn't use all
+    /// its own bytes, is still removed from `src` and gives a reason code
+    /// error, usually `MalformedPacket`.
     pub fn parse_with_version(
         src: &mut BytesMut,
         version: ProtocolVersion,
@@ -271,6 +279,11 @@ impl ControlPacket {
     }
 
     /// Encode a control packet in the wire format of the given protocol version.
+    ///
+    /// CONNACK, SUBACK and UNSUBACK use their own `protocol_version` field
+    /// instead of `version`. PUBACK, PUBREC, PUBREL and PUBCOMP are only
+    /// valid in MQTT 3.x with reason `Success` and no properties, since they
+    /// are then encoded without either.
     pub fn encode_with_version(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
         use ControlPacket::*;
 

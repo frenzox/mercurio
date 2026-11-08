@@ -1,3 +1,6 @@
+//! PUBREL, the second step of a QoS 2 delivery, answering PUBREC
+//! (section 3.6).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -69,6 +72,8 @@ impl Decoder for PubRelProperties {
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubRelPacket {
     pub packet_id: u16,
+    /// Decodes as `Success` when left out. Left out on encode when `Success`
+    /// with no properties, which is the only form MQTT 3.x has.
     pub reason: ReasonCode,
     pub properties: Option<PubRelProperties>,
 }

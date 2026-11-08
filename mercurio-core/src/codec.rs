@@ -9,15 +9,29 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::{error::Error, reason::ReasonCode};
 
+/// A type that can be read from its MQTT wire encoding.
 pub trait Decoder {
+    /// Reads one value from the front of `buffer` and advances past it.
+    ///
+    /// Returns [`Error::PacketIncomplete`] when the buffer ends before a
+    /// fixed-size field or a length prefix is complete. A length prefix that
+    /// points past the end of the buffer, or a value the spec forbids, is a
+    /// [`ReasonCode::MalformedPacket`] or [`ReasonCode::ProtocolError`].
     fn decode<T>(buffer: &mut T) -> crate::Result<Self>
     where
         Self: Sized,
         T: Buf;
 }
 
+/// A type that can be written in its MQTT wire encoding.
 pub trait Encoder {
+    /// Appends the encoded value to `buffer`.
     fn encode(&self, buffer: &mut BytesMut);
+
+    /// Number of bytes [`encode`](Encoder::encode) writes.
+    ///
+    /// The default returns the in-memory size of the value. It is only
+    /// correct for fixed-size integers; every other type overrides it.
     fn encoded_size(&self) -> usize {
         mem::size_of_val(self)
     }
@@ -61,6 +75,27 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
     Err(ReasonCode::MalformedPacket.into())
 }
 
+/// An MQTT Variable Byte Integer (section 1.5.5).
+///
+/// Each byte carries seven bits of the value, least significant first, and
+/// its high bit is set when another byte follows. One to four bytes encode
+/// 0 to 268,435,455. It is used for the Remaining Length, property lengths,
+/// property identifiers and the Subscription Identifier.
+///
+/// Decoding fails with [`Error::PacketIncomplete`] when the buffer ends
+/// before the last byte, and with [`ReasonCode::MalformedPacket`] when a
+/// fourth byte still has its continuation bit set [MQTT-1.5.5-1].
+/// [`Encoder::encoded_size`] panics for values above 268,435,455.
+///
+/// ```
+/// use bytes::BytesMut;
+/// use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
+///
+/// let mut buffer = BytesMut::new();
+/// VariableByteInteger(321).encode(&mut buffer);
+/// assert_eq!(&buffer[..], &[0xc1, 0x02]);
+/// assert_eq!(VariableByteInteger::decode(&mut buffer).unwrap().0, 321);
+/// ```
 #[derive(PartialEq, Eq, Debug, Default, Clone)]
 pub struct VariableByteInteger(pub u32);
 

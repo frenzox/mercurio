@@ -13,10 +13,14 @@ use crate::{
 
 macro_rules! def_prop {
     ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
+        /// An MQTT 5 property. Its meaning is described on the [`Property`]
+        /// variant of the same name.
         #[derive(Debug, Default, PartialEq, Eq, Clone)]
         pub struct $t {$(pub $n: $s,)*}
 
         impl $t {
+            /// Property identifier, encoded as a Variable Byte Integer
+            /// before the value.
             pub const $i: u32 = $a;
             pub fn new($($n: $s,)*) -> $t {
                 $t {
@@ -191,36 +195,107 @@ def_prop!(SharedSubscriptionAvailable {
     value: bool
 });
 
+/// An MQTT 5 property (section 2.2.2.2), as read from a property list.
+///
+/// Decoding reads the identifier and the value. An unknown identifier is a
+/// [`ReasonCode::MalformedPacket`], and a value the spec rules out (such as
+/// a Topic Alias of 0) is a [`ReasonCode::ProtocolError`]. Decoding does
+/// not check that the packet type allows the property; the packet decoders
+/// do that.
 #[derive(PartialEq, Eq, Debug)]
 #[allow(clippy::enum_variant_names)] // Warns because of UserProperty
 #[non_exhaustive]
 pub enum Property {
+    /// 0: the payload is unspecified bytes. 1: the payload is UTF-8 character
+    /// data. Other values are a protocol error. PUBLISH and will properties.
     PayloadFormatIndicator(PayloadFormatIndicator),
+    /// Lifetime of the application message in seconds. Without it the message
+    /// does not expire. PUBLISH and will properties.
     MessageExpiryInterval(MessageExpiryInterval),
+    /// Describes the payload content, such as a MIME type. The application
+    /// defines its meaning. PUBLISH and will properties.
     ContentType(ContentType),
+    /// Topic name the receiver should publish a response to. It must be a
+    /// topic name, without wildcards [MQTT-3.3.2-14]; the decoder rejects a
+    /// filter as a protocol error. PUBLISH and will properties.
     ResponseTopic(ResponseTopic),
+    /// Binary data the requester uses to match a response to its request.
+    /// PUBLISH and will properties.
     CorrelationData(CorrelationData),
+    /// Identifier of a subscription, 1 to 268,435,455; 0 is a protocol
+    /// error. The client sets it in SUBSCRIBE, and the server adds it to
+    /// each PUBLISH that matches the subscription, so one PUBLISH can carry
+    /// several.
     SubscriptionIdentifier(SubscriptionIdentifier),
+    /// Seconds the session state is kept after the network connection
+    /// closes. 0 or absent ends the session with the connection, and
+    /// `u32::MAX` means the session never expires. CONNECT, CONNACK and
+    /// DISCONNECT.
     SessionExpiryInterval(SessionExpiryInterval),
+    /// Client identifier the server assigned because the CONNECT had an empty
+    /// one. CONNACK.
     AssignedClientIdentifier(AssignedClientIdentifier),
+    /// Keep alive in seconds that the server requires. It replaces the value
+    /// the client sent in CONNECT. CONNACK.
     ServerKeepAlive(ServerKeepAlive),
+    /// Name of the extended authentication method (section 4.12). CONNECT,
+    /// CONNACK and AUTH.
     AuthenticationMethod(AuthenticationMethod),
+    /// Binary data of the extended authentication exchange. The
+    /// authentication method defines its content. CONNECT, CONNACK and AUTH.
     AuthenticationData(AuthenticationData),
+    /// 0: the server sends a Reason String or User Properties only in PUBLISH,
+    /// CONNACK and DISCONNECT [MQTT-3.1.2-29]. 1 or absent: in any packet.
+    /// Other values are a protocol error. CONNECT.
     RequestProblemInformation(RequestProblemInformation),
+    /// Seconds the server waits after the connection closes before it
+    /// publishes the will message. The will is not sent if the client
+    /// reconnects to the session first. Will properties in CONNECT.
     WillDelayInterval(WillDelayInterval),
+    /// 1 asks the server to send Response Information in CONNACK. 0 or absent
+    /// does not. Other values are a protocol error. CONNECT.
     RequestResponseInformation(RequestResponseInformation),
+    /// String the client can use as the base of its response topics. CONNACK.
     ResponseInformation(ResponseInformation),
+    /// Other server the client can use, sent with
+    /// [`ReasonCode::UseAnotherServer`] or [`ReasonCode::ServerMoved`].
+    /// CONNACK and DISCONNECT.
     ServerReference(ServerReference),
+    /// Human-readable text about the reason code, for diagnostics. The
+    /// receiver must not parse it.
     ReasonString(ReasonString),
+    /// Most QoS 1 and QoS 2 PUBLISH packets the sender of this property will
+    /// process at once without acknowledging them. 1 to 65,535; absent means
+    /// 65,535 and 0 is a protocol error. CONNECT and CONNACK.
     ReceiveMaximum(ReceiveMaximum),
+    /// Highest Topic Alias the sender of this property accepts. 0 or absent
+    /// means it accepts none. CONNECT and CONNACK.
     TopicAliasMaximum(TopicAliasMaximum),
+    /// Number that stands for a topic name in later PUBLISH packets on the
+    /// same connection. 1 up to the receiver's Topic Alias Maximum; 0 is a
+    /// protocol error. PUBLISH.
     TopicAlias(TopicAlias),
+    /// Highest QoS the server supports: 0 or 1. Absent means 2, and other
+    /// values are a protocol error. CONNACK.
     MaximumQoS(MaximumQoS),
+    /// Whether the server supports retained messages. Absent means it does.
+    /// CONNACK.
     RetainAvailable(RetainAvailable),
+    /// Name and value pair defined by the application. Most packets allow it,
+    /// and it may appear more than once, also with the same name.
     UserProperty(UserProperty),
+    /// Largest whole packet, in bytes, that the sender of this property
+    /// accepts. Absent means no limit beyond the protocol's; 0 is a protocol
+    /// error. CONNECT and CONNACK.
     MaximumPacketSize(MaximumPacketSize),
+    /// Whether the server supports wildcard subscriptions. Absent means it
+    /// does. CONNACK.
     WildcardSubscriptionAvailable(WildcardSubscriptionAvailable),
+    /// Whether the server supports Subscription Identifiers. Absent means it
+    /// does. CONNACK.
     SubscriptionIdentifierAvailable(SubscriptionIdentifierAvailable),
+    /// Whether the server supports shared subscriptions. Absent means it does.
+    /// CONNACK.
     SharedSubscriptionAvailable(SharedSubscriptionAvailable),
 }
 

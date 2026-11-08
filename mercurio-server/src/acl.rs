@@ -38,6 +38,8 @@ pub enum Access {
 #[non_exhaustive]
 pub struct ClientIdentity {
     pub client_id: String,
+    /// Set only for a user the broker verified, by password, certificate
+    /// or enhanced authentication; a claimed user name doesn't count
     pub username: Option<String>,
 }
 
@@ -97,6 +99,10 @@ pub struct AclFile {
 }
 
 impl AclFile {
+    /// Reads rules in mosquitto's ACL file format: `user`, `topic` and
+    /// `pattern` lines, `%c` and `%u` standing for the client id and user
+    /// name in patterns. Fails on a line it doesn't understand, or a topic
+    /// that isn't a valid filter.
     pub fn parse(contents: &str) -> Result<Self, String> {
         let mut acl = AclFile::default();
         let mut current_user: Option<String> = None;

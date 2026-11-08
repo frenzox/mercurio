@@ -1,3 +1,6 @@
+//! AUTH, the steps of MQTT 5 enhanced authentication (section 3.15). MQTT 3.x
+//! has no such packet.
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -76,6 +79,8 @@ impl Decoder for AuthProperties {
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 pub struct AuthPacket {
+    /// `Success`, `ContinueAuthentication` or `ReAuthenticate` (section
+    /// 3.15.2.1). Decodes as `Success` when the packet leaves it out.
     pub reason: ReasonCode,
     pub properties: AuthProperties,
 }

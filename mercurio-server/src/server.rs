@@ -1,3 +1,6 @@
+//! Running the broker: the `run` functions, its configuration and limits,
+//! and in-process connections.
+
 use std::{
     collections::HashMap,
     future::{poll_fn, Future},
@@ -166,6 +169,7 @@ impl Default for Limits {
 pub struct ServerConfig {
     /// Serve TLS instead of plain TCP on the main listener when set.
     pub tls: Option<TlsConfig>,
+    /// For the main listener, and listeners without their own
     pub auth: AuthConfig,
     pub limits: Limits,
     pub policy: ConnectPolicy,
@@ -268,6 +272,8 @@ pub struct LocalConnector(mpsc::UnboundedSender<DuplexStream>);
 pub struct LocalListener(mpsc::UnboundedReceiver<DuplexStream>);
 
 impl LocalConnector {
+    /// A connector, and the listener for `ServerConfig::local_listener`
+    /// it reaches the broker through.
     pub fn new() -> (LocalConnector, LocalListener) {
         let (tx, rx) = mpsc::unbounded_channel();
         (LocalConnector(tx), LocalListener(rx))
@@ -309,7 +315,10 @@ enum Accepted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Transport {
+    /// MQTT packets directly on the stream
     Mqtt,
+    /// MQTT inside WebSocket binary frames, with the `mqtt` subprotocol;
+    /// plain HTTP requests can be answered from `http_dir`
     WebSocket,
 }
 
@@ -1847,6 +1856,8 @@ pub struct AddressRange {
 }
 
 impl AddressRange {
+    /// Whether `ip` is in the range. An IPv4 address mapped into IPv6, as
+    /// IPv4 clients of an IPv6 socket appear, counts as the IPv4 address.
     pub fn contains(&self, ip: IpAddr) -> bool {
         // An IPv4 client may reach an IPv6 socket as a mapped address
         let ip = match ip {

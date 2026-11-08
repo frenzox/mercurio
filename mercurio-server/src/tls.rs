@@ -40,6 +40,7 @@ pub enum CertificateName {
     Subject,
 }
 
+/// The oldest TLS version a listener accepts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TlsVersion {
