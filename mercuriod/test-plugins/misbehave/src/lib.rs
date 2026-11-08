@@ -31,6 +31,7 @@ impl Plugin for Misbehave {
     fn on_control(_client: ClientInfo, path: String, payload: Vec<u8>) -> Option<Vec<u8>> {
         let text = String::from_utf8_lossy(&payload).into_owned();
         match path.as_str() {
+            "panic" => panic!("misbehaving on purpose: {text}"),
             "spin" => loop {
                 std::hint::spin_loop()
             },

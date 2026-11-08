@@ -108,8 +108,23 @@ pub trait Plugin {
     }
 }
 
+/// Sends panic messages to the broker's log, which would otherwise be lost
+/// with the discarded standard error. Called by [`export_plugin!`].
+#[doc(hidden)]
+pub fn __log_panics() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            host::log(Level::Error, &info.to_string());
+        }));
+    });
+}
+
 /// Exports `$plugin`, a type implementing [`Plugin`], as the component's
 /// `guest` interface. Invoke it once, at module level.
+///
+/// A panic in the plugin is logged by the broker at error level, then
+/// fails the call.
 #[macro_export]
 macro_rules! export_plugin {
     ($plugin:ty) => {
@@ -120,6 +135,7 @@ macro_rules! export_plugin {
                 fn init(
                     config: ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
                 ) -> ::core::result::Result<$crate::Registration, ::std::string::String> {
+                    $crate::__log_panics();
                     <$plugin as $crate::Plugin>::init(config)
                 }
                 fn authenticate(

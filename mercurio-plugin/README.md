@@ -91,6 +91,12 @@ The store is shared but not transactional: a get followed by a set can race
 with another copy, so a counter kept as get-then-set can lose updates.
 Prefer writing distinct keys and counting them with `kv_list`.
 
+## Logging
+
+Standard output and error are discarded, so `println!` shows nothing. Log
+with [`host::log`]. A panic is logged by the broker at error level, then the
+call fails.
+
 ## More
 
 The broker's plugin documentation is at

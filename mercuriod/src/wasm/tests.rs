@@ -126,6 +126,37 @@ async fn test_a_plugin_stuck_in_a_host_call_is_stopped() {
     assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
 }
 
+/// Collects what is logged on the test's thread.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// On one thread, so the plugin's calls log where the test listens
+#[tokio::test(flavor = "current_thread")]
+async fn test_a_rust_plugin_panic_is_logged() {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let plugin = misbehave(|_| ()).await;
+    assert_eq!(control(&plugin, "panic", b"ouch").await, None);
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("misbehaving on purpose: ouch"), "{logged}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_a_plugin_that_sleeps_in_init_fails_to_load() {
     let mut settings = settings("misbehave", &[("init_sleep_ms", "120000")]);

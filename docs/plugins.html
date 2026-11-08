@@ -128,7 +128,7 @@ config = { prefix = "$internal/" }</pre>
 
 <h2 id="sandbox">The sandbox</h2>
 <ul>
-<li>A plugin has no files, no environment variables and no standard input. Standard output and error are discarded; use <code>host::log</code>.</li>
+<li>A plugin has no files, no environment variables and no standard input. Standard output and error are discarded; use <code>host::log</code>. A Rust plugin built with <code>mercurio-plugin</code> sends its panic messages to the broker's log, at error level.</li>
 <li><code>allow_http</code> lists the hosts it may send HTTP requests to, as <code>host</code> or <code>host:port</code>. The default port is 443. The scheme is not checked, so <code>http://host:443</code> is allowed too. Other hosts are refused.</li>
 <li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may open sockets to. A socket may bind only to the wildcard address with port 0, which is what a connect needs. DNS lookups are off, so use addresses. With an empty list the plugin can't create a socket at all.</li>
 <li>Each copy may hold at most 4096 host resources at once, such as sockets, streams and HTTP requests. A call that tries to hold more traps.</li>
