@@ -199,3 +199,32 @@ async fn websocket_listeners_serve_files_and_mqtt() {
     ));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Frames are reassembled before the MQTT packet size is known, so a
+/// message growing past the largest packet is refused as it arrives,
+/// before the rest of it is sent.
+#[tokio::test]
+async fn messages_larger_than_the_largest_packet_are_refused() {
+    use tokio_tungstenite::tungstenite::protocol::frame::{coding::Data, coding::OpCode, Frame};
+
+    let (_, websocket_addr) = start_broker().await;
+    let mut websocket = websocket_connect(websocket_addr).await;
+
+    // Twice the default maximum packet size, in a message never finished
+    let fragment = Frame::message(
+        vec![0u8; 2 * 1024 * 1024],
+        OpCode::Data(Data::Binary),
+        false,
+    );
+    let _ = websocket.send(Message::Frame(fragment)).await;
+    let closed = timeout(Duration::from_secs(2), async {
+        loop {
+            match websocket.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "still waiting for the rest of the message");
+}

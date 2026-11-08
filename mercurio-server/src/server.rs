@@ -407,7 +407,9 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     }
                     None => http::Rewind::new(stream, Vec::new()),
                 };
-                let handshake = websocket::accept(stream);
+                // An MQTT packet may span messages, but no honest client
+                // needs one larger than the largest packet
+                let handshake = websocket::accept(stream, self.limits.max_packet_size);
                 match time::timeout(self.limits.connect_timeout, handshake).await {
                     Ok(Ok(websocket)) => self.handle(Connection::new(websocket)).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),

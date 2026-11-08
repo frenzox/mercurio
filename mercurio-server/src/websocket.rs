@@ -15,6 +15,7 @@ use tokio_tungstenite::{
         self,
         handshake::server::{ErrorResponse, Request, Response},
         http::HeaderValue,
+        protocol::WebSocketConfig,
         Message,
     },
     WebSocketStream,
@@ -23,8 +24,12 @@ use tokio_tungstenite::{
 const SUBPROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 /// Completes the WebSocket handshake on `stream`, selecting the `mqtt`
-/// subprotocol when the client offers it [MQTT-6.0.0-4].
-pub(crate) async fn accept<S>(stream: S) -> Result<WebSocketTransport<S>, tungstenite::Error>
+/// subprotocol when the client offers it [MQTT-6.0.0-4]. Messages larger
+/// than `max_message_size` are refused before they are buffered whole.
+pub(crate) async fn accept<S>(
+    stream: S,
+    max_message_size: usize,
+) -> Result<WebSocketTransport<S>, tungstenite::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -46,7 +51,11 @@ where
         Ok::<_, ErrorResponse>(response)
     };
 
-    let websocket = tokio_tungstenite::accept_hdr_async(stream, select_mqtt).await?;
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_message_size));
+    let websocket =
+        tokio_tungstenite::accept_hdr_async_with_config(stream, select_mqtt, Some(config)).await?;
     Ok(WebSocketTransport {
         websocket,
         pending: Bytes::new(),
