@@ -1,3 +1,8 @@
+// Versioning: the broker matches a plugin's imports and exports to these
+// types by structure, so any change to a function, record, variant, enum or
+// flags breaks plugins built for the old shape. New hooks, fields or cases
+// therefore need a new minor version, 0.2.0. Releases 0.1.x change only
+// documentation.
 package mercurio:plugin@0.1.0;
 
 interface types {
@@ -54,10 +59,12 @@ interface types {
     auth-methods: list<string>,
   }
 
-  /// The result of one step of enhanced authentication. `continue` sends
-  /// the challenge to the client; the broker keeps `state` and passes it to
-  /// the next step.
+  /// What `continue` sends: `data` goes to the client, and the broker
+  /// keeps `state` for the next step.
   record challenge { data: list<u8>, state: list<u8> }
+  /// The result of one step of enhanced authentication. `continue` sends
+  /// a challenge to the client; `success` accepts it, as the user it
+  /// names, if any; `failed` refuses it with an MQTT reason code.
   variant auth-result { %continue(challenge), success(option<string>), failed(u8) }
 }
 

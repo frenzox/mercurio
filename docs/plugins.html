@@ -124,6 +124,7 @@ path = "/etc/mercurio/plugins/deny_topic.wasm"
 name = "deny"
 config = { prefix = "$internal/" }</pre>
 <p>A plugin built for <code>mercurio:plugin/guest@0.1.x</code> loads. A component built for another version is refused, with an error that names the version. See the <a href="configuration.html#plugins">configuration reference</a> for every key.</p>
+<p>The broker matches a component to the interface by the shape of its types, so adding a hook, a field or a case would break plugins built for the old shape. Such changes come with a new minor version, such as 0.2. A 0.1.x release changes only documentation, so a plugin built for any 0.1.x loads in a broker built for any other.</p>
 
 <h2 id="sandbox">The sandbox</h2>
 <ul>
