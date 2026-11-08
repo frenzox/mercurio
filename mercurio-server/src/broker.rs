@@ -32,15 +32,15 @@ impl<S: RetainedMessageStore> Broker<S> {
         }
     }
 
-    /// Subscribes `id` to a topic filter, replacing any previous subscription
-    /// of `id` to the same filter. Returns the retained messages matching it.
-    pub(crate) async fn subscribe(
-        &self,
-        filter: &str,
-        id: u64,
-        subscriber: Subscriber,
-    ) -> Result<Vec<Message>> {
+    /// Adds or replaces the subscription of `id` to a topic filter.
+    pub(crate) fn subscribe(&self, filter: &str, id: u64, subscriber: Subscriber) {
         self.subscriptions.subscribe(filter, id, subscriber);
+    }
+
+    /// The retained messages matching a topic filter. Looked up apart from
+    /// subscribing, as most subscriptions are sent none: shared ones, those
+    /// restored, and those asking not to be.
+    pub(crate) async fn retained(&self, filter: &str) -> Result<Vec<Message>> {
         self.storage
             .get_retained(filter)
             .await
@@ -124,17 +124,6 @@ mod tests {
     use mercurio_storage::memory::MemoryStore;
     use std::sync::Arc;
 
-    fn subscriber() -> Subscriber {
-        Subscriber {
-            queue: Default::default(),
-            session_id: 0,
-            granted_qos: QoS::AtMostOnce,
-            no_local: false,
-            retain_as_published: false,
-            subscription_identifier: None,
-        }
-    }
-
     fn create_test_message(topic: &str, payload: &str, retain: bool) -> Message {
         Message {
             packet_id: None,
@@ -158,10 +147,7 @@ mod tests {
         broker.publish("test/topic", msg).await.unwrap();
 
         // Subscribe and check retained message is returned
-        let retained = broker
-            .subscribe("test/topic", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("test/topic").await.unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(
             retained[0].payload.as_ref().unwrap().as_ref(),
@@ -177,10 +163,7 @@ mod tests {
 
         broker.publish("test/topic", msg).await.unwrap();
 
-        let retained = broker
-            .subscribe("test/topic", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("test/topic").await.unwrap();
         assert!(retained.is_empty());
     }
 
@@ -193,10 +176,7 @@ mod tests {
         broker.publish("test/topic", msg).await.unwrap();
 
         // Verify it's stored
-        let retained = broker
-            .subscribe("test/topic", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("test/topic").await.unwrap();
         assert_eq!(retained.len(), 1);
 
         // Clear with empty payload
@@ -215,10 +195,7 @@ mod tests {
         broker.publish("test/topic", clear_msg).await.unwrap();
 
         // Verify it's cleared
-        let retained = broker
-            .subscribe("test/topic", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("test/topic").await.unwrap();
         assert!(retained.is_empty());
     }
 
@@ -235,10 +212,7 @@ mod tests {
         broker.publish("test/topic", msg2).await.unwrap();
 
         // Verify only latest is returned
-        let retained = broker
-            .subscribe("test/topic", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("test/topic").await.unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(
             retained[0].payload.as_ref().unwrap().as_ref(),
@@ -274,24 +248,15 @@ mod tests {
             .unwrap();
 
         // Subscribe with single-level wildcard
-        let retained = broker
-            .subscribe("sensors/temp/+", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("sensors/temp/+").await.unwrap();
         assert_eq!(retained.len(), 2);
 
         // Subscribe with multi-level wildcard
-        let retained = broker
-            .subscribe("sensors/#", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("sensors/#").await.unwrap();
         assert_eq!(retained.len(), 3);
 
         // Exact match
-        let retained = broker
-            .subscribe("sensors/temp/room1", 0, subscriber())
-            .await
-            .unwrap();
+        let retained = broker.retained("sensors/temp/room1").await.unwrap();
         assert_eq!(retained.len(), 1);
     }
 }
