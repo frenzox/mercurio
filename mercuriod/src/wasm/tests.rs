@@ -258,3 +258,133 @@ async fn test_reload_keeps_the_previous_code_when_the_new_fails() {
     assert_eq!(decide().await, Decision::Deny);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_payload_rewrite_tags_and_drops() {
+    use mercurio_core::{message::MessageProperties, qos::QoS};
+    use mercurio_server::plugin::{MessageAction, PluginMessage};
+
+    let runtime = Runtime::new().unwrap();
+    let plugin = WasmPlugin::load(&runtime, settings("payload-rewrite", &[]))
+        .await
+        .unwrap();
+    let client = ClientInfo::new("tagger", None);
+    let message = |payload: &'static [u8]| {
+        PluginMessage::new(
+            "t",
+            bytes::Bytes::from_static(payload),
+            QoS::AtMostOnce,
+            false,
+            MessageProperties::default(),
+        )
+    };
+
+    let mut tagged = message(b"hello");
+    assert_eq!(
+        plugin.on_message(&client, &mut tagged).await,
+        MessageAction::Continue
+    );
+    let properties = tagged.properties.user_property.unwrap();
+    assert_eq!(properties.len(), 1);
+    assert_eq!(properties[0].key, "seen-by");
+    assert_eq!(properties[0].value, "tagger");
+    assert_eq!(tagged.payload.as_ref(), b"hello");
+
+    let mut empty = message(b"");
+    assert_eq!(
+        plugin.on_message(&client, &mut empty).await,
+        MessageAction::Drop
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_webhook_audit_posts_events() {
+    use std::sync::Arc;
+
+    use mercurio_server::server::ServerConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let hook = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_addr = hook.local_addr().unwrap();
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&bodies);
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = hook.accept().await.unwrap();
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(n) if n > 0 => request.extend_from_slice(&buffer[..n]),
+                        _ => return,
+                    }
+                }
+                // The body may arrive after the headers
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Ok(n) = socket.try_read(&mut buffer) {
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+
+    let mut audit = settings(
+        "webhook-audit",
+        &[("url", &format!("http://{hook_addr}/audit"))],
+    );
+    audit.allow_http = vec![hook_addr.to_string()];
+    let plugin = WasmPlugin::load(&Runtime::new().unwrap(), audit)
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = vec![plugin];
+    config.sys_interval = None;
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let id = b"audited-client";
+    let mut connect = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 5, 0x02, 0x00, 60, 0x00];
+    connect.extend_from_slice(&(id.len() as u16).to_be_bytes());
+    connect.extend_from_slice(id);
+    let mut packet = vec![0x10, connect.len() as u8];
+    packet.extend(connect);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&packet).await.unwrap();
+    let mut connack = [0u8; 4];
+    stream.read_exact(&mut connack).await.unwrap();
+    assert_eq!(connack[0], 0x20);
+
+    let found = async {
+        loop {
+            if let Some(body) = bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|body| body.contains("audited-client"))
+            {
+                return body.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let request = tokio::time::timeout(Duration::from_secs(2), found)
+        .await
+        .expect("the webhook never received the event");
+    assert!(request.starts_with("POST /audit "), "{request}");
+    assert!(request.contains(r#""event":"connected""#), "{request}");
+}
