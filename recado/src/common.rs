@@ -1,4 +1,4 @@
-//! Shared utilities for mercurio CLI tools.
+//! Shared utilities for recado.
 
 use clap::Args;
 use mercurio_client::ConnectOptions;

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Core types and traits for the Mercurio MQTT implementation"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+keywords = ["mqtt", "iot", "no-std"]
+categories = ["network-programming", "no-std"]
 
 [features]
 default = ["std"]

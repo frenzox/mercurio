@@ -1,12 +1,14 @@
-# Mercuriod
+# mercuriod
 
-The Mercurio MQTT broker daemon. It serves MQTT 3.1, 3.1.1 and 5.0 over TCP,
-TLS and WebSocket.
+The [Mercurio](https://github.com/frenzox/mercurio) MQTT broker daemon. It
+serves MQTT 3.1, 3.1.1 and 5.0 over TCP, TLS and WebSocket. To try it, the
+[`recado`](https://crates.io/crates/recado) client publishes and subscribes
+from the command line.
 
 ## Installation
 
 ```bash
-cargo install --path mercuriod
+cargo install mercuriod
 ```
 
 Or build from the workspace root:

@@ -41,7 +41,7 @@
 <table>
 <tr><th>Component</th><th>What it is</th></tr>
 <tr><td><code>mercuriod</code></td><td>The broker daemon. Configured with a TOML file, runs as a systemd service.</td></tr>
-<tr><td><code>mercurio</code></td><td>Command-line client: <code>mercurio pub</code> and <code>mercurio sub</code>.</td></tr>
+<tr><td><code>recado</code></td><td>Command-line client: <code>recado pub</code> and <code>recado sub</code>.</td></tr>
 <tr><td><code>mercurio-client</code></td><td>Async Rust client library.</td></tr>
 <tr><td><code>mercurio-server</code></td><td>The broker as a library, to embed in your own program or extend with custom authentication.</td></tr>
 <tr><td><code>mercurio-storage</code></td><td>Storage for sessions, retained messages, wills and queued messages, in memory or SQLite.</td></tr>
@@ -55,10 +55,10 @@
 ./target/release/mercuriod
 
 <span class="comment"># In a second terminal</span>
-./target/release/mercurio sub -t 'sensors/#' -T
+./target/release/recado sub -t 'sensors/#' -T
 
 <span class="comment"># In a third</span>
-./target/release/mercurio pub -t sensors/kitchen -m 21.5 -q 1</pre>
+./target/release/recado pub -t sensors/kitchen -m 21.5 -q 1</pre>
 <p>The subscriber prints <code>sensors/kitchen 21.5</code>. Any MQTT client works with the broker, mosquitto's included:</p>
 <pre>mosquitto_sub -V mqttv5 -t 'sensors/#' -v</pre>
 

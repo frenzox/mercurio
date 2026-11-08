@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "MQTT broker library for the Mercurio implementation"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+keywords = ["mqtt", "mqtt5", "broker", "iot", "server"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 default = ["std"]
@@ -23,9 +26,9 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1.2.2", features = ["v4"] }
 
-mercurio-core = { path = "../mercurio-core", default-features = false }
-mercurio-packets = { path = "../mercurio-packets", default-features = false }
-mercurio-storage = { path = "../mercurio-storage", default-features = false }
+mercurio-core = { path = "../mercurio-core", version = "0.1.0", default-features = false }
+mercurio-packets = { path = "../mercurio-packets", version = "0.1.0", default-features = false }
+mercurio-storage = { path = "../mercurio-storage", version = "0.1.0", default-features = false }
 x509-parser = "0.18"
 
 [dev-dependencies]

@@ -15,7 +15,7 @@ mod common;
 use common::{init_logging, ConnectionArgs};
 
 #[derive(Parser, Debug)]
-#[command(name = "mercurio")]
+#[command(name = "recado")]
 #[command(about = "MQTT command-line client")]
 #[command(version)]
 struct Cli {

@@ -1,0 +1,23 @@
+[package]
+name = "recado"
+version = "0.1.0"
+edition = "2021"
+description = "MQTT command-line client for publishing and subscribing, from the Mercurio project"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+keywords = ["mqtt", "mqtt5", "cli", "iot", "pubsub"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "recado"
+path = "src/main.rs"
+
+[dependencies]
+mercurio-client = { path = "../mercurio-client", version = "0.1.0" }
+mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
+
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "mercurio",
+    "recado",
     "mercurio-client",
     "mercurio-core",
     "mercurio-packets",
