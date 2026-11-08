@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -48,10 +49,12 @@ use mercurio_packets::{
 };
 
 use crate::{
-    acl::{Access, Authorizer, ClientIdentity},
-    auth::{AuthExchange, AuthManager, AuthResult},
+    acl::Access,
     broker::Broker,
     connection::Connection,
+    plugin::{
+        AuthResult, Chain, ClientInfo, Decision, Event, Exchange, MessageAction, PluginMessage,
+    },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
@@ -153,15 +156,12 @@ fn message_properties(properties: Option<&PublishProperties>) -> MessageProperti
 /// along with the identifiers of the subscriptions it was delivered through.
 /// Whether the client that published `message` may still publish to its
 /// topic. Messages from the broker itself, such as `$SYS` ones, always may.
-fn publisher_may_write(authorizer: Option<&dyn Authorizer>, message: &Message) -> bool {
-    let (Some(authorizer), Some(origin)) = (authorizer, &message.origin) else {
+async fn publisher_may_write(chain: &Chain, message: &Message) -> bool {
+    let Some(origin) = &message.origin else {
         return true;
     };
-    let publisher = ClientIdentity {
-        client_id: origin.client_id.clone(),
-        username: origin.username.clone(),
-    };
-    authorizer.authorize(&publisher, &message.topic, Access::Write)
+    let publisher = ClientInfo::new(origin.client_id.clone(), origin.username.clone());
+    chain.may(&publisher, &message.topic, Access::Write).await
 }
 
 fn publish_properties(
@@ -299,9 +299,11 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Re-authentication in progress, if any
-    auth_exchange: Option<Box<dyn AuthExchange>>,
+    auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
+    /// The client's address, None for in-process clients
+    peer: Option<SocketAddr>,
     /// Who may resume the session
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
@@ -359,6 +361,7 @@ impl Session {
                     will_message,
                     auth_exchange: None,
                     verified_user: None,
+                    peer: None,
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
                     max_retained_messages: None,
@@ -561,7 +564,7 @@ impl Session {
         &mut self,
         mut packet: PublishPacket,
         broker: &Broker<S>,
-        authorizer: Option<&dyn Authorizer>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
         let topic_alias = packet
             .properties
@@ -606,21 +609,36 @@ impl Session {
 
         // $SYS topics carry the broker's own statistics
         let sys = packet.topic_name == "$SYS" || packet.topic_name.starts_with("$SYS/");
-        if sys && !authorizer.is_some_and(|a| a.allows_sys_publish()) {
+        if sys && !chain.is_trusted() {
             warn!("Client publish to `{}` refused", packet.topic_name);
             return self
                 .refuse_publish(&packet, ReasonCode::NotAuthorized)
                 .await;
         }
 
-        // $CONTROL topics administer the broker, so only an authorizer can
-        // let clients publish to them
         let control = packet.topic_name == "$CONTROL" || packet.topic_name.starts_with("$CONTROL/");
-        if control && authorizer.is_none() {
-            warn!("Client publish to `{}` refused", packet.topic_name);
-            return self
-                .refuse_publish(&packet, ReasonCode::NotAuthorized)
+        // A trusted chain allows everything, and an empty one only refuses
+        // $CONTROL, so the session lock is taken only when needed
+        if control || (!chain.is_empty() && !chain.is_trusted()) {
+            let identity = self.identity().await;
+            let decision = chain
+                .authorize(&identity, &packet.topic_name, Access::Write)
                 .await;
+            // $CONTROL topics administer the broker, so publishing to them
+            // needs a plugin to allow it, not only none to refuse it
+            let refused = match control {
+                true => decision != Decision::Allow,
+                false => decision == Decision::Deny,
+            };
+            if refused {
+                warn!(
+                    "Client `{}` may not publish to `{}`",
+                    identity.client_id, packet.topic_name
+                );
+                return self
+                    .refuse_publish(&packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
         }
 
         // Only the server sets subscription identifiers [MQTT-3.3.4-6]
@@ -630,19 +648,6 @@ impl Session {
             .is_some_and(|p| !p.subscription_identifiers.is_empty())
         {
             return Err(ReasonCode::ProtocolError.into());
-        }
-
-        if let Some(authorizer) = authorizer {
-            let identity = self.identity().await;
-            if !authorizer.authorize(&identity, &packet.topic_name, Access::Write) {
-                warn!(
-                    "Client `{}` may not publish to `{}`",
-                    identity.client_id, packet.topic_name
-                );
-                return self
-                    .refuse_publish(&packet, ReasonCode::NotAuthorized)
-                    .await;
-            }
         }
 
         // Retaining on a new topic once the store is full; updating or
@@ -728,6 +733,59 @@ impl Session {
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
+        let mut hooked_properties = None;
+        if !chain.is_empty() {
+            // Acknowledged whatever the plugins decide, so a dropped message
+            // isn't sent again
+            let identity = self.identity().await;
+            let mut message = PluginMessage {
+                topic: std::mem::take(&mut packet.topic_name),
+                payload: packet.payload.take().unwrap_or_default(),
+                qos: packet.qos_level,
+                retain: packet.retain,
+                properties: message_properties(packet.properties.as_ref()),
+            };
+            if chain.on_message(&identity, &mut message).await == MessageAction::Drop {
+                return response;
+            }
+            if validate_publish_topic(&message.topic).is_err() {
+                warn!(
+                    "A plugin set the invalid topic `{}`, dropping the message",
+                    message.topic
+                );
+                return response;
+            }
+            packet.topic_name = message.topic;
+            packet.payload = (!message.payload.is_empty()).then_some(message.payload);
+            packet.qos_level = message.qos;
+            packet.retain = message.retain;
+            hooked_properties = Some(message.properties);
+        }
+
+        if packet.topic_name.starts_with("$CONTROL/") {
+            let identity = self.identity().await;
+            let payload = packet.payload.clone().unwrap_or_default();
+            if let Some(answer) = chain.control(&identity, &packet.topic_name, payload).await {
+                if let Some(answer) = answer {
+                    let topic: Arc<str> = format!("{}/response", packet.topic_name).into();
+                    let reply = Message {
+                        packet_id: None,
+                        topic: Arc::clone(&topic),
+                        dup: false,
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        payload: Some(answer),
+                        properties: MessageProperties::default(),
+                        expires_at: None,
+                        subscription_identifiers: Vec::new(),
+                        origin: None,
+                    };
+                    broker.publish_from(&topic, reply, None).await?;
+                }
+                return response;
+            }
+        }
+
         // Only retained messages are checked against their publisher later
         let origin = match packet.retain {
             true => {
@@ -742,7 +800,8 @@ impl Session {
 
         // Publish to broker - convert topic to Arc<str> for cheap cloning to subscribers
         let topic: Arc<str> = packet.topic_name.into();
-        let properties = message_properties(packet.properties.as_ref());
+        let properties =
+            hooked_properties.unwrap_or_else(|| message_properties(packet.properties.as_ref()));
         let message = Message {
             packet_id: packet.packet_id,
             topic: Arc::clone(&topic),
@@ -830,11 +889,12 @@ impl Session {
     }
 
     /// Who the client of this session is, for access control.
-    pub(crate) async fn identity(&self) -> ClientIdentity {
+    pub(crate) async fn identity(&self) -> ClientInfo {
         let session = self.shared.state.lock().await;
-        ClientIdentity {
+        ClientInfo {
             client_id: session.client_id.clone(),
             username: session.verified_user.clone(),
+            peer: session.peer,
         }
     }
 
@@ -861,6 +921,11 @@ impl Session {
     /// Records the user name authentication verified for this connection.
     pub(crate) async fn set_verified_user(&self, username: Option<String>) {
         self.shared.state.lock().await.verified_user = username;
+    }
+
+    /// Records the address of the client now connected to this session.
+    pub(crate) async fn set_peer(&self, peer: Option<SocketAddr>) {
+        self.shared.state.lock().await.peer = peer;
     }
 
     pub(crate) async fn owner(&self) -> SessionOwner {
@@ -944,7 +1009,7 @@ impl Session {
         &mut self,
         packet: mercurio_packets::subscribe::SubscribePacket,
         broker: &Broker<S>,
-        authorizer: Option<&dyn Authorizer>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
         let subscription_identifier = packet
             .properties
@@ -982,17 +1047,18 @@ impl Session {
                 continue;
             }
 
-            if let Some(authorizer) = authorizer {
-                let identity = ClientIdentity {
+            if !chain.is_empty() && !chain.is_trusted() {
+                let identity = ClientInfo {
                     client_id: session.client_id.clone(),
                     username: session.verified_user.clone(),
+                    peer: session.peer,
                 };
                 // The share group decides who gets each message, not which
                 // messages flow, so only the topic filter is checked, as
                 // mosquitto does
                 let filter = parse_shared_subscription(&sub.topic_filter)
                     .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
-                if !authorizer.authorize(&identity, filter, Access::Subscribe) {
+                if !chain.may(&identity, filter, Access::Subscribe).await {
                     warn!(
                         "Client `{}` may not subscribe to `{}`",
                         identity.client_id, sub.topic_filter
@@ -1037,6 +1103,17 @@ impl Session {
                 self.shared.subscriber_id,
                 subscriber.clone(),
             );
+            if !chain.is_empty() {
+                chain.emit(Event::Subscribed {
+                    client: ClientInfo {
+                        client_id: session.client_id.clone(),
+                        username: session.verified_user.clone(),
+                        peer: session.peer,
+                    },
+                    filter: sub.topic_filter.clone(),
+                    qos: granted_qos,
+                });
+            }
 
             // Shared subscriptions are never sent retained messages
             let shared = parse_shared_subscription(&sub.topic_filter).is_some();
@@ -1048,7 +1125,7 @@ impl Session {
                 };
             if send_retained {
                 for message in broker.retained(&sub.topic_filter).await? {
-                    if session.check_retain_source && !publisher_may_write(authorizer, &message) {
+                    if session.check_retain_source && !publisher_may_write(chain, &message).await {
                         continue;
                     }
                     subscriber.deliver_retained(message);
@@ -1075,6 +1152,7 @@ impl Session {
         &mut self,
         packet: UnsubscribePacket,
         broker: &Broker<S>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
@@ -1098,6 +1176,16 @@ impl Session {
             } else {
                 ReasonCode::NoSubscriptionExisted
             };
+            if reason_code == ReasonCode::Success && !chain.is_empty() {
+                chain.emit(Event::Unsubscribed {
+                    client: ClientInfo {
+                        client_id: session.client_id.clone(),
+                        username: session.verified_user.clone(),
+                        peer: session.peer,
+                    },
+                    filter: unsub.topic_filter.clone(),
+                });
+            }
 
             ack.payload.push(UnsubAckPayload { reason_code });
         }
@@ -1108,13 +1196,8 @@ impl Session {
     async fn handle_auth(
         &mut self,
         packet: AuthPacket,
-        auth_manager: Option<&AuthManager>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
-        let Some(auth_manager) = auth_manager else {
-            // No auth manager configured - enhanced auth not supported
-            return Err(ReasonCode::BadAuthenticationMethod.into());
-        };
-
         let mut session = self.shared.state.lock().await;
 
         // Every AUTH must name the method the connection was authenticated
@@ -1133,10 +1216,10 @@ impl Session {
 
         let result = match packet.reason {
             ReasonCode::ReAuthenticate => {
-                let Some(mut exchange) = auth_manager.begin(&method) else {
+                let Some(mut exchange) = chain.begin_auth(&method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
                 };
-                let result = exchange.step(data.as_ref());
+                let result = chain.step(&mut exchange, data.as_ref()).await;
                 session.auth_exchange = Some(exchange);
                 result
             }
@@ -1145,7 +1228,7 @@ impl Session {
                 let Some(exchange) = session.auth_exchange.as_mut() else {
                     return Err(ReasonCode::ProtocolError.into());
                 };
-                exchange.step(data.as_ref())
+                chain.step(exchange, data.as_ref()).await
             }
             _ => return Err(ReasonCode::ProtocolError.into()),
         };
@@ -1178,8 +1261,7 @@ impl Session {
         &mut self,
         packet: ControlPacket,
         broker: &Broker<S>,
-        auth_manager: Option<&AuthManager>,
-        authorizer: Option<&dyn Authorizer>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
         // Packet identifiers are never 0 [MQTT-2.2.1-3]
         let packet_id = match &packet {
@@ -1197,18 +1279,18 @@ impl Session {
         }
 
         match packet {
-            ControlPacket::Publish(packet) => self.handle_publish(packet, broker, authorizer).await,
+            ControlPacket::Publish(packet) => self.handle_publish(packet, broker, chain).await,
             ControlPacket::PubAck(packet) => self.handle_puback(packet).await,
             ControlPacket::PubRec(packet) => self.handle_pubrec(packet).await,
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
-            ControlPacket::Subscribe(packet) => {
-                self.handle_subscribe(packet, broker, authorizer).await
+            ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker, chain).await,
+            ControlPacket::Unsubscribe(packet) => {
+                self.handle_unsubscribe(packet, broker, chain).await
             }
-            ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet, broker).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
-            ControlPacket::Auth(packet) => self.handle_auth(packet, auth_manager).await,
+            ControlPacket::Auth(packet) => self.handle_auth(packet, chain).await,
 
             // Some packets are not supposed to be received by the server.
             // Namely: ConnAck, UnsubAck, PingResp
@@ -1492,6 +1574,10 @@ mod tests {
     use mercurio_storage::memory::MemoryStore;
     use tokio::time::{timeout, Duration};
 
+    fn no_plugins() -> Chain {
+        Chain::new(Vec::new(), Duration::from_secs(5))
+    }
+
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
@@ -1565,7 +1651,10 @@ mod tests {
             }],
         };
 
-        let result = session.handle_unsubscribe(packet, &broker).await.unwrap();
+        let result = session
+            .handle_unsubscribe(packet, &broker, &no_plugins())
+            .await
+            .unwrap();
 
         match result {
             Some(ControlPacket::UnsubAck(ack)) => {
@@ -1595,7 +1684,7 @@ mod tests {
             }],
         };
         session
-            .handle_subscribe(subscribe_packet, &broker, None)
+            .handle_subscribe(subscribe_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1609,7 +1698,7 @@ mod tests {
         };
 
         let result = session
-            .handle_unsubscribe(unsub_packet, &broker)
+            .handle_unsubscribe(unsub_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1644,7 +1733,7 @@ mod tests {
             ],
         };
         session
-            .handle_subscribe(subscribe_packet, &broker, None)
+            .handle_subscribe(subscribe_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1666,7 +1755,7 @@ mod tests {
         };
 
         let result = session
-            .handle_unsubscribe(unsub_packet, &broker)
+            .handle_unsubscribe(unsub_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1731,7 +1820,11 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("a/+", QoS::AtMostOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("a/+", QoS::AtMostOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         broker
@@ -1748,7 +1841,11 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let ack = session
-            .handle_subscribe(subscribe_packet("q/0", QoS::AtMostOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("q/0", QoS::AtMostOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -1757,7 +1854,11 @@ mod tests {
         ));
 
         let ack = session
-            .handle_subscribe(subscribe_packet("q/1", QoS::AtLeastOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("q/1", QoS::AtLeastOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -1792,7 +1893,11 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("p", QoS::ExactlyOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("p", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
 
@@ -1846,13 +1951,17 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         subscriber
-            .handle_subscribe(subscribe_packet("t", QoS::ExactlyOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("t", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
 
         for dup in [false, true] {
             let response = publisher
-                .process_incoming(qos2_publish("t", 5, dup), &broker, None, None)
+                .process_incoming(qos2_publish("t", 5, dup), &broker, &no_plugins())
                 .await
                 .unwrap();
             assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
@@ -1874,13 +1983,12 @@ mod tests {
                     properties: None,
                 }),
                 &broker,
-                None,
-                None,
+                &no_plugins(),
             )
             .await
             .unwrap();
         publisher
-            .process_incoming(qos2_publish("t", 5, false), &broker, None, None)
+            .process_incoming(qos2_publish("t", 5, false), &broker, &no_plugins())
             .await
             .unwrap();
         next_publish(&mut subscriber).await;
@@ -1893,14 +2001,18 @@ mod tests {
         let packet_id = send_qos2_to(&mut session, &broker).await;
 
         let pubrel = session
-            .process_incoming(pubrec(packet_id, ReasonCode::Success), &broker, None, None)
+            .process_incoming(
+                pubrec(packet_id, ReasonCode::Success),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         assert!(
             matches!(pubrel, Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::Success)
         );
         session
-            .process_incoming(pubrel_packet(packet_id), &broker, None, None)
+            .process_incoming(pubrel_packet(packet_id), &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1919,7 +2031,11 @@ mod tests {
         broker: &crate::broker::Broker<MemoryStore>,
     ) -> u16 {
         session
-            .handle_subscribe(subscribe_packet("q2", QoS::ExactlyOnce), broker, None)
+            .handle_subscribe(
+                subscribe_packet("q2", QoS::ExactlyOnce),
+                broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         broker
@@ -1951,7 +2067,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let pubcomp = session
-            .process_incoming(pubrel_packet(77), &broker, None, None)
+            .process_incoming(pubrel_packet(77), &broker, &no_plugins())
             .await
             .unwrap();
         assert!(matches!(
@@ -1960,7 +2076,7 @@ mod tests {
         ));
 
         let pubrel = session
-            .process_incoming(pubrec(78, ReasonCode::Success), &broker, None, None)
+            .process_incoming(pubrec(78, ReasonCode::Success), &broker, &no_plugins())
             .await
             .unwrap();
         assert!(matches!(
@@ -1980,8 +2096,7 @@ mod tests {
             .process_incoming(
                 pubrec(packet_id, ReasonCode::UnspecifiedError),
                 &broker,
-                None,
-                None,
+                &no_plugins(),
             )
             .await
             .unwrap();
@@ -1998,7 +2113,11 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         session
-            .handle_subscribe(subscribe_packet("s", QoS::AtLeastOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("s", QoS::AtLeastOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
 
@@ -2075,7 +2194,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("n", options), &broker, None)
+            .handle_subscribe(subscribe_with("n", options), &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -2085,7 +2204,7 @@ mod tests {
             ..Default::default()
         });
         session
-            .process_incoming(publish, &broker, None, None)
+            .process_incoming(publish, &broker, &no_plugins())
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -2096,7 +2215,7 @@ mod tests {
             ..Default::default()
         });
         other
-            .process_incoming(publish, &broker, None, None)
+            .process_incoming(publish, &broker, &no_plugins())
             .await
             .unwrap();
         next_publish(&mut session).await;
@@ -2112,7 +2231,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("r", options), &broker, None)
+            .handle_subscribe(subscribe_with("r", options), &broker, &no_plugins())
             .await
             .unwrap();
         broker
@@ -2137,7 +2256,7 @@ mod tests {
         };
         let mut session = create_test_session();
         session
-            .handle_subscribe(subscribe_with("h", if_new), &broker, None)
+            .handle_subscribe(subscribe_with("h", if_new), &broker, &no_plugins())
             .await
             .unwrap();
         assert!(next_publish(&mut session).await.retain);
@@ -2146,7 +2265,7 @@ mod tests {
             ..Default::default()
         };
         session
-            .handle_subscribe(subscribe_with("h", if_new), &broker, None)
+            .handle_subscribe(subscribe_with("h", if_new), &broker, &no_plugins())
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -2157,7 +2276,7 @@ mod tests {
         };
         let mut session = create_test_session();
         session
-            .handle_subscribe(subscribe_with("h", never), &broker, None)
+            .handle_subscribe(subscribe_with("h", never), &broker, &no_plugins())
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -2182,7 +2301,11 @@ mod tests {
 
         for (filter, identifier) in [("s/+", 7), ("s/#", 9)] {
             session
-                .handle_subscribe(subscribe_with_identifier(filter, identifier), &broker, None)
+                .handle_subscribe(
+                    subscribe_with_identifier(filter, identifier),
+                    &broker,
+                    &no_plugins(),
+                )
                 .await
                 .unwrap();
         }
@@ -2214,7 +2337,7 @@ mod tests {
 
         for (filter, qos) in [("q/+", QoS::AtMostOnce), ("q/#", QoS::ExactlyOnce)] {
             session
-                .handle_subscribe(subscribe_packet(filter, qos), &broker, None)
+                .handle_subscribe(subscribe_packet(filter, qos), &broker, &no_plugins())
                 .await
                 .unwrap();
         }
@@ -2232,7 +2355,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let zero = session
-            .handle_subscribe(subscribe_with_identifier("z", 0), &broker, None)
+            .handle_subscribe(subscribe_with_identifier("z", 0), &broker, &no_plugins())
             .await;
         assert!(matches!(
             zero,
@@ -2251,7 +2374,7 @@ mod tests {
         });
         assert!(matches!(
             session
-                .process_incoming(from_client, &broker, None, None)
+                .process_incoming(from_client, &broker, &no_plugins())
                 .await,
             Err(mercurio_core::error::Error::MQTTReasonCode(
                 ReasonCode::ProtocolError
@@ -2278,13 +2401,17 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
         publisher.shared.state.lock().await.topic_alias_maximum = 5;
         subscriber
-            .handle_subscribe(subscribe_packet("a/b", QoS::AtMostOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("a/b", QoS::AtMostOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
 
         for topic in ["a/b", ""] {
             publisher
-                .process_incoming(aliased_publish(topic, 1), &broker, None, None)
+                .process_incoming(aliased_publish(topic, 1), &broker, &no_plugins())
                 .await
                 .unwrap();
             let publish = next_publish(&mut subscriber).await;
@@ -2299,7 +2426,7 @@ mod tests {
             ("", 2, ReasonCode::ProtocolError),
         ] {
             let result = publisher
-                .process_incoming(aliased_publish(topic, alias), &broker, None, None)
+                .process_incoming(aliased_publish(topic, alias), &broker, &no_plugins())
                 .await;
             assert!(
                 matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
@@ -2350,7 +2477,7 @@ mod tests {
                 .handle_subscribe(
                     subscribe_packet("$share/g/w", QoS::AtMostOnce),
                     &broker,
-                    None,
+                    &no_plugins(),
                 )
                 .await
                 .unwrap();
@@ -2381,7 +2508,11 @@ mod tests {
             ..Default::default()
         };
         let result = session
-            .handle_subscribe(subscribe_with("$share/g/w", options), &broker, None)
+            .handle_subscribe(
+                subscribe_with("$share/g/w", options),
+                &broker,
+                &no_plugins(),
+            )
             .await;
         assert!(matches!(
             result,
@@ -2412,7 +2543,9 @@ mod tests {
         ];
 
         for packet in packets {
-            let result = session.process_incoming(packet, &broker, None, None).await;
+            let result = session
+                .process_incoming(packet, &broker, &no_plugins())
+                .await;
             assert!(matches!(
                 result,
                 Err(mercurio_core::error::Error::MQTTReasonCode(
@@ -2434,8 +2567,10 @@ mod tests {
                 topic_filter: "a/#/b".into(),
             }],
         };
-        let Some(ControlPacket::UnsubAck(ack)) =
-            session.handle_unsubscribe(packet, &broker).await.unwrap()
+        let Some(ControlPacket::UnsubAck(ack)) = session
+            .handle_unsubscribe(packet, &broker, &no_plugins())
+            .await
+            .unwrap()
         else {
             panic!("Expected UNSUBACK");
         };
@@ -2517,7 +2652,7 @@ mod tests {
         packet: ControlPacket,
     ) -> ReasonCode {
         match session
-            .process_incoming(packet, broker, None, None)
+            .process_incoming(packet, broker, &no_plugins())
             .await
             .unwrap()
         {
@@ -2532,7 +2667,11 @@ mod tests {
         let mut subscriber = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
         subscriber
-            .handle_subscribe(subscribe_packet("watched", QoS::AtLeastOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("watched", QoS::AtLeastOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
 
@@ -2578,7 +2717,11 @@ mod tests {
             .await
             .unwrap();
         session
-            .handle_subscribe(subscribe_packet("r/1", QoS::AtMostOnce), &broker, None)
+            .handle_subscribe(
+                subscribe_packet("r/1", QoS::AtMostOnce),
+                &broker,
+                &no_plugins(),
+            )
             .await
             .unwrap();
         assert!(next_publish(&mut session).await.retain);

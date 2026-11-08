@@ -8,25 +8,21 @@
 
 use std::{
     path::Path,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Mutex, RwLock},
 };
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+use bytes::Bytes;
 use mercurio_core::topic::topic_matches_filter;
-use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::auth::CredentialValidator;
-use mercurio_server::server::LocalConnector;
+use mercurio_server::plugin::{
+    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::error;
 
 use crate::reload::Reload;
-
-const COMMAND_TOPIC: &str = "$CONTROL/dynamic-security/v1";
-const RESPONSE_TOPIC: &str = "$CONTROL/dynamic-security/v1/response";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -499,10 +495,14 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to hash password: {e}"))
 }
 
-/// The dynamic security state, as authorizer and credential validator.
+/// The dynamic security state, checking passwords and topic access.
 pub struct DynamicSecurity {
     path: String,
     data: RwLock<Data>,
+    /// Held while a batch or a reload runs, so concurrent batches don't
+    /// overwrite each other's changes or the temporary file, and a reload
+    /// doesn't land between a batch's copy of the state and its save
+    commands: Mutex<()>,
 }
 
 impl DynamicSecurity {
@@ -510,6 +510,7 @@ impl DynamicSecurity {
         Ok(Self {
             path: path.to_string(),
             data: RwLock::new(read(path)?),
+            commands: Mutex::new(()),
         })
     }
 
@@ -563,8 +564,9 @@ impl DynamicSecurity {
             .unwrap_or_default();
 
         // Applied to a copy, so hashing passwords doesn't hold the lock every
-        // authorization takes; only this client sends commands, so nothing
-        // changes the state in between
+        // authorization takes; batches are serialized so nothing else changes
+        // the state in between
+        let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         let mut data = self.data.read().unwrap().clone();
         let mut changed = false;
         let mut responses = Vec::new();
@@ -596,44 +598,6 @@ impl DynamicSecurity {
         }
         json!({ "responses": responses })
     }
-
-    /// Answers commands sent to `$CONTROL/dynamic-security/v1`, through an
-    /// in-process connection to the broker.
-    pub fn serve(self: Arc<Self>, connector: LocalConnector) {
-        let options = ConnectOptions::new("localhost", 0)
-            .client_id("mercurio-dynamic-security")
-            .connector(move || connector.connect());
-        tokio::spawn(async move {
-            let client = loop {
-                match MqttClient::connect(options.clone()).await {
-                    Ok(client) => break client,
-                    Err(e) => warn!("Dynamic security: connecting failed, retrying: {e}"),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            };
-            if let Err(e) = client.subscribe(&[(COMMAND_TOPIC, QoS::AtLeastOnce)]).await {
-                return error!("Dynamic security: subscribing failed: {e}");
-            }
-            info!("Dynamic security listening on {COMMAND_TOPIC}");
-            while let Some(event) = client.recv().await {
-                if let Event::Message { payload, .. } = event {
-                    // Hashing passwords takes a while; keep it off the runtime
-                    let security = Arc::clone(&self);
-                    let handled = tokio::task::spawn_blocking(move || security.handle(&payload));
-                    let Ok(response) = handled.await else {
-                        continue;
-                    };
-                    let response = response.to_string();
-                    let published = client
-                        .publish(RESPONSE_TOPIC, response, QoS::AtLeastOnce)
-                        .await;
-                    if let Err(e) = published {
-                        warn!("Dynamic security: answering failed: {e}");
-                    }
-                }
-            }
-        });
-    }
 }
 
 fn read(path: &str) -> Result<Data, String> {
@@ -660,15 +624,8 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
-impl Authorizer for DynamicSecurity {
-    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
-        let data = self.data.read().unwrap();
-        data.authorize(client.username.as_deref(), topic, access)
-    }
-}
-
-impl CredentialValidator for DynamicSecurity {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
+impl DynamicSecurity {
+    fn check_password(&self, username: &str, password: &[u8]) -> bool {
         // Copied out so Argon2, which is slow on purpose, runs without the lock
         let hash = {
             let data = self.data.read().unwrap();
@@ -686,8 +643,66 @@ impl CredentialValidator for DynamicSecurity {
     }
 }
 
+impl Plugin for DynamicSecurity {
+    fn name(&self) -> &str {
+        "dynamic-security"
+    }
+
+    fn on_control<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        path: &'a str,
+        payload: Bytes,
+    ) -> BoxFuture<'a, Option<Bytes>> {
+        if path != "v1" {
+            return ready(None);
+        }
+        Box::pin(async move {
+            // Hashing passwords takes a while; keep it off the runtime
+            let response = tokio::task::block_in_place(|| self.handle(&payload));
+            Some(Bytes::from(response.to_string()))
+        })
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        // Hashes take tens of milliseconds of CPU; keep them off the runtime
+        let (username, password) = (
+            credentials.username.to_string(),
+            credentials.password.to_vec(),
+        );
+        Box::pin(async move {
+            let valid = tokio::task::block_in_place(|| self.check_password(&username, &password));
+            if valid {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        })
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+        access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        let data = self.data.read().unwrap();
+        let allowed = data.authorize(client.username.as_deref(), topic, access);
+        ready(if allowed {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
+    }
+}
+
 impl Reload for DynamicSecurity {
     fn reload(&self) -> Result<(), String> {
+        let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         *self.data.write().unwrap() = read(&self.path)?;
         Ok(())
     }
@@ -701,8 +716,64 @@ impl Reload for DynamicSecurity {
 mod tests {
     use super::*;
 
-    fn identity(username: &str) -> ClientIdentity {
-        ClientIdentity::new("c", Some(username.to_string()))
+    const COMMAND_TOPIC: &str = "$CONTROL/dynamic-security/v1";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_commands_arrive_through_control() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-control-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+
+        let request = br#"{"commands":[{"command":"listClients"}]}"#;
+        let answer = security
+            .on_control(
+                &ClientInfo::new("c", Some("admin".into())),
+                "v1",
+                Bytes::from_static(request),
+            )
+            .await
+            .expect("an answer");
+        assert!(String::from_utf8_lossy(&answer).contains("listClients"));
+        assert!(security
+            .on_control(&ClientInfo::new("c", None), "v2", Bytes::new())
+            .await
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_concurrent_batches_keep_every_change() {
+        let path = std::env::temp_dir().join(format!(
+            "mercuriod-dynsec-concurrent-{}",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let security = &security;
+                scope.spawn(move || {
+                    let name = format!("c{n}");
+                    run(
+                        security,
+                        json!([{ "command": "createClient", "username": name, "password": "p" }]),
+                    );
+                });
+            }
+        });
+        let listed = run(&security, json!([{ "command": "listClients" }]));
+        assert_eq!(listed[0]["data"]["totalCount"], 9);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn identity(username: &str) -> ClientInfo {
+        ClientInfo::new("c", Some(username.to_string()))
     }
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
@@ -711,8 +782,8 @@ mod tests {
         response["responses"].as_array().unwrap().clone()
     }
 
-    #[test]
-    fn test_disabled_clients_lose_access_and_the_file_stays_private() {
+    #[tokio::test]
+    async fn test_disabled_clients_lose_access_and_the_file_stays_private() {
         let path =
             std::env::temp_dir().join(format!("mercuriod-dynsec-off-{}", std::process::id()));
         let path = path.to_str().unwrap();
@@ -728,8 +799,18 @@ mod tests {
         );
 
         // Still connected, it may no longer even receive by default
-        assert!(!security.authorize(&identity("s1"), "anything", Access::Read));
-        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+        assert_eq!(
+            security
+                .authorize(&identity("s1"), "anything", Access::Read)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .await,
+            Decision::Allow
+        );
 
         #[cfg(unix)]
         {
@@ -740,15 +821,20 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn test_commands_manage_clients_and_access() {
+    #[tokio::test]
+    async fn test_commands_manage_clients_and_access() {
         let path = std::env::temp_dir().join(format!("mercuriod-dynsec-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
-        assert!(security.validate("admin", b"secret"));
-        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+        assert!(security.check_password("admin", b"secret"));
+        assert_eq!(
+            security
+                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .await,
+            Decision::Allow
+        );
 
         let responses = run(
             &security,
@@ -773,19 +859,41 @@ mod tests {
         assert_eq!(responses[5]["data"]["clients"], json!(["admin", "s1"]));
 
         let s1 = identity("s1");
-        assert!(security.validate("s1", b"pw"));
-        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
-        assert!(!security.authorize(&s1, "sensors/secret", Access::Write));
-        assert!(!security.authorize(&s1, "sensors/t1", Access::Subscribe));
-        assert!(!security.authorize(&s1, COMMAND_TOPIC, Access::Write));
+        assert!(security.check_password("s1", b"pw"));
+        assert_eq!(
+            security.authorize(&s1, "sensors/t1", Access::Write).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security
+                .authorize(&s1, "sensors/secret", Access::Write)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&s1, "sensors/t1", Access::Subscribe)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security.authorize(&s1, COMMAND_TOPIC, Access::Write).await,
+            Decision::Deny
+        );
 
         // Receiving is allowed by default, subscribing isn't
-        assert!(security.authorize(&s1, "anything", Access::Read));
-        assert!(!security.authorize(&s1, "anything", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "anything", Access::Read).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security.authorize(&s1, "anything", Access::Subscribe).await,
+            Decision::Deny
+        );
 
         // Groups give their roles to members, and to anonymous clients when
         // set as the anonymous group
-        let anonymous = ClientIdentity::new("a", None);
+        let anonymous = ClientInfo::new("a", None);
         let responses = run(
             &security,
             json!([
@@ -807,29 +915,48 @@ mod tests {
             responses[5]["data"]["group"]["clients"],
             json!([{ "username": "s1" }])
         );
-        assert!(security.authorize(&s1, "news/#", Access::Subscribe));
-        assert!(security.authorize(&anonymous, "news/today", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "news/#", Access::Subscribe).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Allow
+        );
         run(
             &security,
             json!([{ "command": "deleteGroup", "groupname": "readers" }]),
         );
-        assert!(!security.authorize(&s1, "news/#", Access::Subscribe));
-        assert!(!security.authorize(&anonymous, "news/today", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "news/#", Access::Subscribe).await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Deny
+        );
 
         run(
             &security,
             json!([{ "command": "disableClient", "username": "s1" }]),
         );
-        assert!(!security.validate("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw"));
 
         // Saved, so a reload or a restart keeps the changes
         security.reload().unwrap();
-        assert!(!security.validate("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw"));
         run(
             &security,
             json!([{ "command": "enableClient", "username": "s1" }]),
         );
-        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
+        assert_eq!(
+            security.authorize(&s1, "sensors/t1", Access::Write).await,
+            Decision::Allow
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

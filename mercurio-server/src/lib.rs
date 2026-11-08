@@ -5,6 +5,7 @@ mod broker;
 mod connection;
 pub mod error;
 mod http;
+pub mod plugin;
 mod proxy;
 mod queue;
 pub mod server;

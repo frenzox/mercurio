@@ -13,7 +13,7 @@ use mercurio_client::{
 };
 use mercurio_core::reason::ReasonCode;
 use mercurio_server::{
-    auth::{AuthExchange, AuthManager, AuthMethod, AuthResult},
+    plugin::{ready, AuthExchange, AuthResult, BoxFuture, Plugin},
     server::ServerConfig,
 };
 use tokio::{net::TcpListener, time::timeout};
@@ -25,25 +25,30 @@ struct ChallengeExchange {
     challenged: bool,
 }
 
-impl AuthMethod for ChallengeMethod {
+impl Plugin for ChallengeMethod {
     fn name(&self) -> &str {
-        "CHALLENGE"
+        "challenge"
     }
 
-    fn begin(&self) -> Box<dyn AuthExchange> {
-        Box::new(ChallengeExchange { challenged: false })
+    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+        (method == "CHALLENGE")
+            .then(|| Box::new(ChallengeExchange { challenged: false }) as Box<dyn AuthExchange>)
     }
 }
 
 impl AuthExchange for ChallengeExchange {
-    fn step(&mut self, data: Option<&Bytes>) -> AuthResult {
-        match (std::mem::replace(&mut self.challenged, true), data) {
-            (false, Some(d)) if d == "hello" => AuthResult::Continue(Bytes::from_static(b"nonce")),
-            (true, Some(d)) if d == "nonce-signed" => AuthResult::Success {
-                username: Some("u".into()),
+    fn step<'a>(&'a mut self, data: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
+        ready(
+            match (std::mem::replace(&mut self.challenged, true), data) {
+                (false, Some(d)) if d == "hello" => {
+                    AuthResult::Continue(Bytes::from_static(b"nonce"))
+                }
+                (true, Some(d)) if d == "nonce-signed" => AuthResult::Success {
+                    username: Some("u".into()),
+                },
+                _ => AuthResult::Failed(ReasonCode::NotAuthorized),
             },
-            _ => AuthResult::Failed(ReasonCode::NotAuthorized),
-        }
+        )
     }
 }
 
@@ -77,10 +82,8 @@ impl Authenticator for Signer {
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut manager = AuthManager::new();
-    manager.register(Box::new(ChallengeMethod));
     let mut config = ServerConfig::default();
-    config.auth.auth_manager = Some(Arc::new(manager));
+    config.plugins = vec![Arc::new(ChallengeMethod)];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

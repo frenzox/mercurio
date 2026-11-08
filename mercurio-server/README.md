@@ -22,10 +22,11 @@ It supports:
 - TCP, TLS, WebSocket and Unix socket listeners, any number at once,
   each with its own TLS, authentication, mount point and limits.
 - The PROXY protocol, for brokers behind a load balancer.
-- Authentication through a `CredentialValidator` trait, MQTT 5 enhanced
-  authentication, and TLS client certificates.
-- Topic access control through an `Authorizer` trait, and mosquitto's
-  ACL file format.
+- Plugins: one `Plugin` trait for authentication, MQTT 5 enhanced
+  authentication, topic access control, message hooks, lifecycle events,
+  periodic work and `$CONTROL` commands, run as a chain. Built in: a
+  password list, PLAIN, and mosquitto's `acl_file` format.
+- TLS client certificates.
 - Persistent sessions, retained messages, wills, shared subscriptions,
   topic aliases, message expiry and `$SYS` statistics.
 - In-process client connections, without TCP.

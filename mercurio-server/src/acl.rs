@@ -21,6 +21,8 @@ use std::collections::HashMap;
 
 use mercurio_core::topic::{topic_matches_filter, validate_subscribe_filter};
 
+use crate::plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin};
+
 /// What a client wants to do with a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -31,37 +33,6 @@ pub enum Access {
     Write,
     /// Subscribe to it, `topic` being a topic filter
     Subscribe,
-}
-
-/// Who is asking for access.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ClientIdentity {
-    pub client_id: String,
-    /// Set only for a user the broker verified, by password, certificate
-    /// or enhanced authentication; a claimed user name doesn't count
-    pub username: Option<String>,
-}
-
-impl ClientIdentity {
-    pub fn new(client_id: impl Into<String>, username: Option<String>) -> Self {
-        ClientIdentity {
-            client_id: client_id.into(),
-            username,
-        }
-    }
-}
-
-/// Decides which topics a client may read and write.
-pub trait Authorizer: Send + Sync {
-    /// `topic` is a topic name, or a topic filter when subscribing.
-    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool;
-
-    /// Whether clients may publish to `$SYS` topics, which hold the broker's
-    /// own statistics and are refused to everyone else.
-    fn allows_sys_publish(&self) -> bool {
-        false
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,7 +111,7 @@ impl AclFile {
     }
 
     /// The rules that apply to `client`, patterns already substituted.
-    fn rules_for(&self, client: &ClientIdentity) -> Vec<Rule> {
+    fn rules_for(&self, client: &ClientInfo) -> Vec<Rule> {
         let own = match &client.username {
             Some(username) => self.users.get(username).map(Vec::as_slice),
             None => Some(self.anonymous.as_slice()),
@@ -199,8 +170,10 @@ fn parse_rule(rest: &str) -> Result<Rule, String> {
     })
 }
 
-impl Authorizer for AclFile {
-    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
+impl AclFile {
+    /// Whether the file grants `client` `access` to `topic`, a topic filter
+    /// when subscribing.
+    pub fn allows(&self, client: &ClientInfo, topic: &str, access: Access) -> bool {
         let rules = self.rules_for(client);
         // A subscription filter is checked like a topic, so its wildcards
         // only pass where a rule's own wildcards cover them
@@ -216,6 +189,26 @@ impl Authorizer for AclFile {
             allowed |= rule.grant.allows(access);
         }
         allowed
+    }
+}
+
+impl Plugin for AclFile {
+    fn name(&self) -> &str {
+        "acl-file"
+    }
+
+    /// Never defers: anything the file doesn't grant is denied.
+    fn authorize<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+        access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        ready(if self.allows(client, topic, access) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
 }
 
@@ -236,11 +229,8 @@ mod tests {
         pattern read users/%u/inbox
     ";
 
-    fn client(client_id: &str, username: Option<&str>) -> ClientIdentity {
-        ClientIdentity {
-            client_id: client_id.into(),
-            username: username.map(Into::into),
-        }
+    fn client(client_id: &str, username: Option<&str>) -> ClientInfo {
+        ClientInfo::new(client_id, username.map(Into::into))
     }
 
     #[test]
@@ -249,25 +239,25 @@ mod tests {
         let anonymous = client("c1", None);
         let alice = client("c2", Some("alice"));
 
-        assert!(acl.authorize(&anonymous, "public/news", Access::Read));
-        assert!(!acl.authorize(&anonymous, "public/news", Access::Write));
-        assert!(!acl.authorize(&anonymous, "alice/notes", Access::Read));
+        assert!(acl.allows(&anonymous, "public/news", Access::Read));
+        assert!(!acl.allows(&anonymous, "public/news", Access::Write));
+        assert!(!acl.allows(&anonymous, "alice/notes", Access::Read));
 
-        assert!(acl.authorize(&alice, "alice/notes", Access::Write));
-        assert!(!acl.authorize(&alice, "alice/secret", Access::Read));
-        assert!(acl.authorize(&alice, "sensors/kitchen/temperature", Access::Write));
+        assert!(acl.allows(&alice, "alice/notes", Access::Write));
+        assert!(!acl.allows(&alice, "alice/secret", Access::Read));
+        assert!(acl.allows(&alice, "sensors/kitchen/temperature", Access::Write));
         // Rules for anonymous clients don't apply to named users
-        assert!(!acl.authorize(&alice, "public/news", Access::Read));
+        assert!(!acl.allows(&alice, "public/news", Access::Read));
     }
 
     #[test]
     fn test_patterns_substitute_client_and_user() {
         let acl = AclFile::parse(ACL).unwrap();
 
-        assert!(acl.authorize(&client("dev7", None), "devices/dev7/status", Access::Write));
-        assert!(!acl.authorize(&client("dev7", None), "devices/dev8/status", Access::Write));
-        assert!(acl.authorize(&client("x", Some("bob")), "users/bob/inbox", Access::Read));
-        assert!(!acl.authorize(&client("x", None), "users//inbox", Access::Read));
+        assert!(acl.allows(&client("dev7", None), "devices/dev7/status", Access::Write));
+        assert!(!acl.allows(&client("dev7", None), "devices/dev8/status", Access::Write));
+        assert!(acl.allows(&client("x", Some("bob")), "users/bob/inbox", Access::Read));
+        assert!(!acl.allows(&client("x", None), "users//inbox", Access::Read));
     }
 
     #[test]
@@ -276,17 +266,17 @@ mod tests {
 
         for client_id in ["+", "#", "dev7/../dev8", "a/b"] {
             let client = client(client_id, None);
-            assert!(!acl.authorize(&client, "devices/dev8/status", Access::Write));
-            assert!(!acl.authorize(&client, "devices/a/b/status", Access::Write));
+            assert!(!acl.allows(&client, "devices/dev8/status", Access::Write));
+            assert!(!acl.allows(&client, "devices/a/b/status", Access::Write));
         }
         let bob = client("x", Some("+"));
-        assert!(!acl.authorize(&bob, "users/alice/inbox", Access::Read));
+        assert!(!acl.allows(&bob, "users/alice/inbox", Access::Read));
 
         // A pattern's denial still applies, however wide it becomes
         let acl =
             AclFile::parse("topic readwrite devices/#\npattern deny devices/%c/secret").unwrap();
-        assert!(!acl.authorize(&client("+", None), "devices/dev8/secret", Access::Read));
-        assert!(acl.authorize(&client("+", None), "devices/dev8/status", Access::Read));
+        assert!(!acl.allows(&client("+", None), "devices/dev8/secret", Access::Read));
+        assert!(acl.allows(&client("+", None), "devices/dev8/status", Access::Read));
     }
 
     #[test]
@@ -300,11 +290,11 @@ mod tests {
         let acl = AclFile::parse(ACL).unwrap();
         let alice = client("c", Some("alice"));
 
-        assert!(acl.authorize(&alice, "alice/#", Access::Subscribe));
-        assert!(acl.authorize(&alice, "sensors/+/temperature", Access::Subscribe));
+        assert!(acl.allows(&alice, "alice/#", Access::Subscribe));
+        assert!(acl.allows(&alice, "sensors/+/temperature", Access::Subscribe));
         // Would also match topics no rule grants
-        assert!(!acl.authorize(&alice, "#", Access::Subscribe));
-        assert!(!acl.authorize(&alice, "sensors/#", Access::Subscribe));
+        assert!(!acl.allows(&alice, "#", Access::Subscribe));
+        assert!(!acl.allows(&alice, "sensors/#", Access::Subscribe));
     }
 
     #[test]

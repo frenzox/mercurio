@@ -20,7 +20,7 @@ use mercurio_packets::{
     ControlPacket,
 };
 use mercurio_server::{
-    auth::{AuthExchange, AuthManager, AuthMethod, AuthResult},
+    plugin::{ready, AuthExchange, AuthResult, BoxFuture, Plugin},
     server::ServerConfig,
 };
 use tokio::{
@@ -42,20 +42,23 @@ enum ChallengeExchange {
     Done,
 }
 
-impl AuthMethod for Challenge {
+impl Plugin for Challenge {
     fn name(&self) -> &str {
-        "CHALLENGE"
+        "challenge"
     }
 
-    fn begin(&self) -> Box<dyn AuthExchange> {
+    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+        if method != "CHALLENGE" {
+            return None;
+        }
         let nonce = format!("nonce-{}", self.issued.fetch_add(1, Ordering::Relaxed));
-        Box::new(ChallengeExchange::Start(nonce))
+        Some(Box::new(ChallengeExchange::Start(nonce)))
     }
 }
 
 impl AuthExchange for ChallengeExchange {
-    fn step(&mut self, data: Option<&Bytes>) -> AuthResult {
-        match std::mem::replace(self, ChallengeExchange::Done) {
+    fn step<'a>(&'a mut self, data: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
+        ready(match std::mem::replace(self, ChallengeExchange::Done) {
             ChallengeExchange::Start(nonce) => {
                 let challenge = Bytes::from(nonce.clone());
                 *self = ChallengeExchange::Issued(nonce);
@@ -69,17 +72,15 @@ impl AuthExchange for ChallengeExchange {
                 }
             }
             _ => AuthResult::Failed(ReasonCode::NotAuthorized),
-        }
+        })
     }
 }
 
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut manager = AuthManager::new();
-    manager.register(Box::new(Challenge::default()));
     let mut config = ServerConfig::default();
-    config.auth.auth_manager = Some(Arc::new(manager));
+    config.plugins = vec![Arc::new(Challenge::default())];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

@@ -148,6 +148,7 @@ mosquitto_pub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1' -m
 <pre>{"responses":[{"command":"createRole"},{"command":"addRoleACL"},
  {"command":"createGroup"},{"command":"createClient"}]}</pre>
 <p>Failed commands carry an <code>error</code>, and commands carrying <code>correlationData</code> get it back.</p>
+<p>Only clients of listeners that use the main <code>[auth]</code> can send commands: a listener with its own <code>[listeners.auth]</code> doesn't include dynamic security.</p>
 
 <h3>Model</h3>
 <ul>

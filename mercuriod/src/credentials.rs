@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use mercurio_server::auth::CredentialValidator;
+use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin};
 
 /// Credential validator that supports argon2 password hashes.
 ///
@@ -21,8 +21,8 @@ impl HashedCredentialValidator {
     }
 }
 
-impl CredentialValidator for HashedCredentialValidator {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
+impl HashedCredentialValidator {
+    fn check(&self, username: &str, password: &[u8]) -> bool {
         let Some(stored) = self.credentials.get(username) else {
             // As slow as a wrong password, so timing doesn't tell which
             // users exist
@@ -44,6 +44,32 @@ impl CredentialValidator for HashedCredentialValidator {
             // Plaintext fallback for backwards compatibility
             constant_time_eq(stored.as_bytes(), password)
         }
+    }
+}
+
+impl Plugin for HashedCredentialValidator {
+    fn name(&self) -> &str {
+        "password-file"
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        // Hashes take tens of milliseconds of CPU; keep them off the runtime
+        let (username, password) = (
+            credentials.username.to_string(),
+            credentials.password.to_vec(),
+        );
+        Box::pin(async move {
+            let valid = tokio::task::block_in_place(|| self.check(&username, &password));
+            if valid {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        })
     }
 }
 
@@ -131,10 +157,10 @@ mod tests {
             "$6$pZufTypp2a6RmJv0$0E3Uw01KVS5L6/s+8dWtsoMjdF9mnjUcloZJLTWqsIQbvp1b3crPcunceFO+VmiVpj+Wde8NRnyJs4ZAFgaQUA==".to_string(),
         );
         let validator = HashedCredentialValidator::new(creds);
-        assert!(validator.validate("pbkdf2", b"secret"));
-        assert!(!validator.validate("pbkdf2", b"wrong"));
-        assert!(validator.validate("sha512", b"secret"));
-        assert!(!validator.validate("sha512", b"wrong"));
+        assert!(validator.check("pbkdf2", b"secret"));
+        assert!(!validator.check("pbkdf2", b"wrong"));
+        assert!(validator.check("sha512", b"secret"));
+        assert!(!validator.check("sha512", b"wrong"));
     }
 
     #[test]
@@ -143,7 +169,7 @@ mod tests {
         creds.insert("admin".to_string(), hash_password("secret"));
         let validator = HashedCredentialValidator::new(creds);
 
-        assert!(validator.validate("admin", b"secret"));
+        assert!(validator.check("admin", b"secret"));
     }
 
     #[test]
@@ -152,7 +178,7 @@ mod tests {
         creds.insert("admin".to_string(), hash_password("secret"));
         let validator = HashedCredentialValidator::new(creds);
 
-        assert!(!validator.validate("admin", b"wrong"));
+        assert!(!validator.check("admin", b"wrong"));
     }
 
     #[test]
@@ -161,8 +187,8 @@ mod tests {
         creds.insert("legacy".to_string(), "plainpass".to_string());
         let validator = HashedCredentialValidator::new(creds);
 
-        assert!(validator.validate("legacy", b"plainpass"));
-        assert!(!validator.validate("legacy", b"wrong"));
+        assert!(validator.check("legacy", b"plainpass"));
+        assert!(!validator.check("legacy", b"wrong"));
     }
 
     #[test]
@@ -170,6 +196,6 @@ mod tests {
         let creds = HashMap::new();
         let validator = HashedCredentialValidator::new(creds);
 
-        assert!(!validator.validate("nobody", b"pass"));
+        assert!(!validator.check("nobody", b"pass"));
     }
 }
