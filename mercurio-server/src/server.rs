@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     future::{poll_fn, Future},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
     sync::Arc,
@@ -52,7 +53,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http, proxy,
-    session::{effective_keepalive, Outgoing, Session, WillMessage},
+    session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
@@ -88,8 +89,9 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Limits {
-    /// How long a new connection may take to complete the TLS handshake and
-    /// send CONNECT before it is closed.
+    /// How long a new connection may take, in all, to send its PROXY header,
+    /// complete the TLS and WebSocket handshakes and send CONNECT, enhanced
+    /// authentication included, before it is closed.
     pub connect_timeout: Duration,
     /// Largest packet accepted from a client, fixed header included.
     pub max_packet_size: usize,
@@ -121,6 +123,18 @@ pub struct Limits {
     /// Subscriptions one session may hold; further ones are refused with
     /// Quota Exceeded. Each costs memory and work on every message.
     pub max_subscriptions: Option<usize>,
+    /// Longest a session may outlive its connection. MQTT 5 clients asking
+    /// for longer, or for no expiry, are told to use this; it also bounds
+    /// `persistent_client_expiration`. Unbounded when unset.
+    pub max_session_expiry: Option<Duration>,
+    /// Topics that may hold a retained message at once, the broker's own
+    /// `$SYS` statistics included; retaining a message on another topic is
+    /// then refused with Quota Exceeded. Unbounded when unset.
+    pub max_retained_messages: Option<usize>,
+    /// Connections one client address may hold at once, counting the
+    /// address a PROXY header gives; further ones are closed. Unbounded
+    /// when unset, as many devices can share an address behind NAT.
+    pub max_connections_per_ip: Option<usize>,
 }
 
 impl Default for Limits {
@@ -139,6 +153,9 @@ impl Default for Limits {
             persistent_client_expiration: None,
             check_retain_source: false,
             max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
+            max_session_expiry: None,
+            max_retained_messages: None,
+            max_connections_per_ip: None,
         }
     }
 }
@@ -205,6 +222,10 @@ pub struct ListenerConfig {
     /// Expect every connection to start with a PROXY protocol header, as
     /// sent by load balancers, and take the client's address from it.
     pub proxy_protocol: bool,
+    /// With `proxy_protocol`, the proxies allowed to send the header; other
+    /// connections are closed, as their header could claim any address.
+    /// Any connection may send one when empty.
+    pub proxy_from: Vec<AddressRange>,
     /// Prefixed to every topic the listener's clients use, so they only see
     /// their own part of the topic tree.
     pub mount_point: Option<String>,
@@ -228,6 +249,7 @@ impl ListenerConfig {
             transport,
             tls: None,
             proxy_protocol: false,
+            proxy_from: Vec::new(),
             mount_point: None,
             auth: None,
             max_connections: None,
@@ -306,6 +328,7 @@ struct EndpointSettings {
     tls_acceptor: Option<TlsAcceptor>,
     username_from_certificate: Option<CertificateName>,
     proxy_protocol: bool,
+    proxy_from: Arc<[AddressRange]>,
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
     http_dir: Option<Arc<PathBuf>>,
@@ -328,6 +351,7 @@ impl Endpoint {
                 tls_acceptor,
                 username_from_certificate,
                 proxy_protocol: config.proxy_protocol,
+                proxy_from: config.proxy_from.into(),
                 mount_point: config.mount_point,
                 auth: config.auth.map(Arc::new),
                 http_dir: config.http_dir.map(Arc::new),
@@ -353,6 +377,11 @@ struct HandlerParts<St: MqttStore + 'static> {
     http_dir: Option<Arc<PathBuf>>,
     /// An in-process connection, from the local listener
     local: bool,
+    /// When the PROXY header, the TLS and WebSocket handshakes and CONNECT
+    /// must all be done by; one deadline, so a client trickling bytes can't
+    /// take the time allowed once per step
+    connect_deadline: Instant,
+    address_slots: Arc<AddressSlots>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -378,6 +407,16 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         else {
             return;
         };
+        // Counted once the PROXY header gave the client's own address
+        let _address_slot = match (parts.limits.max_connections_per_ip, peer_addr) {
+            (Some(max), Some(peer)) => match parts.address_slots.acquire(peer.ip(), max) {
+                Some(slot) => Some(slot),
+                None => {
+                    return warn!("{} holds the most connections allowed, closing", peer.ip());
+                }
+            },
+            _ => None,
+        };
         match stream {
             Secured::Plain(stream) => Box::pin(parts.serve(stream, transport, peer_addr)).await,
             Secured::Tls(stream) => Box::pin(parts.serve(*stream, transport, peer_addr)).await,
@@ -396,8 +435,19 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if settings.proxy_protocol {
+            let trusted = settings.proxy_from.is_empty()
+                || peer_addr.is_some_and(|peer| {
+                    settings
+                        .proxy_from
+                        .iter()
+                        .any(|range| range.contains(peer.ip()))
+                });
+            if !trusted {
+                warn!("{:?} may not send a PROXY header, closing", peer_addr);
+                return None;
+            }
             let header = proxy::read_header(&mut socket);
-            match time::timeout(self.limits.connect_timeout, header).await {
+            match time::timeout_at(self.connect_deadline, header).await {
                 Ok(Ok(source)) => {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
@@ -420,7 +470,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let Some(acceptor) = settings.tls_acceptor else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
-        match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
+        match time::timeout_at(self.connect_deadline, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
                 debug!("TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
@@ -458,7 +508,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
                         let request = Box::pin(http::serve_or_upgrade(stream, &dir));
-                        match time::timeout(self.limits.connect_timeout, request).await {
+                        match time::timeout_at(self.connect_deadline, request).await {
                             Ok(Ok(Some(upgrade))) => upgrade,
                             Ok(Ok(None)) => return,
                             Ok(Err(e)) => {
@@ -472,7 +522,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
                 let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
-                match time::timeout(self.limits.connect_timeout, handshake).await {
+                match time::timeout_at(self.connect_deadline, handshake).await {
                     Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
                     Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
@@ -498,6 +548,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             stats: self.stats,
             cert_identity: self.cert_identity,
             local: self.local,
+            connect_deadline: self.connect_deadline,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -562,6 +613,8 @@ struct Listener<St: MqttStore + 'static> {
     stats: Arc<Stats>,
     limits: Limits,
     /// One permit per allowed concurrent connection, when limited
+    /// Connections per client address, for `max_connections_per_ip`
+    address_slots: Arc<AddressSlots>,
     connection_slots: Option<Arc<Semaphore>>,
 }
 
@@ -581,6 +634,7 @@ where
     cert_identity: Option<String>,
     /// An in-process connection, from the local listener
     local: bool,
+    connect_deadline: Instant,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -702,6 +756,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
+        address_slots: Arc::default(),
         connection_slots: limits
             .max_connections
             .map(|max| Arc::new(Semaphore::new(max))),
@@ -823,6 +878,8 @@ impl<St: MqttStore + 'static> Listener<St> {
                 mount_point: None,
                 http_dir: None,
                 local: false,
+                connect_deadline: Instant::now() + self.limits.connect_timeout,
+                address_slots: Arc::clone(&self.address_slots),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -861,11 +918,8 @@ impl<St: MqttStore + 'static> Listener<St> {
             .connection
             .set_max_packet_size(handler.limits.max_packet_size);
 
-        let first_packet = time::timeout(
-            handler.limits.connect_timeout,
-            handler.connection.read_packet(),
-        )
-        .await;
+        let first_packet =
+            time::timeout_at(handler.connect_deadline, handler.connection.read_packet()).await;
 
         // Boxed, as it is kept until the connection ends
         let first_packet = Box::new(first_packet);
@@ -1128,9 +1182,13 @@ where
             .as_ref()
             .and_then(|p| p.maximum_packet_size.as_ref())
             .map(|m| m.value);
+        cap_session_expiry(&mut connect_packet, &self.limits);
         let mut expiry = session_expiry(&connect_packet);
         if expiry.is_none() && !protocol_version.supports_properties() {
             expiry = self.limits.persistent_client_expiration;
+            if let Some(max) = self.limits.max_session_expiry {
+                expiry = Some(expiry.map_or(max, |expiry| expiry.min(max)));
+            }
         }
 
         let owner = SessionOwner {
@@ -1292,10 +1350,9 @@ where
                 .await?;
 
             // The exchange counts towards the time allowed to connect
-            let response =
-                time::timeout(self.limits.connect_timeout, self.connection.read_packet())
-                    .await
-                    .map_err(|_| ReasonCode::MaximumConnectTime)??;
+            let response = time::timeout_at(self.connect_deadline, self.connection.read_packet())
+                .await
+                .map_err(|_| ReasonCode::MaximumConnectTime)??;
 
             // Only AUTH continuing the same method may answer a challenge
             let Some(ControlPacket::Auth(auth)) = response else {
@@ -1744,6 +1801,96 @@ where
     }
 }
 
+/// Connections each client address holds.
+#[derive(Default)]
+struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
+
+impl AddressSlots {
+    /// A slot for `ip`, unless it holds `max` already.
+    fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<AddressSlot> {
+        let mut counts = self.0.lock().unwrap();
+        let count = counts.entry(ip).or_default();
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(AddressSlot {
+            slots: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// One connection's place in its address's count, freed when dropped.
+struct AddressSlot {
+    slots: Arc<AddressSlots>,
+    ip: IpAddr,
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut counts = self.slots.0.lock().unwrap();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// An address, or a block of them in CIDR form, such as `10.0.0.0/8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressRange {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl AddressRange {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        // An IPv4 client may reach an IPv6 socket as a mapped address
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(network) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(network) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::str::FromStr for AddressRange {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, String> {
+        let invalid = || format!("`{text}` is not an address or a CIDR block");
+        let (address, prefix) = text.split_once('/').unwrap_or((text, ""));
+        let network: IpAddr = address.parse().map_err(|_| invalid())?;
+        let bits = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            "" => bits,
+            prefix => prefix
+                .parse()
+                .ok()
+                .filter(|p| *p <= bits)
+                .ok_or_else(invalid)?,
+        };
+        Ok(AddressRange { network, prefix })
+    }
+}
+
 /// A connection after its handshakes, with TLS or without.
 enum Secured<S> {
     Plain(S),
@@ -1847,5 +1994,34 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
 
     if let Err(e) = broker.publish(&topic, message).await {
         error!("Failed to publish will message: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_address_ranges() {
+        let range: AddressRange = "10.0.0.0/8".parse().unwrap();
+        assert!(range.contains("10.200.0.1".parse().unwrap()));
+        assert!(!range.contains("11.0.0.1".parse().unwrap()));
+        // An IPv4 client on an IPv6 socket
+        assert!(range.contains("::ffff:10.0.0.1".parse().unwrap()));
+
+        let single: AddressRange = "192.0.2.7".parse().unwrap();
+        assert!(single.contains("192.0.2.7".parse().unwrap()));
+        assert!(!single.contains("192.0.2.8".parse().unwrap()));
+
+        let v6: AddressRange = "2001:db8::/32".parse().unwrap();
+        assert!(v6.contains("2001:db8:1::1".parse().unwrap()));
+        assert!(!v6.contains("2001:db9::1".parse().unwrap()));
+
+        let everything: AddressRange = "0.0.0.0/0".parse().unwrap();
+        assert!(everything.contains("203.0.113.1".parse().unwrap()));
+
+        for invalid in ["10.0.0.0/33", "example.com", "10.0.0.0/x", ""] {
+            assert!(invalid.parse::<AddressRange>().is_err(), "{invalid}");
+        }
     }
 }

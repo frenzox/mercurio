@@ -290,6 +290,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut value = ListenerConfig::new(listener, extra.protocol.into());
             value.tls = extra.tls.build()?;
             value.proxy_protocol = extra.proxy_protocol;
+            value.proxy_from = extra
+                .proxy_from
+                .iter()
+                .map(|range| range.parse())
+                .collect::<Result<_, _>>()?;
             value.mount_point = extra.mount_point.clone();
             value.max_connections = extra.max_connections;
             value.http_dir = extra.http_dir.clone().map(Into::into);

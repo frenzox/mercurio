@@ -91,3 +91,45 @@ async fn mqtt311_clean_session_ends_with_connection() {
     // Persistent sessions are kept
     assert!(connect_and_disconnect(addr, 4, false, None).await);
 }
+
+/// MQTT 5 CONNECT asking for `expiry`; returns the CONNACK's Session
+/// Expiry Interval property, if any.
+async fn announced_expiry(addr: SocketAddr, expiry: u32) -> Option<u32> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut packet = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x00, 0x00, 0x3c];
+    packet.extend_from_slice(&[0x05, 0x11]);
+    packet.extend_from_slice(&expiry.to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x01, b'x']);
+    let mut connect = vec![0x10, packet.len() as u8];
+    connect.extend_from_slice(&packet);
+    stream.write_all(&connect).await.unwrap();
+
+    let connack = common::read_connack(&mut stream).await;
+    assert_eq!(connack[3], 0x00, "connection refused");
+    // Properties start after the flags and reason code; the length is
+    // one byte here
+    let properties = &connack[5..];
+    let at = properties.iter().position(|&b| b == 0x11)?;
+    Some(u32::from_be_bytes(
+        properties[at + 1..at + 5].try_into().unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn session_expiry_is_capped_and_announced() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = mercurio_server::server::ServerConfig::default();
+    config.limits.max_session_expiry = Some(Duration::from_secs(60));
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // No expiry, and a longer one, are lowered to the maximum
+    assert_eq!(announced_expiry(addr, u32::MAX).await, Some(60));
+    assert_eq!(announced_expiry(addr, 3600).await, Some(60));
+    // A shorter one stands, and isn't announced
+    assert_eq!(announced_expiry(addr, 30).await, None);
+}

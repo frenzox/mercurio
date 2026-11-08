@@ -96,12 +96,14 @@ path = "/run/mercurio/mqtt.sock"</pre>
 <pre>[[listeners]]
 host = "0.0.0.0"
 port = 1884
-proxy_protocol = true</pre>
+proxy_protocol = true
+proxy_from = ["10.0.0.0/8"]</pre>
 <pre><span class="comment"># haproxy.cfg</span>
 backend mqtt
     mode tcp
     server mercurio 10.0.0.5:1884 send-proxy-v2</pre>
 <p>Connections without a valid header are closed. TLS, when enabled on the listener, starts after the header.</p>
+<p>A header can claim any address, so name the balancers in <code>proxy_from</code>: connections from other addresses are closed. That matters most with <code>max_connections_per_ip</code>, which counts the address the header gives.</p>
 
 <h2 id="mount-points">Mount points</h2>
 <p>A mount point gives a listener's clients their own part of the topic tree, for example one per tenant:</p>

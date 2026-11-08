@@ -320,3 +320,47 @@ async fn subscriptions_beyond_the_limit_are_refused() {
     // Replacing a subscription it holds doesn't count as a new one
     assert_eq!(subscribe(&mut stream, &["a"]).await, [0x00]);
 }
+
+/// Retained QoS 1 PUBLISH of "v" on `topic` with packet id 1; returns the
+/// PUBACK's reason code.
+async fn publish_retained(stream: &mut TcpStream, topic: &str) -> u8 {
+    let mut body = Vec::new();
+    body.extend((topic.len() as u16).to_be_bytes());
+    body.extend(topic.as_bytes());
+    // Packet id 1, no properties, payload "v"
+    body.extend([0x00, 0x01, 0x00, b'v']);
+    let mut packet = vec![0x33, body.len() as u8];
+    packet.extend(body);
+    stream.write_all(&packet).await.unwrap();
+
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.unwrap();
+    let mut puback = vec![0u8; header[1] as usize];
+    stream.read_exact(&mut puback).await.unwrap();
+    // Without a reason code it is Success
+    puback.get(2).copied().unwrap_or(0x00)
+}
+
+#[tokio::test]
+async fn retained_messages_beyond_the_limit_are_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.limits.max_retained_messages = Some(1);
+    // The broker's own retained $SYS topics would count too
+    config.sys_interval = None;
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+    let (mut stream, _) = connect(addr, b'r').await;
+
+    // Success, or No Matching Subscribers, also a success
+    let accepted = |reason: u8| reason == 0x00 || reason == 0x10;
+    assert!(accepted(publish_retained(&mut stream, "a").await));
+    // Quota exceeded on a second topic
+    assert_eq!(publish_retained(&mut stream, "b").await, 0x97);
+    // Updating the retained topic is still allowed
+    assert!(accepted(publish_retained(&mut stream, "a").await));
+}

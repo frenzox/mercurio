@@ -21,8 +21,8 @@ use mercurio_core::{
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
         MaximumQoS, MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
-        ServerKeepAlive, SharedSubscriptionAvailable, SubscriptionIdentifier,
-        SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
+        ServerKeepAlive, SessionExpiryInterval, SharedSubscriptionAvailable,
+        SubscriptionIdentifier, SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
         WildcardSubscriptionAvailable,
     },
     qos::QoS,
@@ -183,6 +183,48 @@ fn publish_properties(
     })
 }
 
+/// Lowers the session expiry an MQTT 5 client asks for to the server's
+/// maximum, no expiry included, so every later use of the CONNECT sees the
+/// expiry the session will have.
+pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Limits) {
+    let Some(max) = limits.max_session_expiry else {
+        return;
+    };
+    if !connect_packet.protocol_version.supports_properties() {
+        return;
+    }
+    // u32::MAX means no expiry, so the most a maximum can be is one less
+    let max = u32::try_from(max.as_secs())
+        .unwrap_or(u32::MAX - 1)
+        .min(u32::MAX - 1);
+    let requested = connect_packet
+        .properties
+        .as_ref()
+        .and_then(|p| p.session_expiry_interval.as_ref())
+        .map_or(0, |e| e.value);
+    if requested > max {
+        connect_packet
+            .properties
+            .get_or_insert_with(Default::default)
+            .session_expiry_interval = Some(SessionExpiryInterval::new(max));
+    }
+}
+
+/// The session expiry to announce in CONNACK: the server's maximum, when
+/// the client's request was lowered to it.
+fn announced_session_expiry(connect_packet: &ConnectPacket, limits: &Limits) -> Option<u32> {
+    let max = u32::try_from(limits.max_session_expiry?.as_secs())
+        .unwrap_or(u32::MAX - 1)
+        .min(u32::MAX - 1);
+    let requested = connect_packet
+        .properties
+        .as_ref()?
+        .session_expiry_interval
+        .as_ref()?
+        .value;
+    (requested == max).then_some(max)
+}
+
 /// The keep-alive the connection runs with: the client's own, unless it
 /// exceeds the server's maximum or disables keep-alive, in which case MQTT 5
 /// clients are told to use the maximum. MQTT 3.x has no way to tell them.
@@ -263,6 +305,7 @@ struct State {
     /// Who may resume the session
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
+    max_retained_messages: Option<usize>,
 }
 
 impl From<Session> for SessionDropGuard {
@@ -318,6 +361,7 @@ impl Session {
                     verified_user: None,
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
+                    max_retained_messages: None,
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -434,6 +478,7 @@ impl Session {
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
             session.max_subscriptions = limits.max_subscriptions;
+            session.max_retained_messages = limits.max_retained_messages;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
@@ -472,6 +517,11 @@ impl Session {
                         .map(|template| {
                             ResponseInformation::new(template.replace("%c", &session.client_id))
                         }),
+                    session_expiry_interval: announced_session_expiry(
+                        &session.connect_packet,
+                        limits,
+                    )
+                    .map(SessionExpiryInterval::new),
                     server_keepalive: {
                         let keepalive = effective_keepalive(&session.connect_packet, limits);
                         (keepalive != session.connect_packet.keepalive)
@@ -536,7 +586,7 @@ impl Session {
             }
         }
 
-        {
+        let max_retained = {
             let session = self.shared.state.lock().await;
             // [MQTT-3.2.2-11]
             if packet.qos_level as u8 > session.maximum_qos as u8 {
@@ -546,7 +596,8 @@ impl Session {
             if packet.retain && !session.retain_available {
                 return Err(ReasonCode::RetainNotSupported.into());
             }
-        }
+            session.max_retained_messages
+        };
 
         // Validate topic name (no wildcards, no null chars, etc.)
         if validate_publish_topic(&packet.topic_name).is_err() {
@@ -590,6 +641,21 @@ impl Session {
                 );
                 return self
                     .refuse_publish(&packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+        }
+
+        // Retaining on a new topic once the store is full; updating or
+        // clearing a retained topic is always allowed
+        let retains = packet.retain && packet.payload.as_ref().is_some_and(|p| !p.is_empty());
+        if let Some(max) = max_retained.filter(|_| retains) {
+            if broker.retained_full(&packet.topic_name, max).await? {
+                warn!(
+                    "Retained messages full, refusing one on `{}`",
+                    packet.topic_name
+                );
+                return self
+                    .refuse_publish(&packet, ReasonCode::QuotaExceeded)
                     .await;
             }
         }

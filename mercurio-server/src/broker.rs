@@ -47,6 +47,24 @@ impl<S: RetainedMessageStore> Broker<S> {
             .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
     }
 
+    /// Whether `max` topics hold retained messages already, `topic` not one
+    /// of them, so retaining another would exceed it.
+    // ponytail: counts the store each time, a COUNT(*) on PostgreSQL; keep a
+    // count in memory if retained publishes get frequent under a cap
+    pub(crate) async fn retained_full(&self, topic: &str, max: usize) -> Result<bool> {
+        let storage_error =
+            |e: mercurio_storage::StorageError| mercurio_core::error::Error::Storage(e.to_string());
+        if self.storage.count_retained().await.map_err(storage_error)? < max {
+            return Ok(false);
+        }
+        let existing = self
+            .storage
+            .get_retained(topic)
+            .await
+            .map_err(storage_error)?;
+        Ok(existing.is_empty())
+    }
+
     /// Removes the subscription of `id` to a topic filter. Returns whether it
     /// existed.
     pub(crate) fn unsubscribe(&self, filter: &str, id: u64) -> bool {

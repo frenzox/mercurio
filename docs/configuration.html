@@ -67,7 +67,7 @@ mount_point = "tenant1/"</pre>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>max_connections</code></td><td><code>10000</code></td><td>Concurrent connections, across every listener. Further ones are closed right after being accepted.</td></tr>
 <tr><td><code>max_packet_size</code></td><td><code>1048576</code></td><td>Largest packet accepted from a client, in bytes. Announced to MQTT 5 clients.</td></tr>
-<tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has to complete TLS and send CONNECT.</td></tr>
+<tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has, in all, to send its PROXY header, complete the TLS and WebSocket handshakes and send CONNECT, enhanced authentication included.</td></tr>
 <tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>Messages that may wait for one client, any QoS, before further ones are dropped.</td></tr>
 <tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
 <tr><td><code>max_queued_bytes</code></td><td><code>104857600</code></td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
@@ -85,6 +85,9 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>auto_id_prefix</code></td><td><code>""</code></td><td>Prefix of the client ids the broker assigns.</td></tr>
 <tr><td><code>clientid_prefixes</code></td><td><code>[]</code></td><td>When not empty, only client ids starting with one of these are accepted; others are refused as not authorized.</td></tr>
 <tr><td><code>persistent_client_expiration</code></td><td>never</td><td>Seconds the session of an MQTT 3.x client connected without clean session outlives its connection. MQTT 5 clients choose their own expiry.</td></tr>
+<tr><td><code>max_session_expiry</code></td><td>unbounded</td><td>Most seconds any session may outlive its connection. MQTT 5 clients asking for longer, or for no expiry, are told to use this; it also bounds <code>persistent_client_expiration</code>. Worth setting where clients aren't trusted, as each stored session takes memory and storage.</td></tr>
+<tr><td><code>max_retained_messages</code></td><td>unbounded</td><td>Topics that may hold a retained message at once, about 20 of the broker's own <code>$SYS</code> topics included. Retaining a message on another topic is refused with Quota Exceeded; updating or clearing a retained topic is always allowed.</td></tr>
+<tr><td><code>max_connections_per_ip</code></td><td>unbounded</td><td>Connections one client address may hold at once; further ones are closed. Behind a proxy sending PROXY headers, the address the header gives is counted, so set <code>proxy_from</code> too. Unbounded by default, as carrier NAT puts many devices behind one address.</td></tr>
 </table>
 
 <h3>Delivery</h3>
@@ -168,6 +171,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
+<tr><td><code>proxy_from</code></td><td>any</td><td>With <code>proxy_protocol</code>, the addresses or CIDR blocks of the proxies allowed to send the header, such as <code>["10.0.0.0/8"]</code>. Connections from elsewhere are closed, as their header could claim any address.</td></tr>
 <tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use. Must end with <code>/</code>.</td></tr>
 <tr><td><code>max_connections</code></td><td></td><td>Concurrent connections on this listener, on top of the broker-wide limit.</td></tr>
 <tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this interface. Linux only.</td></tr>
