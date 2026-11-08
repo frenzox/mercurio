@@ -512,6 +512,33 @@ where
     _shutdown_complete: mpsc::Sender<()>,
 }
 
+/// Checks credentials off the async threads, as password hashes take tens
+/// of milliseconds of CPU and validators may block on I/O, and at most one
+/// per core at a time, so a flood of logins queues instead of starving
+/// connections.
+async fn validate_credentials(
+    validator: &Arc<dyn CredentialValidator>,
+    username: &str,
+    password: &[u8],
+) -> bool {
+    static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let checks = CHECKS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Arc::new(tokio::sync::Semaphore::new(cores))
+    });
+    let Ok(_permit) = checks.acquire().await else {
+        return false;
+    };
+    let (validator, username, password) = (
+        Arc::clone(validator),
+        username.to_string(),
+        password.to_vec(),
+    );
+    tokio::task::spawn_blocking(move || validator.validate(&username, &password))
+        .await
+        .unwrap_or(false)
+}
+
 /// Run the MQTT broker with plain TCP connections.
 pub async fn run(
     listener: TcpListener,
@@ -883,8 +910,8 @@ where
                 &connect_packet.payload.password,
             ) {
                 (Some(username), Some(password)) => {
-                    if let Some(ref validator) = self.auth_config.credential_validator {
-                        let valid = validator.validate(username, password);
+                    if let Some(validator) = &self.auth_config.credential_validator {
+                        let valid = validate_credentials(validator, username, password).await;
                         if !valid {
                             warn!("Authentication failed for user `{}`", username);
                         }
