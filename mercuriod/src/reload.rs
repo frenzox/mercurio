@@ -1,9 +1,8 @@
 //! Files the daemon rereads on SIGHUP.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin};
+use mercurio_server::plugin::{Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin};
 
 type Loader<T> = fn(&str) -> Result<T, String>;
 
@@ -14,6 +13,8 @@ pub struct Reloadable<T> {
     path: String,
     load: Loader<T>,
     current: RwLock<Arc<T>>,
+    /// The plugin name of the value, which is the same for every version
+    name: OnceLock<String>,
 }
 
 impl<T> Reloadable<T> {
@@ -22,6 +23,7 @@ impl<T> Reloadable<T> {
             path: path.to_string(),
             load,
             current: RwLock::new(Arc::new(load(path)?)),
+            name: OnceLock::new(),
         })
     }
 
@@ -57,15 +59,9 @@ impl<T: Send + Sync> Reload for Reloadable<T> {
     }
 }
 
-impl<T: Authorizer> Authorizer for Reloadable<T> {
-    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
-        self.get().authorize(client, topic, access)
-    }
-}
-
 impl<T: Plugin> Plugin for Reloadable<T> {
     fn name(&self) -> &str {
-        &self.path
+        self.name.get_or_init(|| self.get().name().to_string())
     }
 
     fn authenticate<'a>(
@@ -90,6 +86,8 @@ impl<T: Plugin> Plugin for Reloadable<T> {
 
 #[cfg(test)]
 mod tests {
+    use mercurio_server::{acl::AclFile, plugin::Plugin};
+
     use super::Reloadable;
 
     fn load(path: &str) -> Result<String, String> {
@@ -120,5 +118,18 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(value.reload().is_err());
         assert_eq!(*value.get(), "two");
+    }
+
+    #[test]
+    fn test_plugins_keep_their_own_name() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-reload-acl-{}", std::process::id()));
+        std::fs::write(&path, "topic read public/#").unwrap();
+        let acl = Reloadable::load(path.to_str().unwrap(), |path| {
+            AclFile::parse(&std::fs::read_to_string(path).unwrap())
+        })
+        .unwrap();
+        assert_eq!(Plugin::name(&acl), "acl-file");
+        std::fs::remove_file(&path).unwrap();
     }
 }

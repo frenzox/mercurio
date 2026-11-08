@@ -1,6 +1,9 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use mercurio_server::server::{LocalConnector, ServerConfig};
+use mercurio_server::{
+    plugin::{ready, Access, BoxFuture, ClientInfo, Decision, Plugin},
+    server::{LocalConnector, ServerConfig},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -48,7 +51,7 @@ async fn local_connections_skip_authentication() {
 }
 
 #[tokio::test]
-async fn control_topics_need_an_authorizer() {
+async fn control_topics_need_an_explicit_allow() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
@@ -60,12 +63,47 @@ async fn control_topics_need_an_authorizer() {
         std::future::pending::<()>(),
     ));
 
-    // Not Authorized for a client of a broker without access control
+    // Not Authorized for a client no plugin allows
     let tcp = TcpStream::connect(addr).await.unwrap();
     assert_eq!(control_puback_reason(tcp).await, 0x87);
     // but trusted local connections may: No Matching Subscribers
     let local = connector.connect().unwrap();
     assert_eq!(control_puback_reason(local).await, 0x10);
+}
+
+#[tokio::test]
+async fn control_topics_open_to_clients_a_plugin_allows() {
+    struct AllowControl;
+    impl Plugin for AllowControl {
+        fn name(&self) -> &str {
+            "allow-control"
+        }
+        fn authorize<'a>(
+            &'a self,
+            _: &'a ClientInfo,
+            topic: &'a str,
+            _: Access,
+        ) -> BoxFuture<'a, Decision> {
+            ready(if topic.starts_with("$CONTROL/") {
+                Decision::Allow
+            } else {
+                Decision::Defer
+            })
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = vec![Arc::new(AllowControl)];
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // No Matching Subscribers: accepted
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(control_puback_reason(tcp).await, 0x10);
 }
 
 /// Connects on `stream` and publishes to `$CONTROL/x` at QoS 1, returning the

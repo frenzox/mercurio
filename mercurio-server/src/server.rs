@@ -51,7 +51,7 @@ use mercurio_packets::{
 use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
-    acl::{Access, Authorizer, ClientIdentity},
+    acl::Access,
     broker::Broker,
     connection::Connection,
     http,
@@ -74,9 +74,6 @@ pub struct AuthConfig {
     /// With authentication required, still accept clients that send no
     /// user name. Credentials that are sent are always checked.
     pub allow_anonymous: bool,
-    /// Decides which topics each client may publish and subscribe to; all
-    /// of them when unset.
-    pub authorizer: Option<Arc<dyn Authorizer>>,
 }
 
 pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
@@ -294,20 +291,6 @@ impl LocalConnector {
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "broker stopped")
         })?;
         Ok(client)
-    }
-}
-
-/// Lets trusted connections use every topic, `$CONTROL` and `$SYS` ones
-/// included.
-struct AllowAll;
-
-impl Authorizer for AllowAll {
-    fn authorize(&self, _: &ClientIdentity, _: &str, _: Access) -> bool {
-        true
-    }
-
-    fn allows_sys_publish(&self) -> bool {
-        true
     }
 }
 
@@ -625,8 +608,6 @@ impl Redirect {
 struct Listener<St: MqttStore + 'static> {
     endpoints: Vec<Endpoint>,
     local_listener: Option<LocalListener>,
-    /// Given to local connections instead of `auth_config`
-    trusted_auth: Arc<AuthConfig>,
     /// Given to local connections instead of `chain`
     trusted_chain: Chain,
     /// Where the next accept starts looking, so a busy listener does not
@@ -776,10 +757,6 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let mut server = Listener {
         endpoints,
         local_listener,
-        trusted_auth: Arc::new(AuthConfig {
-            authorizer: Some(Arc::new(AllowAll)),
-            ..Default::default()
-        }),
         trusted_chain: chain.trusted(),
         next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
@@ -927,7 +904,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
-                        auth_config: Arc::clone(&self.trusted_auth),
+                        auth_config: Arc::new(AuthConfig::default()),
                         chain: self.trusted_chain.clone(),
                         local: true,
                         ..parts
@@ -1182,15 +1159,13 @@ where
         }
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
-        if let (Some(authorizer), Some(will_topic)) = (
-            &self.auth_config.authorizer,
-            &connect_packet.payload.will_topic,
-        ) {
-            let identity = ClientIdentity {
+        if let Some(will_topic) = &connect_packet.payload.will_topic {
+            let identity = ClientInfo {
                 client_id: connect_packet.payload.client_id.clone(),
                 username: verified_user.clone(),
+                peer: self.peer,
             };
-            if !authorizer.authorize(&identity, will_topic, Access::Write) {
+            if !self.chain.may(&identity, will_topic, Access::Write).await {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                     .await;
@@ -1241,6 +1216,7 @@ where
         }
 
         session.set_verified_user(verified_user).await;
+        session.set_peer(self.peer).await;
 
         let result = async {
             Box::pin(session.begin(
@@ -1597,9 +1573,8 @@ where
         let response = match packet {
             HotPacket::Publish(publish) => {
                 Stats::add(&self.stats.messages_received);
-                let authorizer = self.auth_config.authorizer.as_deref();
                 session
-                    .handle_publish(publish, &self.broker, authorizer)
+                    .handle_publish(publish, &self.broker, &self.chain)
                     .await?
             }
             HotPacket::PubAck(ack) => {
@@ -1656,10 +1631,14 @@ where
         let mut session = session.clone();
         // Checked per message: a permitted subscription can still
         // match topics the client may not read
-        if let Some(authorizer) = &self.auth_config.authorizer {
+        if !self.chain.is_empty() && !self.chain.is_trusted() {
             // Re-read each time: re-authentication can change the user
             let identity = session.identity().await;
-            if !authorizer.authorize(&identity, &message.topic, Access::Read) {
+            if !self
+                .chain
+                .may(&identity, &message.topic, Access::Read)
+                .await
+            {
                 return Ok(Flow::Continue);
             }
         }
@@ -1747,12 +1726,7 @@ where
                 };
 
                 let maybe_res = session
-                    .process_incoming(
-                        packet,
-                        &self.broker,
-                        &self.chain,
-                        self.auth_config.authorizer.as_deref(),
-                    )
+                    .process_incoming(packet, &self.broker, &self.chain)
                     .await?;
 
                 // Persist subscriptions after subscribe/unsubscribe operations

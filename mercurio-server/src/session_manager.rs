@@ -768,7 +768,6 @@ mod tests {
                 }),
                 &broker,
                 &crate::plugin::Chain::new(Vec::new(), Duration::from_secs(5)),
-                None,
             )
             .await
             .unwrap();
@@ -815,7 +814,6 @@ mod tests {
                 }),
                 &broker,
                 &crate::plugin::Chain::new(Vec::new(), Duration::from_secs(5)),
-                None,
             )
             .await
             .unwrap();

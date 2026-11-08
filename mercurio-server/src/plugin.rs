@@ -242,7 +242,6 @@ pub(crate) async fn guarded<T>(
 
 /// The plugins one connection runs, in order.
 #[derive(Clone)]
-#[allow(dead_code)] // `trusted` is read by access control, from the next task on
 pub(crate) struct Chain {
     plugins: Arc<[Arc<dyn Plugin>]>,
     timeout: Duration,
@@ -251,7 +250,6 @@ pub(crate) struct Chain {
     trusted: bool,
 }
 
-#[allow(dead_code)] // the other hooks are run from the next tasks on
 impl Chain {
     pub(crate) fn new(plugins: Vec<Arc<dyn Plugin>>, timeout: Duration) -> Chain {
         Chain {
@@ -274,10 +272,6 @@ impl Chain {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.plugins.is_empty()
-    }
-
-    pub(crate) fn plugins(&self) -> &[Arc<dyn Plugin>] {
-        &self.plugins
     }
 
     pub(crate) async fn authenticate(
@@ -337,6 +331,7 @@ impl Chain {
         self.authorize(client, topic, access).await != Decision::Deny
     }
 
+    #[allow(dead_code)] // used from Task 4
     pub(crate) async fn on_message(
         &self,
         client: &ClientInfo,
@@ -352,6 +347,7 @@ impl Chain {
         MessageAction::Continue
     }
 
+    #[allow(dead_code)] // used from Task 5
     pub(crate) fn emit(&self, event: Event) {
         if self.plugins.is_empty() {
             return;
@@ -365,6 +361,7 @@ impl Chain {
         });
     }
 
+    #[allow(dead_code)] // used from Task 6
     pub(crate) async fn control(
         &self,
         client: &ClientInfo,

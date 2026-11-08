@@ -16,8 +16,9 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
 use mercurio_core::topic::topic_matches_filter;
-use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision};
+use mercurio_server::plugin::{
+    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+};
 use mercurio_server::server::LocalConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -499,7 +500,7 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to hash password: {e}"))
 }
 
-/// The dynamic security state, as authorizer and credential validator.
+/// The dynamic security state, checking passwords and topic access.
 pub struct DynamicSecurity {
     path: String,
     data: RwLock<Data>,
@@ -660,13 +661,6 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
-impl Authorizer for DynamicSecurity {
-    fn authorize(&self, client: &ClientIdentity, topic: &str, access: Access) -> bool {
-        let data = self.data.read().unwrap();
-        data.authorize(client.username.as_deref(), topic, access)
-    }
-}
-
 impl DynamicSecurity {
     fn check_password(&self, username: &str, password: &[u8]) -> bool {
         // Copied out so Argon2, which is slow on purpose, runs without the lock
@@ -686,7 +680,7 @@ impl DynamicSecurity {
     }
 }
 
-impl mercurio_server::plugin::Plugin for DynamicSecurity {
+impl Plugin for DynamicSecurity {
     fn name(&self) -> &str {
         "dynamic-security"
     }
@@ -710,6 +704,21 @@ impl mercurio_server::plugin::Plugin for DynamicSecurity {
             }
         })
     }
+
+    fn authorize<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+        access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        let data = self.data.read().unwrap();
+        let allowed = data.authorize(client.username.as_deref(), topic, access);
+        ready(if allowed {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
+    }
 }
 
 impl Reload for DynamicSecurity {
@@ -727,8 +736,8 @@ impl Reload for DynamicSecurity {
 mod tests {
     use super::*;
 
-    fn identity(username: &str) -> ClientIdentity {
-        ClientIdentity::new("c", Some(username.to_string()))
+    fn identity(username: &str) -> ClientInfo {
+        ClientInfo::new("c", Some(username.to_string()))
     }
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
@@ -737,8 +746,8 @@ mod tests {
         response["responses"].as_array().unwrap().clone()
     }
 
-    #[test]
-    fn test_disabled_clients_lose_access_and_the_file_stays_private() {
+    #[tokio::test]
+    async fn test_disabled_clients_lose_access_and_the_file_stays_private() {
         let path =
             std::env::temp_dir().join(format!("mercuriod-dynsec-off-{}", std::process::id()));
         let path = path.to_str().unwrap();
@@ -754,8 +763,18 @@ mod tests {
         );
 
         // Still connected, it may no longer even receive by default
-        assert!(!security.authorize(&identity("s1"), "anything", Access::Read));
-        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+        assert_eq!(
+            security
+                .authorize(&identity("s1"), "anything", Access::Read)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .await,
+            Decision::Allow
+        );
 
         #[cfg(unix)]
         {
@@ -766,15 +785,20 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn test_commands_manage_clients_and_access() {
+    #[tokio::test]
+    async fn test_commands_manage_clients_and_access() {
         let path = std::env::temp_dir().join(format!("mercuriod-dynsec-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
         assert!(security.check_password("admin", b"secret"));
-        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+        assert_eq!(
+            security
+                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .await,
+            Decision::Allow
+        );
 
         let responses = run(
             &security,
@@ -800,18 +824,40 @@ mod tests {
 
         let s1 = identity("s1");
         assert!(security.check_password("s1", b"pw"));
-        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
-        assert!(!security.authorize(&s1, "sensors/secret", Access::Write));
-        assert!(!security.authorize(&s1, "sensors/t1", Access::Subscribe));
-        assert!(!security.authorize(&s1, COMMAND_TOPIC, Access::Write));
+        assert_eq!(
+            security.authorize(&s1, "sensors/t1", Access::Write).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security
+                .authorize(&s1, "sensors/secret", Access::Write)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&s1, "sensors/t1", Access::Subscribe)
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security.authorize(&s1, COMMAND_TOPIC, Access::Write).await,
+            Decision::Deny
+        );
 
         // Receiving is allowed by default, subscribing isn't
-        assert!(security.authorize(&s1, "anything", Access::Read));
-        assert!(!security.authorize(&s1, "anything", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "anything", Access::Read).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security.authorize(&s1, "anything", Access::Subscribe).await,
+            Decision::Deny
+        );
 
         // Groups give their roles to members, and to anonymous clients when
         // set as the anonymous group
-        let anonymous = ClientIdentity::new("a", None);
+        let anonymous = ClientInfo::new("a", None);
         let responses = run(
             &security,
             json!([
@@ -833,14 +879,30 @@ mod tests {
             responses[5]["data"]["group"]["clients"],
             json!([{ "username": "s1" }])
         );
-        assert!(security.authorize(&s1, "news/#", Access::Subscribe));
-        assert!(security.authorize(&anonymous, "news/today", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "news/#", Access::Subscribe).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Allow
+        );
         run(
             &security,
             json!([{ "command": "deleteGroup", "groupname": "readers" }]),
         );
-        assert!(!security.authorize(&s1, "news/#", Access::Subscribe));
-        assert!(!security.authorize(&anonymous, "news/today", Access::Subscribe));
+        assert_eq!(
+            security.authorize(&s1, "news/#", Access::Subscribe).await,
+            Decision::Deny
+        );
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Deny
+        );
 
         run(
             &security,
@@ -855,7 +917,10 @@ mod tests {
             &security,
             json!([{ "command": "enableClient", "username": "s1" }]),
         );
-        assert!(security.authorize(&s1, "sensors/t1", Access::Write));
+        assert_eq!(
+            security.authorize(&s1, "sensors/t1", Access::Write).await,
+            Decision::Allow
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

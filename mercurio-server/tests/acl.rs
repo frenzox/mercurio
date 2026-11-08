@@ -31,11 +31,13 @@ async fn start_broker(verify_users: bool) -> SocketAddr {
     let mut config = ServerConfig::default();
     config.auth.require_auth = verify_users;
     config.auth.allow_anonymous = true;
-    config.plugins = vec![Arc::new(SimpleCredentialValidator::new(HashMap::from([(
-        "alice".to_string(),
-        "secret".to_string(),
-    )])))];
-    config.auth.authorizer = Some(Arc::new(AclFile::parse(ACL).unwrap()));
+    config.plugins = vec![
+        Arc::new(SimpleCredentialValidator::new(HashMap::from([(
+            "alice".to_string(),
+            "secret".to_string(),
+        )]))),
+        Arc::new(AclFile::parse(ACL).unwrap()),
+    ];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

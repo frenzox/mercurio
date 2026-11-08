@@ -9,7 +9,7 @@ use std::time::Duration;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
-use mercurio_server::acl::{AclFile, Authorizer};
+use mercurio_server::acl::AclFile;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
@@ -459,60 +459,49 @@ fn build_auth(
         let mut value = ServerAuthConfig::default();
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
-        value.authorizer = Some(security.clone());
         return Ok((value, vec![security]));
     }
 
-    // The HTTP endpoints, each with the check it replaces
-    let (mut http_users, mut http_acl) = (None, None);
-    if let Some(http) = &config.http {
+    let http = config.http.as_ref().map(|http| {
         let auth = Arc::new(HttpAuth::new(
             http.user_url.clone(),
             http.acl_url.clone(),
             Duration::from_secs(http.timeout_seconds),
             Duration::from_secs(http.cache_seconds),
         ));
-        if http.user_url.is_some() {
-            http_users = Some(Arc::clone(&auth));
-        }
-        if http.acl_url.is_some() {
-            http_acl = Some(auth);
-        }
-    }
-    if (http_users.is_some() && config.password_file.is_some())
-        || (http_acl.is_some() && config.acl_file.is_some())
-    {
+        (auth, http.user_url.is_some(), http.acl_url.is_some())
+    });
+    let (http_users, http_acl) = http
+        .as_ref()
+        .map_or((false, false), |(_, users, acl)| (*users, *acl));
+    // Each URL replaces the file doing the same check
+    if (http_users && config.password_file.is_some()) || (http_acl && config.acl_file.is_some()) {
         return Err("[auth.http] URLs replace password_file and acl_file".to_string());
     }
 
-    let authorizer = match &config.acl_file {
-        _ if http_acl.is_some() => http_acl.map(|http| http as Arc<dyn Authorizer>),
-        Some(path) => {
-            let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
-            info!("Loaded topic access control from {}", path);
-            reloadable.push(acl.clone());
-            Some(acl as Arc<dyn Authorizer>)
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if config.enabled {
+        if let Some(path) = &config.password_file {
+            let validator = Arc::new(Reloadable::load(path, load_credentials)?);
+            info!("Loaded credentials from {}", path);
+            reloadable.push(validator.clone());
+            plugins.push(validator);
         }
-        None => None,
-    };
-    if !config.enabled {
-        let mut value = ServerAuthConfig::default();
-        value.authorizer = authorizer;
-        return Ok((value, Vec::new()));
+    }
+    // Without authentication, only its access control is used
+    if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
+        plugins.push(auth);
+    }
+    if let Some(path) = &config.acl_file {
+        let acl = Arc::new(Reloadable::load(path, load_acl_file)?);
+        info!("Loaded topic access control from {}", path);
+        reloadable.push(acl.clone());
+        plugins.push(acl);
     }
 
-    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-    if let Some(path) = &config.password_file {
-        let validator = Arc::new(Reloadable::load(path, load_credentials)?);
-        info!("Loaded credentials from {}", path);
-        reloadable.push(validator.clone());
-        plugins.push(validator);
-    }
-    plugins.extend(http_users.map(|http| http as Arc<dyn Plugin>));
     let mut value = ServerAuthConfig::default();
-    value.require_auth = true;
+    value.require_auth = config.enabled;
     value.allow_anonymous = config.allow_anonymous;
-    value.authorizer = authorizer;
     Ok((value, plugins))
 }
 
