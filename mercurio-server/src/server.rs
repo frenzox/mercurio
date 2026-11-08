@@ -88,8 +88,9 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Limits {
-    /// How long a new connection may take to complete the TLS handshake and
-    /// send CONNECT before it is closed.
+    /// How long a new connection may take, in all, to send its PROXY header,
+    /// complete the TLS and WebSocket handshakes and send CONNECT, enhanced
+    /// authentication included, before it is closed.
     pub connect_timeout: Duration,
     /// Largest packet accepted from a client, fixed header included.
     pub max_packet_size: usize,
@@ -363,6 +364,10 @@ struct HandlerParts<St: MqttStore + 'static> {
     http_dir: Option<Arc<PathBuf>>,
     /// An in-process connection, from the local listener
     local: bool,
+    /// When the PROXY header, the TLS and WebSocket handshakes and CONNECT
+    /// must all be done by; one deadline, so a client trickling bytes can't
+    /// take the time allowed once per step
+    connect_deadline: Instant,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -407,7 +412,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
     {
         if settings.proxy_protocol {
             let header = proxy::read_header(&mut socket);
-            match time::timeout(self.limits.connect_timeout, header).await {
+            match time::timeout_at(self.connect_deadline, header).await {
                 Ok(Ok(source)) => {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
@@ -430,7 +435,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let Some(acceptor) = settings.tls_acceptor else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
-        match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
+        match time::timeout_at(self.connect_deadline, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
                 debug!("TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
@@ -468,7 +473,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
                         let request = Box::pin(http::serve_or_upgrade(stream, &dir));
-                        match time::timeout(self.limits.connect_timeout, request).await {
+                        match time::timeout_at(self.connect_deadline, request).await {
                             Ok(Ok(Some(upgrade))) => upgrade,
                             Ok(Ok(None)) => return,
                             Ok(Err(e)) => {
@@ -482,7 +487,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
                 let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
-                match time::timeout(self.limits.connect_timeout, handshake).await {
+                match time::timeout_at(self.connect_deadline, handshake).await {
                     Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
                     Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
@@ -508,6 +513,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             stats: self.stats,
             cert_identity: self.cert_identity,
             local: self.local,
+            connect_deadline: self.connect_deadline,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -591,6 +597,7 @@ where
     cert_identity: Option<String>,
     /// An in-process connection, from the local listener
     local: bool,
+    connect_deadline: Instant,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -833,6 +840,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 mount_point: None,
                 http_dir: None,
                 local: false,
+                connect_deadline: Instant::now() + self.limits.connect_timeout,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -871,11 +879,8 @@ impl<St: MqttStore + 'static> Listener<St> {
             .connection
             .set_max_packet_size(handler.limits.max_packet_size);
 
-        let first_packet = time::timeout(
-            handler.limits.connect_timeout,
-            handler.connection.read_packet(),
-        )
-        .await;
+        let first_packet =
+            time::timeout_at(handler.connect_deadline, handler.connection.read_packet()).await;
 
         // Boxed, as it is kept until the connection ends
         let first_packet = Box::new(first_packet);
@@ -1306,10 +1311,9 @@ where
                 .await?;
 
             // The exchange counts towards the time allowed to connect
-            let response =
-                time::timeout(self.limits.connect_timeout, self.connection.read_packet())
-                    .await
-                    .map_err(|_| ReasonCode::MaximumConnectTime)??;
+            let response = time::timeout_at(self.connect_deadline, self.connection.read_packet())
+                .await
+                .map_err(|_| ReasonCode::MaximumConnectTime)??;
 
             // Only AUTH continuing the same method may answer a challenge
             let Some(ControlPacket::Auth(auth)) = response else {

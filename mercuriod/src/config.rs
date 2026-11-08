@@ -335,7 +335,8 @@ pub struct ServerConfig {
     #[serde(default = "default_max_subscriptions")]
     pub max_subscriptions: usize,
 
-    /// Seconds a new connection has to send CONNECT
+    /// Seconds a new connection has, in all, to complete its handshakes and
+    /// send CONNECT
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
 

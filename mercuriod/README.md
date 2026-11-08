@@ -96,7 +96,8 @@ max_queued_qos0_messages = 1000
 # Subscriptions one session may hold; further ones get Quota Exceeded
 # max_subscriptions = 10000
 
-# Seconds a new connection has to complete TLS and send CONNECT
+# Seconds a new connection has, in all, to send its PROXY header, complete
+# the TLS and WebSocket handshakes and send CONNECT
 connect_timeout = 10
 
 # Highest topic alias MQTT 5 clients may use (0 disables topic aliases)

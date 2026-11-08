@@ -67,7 +67,7 @@ mount_point = "tenant1/"</pre>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>max_connections</code></td><td><code>10000</code></td><td>Concurrent connections, across every listener. Further ones are closed right after being accepted.</td></tr>
 <tr><td><code>max_packet_size</code></td><td><code>1048576</code></td><td>Largest packet accepted from a client, in bytes. Announced to MQTT 5 clients.</td></tr>
-<tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has to complete TLS and send CONNECT.</td></tr>
+<tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has, in all, to send its PROXY header, complete the TLS and WebSocket handshakes and send CONNECT, enhanced authentication included.</td></tr>
 <tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>Messages that may wait for one client, any QoS, before further ones are dropped.</td></tr>
 <tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
 <tr><td><code>max_queued_bytes</code></td><td><code>104857600</code></td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
