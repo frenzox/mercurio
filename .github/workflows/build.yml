@@ -31,12 +31,23 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: mercurio
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace --all-features
+        env:
+          MERCURIO_TEST_POSTGRES_URL: postgres://postgres:mercurio@localhost:5432/postgres
 
   audit:
     runs-on: ubuntu-latest

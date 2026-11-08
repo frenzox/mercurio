@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
-    InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
-    SessionStore, StorageError, StoredWillMessage, WillStore,
+    BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
+    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore,
 };
 
 /// In-memory storage backend implementing all storage traits.
@@ -34,6 +34,8 @@ impl MemoryStore {
         Self::default()
     }
 }
+
+impl BatchStore for MemoryStore {}
 
 #[async_trait]
 impl SessionStore for MemoryStore {

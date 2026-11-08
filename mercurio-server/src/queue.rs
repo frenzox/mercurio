@@ -3,10 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use tokio::sync::{mpsc::UnboundedSender, Notify};
+use tokio::sync::Notify;
 use tracing::warn;
 
 use mercurio_core::{message::Message, qos::QoS};
+use mercurio_storage::Write;
+
+use crate::writer::Writer;
 
 /// How many messages one session may have waiting to be sent.
 #[derive(Debug, Clone, Copy)]
@@ -59,15 +62,7 @@ struct QueueState {
     /// logged once rather than for every message
     dropped: u64,
     /// Where QoS 1 and 2 messages are recorded while the client is away
-    journal: Option<UnboundedSender<JournalEvent>>,
-}
-
-/// A change to a queue to apply to its stored copy.
-#[derive(Debug)]
-pub(crate) enum JournalEvent {
-    Enqueued(u64, Box<Message>),
-    /// The stored copy is no longer needed
-    Clear,
+    journal: Option<Writer>,
 }
 
 impl Default for MessageQueue {
@@ -123,7 +118,7 @@ impl MessageQueue {
             .as_ref()
             .filter(|_| message.qos != QoS::AtMostOnce)
         {
-            let _ = journal.send(JournalEvent::Enqueued(sequence, Box::new(message.clone())));
+            journal.write(Write::Enqueue(sequence, message.clone()));
         }
         state.bytes += size;
         state.messages.push_back((sequence, message));
@@ -133,11 +128,11 @@ impl MessageQueue {
 
     /// Starts recording QoS 1 and 2 messages in `journal`, beginning with
     /// those already queued. Used while the client is disconnected.
-    pub(crate) fn start_journal(&self, journal: UnboundedSender<JournalEvent>) {
+    pub(crate) fn start_journal(&self, journal: Writer) {
         let mut state = self.state.lock().unwrap();
         for (sequence, message) in &state.messages {
             if message.qos != QoS::AtMostOnce {
-                let _ = journal.send(JournalEvent::Enqueued(*sequence, Box::new(message.clone())));
+                journal.write(Write::Enqueue(*sequence, message.clone()));
             }
         }
         state.journal = Some(journal);
@@ -147,7 +142,7 @@ impl MessageQueue {
     /// back to receive the queue or the session is gone.
     pub(crate) fn stop_journal(&self) {
         if let Some(journal) = self.state.lock().unwrap().journal.take() {
-            let _ = journal.send(JournalEvent::Clear);
+            journal.write(Write::ClearQueue);
         }
     }
 
@@ -269,6 +264,8 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::timeout;
 
+    use crate::writer::Op;
+
     use super::*;
 
     fn message(qos: QoS) -> Message {
@@ -367,7 +364,7 @@ mod tests {
         queue.push(message(QoS::AtLeastOnce));
         queue.push(message(QoS::AtMostOnce));
 
-        let (journal, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (journal, mut events) = Writer::channel();
         queue.start_journal(journal);
         queue.push(message(QoS::ExactlyOnce));
         queue.stop_journal();
@@ -376,8 +373,9 @@ mod tests {
         let mut recorded = Vec::new();
         while let Ok(event) = events.try_recv() {
             recorded.push(match event {
-                JournalEvent::Enqueued(sequence, m) => format!("{sequence}:{}", m.qos as u8),
-                JournalEvent::Clear => "clear".to_string(),
+                Op::Write(Write::Enqueue(sequence, m), _) => format!("{sequence}:{}", m.qos as u8),
+                Op::Write(Write::ClearQueue, _) => "clear".to_string(),
+                _ => "other".to_string(),
             });
         }
         // The queued QoS 1 message, then the new QoS 2 one; QoS 0 is skipped

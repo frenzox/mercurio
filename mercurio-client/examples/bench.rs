@@ -1,7 +1,7 @@
 //! Load generator for comparing brokers:
 //!
 //! ```text
-//! cargo run --release --example bench -- <port> [fan-in-qos0|fan-in-qos1|fan-out|latency]
+//! cargo run --release --example bench -- <port> [fan-in-qos0|fan-in-qos1|fan-in-qos1-persistent|fan-out|latency]
 //! ```
 //!
 //! Every scenario uses MQTT 5 clients on 127.0.0.1 and prints one line.
@@ -14,10 +14,13 @@ use std::{
 use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
 
 async fn client(port: u16, id: String) -> MqttClient {
-    let options = ConnectOptions::new("127.0.0.1", port)
-        .client_id(id)
-        .receive_maximum(1000);
-    MqttClient::connect(options).await.expect("connect")
+    connect(ConnectOptions::new("127.0.0.1", port).client_id(id)).await
+}
+
+async fn connect(options: ConnectOptions) -> MqttClient {
+    MqttClient::connect(options.receive_maximum(1000))
+        .await
+        .expect("connect")
 }
 
 /// Receives `expected` messages, returning when the last one arrived.
@@ -35,8 +38,15 @@ async fn receive(client: &MqttClient, expected: u64) -> Instant {
 
 /// `publishers` clients each publish `count` messages to their own topic;
 /// one subscriber receives them all.
-async fn fan_in(port: u16, qos: QoS, publishers: u64, count: u64) {
-    let subscriber = client(port, "bench-sub".into()).await;
+/// With `persistent`, the subscriber's session outlives its connection, so
+/// the broker stores what it sends it.
+async fn fan_in(port: u16, qos: QoS, publishers: u64, count: u64, persistent: bool) {
+    let options = ConnectOptions::new("127.0.0.1", port).client_id("bench-sub");
+    let options = match persistent {
+        true => options.session_expiry(3600),
+        false => options,
+    };
+    let subscriber = connect(options).await;
     subscriber.subscribe(&[("bench/#", qos)]).await.unwrap();
 
     let started = Instant::now();
@@ -153,8 +163,9 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let port: u16 = args.next().expect("port").parse().expect("port number");
     match args.next().as_deref().unwrap_or("fan-in-qos0") {
-        "fan-in-qos0" => fan_in(port, QoS::AtMostOnce, 10, 100_000).await,
-        "fan-in-qos1" => fan_in(port, QoS::AtLeastOnce, 10, 20_000).await,
+        "fan-in-qos0" => fan_in(port, QoS::AtMostOnce, 10, 100_000, false).await,
+        "fan-in-qos1" => fan_in(port, QoS::AtLeastOnce, 10, 20_000, false).await,
+        "fan-in-qos1-persistent" => fan_in(port, QoS::AtLeastOnce, 10, 20_000, true).await,
         "fan-out" => fan_out(port, 50, 10_000).await,
         "latency" => latency(port, 1000, 10_000).await,
         other => panic!("unknown scenario {other}"),

@@ -41,7 +41,11 @@
 <pre>[storage]
 backend = "sqlite"
 path = "/var/lib/mercurio/mercurio.db"</pre>
-<p>With <code>backend = "memory"</code>, the default, everything is lost when the broker stops. With SQLite, the broker keeps:</p>
+<p>Or, in a PostgreSQL database:</p>
+<pre>[storage]
+backend = "postgres"
+url = "postgres://mercurio:password@localhost/mercurio"</pre>
+<p>With <code>backend = "memory"</code>, the default, everything is lost when the broker stops. With SQLite or PostgreSQL, the broker keeps:</p>
 <ul>
 <li>sessions and their subscriptions, with their expiry;</li>
 <li>retained messages, with the client that published them;</li>
@@ -49,6 +53,17 @@ path = "/var/lib/mercurio/mercurio.db"</pre>
 <li>messages queued for disconnected clients with persistent sessions, and messages in flight.</li>
 </ul>
 <p>After a restart, clients with persistent sessions resume where they left off: their queued messages are delivered, and unacknowledged ones are sent again. Sessions that expired while the broker was down are discarded, and their wills published.</p>
+<p>Changes are written in the background, in order for each client and in batches, so storage doesn't slow clients down. They reach the database within milliseconds: a broker that crashes loses only the changes of its last moments, and one that shuts down writes everything first. When storage falls behind, by 10,000 changes for one client, that client waits for it.</p>
+<p>PostgreSQL needs version 12 or later. Connect the broker to it directly: PgBouncer drops the connection settings the broker relies on, and in transaction mode the lock described below. The broker creates its tables, and updates them when a new version needs it; it refuses a database updated by a newer version.</p>
+
+<h3 id="standby">Standby brokers</h3>
+<p>Only one broker serves from a PostgreSQL database at a time, since two would overwrite each other's sessions. A broker started on a database another one is using exits with an error, unless it is a standby:</p>
+<pre>[storage]
+backend = "postgres"
+url = "postgres://mercurio:password@db.example.com/mercurio?sslmode=require"
+standby = true</pre>
+<p>A standby waits without listening on its ports. It takes over as soon as the serving broker's process stops, or about 11 seconds after the database last heard from the serving broker's host, and serves every session from the database. Point clients at both brokers, through a load balancer or a list of addresses, so they reconnect to whichever serves.</p>
+<p>A broker that can't reach the database for about 7 seconds stops serving and exits with an error, because a standby may take over. With <code>standby = true</code> and the provided systemd unit, it restarts as the standby. Each takeover is recorded in the database, which refuses writes from brokers that served before it, even those delayed in the network, so a replaced broker can't overwrite the new one's sessions.</p>
 
 <h2 id="queues">Queues and slow clients</h2>
 <p>Each session has its own queue, so a slow or offline client never makes others lose messages. When its queue is full, further messages for that client are dropped:</p>
@@ -112,7 +127,7 @@ level = "info"
 </ul>
 
 <h2 id="shutdown">Shutdown</h2>
-<p>On <code>SIGTERM</code> or Ctrl+C, every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close. With SQLite, persistent sessions and their queues are on disk, so a restart loses nothing a client was promised.</p>
+<p>On <code>SIGTERM</code> or Ctrl+C, every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close. With SQLite or PostgreSQL, persistent sessions and their queues are in the database, so a restart loses nothing a client was promised.</p>
 
 <h2 id="memory">Memory</h2>
 <p>On Linux with glibc, the daemon limits the allocator to two arenas. Under heavy load with many threads, glibc otherwise keeps the memory each thread freed, and the broker's memory grows and stays high; with two arenas it stays flat, at no measurable cost in throughput. Memory use is otherwise dominated by queued messages, which the queue limits above bound.</p>

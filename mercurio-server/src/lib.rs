@@ -14,6 +14,7 @@ mod sys;
 pub mod tls;
 mod topic_tree;
 mod websocket;
+mod writer;
 
 /// Tracing target of the messages logged when clients connect and
 /// disconnect, so they can be filtered out on busy brokers.

@@ -6,13 +6,22 @@ description = "Storage abstraction layer for Mercurio MQTT broker"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frenzox/mercurio"
 homepage = "https://frenzox.github.io/mercurio/"
-keywords = ["mqtt", "broker", "sqlite", "persistence"]
+keywords = ["mqtt", "broker", "sqlite", "postgres", "persistence"]
 categories = ["network-programming", "database"]
 
 [features]
 default = ["std"]
 std = ["mercurio-core/std"]
 sqlite = ["dep:rusqlite", "dep:tokio"]
+postgres = [
+    "dep:tokio",
+    "dep:tokio-postgres",
+    "dep:deadpool-postgres",
+    "dep:futures-util",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.1.0", default-features = false }
@@ -20,7 +29,13 @@ async-trait = "0.1"
 bytes = "1"
 thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-tokio = { version = "1", features = ["rt", "sync"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }

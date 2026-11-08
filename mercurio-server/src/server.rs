@@ -588,14 +588,15 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
             interval,
         );
     }
-    for (client_id, will, due) in session_manager.restore_from_storage(&server.broker).await {
+    let restored_wills = session_manager.restore_from_storage(&server.broker).await?;
+    for (client_id, will, due) in restored_wills {
         let broker = server.broker.clone();
         let session_manager = session_manager.clone();
         tokio::spawn(async move {
             time::sleep(due).await;
             if session_manager.take_restored_will(&client_id).await {
                 publish_will(&broker, will, &client_id).await;
-                let _ = session_manager.delete_will(&client_id).await;
+                session_manager.delete_will(&client_id);
             }
         });
     }
@@ -620,6 +621,13 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         .is_err()
     {
         warn!("Connections still open after waiting to shut down");
+    }
+    // What connections changed as they closed is stored before returning
+    if time::timeout(Duration::from_secs(5), session_manager.flush())
+        .await
+        .is_err()
+    {
+        warn!("Storage still writing after waiting to shut down");
     }
     Ok(())
 }
@@ -1049,7 +1057,7 @@ where
                 }
                 let client_id = session.get_client_id().await;
                 publish_will(&broker, will, &client_id).await;
-                let _ = session_manager.delete_will(&client_id).await;
+                session_manager.delete_will(&client_id);
             };
 
             if delay.is_zero() {
@@ -1278,7 +1286,7 @@ where
                             if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
                                 session.clear_will().await;
                                 let client_id = session.get_client_id().await;
-                                let _ = self.session_manager.delete_will(&client_id).await;
+                                self.session_manager.delete_will(&client_id);
                             }
                             return Ok(());
                         }
@@ -1316,29 +1324,22 @@ where
                     if is_subscription_change {
                         let client_id = session.get_client_id().await;
                         let subscriptions = session.get_subscriptions().await;
-                        let _ = self
-                            .session_manager
-                            .save_subscriptions(&client_id, subscriptions)
-                            .await;
+                        self.session_manager
+                            .save_subscriptions(&client_id, subscriptions).await;
                     }
 
                     // Remove inflight message after acknowledgment
                     if let Some(packet_id) = inflight_completed {
                         let client_id = session.get_client_id().await;
-                        let _ = self
-                            .session_manager
-                            .remove_inflight(&client_id, packet_id)
-                            .await;
+                        self.session_manager.remove_inflight(&client_id, packet_id).await;
                     }
 
                     // After PUBREC only PUBREL remains to be sent for a QoS 2 message
                     if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
                         if pubrel.reason == ReasonCode::Success {
                             let client_id = session.get_client_id().await;
-                            let _ = self
-                                .session_manager
-                                .release_inflight(&client_id, pubrel.packet_id)
-                                .await;
+                            self.session_manager
+                                .release_inflight(&client_id, pubrel.packet_id).await;
                         }
                     }
 
@@ -1372,10 +1373,7 @@ where
 
                     if let Some(inflight) = outgoing.inflight {
                         let client_id = session.get_client_id().await;
-                        let _ = self
-                            .session_manager
-                            .store_inflight(&client_id, inflight.packet_id, &inflight)
-                            .await;
+                        self.session_manager.store_inflight(&client_id, &inflight).await;
                     }
 
                     self.connection.write_packet(outgoing.packet).await?;

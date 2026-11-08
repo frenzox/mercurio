@@ -133,9 +133,16 @@ level = "info"
 
 [storage]
 # Where sessions, retained messages, wills and in-flight messages are kept:
-# "memory" (lost on restart) or "sqlite" (kept in the file at `path`)
+# "memory" (lost on restart), "sqlite" (kept in the file at `path`) or
+# "postgres" (kept in the database at `url`)
 backend = "memory"
 # path = "/var/lib/mercurio/mercurio.db"
+# url = "postgres://mercurio:password@localhost/mercurio?sslmode=require"
+# CA that signed the PostgreSQL server's certificate; Mozilla's roots otherwise
+# ca_path = "/etc/mercurio/postgres-ca.pem"
+# One broker serves from a PostgreSQL database at a time. When another is,
+# exit (false), or wait and take over once it stops (true)
+# standby = false
 
 [auth]
 # Require clients to authenticate
