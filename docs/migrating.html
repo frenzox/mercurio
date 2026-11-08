@@ -124,7 +124,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><th>mosquitto</th><th>Mercurio, in <code>[server]</code></th></tr>
 <tr><td><code>max_queued_messages</code>, <code>max_queued_bytes</code></td><td><code>max_queued_messages</code>, <code>max_queued_bytes</code>; also <code>max_queued_qos0_messages</code></td></tr>
 <tr><td><code>max_packet_size</code>, <code>message_size_limit</code></td><td><code>max_packet_size</code></td></tr>
-<tr><td><code>max_keepalive</code></td><td><code>max_keepalive</code></td></tr>
+<tr><td><code>max_keepalive</code></td><td><code>max_keepalive</code>, for MQTT 5 clients only; see <a href="#differences">below</a></td></tr>
 <tr><td><code>max_qos</code>, <code>retain_available</code></td><td>the same</td></tr>
 <tr><td><code>max_inflight_messages</code></td><td><code>receive_maximum</code>, for QoS 2 from clients; clients announce their own Receive Maximum</td></tr>
 <tr><td><code>upgrade_outgoing_qos</code></td><td><code>upgrade_outgoing_qos</code></td></tr>
@@ -154,8 +154,9 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td><code>notifications</code></td><td><code>notifications</code>; the state goes to this broker only</td></tr>
 </table>
 
-<h2>Differences to know</h2>
+<h2 id="differences">Differences to know</h2>
 <ul>
+<li><code>max_keepalive</code> doesn't apply to MQTT 3.1.1 and 3.1 clients, as those protocols can't tell a client the server's limit. Mosquitto refuses them when they ask for a longer keep-alive, or for none; Mercurio accepts them with the keep-alive they asked for.</li>
 <li>A bridge's local side is trusted: this broker's ACLs don't restrict what it forwards in.</li>
 <li>Bridges to MQTT 3.1.1 brokers drop the remote broker's echo of what they forwarded, without mosquitto's <code>try_private</code> extension; see <a href="bridges.html">Bridges</a>.</li>
 <li>Over HTTP authentication, <code>clientid</code> is empty in login requests.</li>
