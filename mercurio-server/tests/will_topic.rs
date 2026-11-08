@@ -8,7 +8,9 @@ use tokio::{
 
 /// MQTT 5 CONNECT with a will on `topic`; returns the CONNACK reason code.
 async fn connect_with_will(addr: std::net::SocketAddr, topic: &str) -> u8 {
-    let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x06, 0x00, 0x3c, 0x00];
+    let mut body = vec![
+        0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x06, 0x00, 0x3c, 0x00,
+    ];
     // Client id "w", no will properties, the will topic, payload "x"
     body.extend([0x00, 0x01, b'w', 0x00]);
     body.extend((topic.len() as u16).to_be_bytes());

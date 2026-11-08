@@ -515,6 +515,33 @@ where
     _shutdown_complete: mpsc::Sender<()>,
 }
 
+/// A packet for logs: its type, and for a PUBLISH its topic and size,
+/// never the payload, which may carry secrets such as the passwords of
+/// dynamic security commands.
+fn describe(packet: &ControlPacket) -> String {
+    match packet {
+        ControlPacket::Publish(publish) => format!(
+            "PUBLISH on `{}` ({} bytes)",
+            publish.topic_name,
+            publish.payload.as_ref().map_or(0, |p| p.len())
+        ),
+        ControlPacket::Connect(_) => "CONNECT".into(),
+        ControlPacket::ConnAck(_) => "CONNACK".into(),
+        ControlPacket::PubAck(_) => "PUBACK".into(),
+        ControlPacket::PubRec(_) => "PUBREC".into(),
+        ControlPacket::PubRel(_) => "PUBREL".into(),
+        ControlPacket::PubComp(_) => "PUBCOMP".into(),
+        ControlPacket::Subscribe(_) => "SUBSCRIBE".into(),
+        ControlPacket::SubAck(_) => "SUBACK".into(),
+        ControlPacket::Unsubscribe(_) => "UNSUBSCRIBE".into(),
+        ControlPacket::UnsubAck(_) => "UNSUBACK".into(),
+        ControlPacket::PingReq(_) => "PINGREQ".into(),
+        ControlPacket::PingResp(_) => "PINGRESP".into(),
+        ControlPacket::Disconnect(_) => "DISCONNECT".into(),
+        ControlPacket::Auth(_) => "AUTH".into(),
+    }
+}
+
 /// Checks credentials off the async threads, as password hashes take tens
 /// of milliseconds of CPU and validators may block on I/O, and at most one
 /// per core at a time, so a flood of logins queues instead of starving
@@ -1419,7 +1446,7 @@ where
                     }
 
                     if let Some(res) = maybe_res {
-                        tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
+                        debug!("Sending {} to client {:?}", describe(&res), session.get_client_id().await);
                         self.connection.write_packet(res).await?;
                     }
 
@@ -1444,7 +1471,7 @@ where
                     let Some(outgoing) = session.prepare_publish(message).await else {
                         continue;
                     };
-                    tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", outgoing.packet, session.get_client_id().await);
+                    debug!("Sending {} to client {:?}", describe(&outgoing.packet), session.get_client_id().await);
 
                     if let Some(inflight) = outgoing.inflight {
                         let client_id = session.get_client_id().await;
