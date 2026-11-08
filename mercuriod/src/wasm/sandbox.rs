@@ -275,11 +275,35 @@ fn authority(uri: &http::Uri) -> Option<String> {
     Some(format!("{}:{port}", authority.host()).to_ascii_lowercase())
 }
 
+/// The most bytes of one message a plugin logs; the rest is cut.
+const LOG_MESSAGE: usize = 4096;
+
+/// `message` cut to [`LOG_MESSAGE`] bytes, with control characters
+/// escaped, so a plugin can't flood the log or forge lines in it.
+fn loggable(message: String) -> String {
+    let mut end = message.len().min(LOG_MESSAGE);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut line = String::with_capacity(end);
+    for c in message[..end].chars() {
+        match c.is_control() {
+            true => line.extend(c.escape_default()),
+            false => line.push(c),
+        }
+    }
+    if end < message.len() {
+        line.push('…');
+    }
+    line
+}
+
 impl super::runtime::bindings::mercurio::plugin::types::Host for State {}
 
 impl host::Host for State {
     async fn log(&mut self, level: Level, message: String) {
         let name = &self.name;
+        let message = loggable(message);
         match level {
             Level::Trace => tracing::trace!(plugin = %name, "{message}"),
             Level::Debug => tracing::debug!(plugin = %name, "{message}"),
@@ -377,6 +401,18 @@ mod tests {
         kv.set("b".into(), vec![0; 9]).unwrap();
         assert_eq!(kv.get("b").map(|v| v.len()), Some(9));
         assert!(kv.get("a").is_none());
+    }
+
+    #[test]
+    fn test_logged_messages_stay_on_one_bounded_line() {
+        assert_eq!(
+            loggable("ok\nINFO forged\r\x1b[31m\tx".into()),
+            "ok\\nINFO forged\\r\\u{1b}[31m\\tx"
+        );
+        let long = loggable("é".repeat(LOG_MESSAGE));
+        assert!(long.len() <= LOG_MESSAGE + "…".len(), "{}", long.len());
+        assert!(long.ends_with('…'));
+        assert_eq!(loggable("plain".into()), "plain");
     }
 
     #[test]
