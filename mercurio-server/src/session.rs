@@ -21,8 +21,8 @@ use mercurio_core::{
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
         MaximumQoS, MessageExpiryInterval, ReceiveMaximum, ResponseInformation, RetainAvailable,
-        ServerKeepAlive, SharedSubscriptionAvailable, SubscriptionIdentifier,
-        SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
+        ServerKeepAlive, SessionExpiryInterval, SharedSubscriptionAvailable,
+        SubscriptionIdentifier, SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
         WildcardSubscriptionAvailable,
     },
     qos::QoS,
@@ -181,6 +181,48 @@ fn publish_properties(
         user_property: properties.user_property.clone(),
         ..Default::default()
     })
+}
+
+/// Lowers the session expiry an MQTT 5 client asks for to the server's
+/// maximum, no expiry included, so every later use of the CONNECT sees the
+/// expiry the session will have.
+pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Limits) {
+    let Some(max) = limits.max_session_expiry else {
+        return;
+    };
+    if !connect_packet.protocol_version.supports_properties() {
+        return;
+    }
+    // u32::MAX means no expiry, so the most a maximum can be is one less
+    let max = u32::try_from(max.as_secs())
+        .unwrap_or(u32::MAX - 1)
+        .min(u32::MAX - 1);
+    let requested = connect_packet
+        .properties
+        .as_ref()
+        .and_then(|p| p.session_expiry_interval.as_ref())
+        .map_or(0, |e| e.value);
+    if requested > max {
+        connect_packet
+            .properties
+            .get_or_insert_with(Default::default)
+            .session_expiry_interval = Some(SessionExpiryInterval::new(max));
+    }
+}
+
+/// The session expiry to announce in CONNACK: the server's maximum, when
+/// the client's request was lowered to it.
+fn announced_session_expiry(connect_packet: &ConnectPacket, limits: &Limits) -> Option<u32> {
+    let max = u32::try_from(limits.max_session_expiry?.as_secs())
+        .unwrap_or(u32::MAX - 1)
+        .min(u32::MAX - 1);
+    let requested = connect_packet
+        .properties
+        .as_ref()?
+        .session_expiry_interval
+        .as_ref()?
+        .value;
+    (requested == max).then_some(max)
 }
 
 /// The keep-alive the connection runs with: the client's own, unless it
@@ -472,6 +514,11 @@ impl Session {
                         .map(|template| {
                             ResponseInformation::new(template.replace("%c", &session.client_id))
                         }),
+                    session_expiry_interval: announced_session_expiry(
+                        &session.connect_packet,
+                        limits,
+                    )
+                    .map(SessionExpiryInterval::new),
                     server_keepalive: {
                         let keepalive = effective_keepalive(&session.connect_packet, limits);
                         (keepalive != session.connect_packet.keepalive)

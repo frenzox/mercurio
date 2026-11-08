@@ -52,7 +52,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http, proxy,
-    session::{effective_keepalive, Outgoing, Session, WillMessage},
+    session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
@@ -121,6 +121,10 @@ pub struct Limits {
     /// Subscriptions one session may hold; further ones are refused with
     /// Quota Exceeded. Each costs memory and work on every message.
     pub max_subscriptions: Option<usize>,
+    /// Longest a session may outlive its connection. MQTT 5 clients asking
+    /// for longer, or for no expiry, are told to use this; it also bounds
+    /// `persistent_client_expiration`. Unbounded when unset.
+    pub max_session_expiry: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -139,6 +143,7 @@ impl Default for Limits {
             persistent_client_expiration: None,
             check_retain_source: false,
             max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
+            max_session_expiry: None,
         }
     }
 }
@@ -1128,9 +1133,13 @@ where
             .as_ref()
             .and_then(|p| p.maximum_packet_size.as_ref())
             .map(|m| m.value);
+        cap_session_expiry(&mut connect_packet, &self.limits);
         let mut expiry = session_expiry(&connect_packet);
         if expiry.is_none() && !protocol_version.supports_properties() {
             expiry = self.limits.persistent_client_expiration;
+            if let Some(max) = self.limits.max_session_expiry {
+                expiry = Some(expiry.map_or(max, |expiry| expiry.min(max)));
+            }
         }
 
         let owner = SessionOwner {

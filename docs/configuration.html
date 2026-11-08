@@ -85,6 +85,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>auto_id_prefix</code></td><td><code>""</code></td><td>Prefix of the client ids the broker assigns.</td></tr>
 <tr><td><code>clientid_prefixes</code></td><td><code>[]</code></td><td>When not empty, only client ids starting with one of these are accepted; others are refused as not authorized.</td></tr>
 <tr><td><code>persistent_client_expiration</code></td><td>never</td><td>Seconds the session of an MQTT 3.x client connected without clean session outlives its connection. MQTT 5 clients choose their own expiry.</td></tr>
+<tr><td><code>max_session_expiry</code></td><td>unbounded</td><td>Most seconds any session may outlive its connection. MQTT 5 clients asking for longer, or for no expiry, are told to use this; it also bounds <code>persistent_client_expiration</code>. Worth setting where clients aren't trusted, as each stored session takes memory and storage.</td></tr>
 </table>
 
 <h3>Delivery</h3>

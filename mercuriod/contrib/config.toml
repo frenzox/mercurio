@@ -96,6 +96,9 @@ receive_maximum = 65535
 # session outlives its connection; forever when unset, as MQTT 3.x has no
 # session expiry of its own
 # persistent_client_expiration = 604800
+# Most seconds any session may outlive its connection, MQTT 5 clients
+# included; worth setting where clients aren't trusted (unbounded by default)
+# max_session_expiry = 2592000
 
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.

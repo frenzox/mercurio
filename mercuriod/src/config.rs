@@ -386,6 +386,10 @@ pub struct ServerConfig {
     /// connection; forever when unset
     pub persistent_client_expiration: Option<u64>,
 
+    /// Most seconds any session may outlive its connection; MQTT 5 clients
+    /// asking for longer are told to use this. Unbounded when unset
+    pub max_session_expiry: Option<u64>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -421,6 +425,7 @@ impl Default for ServerConfig {
             auto_id_prefix: String::new(),
             clientid_prefixes: Vec::new(),
             persistent_client_expiration: None,
+            max_session_expiry: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -598,6 +603,7 @@ impl ServerConfig {
             self.persistent_client_expiration.map(Duration::from_secs);
         limits.check_retain_source = self.check_retain_source;
         limits.max_subscriptions = Some(self.max_subscriptions);
+        limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
         Ok(limits)
     }
 }
