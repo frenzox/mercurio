@@ -289,7 +289,8 @@ impl ConnAckPacket {
             0x03 => ReasonCode::ServerUnavailable,
             0x04 => ReasonCode::BadUserNameOrPassword,
             0x05 => ReasonCode::NotAuthorized,
-            _ => ReasonCode::UnspecifiedError,
+            // Reserved [MQTT-3.2.2.3]
+            _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 
         Ok(ConnAckPacket {
