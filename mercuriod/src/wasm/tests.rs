@@ -238,15 +238,16 @@ async fn test_http_resources_share_the_resource_limit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kv_is_shared_by_instances() {
     let plugin = misbehave(|s| s.instances = 2).await;
-    let (a, b, c, d) = tokio::join!(
-        control(&plugin, "kv-count", b""),
-        control(&plugin, "kv-count", b""),
-        control(&plugin, "kv-count", b""),
-        control(&plugin, "kv-count", b""),
+    let marks = tokio::join!(
+        control(&plugin, "kv-mark", b"a"),
+        control(&plugin, "kv-mark", b"b"),
+        control(&plugin, "kv-mark", b"c"),
+        control(&plugin, "kv-mark", b"d"),
     );
-    let mut counts: Vec<_> = [a, b, c, d].into_iter().map(Option::unwrap).collect();
-    counts.sort();
-    assert_eq!(counts, ["1", "2", "3", "4"]);
+    assert!([marks.0, marks.1, marks.2, marks.3]
+        .iter()
+        .all(Option::is_some));
+    assert_eq!(control(&plugin, "kv-marks", b"").await.unwrap(), "4");
 }
 
 async fn free_port() -> u16 {

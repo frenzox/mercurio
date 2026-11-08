@@ -87,6 +87,10 @@ in the plugin type. Keep shared state in the host store: [`host::kv_get`],
 in memory and is lost when the broker stops. `kv_set` can fail, for
 example when the plugin is over its quota.
 
+The store is shared but not transactional: a get followed by a set can race
+with another copy, so a counter kept as get-then-set can lose updates.
+Prefer writing distinct keys and counting them with `kv_list`.
+
 ## More
 
 The broker's plugin documentation is at

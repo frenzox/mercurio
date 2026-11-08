@@ -65,7 +65,8 @@ interface host {
   log: func(level: level, message: string);
 
   /// A store shared by every copy of the plugin, kept in memory until the
-  /// broker stops.
+  /// broker stops. It is shared but not transactional: a get followed by a
+  /// set can race with another copy.
   kv-get: func(key: string) -> option<list<u8>>;
   /// Fails when the store refuses the value, for example over a quota.
   kv-set: func(key: string, value: list<u8>) -> result<_, string>;

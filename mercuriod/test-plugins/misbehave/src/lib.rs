@@ -72,6 +72,11 @@ impl Plugin for Misbehave {
                 std::mem::forget(held);
                 Some(most.to_string().into_bytes())
             }
+            "kv-mark" => {
+                host::kv_set(&format!("mark/{text}"), b"").ok()?;
+                Some(Vec::new())
+            }
+            "kv-marks" => Some(host::kv_list("mark/").len().to_string().into_bytes()),
             "kv-count" => {
                 let count = host::kv_get("count")
                     .and_then(|v| String::from_utf8(v).ok())
