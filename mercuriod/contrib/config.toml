@@ -151,7 +151,7 @@ backend = "memory"
 enabled = false
 
 # Allow clients that send no user name (when auth is enabled)
-allow_anonymous = true
+allow_anonymous = false
 
 # User names and Argon2 password hashes, managed with `mercuriod passwd`
 # password_file = "/etc/mercurio/passwd"

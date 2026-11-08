@@ -700,8 +700,10 @@ impl Default for AuthConfig {
     }
 }
 
+/// Enabling authentication refuses clients without credentials unless
+/// they are explicitly allowed, as in mosquitto 2.
 fn default_allow_anonymous() -> bool {
-    true
+    false
 }
 
 #[cfg(test)]
