@@ -123,17 +123,22 @@ export_plugin!(DenyTopic);</pre>
 path = "/etc/mercurio/plugins/deny_topic.wasm"
 name = "deny"
 config = { prefix = "$internal/" }</pre>
+<p><code>webhook-audit</code> sends plain HTTP, so its host needs the port in <code>allow_http</code>:</p>
+<pre>[[plugins]]
+path = "/etc/mercurio/plugins/webhook_audit.wasm"
+config = { url = "http://audit.internal/events" }
+allow_http = ["audit.internal:80"]</pre>
 <p>A plugin built for <code>mercurio:plugin/guest@0.1.x</code> loads. A component built for another version is refused, with an error that names the version. See the <a href="configuration.html#plugins">configuration reference</a> for every key.</p>
 <p>The broker matches a component to the interface by the shape of its types, so adding a hook, a field or a case would break plugins built for the old shape. Such changes come with a new minor version, such as 0.2. A 0.1.x release changes only documentation, so a plugin built for any 0.1.x loads in a broker built for any other.</p>
 
 <h2 id="sandbox">The sandbox</h2>
 <ul>
 <li>A plugin has no files, no environment variables and no standard input. Standard output and error are discarded; use <code>host::log</code>, which keeps the first 4 KiB of a message and escapes control characters such as newlines. A Rust plugin built with <code>mercurio-plugin</code> sends its panic messages to the broker's log, at error level.</li>
-<li><code>allow_http</code> lists the hosts it may send HTTP requests to, as <code>host</code> or <code>host:port</code>. The default port is 443. The scheme is not checked, so <code>http://host:443</code> is allowed too. Other hosts are refused.</li>
+<li><code>allow_http</code> lists the hosts it may send HTTP requests to, as <code>host</code> or <code>host:port</code>. An entry without a port means port 443. The scheme is not checked, so <code>http://host:443</code> is allowed too, and a plain-HTTP endpoint on port 80 needs <code>host:80</code>. Other hosts are refused.</li>
 <li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may open sockets to. A socket may bind only to the wildcard address with port 0, which is what a connect needs. DNS lookups are off, so use addresses. With an empty list the plugin can't create a socket at all.</li>
 <li>Each copy may hold at most 4096 host resources at once, such as sockets, streams and HTTP requests. A call that tries to hold more traps.</li>
 <li><code>memory_mb</code> caps the linear memory of each copy. The default is 64.</li>
-<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. The default is 5000. The broker's own limit per hook is 5 seconds, so a larger value is cut to 5 seconds by the chain.</li>
+<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. The default is 5000. The broker's own limit per hook call is 5 seconds, so for hooks a larger value acts as 5 seconds. <code>init</code> when the plugin loads, or reloads, gets the full value.</li>
 </ul>
 <p>A plugin that traps, runs out of memory or runs out of time fails that call as described above, and its copy is replaced. The broker logs the cause.</p>
 
