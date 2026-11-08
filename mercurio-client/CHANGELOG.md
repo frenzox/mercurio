@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.2.0...mercurio-client-v0.3.0) - 2026-11-08
+
+### Fixed
+
+- refuse values too long for MQTT instead of truncating them
+
+### Other
+
+- *(packets)* [**breaking**] take a shared slice in ControlPacket::check
+- [**breaking**] remove API the crates never used
+- document the crates' APIs
+- declare Rust 1.89 as the minimum supported version
+- [**breaking**] mark the enums that may grow as non-exhaustive
+- *(server)* [**breaking**] let configuration grow without breaking users
+- *(client)* add an endurance check through broker failures
+- *(client)* benchmark many concurrent connections
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.1.0...mercurio-client-v0.2.0) - 2026-11-08
 
 ### Fixed

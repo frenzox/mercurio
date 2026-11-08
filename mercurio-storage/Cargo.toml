@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-storage"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Storage abstraction layer for Mercurio MQTT broker"
@@ -23,7 +23,7 @@ postgres = [
 ]
 
 [dependencies]
-mercurio-core = { path = "../mercurio-core", version = "0.1.1" }
+mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 async-trait = "0.1"
 bytes = "1"
 thiserror = "2"

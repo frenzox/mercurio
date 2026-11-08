@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-core-v0.1.1...mercurio-core-v0.2.0) - 2026-11-08
+
+### Fixed
+
+- *(core)* [**breaking**] refuse unknown levels in the ProtocolVersion conversion
+- refuse values too long for MQTT instead of truncating them
+- *(packets)* reject packets the spec calls malformed
+- *(server)* cap topic levels so a deep filter can't overflow the stack
+
+### Other
+
+- document the crates' APIs
+- declare Rust 1.89 as the minimum supported version
+- [**breaking**] mark the enums that may grow as non-exhaustive
+
 ## [0.1.1](https://github.com/frenzox/mercurio/compare/mercurio-core-v0.1.0...mercurio-core-v0.1.1) - 2026-11-08
 
 ### Other

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.2.0...mercurio-storage-v0.3.0) - 2026-11-08
+
+### Fixed
+
+- *(server)* resume a session only for the user and listener it belongs to
+
+### Other
+
+- [**breaking**] remove API the crates never used
+- *(storage)* point stores overriding apply to apply_each
+- declare Rust 1.89 as the minimum supported version
+- *(storage)* [**breaking**] keep database libraries' types out of the API
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.1.0...mercurio-storage-v0.2.0) - 2026-11-08
 
 ### Added
