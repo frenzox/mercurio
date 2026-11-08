@@ -28,11 +28,15 @@ pub(crate) struct State {
     name: Arc<str>,
 }
 
-/// How many bytes, keys and values together, a plugin's key-value store
-/// may hold. The store lives outside the copies' memory, so their memory
-/// limit doesn't cover it.
-// ponytail: fixed for now; Task 4 may make it configurable
+/// How many bytes a plugin's key-value store may hold, counting each
+/// entry's key, value and [`ENTRY_OVERHEAD`]. The store lives outside the
+/// copies' memory, so their memory limit doesn't cover it.
 const KV_CAPACITY: usize = 16 << 20;
+
+/// What an entry costs the host beyond its key and value, roughly: the
+/// map's node and the two allocations. Without it, millions of empty
+/// entries would fit in the quota.
+const ENTRY_OVERHEAD: usize = 64;
 
 /// The resources one component may create, beyond its memory size. A Rust
 /// plugin for wasm32-wasip2 needs 3 instances, 2 tables, 1 memory and
@@ -58,7 +62,7 @@ pub(crate) struct Kv {
 #[derive(Default)]
 struct Entries {
     map: BTreeMap<String, Vec<u8>>,
-    /// Bytes of the keys and values in `map`
+    /// Bytes of the entries in `map`, see [`Kv::cost`]
     size: usize,
 }
 
@@ -76,14 +80,18 @@ impl Kv {
         }
     }
 
+    fn cost(key: &str, value: &[u8]) -> usize {
+        key.len() + value.len() + ENTRY_OVERHEAD
+    }
+
     fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.entries.lock().unwrap().map.get(key).cloned()
     }
 
     fn set(&self, key: String, value: Vec<u8>) -> Result<(), String> {
         let mut entries = self.entries.lock().unwrap();
-        let old = entries.map.get(&key).map_or(0, |old| key.len() + old.len());
-        let size = entries.size - old + key.len() + value.len();
+        let old = entries.map.get(&key).map_or(0, |old| Kv::cost(&key, old));
+        let size = entries.size - old + Kv::cost(&key, &value);
         if size > self.capacity {
             return Err("kv store full".into());
         }
@@ -95,7 +103,7 @@ impl Kv {
     fn delete(&self, key: &str) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(value) = entries.map.remove(key) {
-            entries.size -= key.len() + value.len();
+            entries.size -= Kv::cost(key, &value);
         }
     }
 
@@ -360,14 +368,26 @@ mod tests {
 
     #[test]
     fn test_the_kv_store_refuses_values_past_its_capacity() {
-        let kv = Kv::with_capacity(10);
+        let kv = Kv::with_capacity(ENTRY_OVERHEAD + 10);
         kv.set("a".into(), vec![0; 5]).unwrap();
-        assert_eq!(kv.set("b".into(), vec![0; 4]), Err("kv store full".into()));
+        assert_eq!(kv.set("b".into(), vec![0; 1]), Err("kv store full".into()));
         // Overwriting counts the new value, not both
         kv.set("a".into(), vec![0; 9]).unwrap();
         kv.delete("a");
         kv.set("b".into(), vec![0; 9]).unwrap();
         assert_eq!(kv.get("b").map(|v| v.len()), Some(9));
         assert!(kv.get("a").is_none());
+    }
+
+    #[test]
+    fn test_every_kv_entry_costs_its_overhead() {
+        // Empty values still cost their key and the entry
+        let kv = Kv::with_capacity(4 * (ENTRY_OVERHEAD + 1));
+        for key in ["a", "b", "c", "d"] {
+            kv.set(key.into(), Vec::new()).unwrap();
+        }
+        assert_eq!(kv.set("e".into(), Vec::new()), Err("kv store full".into()));
+        kv.delete("a");
+        kv.set("e".into(), Vec::new()).unwrap();
     }
 }

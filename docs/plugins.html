@@ -65,7 +65,7 @@
 <p><code>kv-get</code>, <code>kv-set</code>, <code>kv-delete</code> and <code>kv-list</code> give copies a place for shared state.</p>
 <ul>
 <li>One store is shared by all copies of a plugin. It is in memory and is lost when the broker restarts. It stays across SIGHUP reloads.</li>
-<li>It holds at most 16 MiB. Past that, <code>kv-set</code> returns an error.</li>
+<li>It holds at most 16 MiB. Each entry counts its key, its value and 64 bytes for the entry itself. Past that, <code>kv-set</code> returns an error.</li>
 <li>It is not transactional. A <code>kv-get</code> followed by a <code>kv-set</code> can race with another copy doing the same, so do not rely on a read-modify-write being atomic.</li>
 </ul>
 
