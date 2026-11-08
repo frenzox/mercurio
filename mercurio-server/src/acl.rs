@@ -34,9 +34,19 @@ pub enum Access {
 
 /// Who is asking for access.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientIdentity {
     pub client_id: String,
     pub username: Option<String>,
+}
+
+impl ClientIdentity {
+    pub fn new(client_id: impl Into<String>, username: Option<String>) -> Self {
+        ClientIdentity {
+            client_id: client_id.into(),
+            username,
+        }
+    }
 }
 
 /// Decides which topics a client may read and write.

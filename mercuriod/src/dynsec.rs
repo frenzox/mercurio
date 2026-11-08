@@ -700,10 +700,7 @@ mod tests {
     use super::*;
 
     fn identity(username: &str) -> ClientIdentity {
-        ClientIdentity {
-            client_id: "c".to_string(),
-            username: Some(username.to_string()),
-        }
+        ClientIdentity::new("c", Some(username.to_string()))
     }
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
@@ -786,10 +783,7 @@ mod tests {
 
         // Groups give their roles to members, and to anonymous clients when
         // set as the anonymous group
-        let anonymous = ClientIdentity {
-            client_id: "a".to_string(),
-            username: None,
-        };
+        let anonymous = ClientIdentity::new("a", None);
         let responses = run(
             &security,
             json!([

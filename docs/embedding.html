@@ -80,13 +80,13 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 };
 use tokio::net::TcpListener;
 
-let config = ServerConfig {
-    listeners: vec![ListenerConfig {
-        tls: Some(TlsConfig::new("server.crt", "server.key")),
-        ..ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt)
-    }],
-    ..Default::default()
-};</pre>
+let mut tls_listener =
+    ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt);
+tls_listener.tls = Some(TlsConfig::new("server.crt", "server.key"));
+
+let mut config = ServerConfig::default();
+config.listeners.push(tls_listener);</pre>
+<p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
 
 <h2 id="auth">Authentication and access control</h2>
 <p>Two traits cover most needs. A <code>CredentialValidator</code> checks user names and passwords; an <code>Authorizer</code> decides topic access:</p>
@@ -95,7 +95,7 @@ let config = ServerConfig {
 use mercurio_server::{
     acl::{Access, Authorizer, ClientIdentity},
     auth::CredentialValidator,
-    server::{AuthConfig, ServerConfig},
+    server::ServerConfig,
 };
 
 struct Users;
@@ -118,16 +118,11 @@ impl Authorizer for OwnTopics {
     }
 }
 
-let config = ServerConfig {
-    auth: AuthConfig {
-        require_auth: true,
-        allow_anonymous: false,
-        credential_validator: Some(Arc::new(Users)),
-        authorizer: Some(Arc::new(OwnTopics)),
-        ..Default::default()
-    },
-    ..Default::default()
-};</pre>
+let mut config = ServerConfig::default();
+config.auth.require_auth = true;
+config.auth.allow_anonymous = false;
+config.auth.credential_validator = Some(Arc::new(Users));
+config.auth.authorizer = Some(Arc::new(OwnTopics));</pre>
 <ul>
 <li><code>Access</code> is <code>Write</code> to publish, <code>Subscribe</code> to subscribe, with the topic filter, and <code>Read</code> to receive a message.</li>
 <li><code>ClientIdentity::username</code> is only set for users the broker verified.</li>
@@ -149,11 +144,9 @@ methods.register(Box::new(PlainAuth::new(HashMap::from([(
     "alice".to_string(),
     "secret".to_string(),
 )]))));
-let auth = AuthConfig {
-    require_auth: true,
-    auth_manager: Some(Arc::new(methods)),
-    ..Default::default()
-};</pre>
+let mut auth = AuthConfig::default();
+auth.require_auth = true;
+auth.auth_manager = Some(Arc::new(methods));</pre>
 
 <h2>Storage</h2>
 <pre>use std::sync::Arc;
@@ -171,10 +164,8 @@ run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;</
 use mercurio_server::server::{run_with_config, LocalConnector, ServerConfig};
 
 let (connector, local_listener) = LocalConnector::new();
-let config = ServerConfig {
-    local_listener: Some(local_listener),
-    ..Default::default()
-};
+let mut config = ServerConfig::default();
+config.local_listener = Some(local_listener);
 tokio::spawn(run_with_config(listener, config, std::future::pending::&lt;()&gt;()));
 
 let options = ConnectOptions::new("localhost", 0)

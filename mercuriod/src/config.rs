@@ -580,28 +580,25 @@ impl ServerConfig {
         if maximum_qos == QoS::Invalid {
             return Err(format!("max_qos must be 0, 1 or 2, not {}", self.max_qos));
         }
-        Ok(Limits {
-            connect_timeout: Duration::from_secs(self.connect_timeout),
-            max_packet_size: self.max_packet_size,
-            queue: QueueLimits {
-                max_qos0: self.max_queued_qos0_messages,
-                max_messages: self.max_queued_messages,
-                max_bytes: Some(self.max_queued_bytes),
-                upgrade_qos: self.upgrade_outgoing_qos,
-            },
-            max_connections: Some(self.max_connections),
-            topic_alias_maximum: self.max_topic_alias,
-            receive_maximum: self.receive_maximum,
-            max_keepalive: self.max_keepalive,
-            send_topic_aliases: self.send_topic_aliases,
-            maximum_qos,
-            retain_available: self.retain_available,
-            persistent_client_expiration: self
-                .persistent_client_expiration
-                .map(Duration::from_secs),
-            check_retain_source: self.check_retain_source,
-            max_subscriptions: Some(self.max_subscriptions),
-        })
+        let mut limits = Limits::default();
+        limits.connect_timeout = Duration::from_secs(self.connect_timeout);
+        limits.max_packet_size = self.max_packet_size;
+        limits.queue.max_qos0 = self.max_queued_qos0_messages;
+        limits.queue.max_messages = self.max_queued_messages;
+        limits.queue.max_bytes = Some(self.max_queued_bytes);
+        limits.queue.upgrade_qos = self.upgrade_outgoing_qos;
+        limits.max_connections = Some(self.max_connections);
+        limits.topic_alias_maximum = self.max_topic_alias;
+        limits.receive_maximum = self.receive_maximum;
+        limits.max_keepalive = self.max_keepalive;
+        limits.send_topic_aliases = self.send_topic_aliases;
+        limits.maximum_qos = maximum_qos;
+        limits.retain_available = self.retain_available;
+        limits.persistent_client_expiration =
+            self.persistent_client_expiration.map(Duration::from_secs);
+        limits.check_retain_source = self.check_retain_source;
+        limits.max_subscriptions = Some(self.max_subscriptions);
+        Ok(limits)
     }
 }
 

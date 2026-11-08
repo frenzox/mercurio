@@ -2,10 +2,7 @@ mod common;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use mercurio_server::{
-    auth::SimpleCredentialValidator,
-    server::{AuthConfig, ServerConfig},
-};
+use mercurio_server::{auth::SimpleCredentialValidator, server::ServerConfig};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -15,16 +12,10 @@ async fn start_broker(allow_anonymous: bool) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let credentials = HashMap::from([("user".to_string(), "secret".to_string())]);
-    let config = ServerConfig {
-        auth: AuthConfig {
-            require_auth: true,
-            allow_anonymous,
-            credential_validator: Some(Arc::new(SimpleCredentialValidator::new(credentials))),
-            auth_manager: None,
-            authorizer: None,
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.auth.require_auth = true;
+    config.auth.allow_anonymous = allow_anonymous;
+    config.auth.credential_validator = Some(Arc::new(SimpleCredentialValidator::new(credentials)));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

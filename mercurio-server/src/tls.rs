@@ -11,6 +11,7 @@ use crate::error::ServerError;
 
 /// TLS configuration for the server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TlsConfig {
     /// Path to the certificate file (PEM format)
     pub cert_path: String,

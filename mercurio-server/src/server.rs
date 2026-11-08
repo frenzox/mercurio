@@ -55,6 +55,7 @@ use crate::{
 
 /// Authentication configuration for the server.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct AuthConfig {
     /// Whether authentication is required.
     pub require_auth: bool,
@@ -78,6 +79,7 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
 /// Tunable limits of the broker.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Limits {
     /// How long a new connection may take to complete the TLS handshake and
     /// send CONNECT before it is closed.
@@ -134,7 +136,9 @@ impl Default for Limits {
     }
 }
 
-/// Broker configuration.
+/// Broker configuration. Start from `ServerConfig::default()` and set
+/// what differs; fields may be added in minor releases.
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Serve TLS instead of plain TCP on the main listener when set.
     pub tls: Option<TlsConfig>,
@@ -184,6 +188,7 @@ impl From<UnixListener> for Socket {
 }
 
 /// A listener with its own transport and TLS settings.
+#[non_exhaustive]
 pub struct ListenerConfig {
     pub listener: Socket,
     pub transport: Transport,
@@ -456,6 +461,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
 
 /// What the broker tells clients when they connect, beyond limits.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConnectPolicy {
     /// Returned to MQTT 5 clients that ask for Response Information, with
     /// `%c` replaced by their client id: a topic prefix they may use for the
@@ -474,6 +480,7 @@ pub struct ConnectPolicy {
 
 /// Where clients are sent instead of being served.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Redirect {
     /// The server clients should use, in the form MQTT 5 clients expect,
     /// such as `host:port`
@@ -481,6 +488,15 @@ pub struct Redirect {
     /// Whether the move is permanent (Server Moved) or temporary (Use Another
     /// Server)
     pub permanent: bool,
+}
+
+impl Redirect {
+    pub fn new(server_reference: impl Into<String>, permanent: bool) -> Self {
+        Redirect {
+            server_reference: server_reference.into(),
+            permanent,
+        }
+    }
 }
 
 struct Listener<St: MqttStore + 'static> {

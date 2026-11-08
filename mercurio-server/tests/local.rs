@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mercurio_server::server::{AuthConfig, LocalConnector, ServerConfig};
+use mercurio_server::server::{LocalConnector, ServerConfig};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -30,15 +30,10 @@ async fn local_connections_skip_authentication() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let config = ServerConfig {
-        auth: AuthConfig {
-            require_auth: true,
-            allow_anonymous: false,
-            ..Default::default()
-        },
-        local_listener: Some(local_listener),
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.auth.require_auth = true;
+    config.auth.allow_anonymous = false;
+    config.local_listener = Some(local_listener);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -57,10 +52,8 @@ async fn control_topics_need_an_authorizer() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let config = ServerConfig {
-        local_listener: Some(local_listener),
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.local_listener = Some(local_listener);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -99,10 +92,8 @@ async fn network_clients_cant_take_an_in_process_client_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let config = ServerConfig {
-        local_listener: Some(local_listener),
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.local_listener = Some(local_listener);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

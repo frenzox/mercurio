@@ -8,11 +8,7 @@ use mercurio_packets::{
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
 };
-use mercurio_server::{
-    acl::AclFile,
-    auth::SimpleCredentialValidator,
-    server::{AuthConfig, ServerConfig},
-};
+use mercurio_server::{acl::AclFile, auth::SimpleCredentialValidator, server::ServerConfig};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -32,18 +28,13 @@ topic write public/#
 async fn start_broker(verify_users: bool) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        auth: AuthConfig {
-            require_auth: verify_users,
-            allow_anonymous: true,
-            credential_validator: Some(Arc::new(SimpleCredentialValidator::new(HashMap::from([
-                ("alice".to_string(), "secret".to_string()),
-            ])))),
-            authorizer: Some(Arc::new(AclFile::parse(ACL).unwrap())),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.auth.require_auth = verify_users;
+    config.auth.allow_anonymous = true;
+    config.auth.credential_validator = Some(Arc::new(SimpleCredentialValidator::new(
+        HashMap::from([("alice".to_string(), "secret".to_string())]),
+    )));
+    config.auth.authorizer = Some(Arc::new(AclFile::parse(ACL).unwrap()));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

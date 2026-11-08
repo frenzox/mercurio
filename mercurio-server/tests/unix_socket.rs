@@ -13,13 +13,11 @@ use tokio::{
 async fn clients_connect_over_unix_sockets() {
     let path = std::env::temp_dir().join(format!("mercurio-test-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let config = ServerConfig {
-        listeners: vec![ListenerConfig::new(
-            UnixListener::bind(&path).unwrap(),
-            Transport::Mqtt,
-        )],
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.listeners = vec![ListenerConfig::new(
+        UnixListener::bind(&path).unwrap(),
+        Transport::Mqtt,
+    )];
     tokio::spawn(mercurio_server::server::run_with_config(
         TcpListener::bind("127.0.0.1:0").await.unwrap(),
         config,

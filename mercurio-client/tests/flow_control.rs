@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_client::{ConnectOptions, DisconnectReason, Event, MqttClient, QoS};
-use mercurio_server::server::{ConnectPolicy, Limits, ServerConfig};
+use mercurio_server::server::ServerConfig;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -11,17 +11,9 @@ use tokio::{
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        limits: Limits {
-            send_topic_aliases: true,
-            ..Default::default()
-        },
-        policy: ConnectPolicy {
-            response_information: Some("replies/%c/".into()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.limits.send_topic_aliases = true;
+    config.policy.response_information = Some("replies/%c/".into());
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

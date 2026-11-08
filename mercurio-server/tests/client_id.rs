@@ -15,10 +15,8 @@ async fn start_broker() -> SocketAddr {
 async fn start_broker_with(policy: ConnectPolicy) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        policy,
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.policy = policy;
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -84,10 +82,11 @@ async fn mqtt311_rejects_empty_id_without_clean_session() {
 
 #[tokio::test]
 async fn assigned_ids_use_the_prefix_and_prefixes_are_enforced() {
-    let addr = start_broker_with(ConnectPolicy {
-        auto_id_prefix: "auto-".to_string(),
-        client_id_prefixes: vec!["auto-".to_string(), "dev-".to_string()],
-        ..Default::default()
+    let addr = start_broker_with({
+        let mut value = ConnectPolicy::default();
+        value.auto_id_prefix = "auto-".to_string();
+        value.client_id_prefixes = vec!["auto-".to_string(), "dev-".to_string()];
+        value
     })
     .await;
 
@@ -111,9 +110,10 @@ async fn assigned_ids_use_the_prefix_and_prefixes_are_enforced() {
 
 #[tokio::test]
 async fn required_client_ids_refuse_empty_ones() {
-    let addr = start_broker_with(ConnectPolicy {
-        require_client_id: true,
-        ..Default::default()
+    let addr = start_broker_with({
+        let mut value = ConnectPolicy::default();
+        value.require_client_id = true;
+        value
     })
     .await;
 

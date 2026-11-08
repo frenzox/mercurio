@@ -21,7 +21,7 @@ use mercurio_packets::{
 };
 use mercurio_server::{
     auth::{AuthExchange, AuthManager, AuthMethod, AuthResult},
-    server::{AuthConfig, ServerConfig},
+    server::ServerConfig,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -78,13 +78,8 @@ async fn start_broker() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut manager = AuthManager::new();
     manager.register(Box::new(Challenge::default()));
-    let config = ServerConfig {
-        auth: AuthConfig {
-            auth_manager: Some(Arc::new(manager)),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.auth.auth_manager = Some(Arc::new(manager));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

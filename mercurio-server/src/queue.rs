@@ -13,6 +13,7 @@ use crate::writer::Writer;
 
 /// How many messages one session may have waiting to be sent.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct QueueLimits {
     /// QoS 0 messages are dropped once this many messages are queued.
     pub max_qos0: usize,

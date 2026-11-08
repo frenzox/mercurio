@@ -26,13 +26,11 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
         listener.local_addr().unwrap(),
         websocket_listener.local_addr().unwrap(),
     );
-    let config = ServerConfig {
-        listeners: vec![ListenerConfig::new(
-            websocket_listener,
-            Transport::WebSocket,
-        )],
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.listeners = vec![ListenerConfig::new(
+        websocket_listener,
+        Transport::WebSocket,
+    )];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -157,13 +155,12 @@ async fn websocket_listeners_serve_files_and_mqtt() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = websocket_listener.local_addr().unwrap();
-    let config = ServerConfig {
-        listeners: vec![ListenerConfig {
-            http_dir: Some(dir.clone()),
-            ..ListenerConfig::new(websocket_listener, Transport::WebSocket)
-        }],
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.listeners = vec![{
+        let mut value = ListenerConfig::new(websocket_listener, Transport::WebSocket);
+        value.http_dir = Some(dir.clone());
+        value
+    }];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

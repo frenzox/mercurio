@@ -8,10 +8,8 @@ use tokio::{net::TcpListener, time::timeout};
 async fn connector_replaces_tcp() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let config = ServerConfig {
-        local_listener: Some(local_listener),
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.local_listener = Some(local_listener);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

@@ -199,10 +199,7 @@ mod tests {
         assert!(auth.validate("alice", b"secret"));
         assert!(!auth.validate("alice", b"wrong"));
 
-        let alice = ClientIdentity {
-            client_id: "c".to_string(),
-            username: Some("alice".to_string()),
-        };
+        let alice = ClientIdentity::new("c", Some("alice".to_string()));
         assert!(auth.authorize(&alice, "allowed", Access::Write));
         assert!(!auth.authorize(&alice, "other", Access::Write));
         assert!(auth.authorize(&alice, "allowed", Access::Write));

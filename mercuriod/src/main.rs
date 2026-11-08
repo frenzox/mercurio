@@ -255,24 +255,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build TLS configuration if enabled
     let limits = config.server.limits()?;
-    let policy = ConnectPolicy {
-        response_information: config.server.response_information.clone(),
-        redirect: config.server.redirect.clone().map(|r| Redirect {
-            server_reference: r.server_reference,
-            permanent: r.permanent,
-        }),
-        require_client_id: !config.server.allow_zero_length_clientid,
-        auto_id_prefix: config.server.auto_id_prefix.clone(),
-        client_id_prefixes: config.server.clientid_prefixes.clone(),
-    };
+    let mut policy = ConnectPolicy::default();
+    policy.response_information = config.server.response_information.clone();
+    policy.redirect = config
+        .server
+        .redirect
+        .clone()
+        .map(|r| Redirect::new(r.server_reference, r.permanent));
+    policy.require_client_id = !config.server.allow_zero_length_clientid;
+    policy.auto_id_prefix = config.server.auto_id_prefix.clone();
+    policy.client_id_prefixes = config.server.clientid_prefixes.clone();
 
     let tls_config = config.server.tls.build()?;
     // The WebSocket listener shares the main listener's TLS settings
     let mut listeners: Vec<_> = websocket_listener
-        .map(|listener| ListenerConfig {
-            tls: tls_config.clone(),
-            http_dir: config.server.http_dir.clone().map(Into::into),
-            ..ListenerConfig::new(listener, Transport::WebSocket)
+        .map(|listener| {
+            let mut value = ListenerConfig::new(listener, Transport::WebSocket);
+            value.tls = tls_config.clone();
+            value.http_dir = config.server.http_dir.clone().map(Into::into);
+            value
         })
         .into_iter()
         .collect();
@@ -285,17 +286,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if extra.tls.enabled { " with TLS" } else { "" },
             addr
         );
-        listeners.push(ListenerConfig {
-            tls: extra.tls.build()?,
-            proxy_protocol: extra.proxy_protocol,
-            mount_point: extra.mount_point.clone(),
-            max_connections: extra.max_connections,
-            http_dir: extra.http_dir.clone().map(Into::into),
-            auth: match &extra.auth {
+        listeners.push({
+            let mut value = ListenerConfig::new(listener, extra.protocol.into());
+            value.tls = extra.tls.build()?;
+            value.proxy_protocol = extra.proxy_protocol;
+            value.mount_point = extra.mount_point.clone();
+            value.max_connections = extra.max_connections;
+            value.http_dir = extra.http_dir.clone().map(Into::into);
+            value.auth = match &extra.auth {
                 Some(auth) => Some(build_auth(auth, &mut reloadable, None)?),
                 None => None,
-            },
-            ..ListenerConfig::new(listener, extra.protocol.into())
+            };
+            value
         });
     }
 
@@ -307,16 +309,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bridge::spawn(bridge, connector.clone())?;
     }
 
-    let server_config = ServerConfig {
-        tls: tls_config,
-        auth: auth_config,
-        limits,
-        policy,
-        listeners,
-        local_listener: Some(local_listener),
-        sys_interval: (config.server.sys_interval > 0)
-            .then(|| Duration::from_secs(config.server.sys_interval)),
-    };
+    let mut server_config = ServerConfig::default();
+    server_config.tls = tls_config;
+    server_config.auth = auth_config;
+    server_config.limits = limits;
+    server_config.policy = policy;
+    server_config.listeners = listeners;
+    server_config.local_listener = Some(local_listener);
+    server_config.sys_interval =
+        (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(reloadable));
 
@@ -447,12 +448,14 @@ fn build_auth(
         info!("Loaded dynamic security from {}", path);
         reloadable.push(security.clone());
         Arc::clone(&security).serve(connector.clone());
-        return Ok(ServerAuthConfig {
-            require_auth: config.enabled,
-            allow_anonymous: config.allow_anonymous,
-            credential_validator: Some(security.clone()),
-            auth_manager: None,
-            authorizer: Some(security),
+        return Ok({
+            let mut value = ServerAuthConfig::default();
+            value.require_auth = config.enabled;
+            value.allow_anonymous = config.allow_anonymous;
+            value.credential_validator = Some(security.clone());
+            value.auth_manager = None;
+            value.authorizer = Some(security);
+            value
         });
     }
 
@@ -489,9 +492,10 @@ fn build_auth(
         None => None,
     };
     if !config.enabled {
-        return Ok(ServerAuthConfig {
-            authorizer,
-            ..Default::default()
+        return Ok({
+            let mut value = ServerAuthConfig::default();
+            value.authorizer = authorizer;
+            value
         });
     }
 
@@ -507,12 +511,14 @@ fn build_auth(
         }
         None => None,
     };
-    Ok(ServerAuthConfig {
-        require_auth: true,
-        allow_anonymous: config.allow_anonymous,
-        credential_validator,
-        auth_manager: None,
-        authorizer,
+    Ok({
+        let mut value = ServerAuthConfig::default();
+        value.require_auth = true;
+        value.allow_anonymous = config.allow_anonymous;
+        value.credential_validator = credential_validator;
+        value.auth_manager = None;
+        value.authorizer = authorizer;
+        value
     })
 }
 

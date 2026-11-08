@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use mercurio_server::server::{Limits, ServerConfig};
+use mercurio_server::server::ServerConfig;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -18,13 +18,8 @@ fn qos2_publish(id: u8) -> [u8; 9] {
 async fn disconnect_survives_a_client_still_sending() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        limits: Limits {
-            receive_maximum: 1,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.limits.receive_maximum = 1;
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
