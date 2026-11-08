@@ -379,6 +379,15 @@ impl Session {
 
         session.topics = Some(broker.topics());
         for subscription in subscriptions {
+            // Stored by an older version that accepted it, such as one
+            // deeper than the level limit
+            if let Err(e) = validate_subscribe_filter(&subscription.topic_filter) {
+                warn!(
+                    "Dropping stored subscription of `{}` to an invalid filter: {}",
+                    session.client_id, e
+                );
+                continue;
+            }
             // Retained messages are only sent for a new SUBSCRIBE, not when an
             // existing subscription is resumed [MQTT-3.3.1-9]
             broker

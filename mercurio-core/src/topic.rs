@@ -11,6 +11,11 @@ use alloc::vec::Vec;
 /// Maximum topic name/filter length in bytes (UTF-8 encoded).
 pub const MAX_TOPIC_LENGTH: usize = 65535;
 
+/// Most levels a topic name or filter may have. MQTT sets no limit, but
+/// brokers walk topics level by level, and an unbounded depth lets one
+/// client exhaust a thread's stack; real topics rarely pass ten.
+pub const MAX_TOPIC_LEVELS: usize = 256;
+
 /// Error type for topic validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicValidationError {
@@ -18,6 +23,8 @@ pub enum TopicValidationError {
     Empty,
     /// Topic exceeds maximum length.
     TooLong,
+    /// Topic has more than `MAX_TOPIC_LEVELS` levels.
+    TooManyLevels,
     /// Topic contains null character (U+0000).
     ContainsNullChar,
     /// Wildcard characters not allowed in publish topics.
@@ -39,6 +46,13 @@ impl fmt::Display for TopicValidationError {
                     f,
                     "topic name exceeds maximum length of {} bytes",
                     MAX_TOPIC_LENGTH
+                )
+            }
+            TopicValidationError::TooManyLevels => {
+                write!(
+                    f,
+                    "topic name exceeds the maximum of {} levels",
+                    MAX_TOPIC_LEVELS
                 )
             }
             TopicValidationError::ContainsNullChar => {
@@ -189,6 +203,10 @@ fn validate_common(topic: &str) -> Result<(), TopicValidationError> {
     // Check for null character
     if topic.contains('\0') {
         return Err(TopicValidationError::ContainsNullChar);
+    }
+
+    if topic.bytes().filter(|&b| b == b'/').count() >= MAX_TOPIC_LEVELS {
+        return Err(TopicValidationError::TooManyLevels);
     }
 
     Ok(())
@@ -409,6 +427,20 @@ mod tests {
         assert_eq!(
             validate_subscribe_filter(&long_filter),
             Err(TopicValidationError::TooLong)
+        );
+    }
+
+    #[test]
+    fn test_topic_levels_are_capped() {
+        let deepest = "a/".repeat(MAX_TOPIC_LEVELS - 1) + "a";
+        assert!(validate_publish_topic(&deepest).is_ok());
+        assert_eq!(
+            validate_publish_topic(&format!("{deepest}/a")),
+            Err(TopicValidationError::TooManyLevels)
+        );
+        assert_eq!(
+            validate_subscribe_filter(&"/".repeat(8000)),
+            Err(TopicValidationError::TooManyLevels)
         );
     }
 }
