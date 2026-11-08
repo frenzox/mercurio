@@ -1,0 +1,41 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/mercurio-storage-v0.1.0) - 2026-11-08
+
+### Added
+
+- stop sending retained messages whose publisher lost access
+- publish mosquitto's traffic, load and client statistics in $SYS
+- *(storage)* add a store for messages queued for offline clients
+- *(server)* run on any storage backend, expiring sessions across restarts
+- support MQTT 5 subscription identifiers
+- support MQTT 5 subscription options
+- honour the MQTT 5 Message Expiry Interval
+- forward MQTT 5 message properties to subscribers
+- *(core,packets)* add no_std support for embedded systems
+- *(storage)* add SQLite persistent storage backend
+- *(storage)* add storage abstraction layer
+
+### Fixed
+
+- *(server)* deliver one copy to clients with overlapping subscriptions
+- *(storage)* report unreadable message properties instead of dropping them
+- *(storage)* remove expired retained messages instead of skipping them
+- keep will messages accurate across reconnects and restarts
+- *(server)* resend unacknowledged messages when a session resumes
+- don't match $-prefixed topics with leading wildcards
+- *(server)* persist the granted QoS of each subscription
+
+### Other
+
+- link to the documentation on GitHub Pages
+- give every crate a README for its crates.io page
+- add the metadata crates.io needs to publish each crate
+- dual-license under MIT or Apache-2.0
