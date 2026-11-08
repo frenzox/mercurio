@@ -18,6 +18,7 @@ pub const MAX_TOPIC_LEVELS: usize = 256;
 
 /// Error type for topic validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TopicValidationError {
     /// Topic is empty (zero length).
     Empty,

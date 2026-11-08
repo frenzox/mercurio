@@ -8,6 +8,7 @@ use core::fmt;
 /// used in communication between clients and the broker.
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
 pub enum ProtocolVersion {
     /// MQTT 3.1 - Protocol name "MQIsdp", level 3
     V3_1 = 3,

@@ -23,6 +23,7 @@ use mercurio_core::topic::{topic_matches_filter, validate_subscribe_filter};
 
 /// What a client wants to do with a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Access {
     /// Receive a message published to it
     Read,

@@ -199,6 +199,8 @@ impl Data {
                 Access::Write => self.default_acl_access.publish_client_send,
                 Access::Read => self.default_acl_access.publish_client_receive,
                 Access::Subscribe => self.default_acl_access.subscribe,
+                // A kind of access added later is denied until handled
+                _ => false,
             },
         }
     }

@@ -327,6 +327,7 @@ impl Bridge {
                 Event::Disconnected { reason } => {
                     warn!("Bridge {} disconnected: {:?}", self.name, reason);
                 }
+                _ => {}
             }
         }
     }

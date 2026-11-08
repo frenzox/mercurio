@@ -3,6 +3,7 @@ use thiserror::Error;
 
 /// Errors that can occur in the MQTT client.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

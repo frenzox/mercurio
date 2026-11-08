@@ -11,6 +11,7 @@ use mercurio_core::reason::ReasonCode;
 
 /// Result of an authentication step.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthResult {
     /// The client is authenticated, as `username` if the method identifies
     /// users.

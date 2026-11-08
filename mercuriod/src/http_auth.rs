@@ -97,6 +97,8 @@ impl Authorizer for HttpAuth {
             Access::Read => 1,
             Access::Write => 2,
             Access::Subscribe => 4,
+            // A kind of access added later is denied until handled
+            _ => return false,
         };
         let key = (
             client.username.clone(),

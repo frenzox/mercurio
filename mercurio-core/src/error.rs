@@ -9,6 +9,7 @@ use crate::reason::ReasonCode;
 
 /// Error type for mercurio operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The packet is incomplete and needs more data.
     PacketIncomplete,

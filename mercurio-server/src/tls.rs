@@ -31,6 +31,7 @@ pub struct TlsConfig {
 
 /// What part of a client certificate names the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CertificateName {
     /// The subject's Common Name, as mosquitto's `use_identity_as_username`
     CommonName,
@@ -40,6 +41,7 @@ pub enum CertificateName {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsVersion {
     #[default]
     Tls12,

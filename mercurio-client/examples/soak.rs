@@ -99,7 +99,7 @@ async fn main() {
                             eprintln!("subscriber's session was lost on reconnecting");
                         }
                     }
-                    Event::Disconnected { .. } => {}
+                    _ => {}
                 }
             }
         });

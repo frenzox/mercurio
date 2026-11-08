@@ -168,6 +168,7 @@ impl Default for ServerConfig {
 }
 
 /// A socket to accept connections on.
+#[non_exhaustive]
 pub enum Socket {
     Tcp(TcpListener),
     #[cfg(unix)]
@@ -277,6 +278,7 @@ enum Accepted {
 
 /// How MQTT is carried on a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     Mqtt,
     WebSocket,

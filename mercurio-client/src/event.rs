@@ -5,6 +5,7 @@ use crate::options::MessageProperties;
 
 /// Events received from the MQTT broker.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     /// A message was received on a subscribed topic.
     Message {
@@ -27,6 +28,7 @@ pub enum Event {
 
 /// Reason for disconnection.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum DisconnectReason {
     /// Client initiated disconnect.
     ClientInitiated,
