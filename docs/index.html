@@ -44,7 +44,7 @@
 <tr><td><code>recado</code></td><td>Command-line client: <code>recado pub</code> and <code>recado sub</code>.</td></tr>
 <tr><td><code>mercurio-client</code></td><td>Async Rust client library.</td></tr>
 <tr><td><code>mercurio-server</code></td><td>The broker as a library, to embed in your own program or extend with custom authentication.</td></tr>
-<tr><td><code>mercurio-storage</code></td><td>Storage for sessions, retained messages, wills and queued messages, in memory or SQLite.</td></tr>
+<tr><td><code>mercurio-storage</code></td><td>Storage for sessions, retained messages, wills and queued messages, in memory, SQLite or PostgreSQL.</td></tr>
 <tr><td><code>mercurio-core</code>, <code>mercurio-packets</code></td><td>Shared types and the encoding of every MQTT packet, for all three protocol versions.</td></tr>
 </table>
 
@@ -78,7 +78,7 @@
 <li>Authentication with password files (Argon2 or mosquitto's hashes), client certificates, an HTTP service, or dynamic security managed at runtime.</li>
 <li>Topic access control in mosquitto's <code>acl_file</code> format.</li>
 <li>Bridges to other brokers, MQTT 5 or 3.1.1, with failover and mutual TLS.</li>
-<li>State in memory or SQLite, so persistent sessions survive restarts.</li>
+<li>State in memory, SQLite or PostgreSQL, so persistent sessions survive restarts.</li>
 <li><code>$SYS</code> statistics with mosquitto's names, logging to file or syslog.</li>
 <li>Configuration reloads on <code>SIGHUP</code>, graceful shutdown on <code>SIGTERM</code>.</li>
 </ul>

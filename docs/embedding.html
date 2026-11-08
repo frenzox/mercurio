@@ -163,7 +163,7 @@ use mercurio_storage::sqlite::SqliteStore;
 
 let storage = Arc::new(SqliteStore::new("/var/lib/myapp/mqtt.db")?);
 run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;</pre>
-<p>Any type implementing the storage traits of <code>mercurio-storage</code> (sessions, retained messages, wills, in-flight messages and queues) can replace SQLite.</p>
+<p>Any type implementing the storage traits of <code>mercurio-storage</code> (sessions, retained messages, wills, in-flight messages and queues) can replace SQLite; <code>postgres::PostgresStore::connect(url, ca_path)</code>, behind the <code>postgres</code> feature, keeps it in PostgreSQL.</p>
 
 <h2 id="local">In-process clients</h2>
 <p>A <code>LocalConnector</code> opens connections to the broker in memory, without TCP. Combined with <code>mercurio-client</code>'s <code>connector</code> option, it lets your program publish and subscribe on its own broker. These connections are trusted: authentication and access control don't apply to them.</p>

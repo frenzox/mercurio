@@ -14,7 +14,10 @@ use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
     ServerConfig, Socket, Transport,
 };
-use mercurio_storage::sqlite::SqliteStore;
+use mercurio_storage::{
+    postgres::{DatabaseLock, PostgresStore},
+    sqlite::SqliteStore,
+};
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -194,6 +197,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .listen
         .unwrap_or_else(|| address(&config.server.host, config.server.port));
 
+    // Before binding, so a standby doesn't accept connections it can't serve
+    let (postgres, database_lock) = match &config.storage {
+        StorageConfig::Postgres {
+            url,
+            ca_path,
+            standby,
+        } => {
+            info!("Using PostgreSQL storage");
+            let store = PostgresStore::connect(url, ca_path.as_deref()).await?;
+            let lock = match store.try_lock().await? {
+                Some(lock) => lock,
+                None if *standby => {
+                    info!("Another broker is using the database; standing by to take over");
+                    let lock = store.lock().await?;
+                    info!("Took over the database");
+                    lock
+                }
+                None => {
+                    return Err("Another broker is using the database; set \
+                         `standby = true` in [storage] to stand by for it"
+                        .into())
+                }
+            };
+            (Some(store), Some(lock))
+        }
+        _ => (None, None),
+    };
+    let shutdown = async {
+        match &database_lock {
+            Some(lock) => tokio::select! {
+                _ = shutdown_signal() => {}
+                _ = lock.lost() => error!("Lost the connection holding the database; stopping, since a standby may take over"),
+            },
+            None => shutdown_signal().await,
+        }
+    };
+
     info!("Starting Mercurio MQTT broker on {}", listen_addr);
 
     let listener = bind_tcp(&listen_addr, interface).await?;
@@ -279,24 +319,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match config.storage {
         StorageConfig::Memory => {
-            mercurio_server::server::run_with_config(listener, server_config, shutdown_signal())
-                .await
+            mercurio_server::server::run_with_config(listener, server_config, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            mercurio_server::server::run_with_storage(
-                listener,
-                server_config,
-                storage,
-                shutdown_signal(),
-            )
-            .await
+            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
+                .await
+        }
+        StorageConfig::Postgres { .. } => {
+            let storage = Arc::new(postgres.expect("opened before binding"));
+            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
+                .await
         }
     };
     // A non-zero status tells service managers the broker failed to start
     if let Err(e) = result {
         error!("Failed to start the broker: {}", e);
+        std::process::exit(1);
+    }
+
+    if database_lock.as_ref().is_some_and(DatabaseLock::is_lost) {
         std::process::exit(1);
     }
 

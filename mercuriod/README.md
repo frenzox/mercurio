@@ -173,9 +173,16 @@ level = "info"
 
 [storage]
 # Where sessions, retained messages, wills and in-flight messages are kept:
-# "memory" (lost on restart) or "sqlite" (kept in the file at `path`)
+# "memory" (lost on restart), "sqlite" (kept in the file at `path`) or
+# "postgres" (kept in the database at `url`)
 backend = "memory"
 # path = "/var/lib/mercurio/mercurio.db"
+# url = "postgres://mercurio:password@localhost/mercurio?sslmode=require"
+# CA that signed the PostgreSQL server's certificate; Mozilla's roots otherwise
+# ca_path = "/etc/mercurio/postgres-ca.pem"
+# One broker serves from a PostgreSQL database at a time. When another is,
+# exit (false), or wait and take over once it stops (true)
+# standby = false
 
 [auth]
 # Require clients to authenticate
@@ -454,10 +461,17 @@ wait for the bridge across short outages.
 ### Persistence
 
 With `backend = "memory"`, everything is lost when the broker stops. With
-`backend = "sqlite"`, sessions, subscriptions, retained messages, wills,
-queued messages and messages in flight are kept in the database file, so
+`backend = "sqlite"` or `backend = "postgres"`, sessions, subscriptions,
+retained messages, wills, queued messages and messages in flight are kept in
+the database, so
 clients with persistent sessions resume where they left off after a
 restart.
+
+Only one broker serves from a PostgreSQL database at a time. Another one
+started on it exits, or, with `standby = true`, waits without listening and
+takes over within seconds once the serving broker stops. A broker that loses
+its connection to the database stops and exits with an error, as a standby
+may have taken over.
 
 ### Statistics
 

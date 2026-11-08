@@ -1,6 +1,9 @@
 //! Configuration file handling for mercuriod.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
@@ -201,6 +204,17 @@ pub enum StorageConfig {
     Memory,
     /// Kept in a SQLite database file
     Sqlite { path: String },
+    /// Kept in a PostgreSQL database, such as
+    /// `postgres://user:password@localhost/mercurio`, whose certificate is
+    /// verified against `ca_path` or the Mozilla root certificates
+    Postgres {
+        url: String,
+        ca_path: Option<PathBuf>,
+        /// When another broker holds the database, wait and take over once
+        /// it stops, instead of exiting
+        #[serde(default)]
+        standby: bool,
+    },
 }
 
 impl Config {

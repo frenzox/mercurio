@@ -10,8 +10,8 @@ top of tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
 ### Broker (`mercuriod`)
 
 - QoS 0, 1 and 2 in both directions, with retransmission on reconnect
-- Persistent sessions with session expiry, kept in memory or in SQLite so
-  they survive restarts
+- Persistent sessions with session expiry, kept in memory, SQLite or
+  PostgreSQL so they survive restarts
 - Retained messages, wills, and will delay
 - Shared subscriptions (`$share/group/filter`) and subscription identifiers
 - MQTT 5 subscription options: No Local, Retain As Published and Retain
@@ -162,7 +162,7 @@ in an enhanced authentication method.
 |-------|----------|
 | [`mercurio-core`](mercurio-core) | Shared types: QoS, reason codes, properties, topic matching, codec primitives |
 | [`mercurio-packets`](mercurio-packets) | Encoding and decoding of every MQTT control packet, for all three protocol versions |
-| [`mercurio-storage`](mercurio-storage) | Storage traits for sessions, retained messages, wills, in-flight and queued messages, with memory and SQLite backends |
+| [`mercurio-storage`](mercurio-storage) | Storage traits for sessions, retained messages, wills, in-flight and queued messages, with memory, SQLite and PostgreSQL backends |
 | [`mercurio-server`](mercurio-server) | The broker as a library, to embed or extend with custom authentication and authorization |
 | [`mercuriod`](mercuriod) | The broker daemon: configuration, logging, password files |
 | [`mercurio-client`](mercurio-client) | The async client library |

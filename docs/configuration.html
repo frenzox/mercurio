@@ -131,8 +131,11 @@ mount_point = "tenant1/"</pre>
 <h2 id="storage">[storage]</h2>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>backend</code></td><td><code>"memory"</code></td><td><code>"memory"</code>, lost on restart, or <code>"sqlite"</code>.</td></tr>
+<tr><td><code>backend</code></td><td><code>"memory"</code></td><td><code>"memory"</code>, lost on restart, <code>"sqlite"</code> or <code>"postgres"</code>.</td></tr>
 <tr><td><code>path</code></td><td></td><td>The SQLite database file, with <code>backend = "sqlite"</code>.</td></tr>
+<tr><td><code>url</code></td><td></td><td>The PostgreSQL database, such as <code>"postgres://mercurio:password@localhost/mercurio"</code>, with <code>backend = "postgres"</code>. The broker creates its tables on start. Connections are encrypted when the server supports it; add <code>?sslmode=require</code> to insist on it, or <code>?sslmode=disable</code> to never encrypt.</td></tr>
+<tr><td><code>ca_path</code></td><td>Mozilla's root certificates</td><td>PEM file of the certificate authority that signed the PostgreSQL server's certificate, such as a cloud provider's bundle. The certificate and the host name are always verified.</td></tr>
+<tr><td><code>standby</code></td><td><code>false</code></td><td>With PostgreSQL, when another broker is using the database, wait and take over once it stops, instead of exiting. See <a href="operations.html#standby">Standby brokers</a>.</td></tr>
 </table>
 
 <h2 id="auth">[auth]</h2>
