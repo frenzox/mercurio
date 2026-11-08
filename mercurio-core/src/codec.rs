@@ -146,8 +146,9 @@ impl Decoder for String {
         let bytes = buffer.copy_to_bytes(length.into());
 
         match String::from_utf8(bytes.to_vec()) {
-            Err(_) => Err(ReasonCode::MalformedPacket.into()),
-            Ok(s) => Ok(s),
+            // U+0000 is never allowed in an MQTT string [MQTT-1.5.4-2]
+            Ok(s) if !s.contains('\0') => Ok(s),
+            _ => Err(ReasonCode::MalformedPacket.into()),
         }
     }
 }

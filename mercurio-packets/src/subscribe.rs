@@ -142,6 +142,11 @@ impl Decoder for SubscriptionOptions {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let opt = u8::decode(buffer)?;
 
+        // Bits 6 and 7 are reserved [MQTT-3.8.3-5]
+        if opt & 0b1100_0000 != 0 {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+
         let qos: QoS = (opt & 0b0000_0011).into();
 
         if qos == QoS::Invalid {

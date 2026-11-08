@@ -94,7 +94,11 @@ impl Encoder for SubAckPayload {
 
 impl Decoder for SubAckPayload {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reason_code = ReasonCode::decode(buffer)?;
+        // 0x00 is "Granted QoS 0" in SUBACK
+        let reason_code = match ReasonCode::decode(buffer)? {
+            ReasonCode::Success => ReasonCode::GrantedQoS0,
+            reason => reason,
+        };
 
         Ok(SubAckPayload { reason_code })
     }
@@ -210,7 +214,8 @@ impl SubAckPacket {
                 0x01 => ReasonCode::GrantedQoS1,
                 0x02 => ReasonCode::GrantedQoS2,
                 0x80 => ReasonCode::UnspecifiedError,
-                _ => ReasonCode::UnspecifiedError,
+                // Reserved [MQTT-3.9.3-2]
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             };
             payload.push(SubAckPayload { reason_code });
         }
@@ -250,6 +255,13 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use crate::suback::*;
+
+    #[test]
+    fn test_v5_decode_reads_0x00_as_granted_qos_0() {
+        let mut bytes = Bytes::from_static(&[0x90, 0x04, 0x00, 0x01, 0x00, 0x00]);
+        let packet = SubAckPacket::decode(&mut bytes).unwrap();
+        assert_eq!(packet.payload[0].reason_code, ReasonCode::GrantedQoS0);
+    }
 
     #[test]
     fn test_suback_packet_encode_decode() {

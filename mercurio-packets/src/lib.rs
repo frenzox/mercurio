@@ -574,7 +574,7 @@ mod robustness_tests {
 
     #[test]
     fn test_reserved_flags_are_malformed() {
-        let malformed: [(&[u8], ProtocolVersion); 6] = [
+        let malformed: [(&[u8], ProtocolVersion); 9] = [
             // PINGREQ with a reserved flag set
             (&[0xc1, 0x00], ProtocolVersion::V5),
             // SUBSCRIBE without the mandatory 0b0010 flags
@@ -603,6 +603,18 @@ mod robustness_tests {
                     0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x42, 0x00, 0x3c, 0x00,
                     0x01, b'c', 0x00, 0x01, b'p',
                 ],
+                ProtocolVersion::V3_1_1,
+            ),
+            // SUBSCRIBE with a reserved option bit set
+            (
+                &[0x82, 0x08, 0x00, 0x01, 0x00, 0x00, 0x02, b'a', b'#', 0x41],
+                ProtocolVersion::V5,
+            ),
+            // MQTT 3.1.1 SUBACK with a reserved return code
+            (&[0x90, 0x03, 0x00, 0x01, 0x03], ProtocolVersion::V3_1_1),
+            // PUBLISH whose topic holds U+0000
+            (
+                &[0x30, 0x04, 0x00, 0x02, b'a', 0x00],
                 ProtocolVersion::V3_1_1,
             ),
         ];
