@@ -55,22 +55,24 @@ impl HttpAuth {
     }
 
     /// Whether `url` answers `body` with a 2xx status. Any error denies.
-    fn allows(&self, url: &str, body: serde_json::Value) -> bool {
-        // The auth traits are synchronous; this lets the runtime move other
-        // tasks off this thread while the request is under way
-        let send = || {
-            self.agent
-                .post(url)
+    async fn allows(&self, url: &str, body: serde_json::Value) -> bool {
+        let (agent, url) = (self.agent.clone(), url.to_string());
+        let send = move || {
+            agent
+                .post(&url)
                 .header("Content-Type", "application/json")
                 .send(body.to_string())
+                .map(|_| ())
+                .map_err(|e| (url, e))
         };
-        match tokio::task::block_in_place(send) {
-            Ok(_) => true,
-            Err(ureq::Error::StatusCode(_)) => false,
-            Err(e) => {
+        match tokio::task::spawn_blocking(send).await {
+            Ok(Ok(())) => true,
+            Ok(Err((_, ureq::Error::StatusCode(_)))) => false,
+            Ok(Err((url, e))) => {
                 warn!("Auth request to {} failed: {}", url, e);
                 false
             }
+            Err(_) => false,
         }
     }
 }
@@ -93,10 +95,12 @@ impl Plugin for HttpAuth {
             "password": String::from_utf8_lossy(credentials.password),
             "clientid": client.client_id,
         });
-        ready(if self.allows(url, body) {
-            Decision::Allow
-        } else {
-            Decision::Deny
+        Box::pin(async move {
+            if self.allows(url, body).await {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
         })
     }
 
@@ -126,34 +130,35 @@ impl Plugin for HttpAuth {
             topic.to_string(),
             acc,
         );
-        if let Some((allowed, at)) = self.cache.lock().unwrap().get(&key) {
-            if at.elapsed() < self.cache_for {
-                return ready(decision(*allowed));
-            }
-        }
-
         let body = json!({
             "username": client.username,
             "clientid": client.client_id,
             "topic": topic,
             "acc": acc,
         });
-        let allowed = self.allows(url, body);
-        let mut cache = self.cache.lock().unwrap();
-        // Making room one entry at a time: clearing it all would let one
-        // client, publishing to many topics, send every other client's
-        // checks back to the HTTP service
-        if cache.len() >= CACHE_LIMIT {
-            cache.retain(|_, (_, at)| at.elapsed() < self.cache_for);
-        }
-        if cache.len() >= CACHE_LIMIT {
-            // ponytail: an arbitrary entry, an LRU if hit rates ever matter
-            if let Some(evicted) = cache.keys().next().cloned() {
-                cache.remove(&evicted);
+        Box::pin(async move {
+            if let Some((allowed, at)) = self.cache.lock().unwrap().get(&key) {
+                if at.elapsed() < self.cache_for {
+                    return decision(*allowed);
+                }
             }
-        }
-        cache.insert(key, (allowed, Instant::now()));
-        ready(decision(allowed))
+            let allowed = self.allows(url, body).await;
+            let mut cache = self.cache.lock().unwrap();
+            // Making room one entry at a time: clearing it all would let one
+            // client, publishing to many topics, send every other client's
+            // checks back to the HTTP service
+            if cache.len() >= CACHE_LIMIT {
+                cache.retain(|_, (_, at)| at.elapsed() < self.cache_for);
+            }
+            if cache.len() >= CACHE_LIMIT {
+                // ponytail: an arbitrary entry, an LRU if hit rates ever matter
+                if let Some(evicted) = cache.keys().next().cloned() {
+                    cache.remove(&evicted);
+                }
+            }
+            cache.insert(key, (allowed, Instant::now()));
+            decision(allowed)
+        })
     }
 }
 
@@ -213,7 +218,7 @@ mod tests {
         auth.authenticate(&client, &credentials).await
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_endpoints_decide_and_acl_answers_are_cached() {
         let (user_url, _) = serve("\"password\":\"secret\"");
         let (acl_url, acl_requests) = serve("\"topic\":\"allowed\"");
@@ -243,7 +248,7 @@ mod tests {
         assert_eq!(acl_requests.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unreachable_endpoints_deny() {
         let auth = HttpAuth::new(
             Some("http://127.0.0.1:1/".to_string()),
