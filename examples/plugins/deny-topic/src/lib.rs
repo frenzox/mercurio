@@ -14,7 +14,10 @@ impl Plugin for DenyTopic {
             .find(|(key, _)| key == "prefix")
             .map(|(_, value)| value)
             .ok_or("missing `prefix`")?;
-        host::kv_set("prefix", prefix.as_bytes());
+        if prefix.is_empty() {
+            return Err("`prefix` is empty, which would deny every publish".into());
+        }
+        host::kv_set("prefix", prefix.as_bytes())?;
         Ok(Registration {
             hooks: Hooks::AUTHORIZE,
             auth_methods: Vec::new(),
@@ -22,7 +25,9 @@ impl Plugin for DenyTopic {
     }
 
     fn authorize(_client: ClientInfo, topic: String, access: Access) -> Decision {
-        let prefix = host::kv_get("prefix").unwrap_or_default();
+        let Some(prefix) = host::kv_get("prefix") else {
+            return Decision::Defer;
+        };
         if access == Access::Write && topic.as_bytes().starts_with(&prefix) {
             Decision::Deny
         } else {

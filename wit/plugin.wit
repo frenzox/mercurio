@@ -52,10 +52,11 @@ interface types {
     auth-methods: list<string>,
   }
 
-  /// One step of enhanced authentication. `continue` sends the challenge to
-  /// the client; the broker keeps `state` and passes it to the next step.
+  /// The result of one step of enhanced authentication. `continue` sends
+  /// the challenge to the client; the broker keeps `state` and passes it to
+  /// the next step.
   record challenge { data: list<u8>, state: list<u8> }
-  variant auth-step { %continue(challenge), success(option<string>), failed(u8) }
+  variant auth-result { %continue(challenge), success(option<string>), failed(u8) }
 }
 
 interface host {
@@ -66,20 +67,19 @@ interface host {
   /// A store shared by every copy of the plugin, kept in memory until the
   /// broker stops.
   kv-get: func(key: string) -> option<list<u8>>;
-  kv-set: func(key: string, value: list<u8>);
+  /// Fails when the store refuses the value, for example over a quota.
+  kv-set: func(key: string, value: list<u8>) -> result<_, string>;
   kv-delete: func(key: string);
   kv-list: func(prefix: string) -> list<string>;
 }
 
 interface guest {
-  use types.{client-info, access, decision, message, message-action, event, registration};
-  // A function and a type can't share a name in one interface
-  use types.{auth-step as step};
+  use types.{client-info, access, decision, message, message-action, event, registration, auth-result};
 
   init: func(config: list<tuple<string, string>>) -> result<registration, string>;
   authenticate: func(client: client-info, username: string, password: list<u8>) -> decision;
   /// `state` is None on the first step of an exchange.
-  auth-step: func(method: string, state: option<list<u8>>, data: option<list<u8>>) -> step;
+  auth-step: func(client: client-info, method: string, state: option<list<u8>>, data: option<list<u8>>) -> auth-result;
   authorize: func(client: client-info, topic: string, access: access) -> decision;
   on-message: func(client: client-info, message: message) -> message-action;
   on-event: func(event: event);
