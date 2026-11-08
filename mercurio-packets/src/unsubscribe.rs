@@ -154,7 +154,7 @@ impl UnsubscribePacket {
 
         let packet_id = u16::decode(buffer)?;
         let properties = if with_properties {
-            Some(UnsubscribeProperties::decode(buffer)?)
+            crate::present(UnsubscribeProperties::decode(buffer)?)
         } else {
             None
         };
@@ -193,7 +193,7 @@ mod tests {
 
         let packet = UnsubscribePacket {
             packet_id: 1,
-            properties: UnsubscribeProperties::default().into(),
+            properties: None,
             payload: vec![UnsubscribePayload {
                 topic_filter: "test_topic".to_string(),
             }],

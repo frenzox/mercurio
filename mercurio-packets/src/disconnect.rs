@@ -124,8 +124,8 @@ impl Decoder for DisconnectPacket {
         let min_len_properties = 2;
 
         let remaining_len = VariableByteInteger::decode(buffer)?; //Remaining length
-        // 0x00 is "Normal disconnection" in DISCONNECT, whether it is sent
-        // or left out
+                                                                  // 0x00 is "Normal disconnection" in DISCONNECT, whether it is sent
+                                                                  // or left out
         let reason = match remaining_len.0.cmp(&min_len_reason) {
             core::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
             _ => match ReasonCode::decode(buffer)? {
@@ -136,7 +136,7 @@ impl Decoder for DisconnectPacket {
 
         let properties = match remaining_len.0.cmp(&min_len_properties) {
             core::cmp::Ordering::Less => None,
-            _ => Some(DisconnectProperties::decode(buffer)?),
+            _ => crate::present(DisconnectProperties::decode(buffer)?),
         };
 
         Ok(DisconnectPacket { reason, properties })

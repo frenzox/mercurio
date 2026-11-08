@@ -122,7 +122,7 @@ impl Decoder for PubAckPacket {
         let reason = ReasonCode::decode(buffer)?;
         // The property length is omitted when there are none [MQTT-3.4.2.2]
         let properties = if remaining_len.0 > 3 {
-            Some(PubAckProperties::decode(buffer)?)
+            crate::present(PubAckProperties::decode(buffer)?)
         } else {
             None
         };
@@ -144,7 +144,7 @@ mod tests {
         reason::ReasonCode,
     };
 
-    use crate::puback::{PubAckPacket, PubAckProperties};
+    use crate::puback::PubAckPacket;
 
     #[test]
     fn test_puback_packet_encode_decode() {
@@ -153,7 +153,7 @@ mod tests {
         let packet = PubAckPacket {
             packet_id: 1,
             reason: ReasonCode::NoMatchingSubscribers,
-            properties: PubAckProperties::default().into(),
+            properties: None,
         };
 
         let mut encoded = BytesMut::new();

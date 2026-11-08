@@ -158,7 +158,7 @@ impl Decoder for SubAckPacket {
         let buffer_len = buffer.remaining();
 
         let packet_id = u16::decode(buffer)?;
-        let properties = Some(SubAckProperties::decode(buffer)?);
+        let properties = crate::present(SubAckProperties::decode(buffer)?);
 
         if !buffer.has_remaining() {
             return Err(ReasonCode::ProtocolError.into());
@@ -250,7 +250,7 @@ mod tests {
         let packet = SubAckPacket {
             protocol_version: ProtocolVersion::V5,
             packet_id: 1,
-            properties: SubAckProperties::default().into(),
+            properties: None,
             payload: vec![SubAckPayload {
                 reason_code: ReasonCode::GrantedQoS1,
             }],

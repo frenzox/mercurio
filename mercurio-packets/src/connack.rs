@@ -261,7 +261,7 @@ impl Decoder for ConnAckPacket {
 
         let flags = ConnAckFlags::decode(buffer)?;
         let reason_code = ReasonCode::decode(buffer)?;
-        let properties = Some(ConnAckProperties::decode(buffer)?);
+        let properties = crate::present(ConnAckProperties::decode(buffer)?);
 
         Ok(ConnAckPacket {
             protocol_version: ProtocolVersion::V5,
