@@ -1,12 +1,14 @@
 //! Storage abstraction layer for Mercurio MQTT broker.
 //!
 //! This crate provides traits for persistent storage of MQTT broker state,
-//! allowing different storage backends (in-memory, SQLite, Redis, etc.).
+//! allowing different storage backends (in-memory, SQLite, PostgreSQL).
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod encoding;
 pub mod memory;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
@@ -36,6 +38,10 @@ pub enum StorageError {
     #[cfg(feature = "sqlite")]
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
+
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL error: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
 }
 
 /// Result type for storage operations.
