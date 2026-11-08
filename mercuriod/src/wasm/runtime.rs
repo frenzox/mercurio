@@ -30,8 +30,6 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    // Used once the configuration loads plugins (Task 4)
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> anyhow::Result<Runtime> {
         let mut config = Config::new();
         config.epoch_interruption(true);

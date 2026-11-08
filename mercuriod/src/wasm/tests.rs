@@ -224,3 +224,37 @@ async fn free_port() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reload_keeps_the_previous_code_when_the_new_fails() {
+    let dir = std::env::temp_dir().join(format!("mercuriod-wasm-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deny-topic.wasm");
+    std::fs::copy(example("deny-topic"), &path).unwrap();
+    let mut settings = settings("deny-topic", &[("prefix", "a/")]);
+    settings.path = path.clone();
+    let runtime = Runtime::new().unwrap();
+    let plugin = WasmPlugin::load(&runtime, settings).await.unwrap();
+    let client = ClientInfo::new("c", None);
+    let decide = || plugin.authorize(&client, "a/x", Access::Write);
+    assert_eq!(decide().await, Decision::Deny);
+
+    std::fs::write(&path, b"not a component").unwrap();
+    let error = plugin.reload(&runtime).await.unwrap_err();
+    assert!(format!("{error:#}").contains("compiling"), "{error:#}");
+    assert_eq!(decide().await, Decision::Deny);
+
+    std::fs::copy(example("deny-topic"), &path).unwrap();
+    plugin.reload(&runtime).await.unwrap();
+    assert_eq!(decide().await, Decision::Deny);
+
+    // The SIGHUP loop calls reloads synchronously from a runtime thread
+    let reloader = super::Reloader::new(std::sync::Arc::clone(&plugin), runtime);
+    assert_eq!(
+        crate::reload::Reload::path(&reloader),
+        path.to_str().unwrap()
+    );
+    crate::reload::Reload::reload(&reloader).unwrap();
+    assert_eq!(decide().await, Decision::Deny);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

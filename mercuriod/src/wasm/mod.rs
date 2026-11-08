@@ -23,6 +23,7 @@ use mercurio_server::plugin::{
 };
 use wasmtime::component::Component;
 
+use crate::reload::Reload;
 use pool::Pool;
 use runtime::bindings::{
     self,
@@ -39,8 +40,6 @@ const INTERFACE: &str = "mercurio:plugin/guest@";
 const VERSION: &str = "0.1";
 
 /// How to load and confine one plugin.
-// Built from the configuration (Task 4)
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct PluginSettings {
     pub name: String,
     /// The component, a `.wasm` file
@@ -61,11 +60,9 @@ pub struct PluginSettings {
 
 /// A WebAssembly plugin in the server's plugin chain.
 pub struct WasmPlugin {
-    name: String,
+    settings: PluginSettings,
     loaded: RwLock<Arc<Loaded>>,
-    // Read once reloading replaces `loaded` and hands the new code the
-    // same store
-    #[allow(dead_code)]
+    /// Kept across reloads, so the new code sees what the old stored
     kv: Arc<Kv>,
 }
 
@@ -77,16 +74,23 @@ struct Loaded {
 
 impl WasmPlugin {
     /// Compiles the plugin, makes its first copy and runs its `init`.
-    // Used once the configuration loads plugins (Task 4)
-    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn load(runtime: &Runtime, settings: PluginSettings) -> anyhow::Result<Arc<Self>> {
         let kv = Arc::new(Kv::default());
         let loaded = Loaded::new(runtime, &settings, Arc::clone(&kv)).await?;
         Ok(Arc::new(WasmPlugin {
-            name: settings.name,
+            settings,
             loaded: RwLock::new(Arc::new(loaded)),
             kv,
         }))
+    }
+
+    /// Rereads the plugin's file and, once its first copy has run `init`,
+    /// replaces the running code with it. Calls already running finish on
+    /// the old code; on error the old code stays. The settings stay too.
+    pub async fn reload(&self, runtime: &Runtime) -> anyhow::Result<()> {
+        let loaded = Loaded::new(runtime, &self.settings, Arc::clone(&self.kv)).await?;
+        *self.loaded.write().unwrap() = Arc::new(loaded);
+        Ok(())
     }
 
     /// The current code, which a reload may replace while a call runs.
@@ -98,6 +102,38 @@ impl WasmPlugin {
     fn with(&self, hook: Hooks) -> Option<Arc<Loaded>> {
         let loaded = self.loaded();
         loaded.hooks.contains(hook).then_some(loaded)
+    }
+}
+
+/// Reloads a plugin on SIGHUP, next to the daemon's files.
+pub struct Reloader {
+    plugin: Arc<WasmPlugin>,
+    runtime: Runtime,
+    path: String,
+}
+
+impl Reloader {
+    pub fn new(plugin: Arc<WasmPlugin>, runtime: Runtime) -> Reloader {
+        let path = plugin.settings.path.display().to_string();
+        Reloader {
+            plugin,
+            runtime,
+            path,
+        }
+    }
+}
+
+impl Reload for Reloader {
+    fn reload(&self) -> Result<(), String> {
+        // Called from a thread of the multi-threaded runtime
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.plugin.reload(&self.runtime))
+        })
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    fn path(&self) -> &str {
+        &self.path
     }
 }
 
@@ -190,7 +226,7 @@ fn compatible(version: &str) -> bool {
 
 impl Plugin for WasmPlugin {
     fn name(&self) -> &str {
-        &self.name
+        &self.settings.name
     }
 
     fn authenticate<'a>(
