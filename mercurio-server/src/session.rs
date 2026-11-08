@@ -52,7 +52,9 @@ use crate::{
     acl::Access,
     broker::Broker,
     connection::Connection,
-    plugin::{AuthExchange, AuthResult, Chain, ClientInfo, Decision, MessageAction, PluginMessage},
+    plugin::{
+        AuthExchange, AuthResult, Chain, ClientInfo, Decision, Event, MessageAction, PluginMessage,
+    },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
@@ -1077,6 +1079,15 @@ impl Session {
                 self.shared.subscriber_id,
                 subscriber.clone(),
             );
+            chain.emit(Event::Subscribed {
+                client: ClientInfo {
+                    client_id: session.client_id.clone(),
+                    username: session.verified_user.clone(),
+                    peer: session.peer,
+                },
+                filter: sub.topic_filter.clone(),
+                qos: granted_qos,
+            });
 
             // Shared subscriptions are never sent retained messages
             let shared = parse_shared_subscription(&sub.topic_filter).is_some();
@@ -1115,6 +1126,7 @@ impl Session {
         &mut self,
         packet: UnsubscribePacket,
         broker: &Broker<S>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
@@ -1138,6 +1150,16 @@ impl Session {
             } else {
                 ReasonCode::NoSubscriptionExisted
             };
+            if reason_code == ReasonCode::Success {
+                chain.emit(Event::Unsubscribed {
+                    client: ClientInfo {
+                        client_id: session.client_id.clone(),
+                        username: session.verified_user.clone(),
+                        peer: session.peer,
+                    },
+                    filter: unsub.topic_filter.clone(),
+                });
+            }
 
             ack.payload.push(UnsubAckPayload { reason_code });
         }
@@ -1237,7 +1259,9 @@ impl Session {
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
             ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker, chain).await,
-            ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet, broker).await,
+            ControlPacket::Unsubscribe(packet) => {
+                self.handle_unsubscribe(packet, broker, chain).await
+            }
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
             ControlPacket::Auth(packet) => self.handle_auth(packet, chain).await,
@@ -1601,7 +1625,10 @@ mod tests {
             }],
         };
 
-        let result = session.handle_unsubscribe(packet, &broker).await.unwrap();
+        let result = session
+            .handle_unsubscribe(packet, &broker, &no_plugins())
+            .await
+            .unwrap();
 
         match result {
             Some(ControlPacket::UnsubAck(ack)) => {
@@ -1645,7 +1672,7 @@ mod tests {
         };
 
         let result = session
-            .handle_unsubscribe(unsub_packet, &broker)
+            .handle_unsubscribe(unsub_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -1702,7 +1729,7 @@ mod tests {
         };
 
         let result = session
-            .handle_unsubscribe(unsub_packet, &broker)
+            .handle_unsubscribe(unsub_packet, &broker, &no_plugins())
             .await
             .unwrap();
 
@@ -2514,8 +2541,10 @@ mod tests {
                 topic_filter: "a/#/b".into(),
             }],
         };
-        let Some(ControlPacket::UnsubAck(ack)) =
-            session.handle_unsubscribe(packet, &broker).await.unwrap()
+        let Some(ControlPacket::UnsubAck(ack)) = session
+            .handle_unsubscribe(packet, &broker, &no_plugins())
+            .await
+            .unwrap()
         else {
             panic!("Expected UNSUBACK");
         };

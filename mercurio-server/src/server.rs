@@ -55,7 +55,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http,
-    plugin::{AuthResult, Chain, ClientInfo, Credentials, Decision, Plugin},
+    plugin::{AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
     proxy,
     session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
@@ -706,6 +706,20 @@ pub async fn run(
     run_with_config(listener, ServerConfig::default(), shutdown).await
 }
 
+/// Every plugin of the broker and of its listeners, each once.
+fn distinct_plugins(
+    main: &[Arc<dyn Plugin>],
+    listeners: &[Option<Vec<Arc<dyn Plugin>>>],
+) -> Vec<Arc<dyn Plugin>> {
+    let mut all: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in main.iter().chain(listeners.iter().flatten().flatten()) {
+        if !all.iter().any(|seen| Arc::ptr_eq(seen, plugin)) {
+            all.push(Arc::clone(plugin));
+        }
+    }
+    all
+}
+
 /// Run the MQTT broker with the given configuration, keeping its state in
 /// memory.
 pub async fn run_with_config(
@@ -742,6 +756,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
 
+    let listener_plugins: Vec<_> = listeners.iter().map(|l| l.plugins.clone()).collect();
     let main = ListenerConfig {
         tls: tls_config,
         ..ListenerConfig::new(listener, Transport::Mqtt)
@@ -752,6 +767,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let auth_config = Arc::new(auth_config);
+    let all_plugins = distinct_plugins(&plugins, &listener_plugins);
     let chain = Chain::new(plugins, plugin_timeout);
 
     let mut server = Listener {
@@ -775,6 +791,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     };
 
     let session_manager = server.session_manager_holder.session_manager();
+    session_manager.set_expiry_chain(Chain::new(all_plugins, plugin_timeout));
     if let Some(interval) = sys_interval {
         sys::spawn_publisher(
             server.broker.clone(),
@@ -1246,6 +1263,9 @@ where
             }
 
             let _connected = ConnectedGuard::new(Arc::clone(&self.stats));
+            self.chain.emit(Event::Connected {
+                client: session.identity().await,
+            });
             self.handle_connection(
                 &session,
                 keepalive,
@@ -1256,6 +1276,15 @@ where
             .await
         }
         .await;
+
+        let reason = match &result {
+            Err(Error::MQTTReasonCode(reason)) => Some(*reason),
+            _ => None,
+        };
+        self.chain.emit(Event::Disconnected {
+            client: session.identity().await,
+            reason,
+        });
 
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::MQTTReasonCode(reason)) = &result {

@@ -248,6 +248,9 @@ pub(crate) struct Chain {
     /// In-process connections: every topic is allowed, `$SYS` and
     /// `$CONTROL` included, and nothing is authenticated
     trusted: bool,
+    /// Feeds the task that hands events to the plugins, started by the
+    /// first event. Shared by the clones of a chain.
+    events: Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Event>>>,
 }
 
 impl Chain {
@@ -256,6 +259,7 @@ impl Chain {
             plugins: plugins.into(),
             timeout,
             trusted: false,
+            events: Arc::default(),
         }
     }
 
@@ -346,18 +350,28 @@ impl Chain {
         MessageAction::Continue
     }
 
-    #[allow(dead_code)] // used from Task 5
     pub(crate) fn emit(&self, event: Event) {
         if self.plugins.is_empty() {
             return;
         }
-        let chain = self.clone();
-        tokio::spawn(async move {
-            for plugin in chain.plugins.iter() {
-                let hook = plugin.on_event(&event);
-                guarded(plugin.name(), "on_event", chain.timeout, hook).await;
-            }
+        let sender = self.events.get_or_init(|| {
+            // One task per chain hands events to the plugins in the order
+            // they happened
+            // ponytail: unbounded, so a plugin slower than the event rate
+            // grows the queue; bound it and drop events if that becomes a
+            // problem
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Event>();
+            let (plugins, timeout) = (Arc::clone(&self.plugins), self.timeout);
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    for plugin in plugins.iter() {
+                        guarded(plugin.name(), "on_event", timeout, plugin.on_event(&event)).await;
+                    }
+                }
+            });
+            sender
         });
+        let _ = sender.send(event);
     }
 
     #[allow(dead_code)] // used from Task 6

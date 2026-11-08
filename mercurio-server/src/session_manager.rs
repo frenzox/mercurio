@@ -22,6 +22,7 @@ use tracing::{error, warn};
 
 use crate::{
     broker::Broker,
+    plugin::{Chain, Event},
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
     writer::Writers,
@@ -60,6 +61,8 @@ struct Shared {
     local: std::sync::Mutex<HashSet<String>>,
     /// Sessions ended by their expiry
     expired: std::sync::atomic::AtomicU64,
+    /// Who hears about expired sessions, which belong to no connection
+    expiry_chain: std::sync::OnceLock<Chain>,
 }
 
 struct State {
@@ -137,6 +140,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             persistent: Default::default(),
             local: Default::default(),
             expired: Default::default(),
+            expiry_chain: Default::default(),
         });
 
         SessionManager {
@@ -407,6 +411,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
     }
 
+    pub(crate) fn set_expiry_chain(&self, chain: Chain) {
+        let _ = self.shared.expiry_chain.set(chain);
+    }
+
     /// Ends the session of `client_id` after `delay`, unless a connection
     /// newer than `generation` uses it in the meantime.
     fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
@@ -418,6 +426,11 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     .shared
                     .expired
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(chain) = manager.shared.expiry_chain.get() {
+                    chain.emit(Event::SessionExpired {
+                        client_id: client_id.clone(),
+                    });
+                }
             }
         });
     }
@@ -743,6 +756,46 @@ mod tests {
         assert!(state.connections.is_empty());
         assert!(storage.load_session("c").await.unwrap().is_none());
         assert!(storage.get_all_inflight("c").await.unwrap().is_empty());
+    }
+
+    struct ExpiryRecorder(std::sync::Mutex<Vec<String>>);
+
+    impl crate::plugin::Plugin for ExpiryRecorder {
+        fn name(&self) -> &str {
+            "expiry-recorder"
+        }
+
+        fn on_event<'a>(
+            &'a self,
+            event: &'a crate::plugin::Event,
+        ) -> crate::plugin::BoxFuture<'a, ()> {
+            if let crate::plugin::Event::SessionExpired { client_id } = event {
+                self.0.lock().unwrap().push(client_id.clone());
+            }
+            crate::plugin::ready(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expiry_is_reported_to_plugins() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
+        let recorder = Arc::new(ExpiryRecorder(Default::default()));
+        manager.set_expiry_chain(crate::plugin::Chain::new(
+            vec![recorder.clone()],
+            Duration::from_secs(5),
+        ));
+
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        manager
+            .end_connection(started.lease, Some(Duration::from_millis(10)))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(*recorder.0.lock().unwrap(), ["c"]);
     }
 
     #[tokio::test]

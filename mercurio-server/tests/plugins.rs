@@ -176,3 +176,66 @@ async fn message_hook_rewrites_and_drops() {
     assert_eq!(publisher.publish("a", b"drop").await, ReasonCode::Success);
     assert!(subscriber.receive().await.is_none());
 }
+
+/// Records the events it hears.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<String>>);
+
+impl Plugin for Recorder {
+    fn name(&self) -> &str {
+        "recorder"
+    }
+
+    fn on_event<'a>(&'a self, event: &'a mercurio_server::plugin::Event) -> BoxFuture<'a, ()> {
+        use mercurio_server::plugin::Event::*;
+        let line = match event {
+            Connected { client } => format!("connected {}", client.client_id),
+            Disconnected { client, .. } => format!("disconnected {}", client.client_id),
+            Subscribed { client, filter, .. } => {
+                format!("subscribed {} {filter}", client.client_id)
+            }
+            Unsubscribed { client, filter } => {
+                format!("unsubscribed {} {filter}", client.client_id)
+            }
+            SessionExpired { client_id } => format!("expired {client_id}"),
+            _ => "other".into(),
+        };
+        self.0.lock().unwrap().push(line);
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_events_reach_plugins() {
+    let recorder = Arc::new(Recorder::default());
+    let addr = start_broker(vec![recorder.clone()]).await;
+    let mut client = Client::connect(addr, "c1").await;
+    client.subscribe("a/#").await;
+    client
+        .send(ControlPacket::Unsubscribe(
+            mercurio_packets::unsubscribe::UnsubscribePacket {
+                packet_id: 2,
+                properties: None,
+                payload: vec![mercurio_packets::unsubscribe::UnsubscribePayload {
+                    topic_filter: "a/#".into(),
+                }],
+            },
+        ))
+        .await;
+    assert!(matches!(
+        client.receive().await,
+        Some(ControlPacket::UnsubAck(_))
+    ));
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        [
+            "connected c1",
+            "subscribed c1 a/#",
+            "unsubscribed c1 a/#",
+            "disconnected c1"
+        ]
+    );
+}
