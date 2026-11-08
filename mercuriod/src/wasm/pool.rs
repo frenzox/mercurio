@@ -72,16 +72,27 @@ impl Pool {
             Ok(UpdateDeadline::Yield(1))
         });
         self.arm(&mut store);
-        let plugin = self.pre.instantiate_async(&mut store).await?;
-        let mut instance = Instance {
-            store,
-            guest: plugin.mercurio_plugin_guest().clone(),
+        // Epochs count only time spent running; a plugin waiting in a host
+        // call, such as an HTTP request, needs a clock too
+        let init = async {
+            let plugin = self.pre.instantiate_async(&mut store).await?;
+            let guest = plugin.mercurio_plugin_guest().clone();
+            let registration = guest.call_init(&mut store, &self.config).await?;
+            Ok::<_, wasmtime::Error>((guest, registration))
         };
-        let registration = instance
-            .guest
-            .call_init(&mut instance.store, &self.config)
-            .await?
-            .map_err(|message| anyhow::anyhow!("plugin `{}`: {message}", self.name))?;
+        let (guest, registration) =
+            tokio::time::timeout(self.timeout, init)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "plugin `{}`: init took longer than {:?}",
+                        self.name,
+                        self.timeout
+                    )
+                })??;
+        let registration =
+            registration.map_err(|message| anyhow::anyhow!("plugin `{}`: {message}", self.name))?;
+        let instance = Instance { store, guest };
         Ok((instance, registration))
     }
 
@@ -112,12 +123,17 @@ impl Pool {
         };
         self.arm(&mut instance.store);
         // When this future is dropped mid-call the copy goes with it
-        match call(&mut instance).await {
-            Ok(value) => {
+        let result = tokio::time::timeout(self.timeout, call(&mut instance)).await;
+        match result {
+            Ok(Ok(value)) => {
                 self.put(instance);
                 Some(value)
             }
-            Err(error) => {
+            Err(_) => {
+                tracing::warn!(plugin = %self.name, "Took longer than {:?} in {hook}", self.timeout);
+                None
+            }
+            Ok(Err(error)) => {
                 tracing::warn!(plugin = %self.name, "Failed in {hook}: {error:#}");
                 None
             }

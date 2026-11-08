@@ -9,7 +9,7 @@ mod sandbox;
 mod tests;
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -31,9 +31,12 @@ use runtime::bindings::{
 pub use runtime::Runtime;
 use sandbox::{Allowed, Kv, State};
 
-/// The interface version a plugin must be built for, as a prefix of its
-/// `mercurio:plugin/guest@` export.
-const VERSION: &str = "0.1.";
+/// The export a plugin implements, before its version.
+const INTERFACE: &str = "mercurio:plugin/guest@";
+
+/// The interface versions a plugin may be built for: wasmtime matches any
+/// patch release of a 0.x minor to the version the bindings name.
+const VERSION: &str = "0.1";
 
 /// How to load and confine one plugin.
 // Built from the configuration (Task 4)
@@ -104,12 +107,20 @@ impl Loaded {
         settings: &PluginSettings,
         kv: Arc<Kv>,
     ) -> anyhow::Result<Self> {
+        let path = settings.path.clone();
+        let engine = runtime.engine.clone();
+        // Compiling takes tens of milliseconds, too long for a runtime
+        // thread of a running broker
+        let component = tokio::task::spawn_blocking(move || {
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            Component::from_binary(&engine, &bytes)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("compiling {}", path.display()))
+        })
+        .await??;
         let path = &settings.path;
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let component = Component::from_binary(&runtime.engine, &bytes)
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("compiling {}", path.display()))?;
-        check_version(runtime, &component).with_context(|| path.display().to_string())?;
+        check_version(runtime, &component, path)?;
         let pre = runtime
             .linker
             .instantiate_pre(&component)
@@ -142,19 +153,17 @@ impl Loaded {
 }
 
 /// Refuses a component that doesn't export the plugin interface, or
-/// exports another version of it.
-fn check_version(runtime: &Runtime, component: &Component) -> anyhow::Result<()> {
+/// exports a version of it this broker can't call.
+fn check_version(runtime: &Runtime, component: &Component, path: &Path) -> anyhow::Result<()> {
     let names: Vec<String> = component
         .component_type()
         .exports(&runtime.engine)
         .map(|(name, _)| name.to_string())
         .collect();
-    let Some(version) = names
-        .iter()
-        .find_map(|name| name.strip_prefix("mercurio:plugin/guest@"))
-    else {
+    let path = path.display();
+    let Some(version) = names.iter().find_map(|name| name.strip_prefix(INTERFACE)) else {
         anyhow::bail!(
-            "not a mercurio plugin: it exports {}",
+            "{path}: not a mercurio plugin, it exports {}",
             if names.is_empty() {
                 "nothing".to_string()
             } else {
@@ -163,10 +172,20 @@ fn check_version(runtime: &Runtime, component: &Component) -> anyhow::Result<()>
         );
     };
     anyhow::ensure!(
-        version.starts_with(VERSION),
-        "built for plugin interface {version}, this broker runs {VERSION}x"
+        compatible(version),
+        "{path}: built for {INTERFACE}{version}, this broker supports {VERSION}"
     );
     Ok(())
+}
+
+/// Whether wasmtime's export lookup matches `version` to the interface
+/// this broker was built with: any patch release of the same 0.x minor,
+/// with no pre-release or build suffix.
+fn compatible(version: &str) -> bool {
+    version
+        .strip_prefix(VERSION)
+        .and_then(|patch| patch.strip_prefix('.'))
+        .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl Plugin for WasmPlugin {
@@ -277,8 +296,10 @@ impl Plugin for WasmPlugin {
     }
 
     fn on_event<'a>(&'a self, event: &'a Event) -> BoxFuture<'a, ()> {
-        let (Some(loaded), Some(event)) = (self.with(Hooks::ON_EVENT), convert::event(event))
-        else {
+        let Some(loaded) = self.with(Hooks::ON_EVENT) else {
+            return ready(());
+        };
+        let Some(event) = convert::event(event) else {
             return ready(());
         };
         Box::pin(async move {
@@ -378,5 +399,20 @@ impl AuthExchange for WasmAuth {
             self.state = state;
             result
         })
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::compatible;
+
+    #[test]
+    fn test_patch_releases_of_the_minor_are_compatible() {
+        assert!(compatible("0.1.0"));
+        assert!(compatible("0.1.7"));
+        assert!(!compatible("0.2.0"));
+        assert!(!compatible("0.10.0"));
+        assert!(!compatible("0.1.0-rc1"));
+        assert!(!compatible("0.1"));
     }
 }
