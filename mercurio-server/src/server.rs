@@ -2,6 +2,7 @@ use std::{
     future::{poll_fn, Future},
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     task::Poll,
 };
@@ -35,6 +36,12 @@ use mercurio_packets::{
     connack::{ConnAckFlags, ConnAckPacket, ConnAckProperties},
     connect::ConnectPacket,
     disconnect::{DisconnectPacket, DisconnectProperties},
+    pingresp::PingRespPacket,
+    puback::PubAckPacket,
+    pubcomp::PubCompPacket,
+    publish::PublishPacket,
+    pubrec::PubRecPacket,
+    pubrel::PubRelPacket,
     ControlPacket,
 };
 use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
@@ -45,7 +52,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http, proxy,
-    session::{effective_keepalive, Session, WillMessage},
+    session::{effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
@@ -352,13 +359,40 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
     /// Serves a connection accepted on a listener, after the PROXY header
     /// and the TLS handshake if the listener has them. `_slots` are held for
     /// as long as it runs.
+    ///
+    /// Everything here is boxed: the task holds this function's state for
+    /// the whole connection, so it keeps only pointers, and the handshakes'
+    /// state is freed once they are done.
     async fn serve_accepted<S>(
-        mut self,
+        self: Box<Self>,
+        socket: S,
+        settings: EndpointSettings,
+        peer_addr: Option<SocketAddr>,
+        _slots: [Option<OwnedSemaphorePermit>; 2],
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let transport = settings.transport;
+        let Some((parts, stream, peer_addr)) =
+            Box::pin(self.handshake(socket, settings, peer_addr)).await
+        else {
+            return;
+        };
+        match stream {
+            Secured::Plain(stream) => Box::pin(parts.serve(stream, transport, peer_addr)).await,
+            Secured::Tls(stream) => Box::pin(parts.serve(*stream, transport, peer_addr)).await,
+        }
+    }
+
+    /// Reads the PROXY header and completes the TLS handshake the listener
+    /// asks for. None if they failed, which is logged.
+    async fn handshake<S>(
+        mut self: Box<Self>,
         mut socket: S,
         settings: EndpointSettings,
         mut peer_addr: Option<SocketAddr>,
-        _slots: [Option<OwnedSemaphorePermit>; 2],
-    ) where
+    ) -> Option<(Self, Secured<S>, Option<SocketAddr>)>
+    where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if settings.proxy_protocol {
@@ -368,20 +402,23 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
                 }
-                Ok(Err(e)) => return warn!("Bad PROXY header from {:?}: {}", peer_addr, e),
-                Err(_) => return warn!("No PROXY header from {:?} in time", peer_addr),
+                Ok(Err(e)) => {
+                    warn!("Bad PROXY header from {:?}: {}", peer_addr, e);
+                    return None;
+                }
+                Err(_) => {
+                    warn!("No PROXY header from {:?} in time", peer_addr);
+                    return None;
+                }
             }
         }
-        let transport = settings.transport;
         self.mount_point = settings.mount_point;
         self.http_dir = settings.http_dir;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
-        // Boxed, so each connection holds the state of its own path, plain
-        // or TLS, not that of the largest
         let Some(acceptor) = settings.tls_acceptor else {
-            return Box::pin(self.serve(socket, transport, peer_addr)).await;
+            return Some((*self, Secured::Plain(socket), peer_addr));
         };
         match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
@@ -393,13 +430,19 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         .and_then(|cert| certificate_name(cert, part));
                     if self.cert_identity.is_none() {
                         warn!("No Common Name in the certificate of {:?}", peer_addr);
-                        return;
+                        return None;
                     }
                 }
-                Box::pin(self.serve(tls_stream, transport, peer_addr)).await;
+                Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
             }
-            Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
-            Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
+            Ok(Err(e)) => {
+                error!("TLS handshake failed for {:?}: {}", peer_addr, e);
+                None
+            }
+            Err(_) => {
+                warn!("TLS handshake timed out for {:?}", peer_addr);
+                None
+            }
         }
     }
 
@@ -414,7 +457,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             Transport::WebSocket => {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
-                        let request = http::serve_or_upgrade(stream, &dir);
+                        let request = Box::pin(http::serve_or_upgrade(stream, &dir));
                         match time::timeout(self.limits.connect_timeout, request).await {
                             Ok(Ok(Some(upgrade))) => upgrade,
                             Ok(Ok(None)) => return,
@@ -428,7 +471,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 };
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
-                let handshake = websocket::accept(stream, self.limits.max_packet_size);
+                let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
                 match time::timeout(self.limits.connect_timeout, handshake).await {
                     Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
@@ -784,12 +827,16 @@ impl<St: MqttStore + 'static> Listener<St> {
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
-                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slots));
+                    tokio::spawn(
+                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots),
+                    );
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
-                    tokio::spawn(parts.serve_accepted(socket, settings, peer_addr, slots));
+                    tokio::spawn(
+                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots),
+                    );
                 }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
@@ -820,13 +867,17 @@ impl<St: MqttStore + 'static> Listener<St> {
         )
         .await;
 
-        match first_packet {
+        // Boxed, as it is kept until the connection ends
+        let first_packet = Box::new(first_packet);
+        match *first_packet {
             // [MQTT-3.1.0-1]
             // After a Network Connection is established by a Client
             // to a Server, the first packet sent from the Client to
             // the Server MUST be a CONNECT packet.
             Ok(Ok(Some(ControlPacket::Connect(p)))) => {
-                match handler.run(p).await {
+                // Boxed: an async function's arguments take room in its state
+                // for as long as it runs, the whole connection
+                match handler.run(Box::new(p)).await {
                     // Closed by the broker's own shutdown
                     Err(mercurio_core::error::Error::MQTTReasonCode(
                         ReasonCode::ServerShuttingDown,
@@ -876,7 +927,9 @@ impl<St: MqttStore + 'static> Listener<St> {
             }
             _ => error!("ConnectPacket expectation not met"),
         }
-        handler.connection.close().await;
+        // Boxed: it runs once, at the end, but would take room in this
+        // state for the whole connection
+        Box::pin(handler.connection.close()).await;
     }
 
     /// Waits for the next connection. Errors such as running out of file
@@ -933,7 +986,7 @@ where
     St: MqttStore + 'static,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    async fn run(&mut self, mut connect_packet: ConnectPacket) -> Result<()> {
+    async fn run(&mut self, mut connect_packet: Box<ConnectPacket>) -> Result<()> {
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
 
@@ -957,7 +1010,9 @@ where
             // Verified by the TLS handshake, in place of any credentials
             verified_user = Some(identity);
         } else if let Some(method) = authentication_method {
-            match self.authenticate_enhanced(&connect_packet, &method).await? {
+            // Boxed, like the rest of the connect phase, so its state isn't
+            // kept for the whole connection
+            match Box::pin(self.authenticate_enhanced(&connect_packet, &method)).await? {
                 Some(username) => verified_user = username,
                 None => return Ok(()),
             }
@@ -1082,10 +1137,8 @@ where
             username: verified_user.clone(),
             mount_point: self.connection.mount_point().map(str::to_string),
         };
-        let mut start_result = self
-            .session_manager
-            .start_session(connect_packet, owner)
-            .await?;
+        let mut start_result =
+            Box::pin(self.session_manager.start_session(*connect_packet, owner)).await?;
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
@@ -1100,21 +1153,22 @@ where
         session.set_verified_user(verified_user).await;
 
         let result = async {
-            session
-                .begin(
-                    &mut self.connection,
-                    start_result.resume,
-                    start_result.assigned_client_id,
-                    &self.limits,
-                    &self.policy,
-                )
-                .await?;
+            Box::pin(session.begin(
+                &mut self.connection,
+                start_result.resume,
+                start_result.assigned_client_id,
+                &self.limits,
+                &self.policy,
+            ))
+            .await?;
 
             // Restore subscriptions if resuming a persisted session
             if !start_result.subscriptions_to_restore.is_empty() {
-                session
-                    .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker)
-                    .await?;
+                Box::pin(
+                    session
+                        .restore_subscriptions(start_result.subscriptions_to_restore, &self.broker),
+                )
+                .await?;
             }
 
             // Resend whatever the client hadn't acknowledged when it left
@@ -1122,7 +1176,7 @@ where
                 .restore_inflight(start_result.inflight_to_retry)
                 .await;
             for packet in session.pending_retransmissions().await {
-                self.connection.write_packet(packet).await?;
+                Box::pin(self.connection.write_packet(packet)).await?;
             }
 
             let _connected = ConnectedGuard::new(Arc::clone(&self.stats));
@@ -1140,16 +1194,14 @@ where
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::MQTTReasonCode(reason)) = &result {
             if protocol_version.supports_reason_codes() && reason.get_code() >= 0x80 {
-                let _ = self
-                    .connection
-                    .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                        reason: *reason,
-                        properties: Some(DisconnectProperties {
-                            reason_string: reason_string(*reason, client_maximum_packet_size),
-                            ..Default::default()
-                        }),
-                    }))
-                    .await;
+                let disconnect = ControlPacket::Disconnect(DisconnectPacket {
+                    reason: *reason,
+                    properties: Some(DisconnectProperties {
+                        reason_string: reason_string(*reason, client_maximum_packet_size),
+                        ..Default::default()
+                    }),
+                });
+                let _ = Box::pin(self.connection.write_packet(disconnect)).await;
             }
         }
 
@@ -1177,7 +1229,7 @@ where
             };
 
             if delay.is_zero() {
-                publish.await;
+                Box::pin(publish).await;
             } else {
                 tokio::spawn(publish);
             }
@@ -1270,42 +1322,48 @@ where
     /// Refuses the connection, pointing MQTT 5 clients to another server.
     /// MQTT 3.x has no way to name one, so its clients learn only that this
     /// server is unavailable.
-    async fn redirect(
-        &mut self,
-        connect_packet: &ConnectPacket,
-        redirect: &Redirect,
-    ) -> Result<()> {
-        let connack = if connect_packet.protocol_version.supports_properties() {
-            ConnAckPacket {
-                protocol_version: connect_packet.protocol_version,
-                flags: ConnAckFlags {
-                    session_present: false,
-                },
-                reason_code: if redirect.permanent {
-                    ReasonCode::ServerMoved
-                } else {
-                    ReasonCode::UseAnotherServer
-                },
-                properties: Some(ConnAckProperties {
-                    server_reference: Some(ServerReference::new(redirect.server_reference.clone())),
-                    ..Default::default()
-                }),
-            }
-        } else {
-            ConnAckPacket {
-                protocol_version: connect_packet.protocol_version,
-                flags: ConnAckFlags {
-                    session_present: false,
-                },
-                reason_code: ReasonCode::ServerUnavailable,
-                properties: None,
-            }
-        };
-        let _ = self
-            .connection
-            .write_packet(ControlPacket::ConnAck(connack))
-            .await;
-        Ok(())
+    // Boxed, as are the other refusals: they are rare, and inline they would
+    // take room in the state of every connection
+    fn redirect<'a>(
+        &'a mut self,
+        connect_packet: &'a ConnectPacket,
+        redirect: &'a Redirect,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let connack = if connect_packet.protocol_version.supports_properties() {
+                ConnAckPacket {
+                    protocol_version: connect_packet.protocol_version,
+                    flags: ConnAckFlags {
+                        session_present: false,
+                    },
+                    reason_code: if redirect.permanent {
+                        ReasonCode::ServerMoved
+                    } else {
+                        ReasonCode::UseAnotherServer
+                    },
+                    properties: Some(ConnAckProperties {
+                        server_reference: Some(ServerReference::new(
+                            redirect.server_reference.clone(),
+                        )),
+                        ..Default::default()
+                    }),
+                }
+            } else {
+                ConnAckPacket {
+                    protocol_version: connect_packet.protocol_version,
+                    flags: ConnAckFlags {
+                        session_present: false,
+                    },
+                    reason_code: ReasonCode::ServerUnavailable,
+                    properties: None,
+                }
+            };
+            let _ = self
+                .connection
+                .write_packet(ControlPacket::ConnAck(connack))
+                .await;
+            Ok(())
+        })
     }
 
     /// Why a will the broker can't honour is refused [MQTT-3.2.2-12]
@@ -1334,35 +1392,37 @@ where
         None
     }
 
-    async fn reject_connect(
-        &mut self,
-        connect_packet: &ConnectPacket,
+    fn reject_connect<'a>(
+        &'a mut self,
+        connect_packet: &'a ConnectPacket,
         reason_code: ReasonCode,
-    ) -> Result<()> {
-        let client_maximum = connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.maximum_packet_size.as_ref())
-            .map(|m| m.value);
-        let connack = ConnAckPacket {
-            protocol_version: connect_packet.protocol_version,
-            flags: ConnAckFlags {
-                session_present: false,
-            },
-            reason_code,
-            properties: connect_packet
-                .protocol_version
-                .supports_properties()
-                .then(|| ConnAckProperties {
-                    reason_string: reason_string(reason_code, client_maximum),
-                    ..Default::default()
-                }),
-        };
-        let _ = self
-            .connection
-            .write_packet(ControlPacket::ConnAck(connack))
-            .await;
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let client_maximum = connect_packet
+                .properties
+                .as_ref()
+                .and_then(|p| p.maximum_packet_size.as_ref())
+                .map(|m| m.value);
+            let connack = ConnAckPacket {
+                protocol_version: connect_packet.protocol_version,
+                flags: ConnAckFlags {
+                    session_present: false,
+                },
+                reason_code,
+                properties: connect_packet
+                    .protocol_version
+                    .supports_properties()
+                    .then(|| ConnAckProperties {
+                        reason_string: reason_string(reason_code, client_maximum),
+                        ..Default::default()
+                    }),
+            };
+            let _ = self
+                .connection
+                .write_packet(ControlPacket::ConnAck(connack))
+                .await;
+            Ok(())
+        })
     }
 
     async fn handle_connection(
@@ -1373,7 +1433,7 @@ where
         protocol_version: ProtocolVersion,
         expiry: &mut Option<Duration>,
     ) -> Result<()> {
-        let mut session = session.clone();
+        let session = session.clone();
 
         // Keep-alive timeout is 1.5x the keepalive interval; 0 disables it
         let timeout_duration =
@@ -1382,177 +1442,375 @@ where
         let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
 
+        let client_id = session.get_client_id().await;
         while !self.shutdown.is_shutdown() {
             // Re-evaluated after every packet, so acknowledgements reopen it
             let window_open = session.can_send_more().await;
 
-            tokio::select! {
-                // Try to read and process new incoming packet
-                maybe_packet = self.connection.read_packet() => {
-                    let packet = match maybe_packet? {
-                        None => {
-                            // Connection closed without DISCONNECT - abnormal
-                            return Ok(());
-                        }
-                        Some(ControlPacket::Disconnect(disconnect)) => {
-                            let new_interval = disconnect
-                                .properties
-                                .as_ref()
-                                .and_then(|p| p.session_expiry_interval.as_ref())
-                                .map(|p| p.value);
-
-                            if let Some(interval) = new_interval {
-                                // A session that was to end with the connection can't
-                                // be extended on the way out [MQTT-3.14.2-2]
-                                if *expiry == Some(Duration::ZERO) && interval != 0 {
-                                    return Err(ReasonCode::ProtocolError.into());
-                                }
-                                *expiry = (interval != u32::MAX)
-                                    .then(|| Duration::from_secs(interval.into()));
-                            }
-
-                            // Reason 0x04 asks for the will to be published anyway
-                            if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
-                                session.clear_will().await;
-                                let client_id = session.get_client_id().await;
-                                self.session_manager.delete_will(&client_id);
-                            }
-                            return Ok(());
-                        }
-                        Some(packet) => packet,
-                    };
-
-                    if matches!(packet, ControlPacket::Publish(_)) {
-                        Stats::add(&self.stats.messages_received);
-                    }
-
-                    let is_subscription_change = matches!(
-                        packet,
-                        ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
-                    );
-
-                    // Check if this is an ack that completes an inflight message
-                    let inflight_completed = match &packet {
-                        ControlPacket::PubAck(ack) => Some(ack.packet_id),
-                        ControlPacket::PubComp(comp) => Some(comp.packet_id),
-                        ControlPacket::PubRec(rec) if rec.reason.get_code() >= 0x80 => {
-                            Some(rec.packet_id)
-                        }
-                        _ => None,
-                    };
-
-                    let maybe_res = session
-                        .process_incoming(
-                            packet,
-                            &self.broker,
-                            self.auth_config.auth_manager.as_deref(),
-                            self.auth_config.authorizer.as_deref(),
-                        ).await?;
-
-                    // Persist subscriptions after subscribe/unsubscribe operations
-                    if is_subscription_change {
-                        let client_id = session.get_client_id().await;
-                        let subscriptions = session.get_subscriptions().await;
-                        self.session_manager
-                            .save_subscriptions(&client_id, subscriptions).await;
-                    }
-
-                    // Remove inflight message after acknowledgment
-                    if let Some(packet_id) = inflight_completed {
-                        let client_id = session.get_client_id().await;
-                        self.session_manager.remove_inflight(&client_id, packet_id).await;
-                    }
-
-                    // After PUBREC only PUBREL remains to be sent for a QoS 2 message
-                    if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
-                        if pubrel.reason == ReasonCode::Success {
-                            let client_id = session.get_client_id().await;
-                            self.session_manager
-                                .release_inflight(&client_id, pubrel.packet_id).await;
-                        }
-                    }
-
-                    if let Some(res) = maybe_res {
-                        debug!("Sending {} to client {:?}", describe(&res), session.get_client_id().await);
-                        self.connection.write_packet(res).await?;
-                    }
-
+            // Only waiting happens here, and the work an event brings runs in
+            // a boxed future while it lasts: an idle connection holds just
+            // what waiting takes, not the state of its heaviest handling
+            let step = tokio::select! {
+                // So are the packets most clients send, PUBLISH and its
+                // acknowledgements; the rest are boxed
+                packet = self.connection.read_packet() => match HotPacket::try_from(packet?) {
+                    Ok(packet) => Step::Done(self.handle_hot(&session, &client_id, packet).await?),
+                    Err(packet) => Step::Wake(Wake::Packet(packet)),
+                },
+                // The common case, a message to send, isn't boxed: it would
+                // cost an allocation per message
+                message = session.next_outgoing(window_open) => {
+                    Step::Done(self.send_outgoing(&session, &client_id, message).await?)
+                }
+                _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
+                Ok(()) = lease.takeover.changed() => Step::Wake(Wake::TakenOver),
+                _ = self.shutdown.recv() => {
+                    return Err(ReasonCode::ServerShuttingDown.into());
+                }
+            };
+            let flow = match step {
+                Step::Done(flow) => flow,
+                Step::Wake(wake) => {
+                    Box::pin(self.handle_wake(
+                        wake,
+                        &session,
+                        timeout_duration,
+                        protocol_version,
+                        expiry,
+                    ))
+                    .await?
+                }
+            };
+            match flow {
+                Flow::Continue => {}
+                Flow::PacketHandled => {
                     // Reset keep-alive deadline after receiving any packet
                     if let Some(timeout) = timeout_duration {
                         deadline.as_mut().reset(Instant::now() + timeout);
                     }
                 }
-
-                // Try to send outgoing packet
-                // With the client's window full only QoS 0 messages can go out
-                message = session.next_outgoing(window_open) => {
-                    // Checked per message: a permitted subscription can still
-                    // match topics the client may not read
-                    if let Some(authorizer) = &self.auth_config.authorizer {
-                        // Re-read each time: re-authentication can change the user
-                        let identity = session.identity().await;
-                        if !authorizer.authorize(&identity, &message.topic, Access::Read) {
-                            continue;
-                        }
-                    }
-                    let Some(outgoing) = session.prepare_publish(message).await else {
-                        continue;
-                    };
-                    debug!("Sending {} to client {:?}", describe(&outgoing.packet), session.get_client_id().await);
-
-                    if let Some(inflight) = outgoing.inflight {
-                        let client_id = session.get_client_id().await;
-                        self.session_manager.store_inflight(&client_id, &inflight).await;
-                    }
-
-                    self.connection.write_packet(outgoing.packet).await?;
-                    Stats::add(&self.stats.messages_sent);
-                }
-
-                // Keep-alive timeout expired - disconnect client
-                _ = &mut deadline, if timeout_duration.is_some() => {
-                    let client_id = session.get_client_id().await;
-                    warn!(
-                        "Keep-alive timeout for client `{}` ({:?} with no packets)",
-                        client_id, timeout_duration.unwrap_or_default()
-                    );
-                    // An abnormal disconnect: the will is published
-                    return Err(ReasonCode::KeepAliveTimeout.into());
-                }
-
-                // Another connection with the same client id replaces this one
-                Ok(()) = lease.takeover.changed() => {
-                    info!(
-                        "Client `{}` was taken over by a new connection",
-                        session.get_client_id().await
-                    );
-                    if protocol_version.supports_reason_codes() {
-                        let _ = self
-                            .connection
-                            .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                                reason: ReasonCode::SessionTakenOver,
-                                properties: Some(DisconnectProperties {
-                                    reason_string: reason_string(
-                                        ReasonCode::SessionTakenOver,
-                                        session.client_maximum_packet_size().await,
-                                    ),
-                                    ..Default::default()
-                                }),
-                            }))
-                            .await;
-                    }
-                    return Ok(());
-                }
-
-                // Exit in case a signal is received
-                _ = self.shutdown.recv() => {
-                    return Err(ReasonCode::ServerShuttingDown.into());
-                },
+                Flow::Close => return Ok(()),
             }
         }
 
         Ok(())
     }
+
+    /// Handles the packets clients send most, without boxing, as
+    /// `handle_wake` does the rest.
+    async fn handle_hot(
+        &mut self,
+        session: &Session,
+        client_id: &str,
+        packet: HotPacket,
+    ) -> Result<Flow> {
+        let mut session = session.clone();
+        // Packet identifiers are never 0 [MQTT-2.2.1-3]
+        if packet.packet_id() == Some(0) {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+        let response = match packet {
+            HotPacket::Publish(publish) => {
+                Stats::add(&self.stats.messages_received);
+                let authorizer = self.auth_config.authorizer.as_deref();
+                session
+                    .handle_publish(publish, &self.broker, authorizer)
+                    .await?
+            }
+            HotPacket::PubAck(ack) => {
+                let packet_id = ack.packet_id;
+                let response = session.handle_puback(ack).await?;
+                self.session_manager
+                    .remove_inflight(client_id, packet_id)
+                    .await;
+                response
+            }
+            HotPacket::PubRec(rec) => {
+                let (packet_id, failed) = (rec.packet_id, rec.reason.get_code() >= 0x80);
+                let response = session.handle_pubrec(rec).await?;
+                if failed {
+                    self.session_manager
+                        .remove_inflight(client_id, packet_id)
+                        .await;
+                }
+                // After PUBREC only PUBREL remains to be sent for a QoS 2 message
+                if let Some(ControlPacket::PubRel(pubrel)) = &response {
+                    if pubrel.reason == ReasonCode::Success {
+                        self.session_manager
+                            .release_inflight(client_id, pubrel.packet_id)
+                            .await;
+                    }
+                }
+                response
+            }
+            HotPacket::PubRel(rel) => session.handle_pubrel(rel).await?,
+            HotPacket::PubComp(comp) => {
+                let packet_id = comp.packet_id;
+                let response = session.handle_pubcomp(comp).await?;
+                self.session_manager
+                    .remove_inflight(client_id, packet_id)
+                    .await;
+                response
+            }
+            HotPacket::PingReq => Some(ControlPacket::PingResp(PingRespPacket {})),
+        };
+        if let Some(response) = response {
+            debug!("Sending {} to client {:?}", describe(&response), client_id);
+            self.connection.write_packet(response).await?;
+        }
+        Ok(Flow::PacketHandled)
+    }
+
+    /// Sends a message the session queued for the client.
+    async fn send_outgoing(
+        &mut self,
+        session: &Session,
+        client_id: &str,
+        message: Message,
+    ) -> Result<Flow> {
+        let mut session = session.clone();
+        // Checked per message: a permitted subscription can still
+        // match topics the client may not read
+        if let Some(authorizer) = &self.auth_config.authorizer {
+            // Re-read each time: re-authentication can change the user
+            let identity = session.identity().await;
+            if !authorizer.authorize(&identity, &message.topic, Access::Read) {
+                return Ok(Flow::Continue);
+            }
+        }
+        // Encoded within this block, so only its bytes wait while the
+        // in-flight record is stored, not the packet
+        let (write, inflight) = {
+            let Some(Outgoing { packet, inflight }) = session.prepare_publish(message).await else {
+                return Ok(Flow::Continue);
+            };
+            debug!("Sending {} to client {:?}", describe(&packet), client_id);
+            (self.connection.write_packet(packet), inflight)
+        };
+        if let Some(inflight) = inflight {
+            self.session_manager
+                .store_inflight(client_id, &inflight)
+                .await;
+        }
+        write.await?;
+        Stats::add(&self.stats.messages_sent);
+        Ok(Flow::Continue)
+    }
+
+    /// Does what `wake` calls for; see `handle_connection`.
+    async fn handle_wake(
+        &mut self,
+        wake: Wake,
+        session: &Session,
+        timeout_duration: Option<Duration>,
+        protocol_version: ProtocolVersion,
+        expiry: &mut Option<Duration>,
+    ) -> Result<Flow> {
+        let mut session = session.clone();
+        match wake {
+            Wake::Packet(maybe_packet) => {
+                let packet = match maybe_packet {
+                    None => {
+                        // Connection closed without DISCONNECT - abnormal
+                        return Ok(Flow::Close);
+                    }
+                    Some(ControlPacket::Disconnect(disconnect)) => {
+                        let new_interval = disconnect
+                            .properties
+                            .as_ref()
+                            .and_then(|p| p.session_expiry_interval.as_ref())
+                            .map(|p| p.value);
+
+                        if let Some(interval) = new_interval {
+                            // A session that was to end with the connection can't
+                            // be extended on the way out [MQTT-3.14.2-2]
+                            if *expiry == Some(Duration::ZERO) && interval != 0 {
+                                return Err(ReasonCode::ProtocolError.into());
+                            }
+                            *expiry = (interval != u32::MAX)
+                                .then(|| Duration::from_secs(interval.into()));
+                        }
+
+                        // Reason 0x04 asks for the will to be published anyway
+                        if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
+                            session.clear_will().await;
+                            let client_id = session.get_client_id().await;
+                            self.session_manager.delete_will(&client_id);
+                        }
+                        return Ok(Flow::Close);
+                    }
+                    Some(packet) => packet,
+                };
+
+                if matches!(packet, ControlPacket::Publish(_)) {
+                    Stats::add(&self.stats.messages_received);
+                }
+
+                let is_subscription_change = matches!(
+                    packet,
+                    ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
+                );
+
+                // Check if this is an ack that completes an inflight message
+                let inflight_completed = match &packet {
+                    ControlPacket::PubAck(ack) => Some(ack.packet_id),
+                    ControlPacket::PubComp(comp) => Some(comp.packet_id),
+                    ControlPacket::PubRec(rec) if rec.reason.get_code() >= 0x80 => {
+                        Some(rec.packet_id)
+                    }
+                    _ => None,
+                };
+
+                let maybe_res = session
+                    .process_incoming(
+                        packet,
+                        &self.broker,
+                        self.auth_config.auth_manager.as_deref(),
+                        self.auth_config.authorizer.as_deref(),
+                    )
+                    .await?;
+
+                // Persist subscriptions after subscribe/unsubscribe operations
+                if is_subscription_change {
+                    let client_id = session.get_client_id().await;
+                    let subscriptions = session.get_subscriptions().await;
+                    self.session_manager
+                        .save_subscriptions(&client_id, subscriptions)
+                        .await;
+                }
+
+                // Remove inflight message after acknowledgment
+                if let Some(packet_id) = inflight_completed {
+                    let client_id = session.get_client_id().await;
+                    self.session_manager
+                        .remove_inflight(&client_id, packet_id)
+                        .await;
+                }
+
+                // After PUBREC only PUBREL remains to be sent for a QoS 2 message
+                if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
+                    if pubrel.reason == ReasonCode::Success {
+                        let client_id = session.get_client_id().await;
+                        self.session_manager
+                            .release_inflight(&client_id, pubrel.packet_id)
+                            .await;
+                    }
+                }
+
+                if let Some(res) = maybe_res {
+                    debug!(
+                        "Sending {} to client {:?}",
+                        describe(&res),
+                        session.get_client_id().await
+                    );
+                    self.connection.write_packet(res).await?;
+                }
+
+                Ok(Flow::PacketHandled)
+            }
+            Wake::KeepAliveExpired => {
+                let client_id = session.get_client_id().await;
+                warn!(
+                    "Keep-alive timeout for client `{}` ({:?} with no packets)",
+                    client_id,
+                    timeout_duration.unwrap_or_default()
+                );
+                // An abnormal disconnect: the will is published
+                Err(ReasonCode::KeepAliveTimeout.into())
+            }
+            Wake::TakenOver => {
+                info!(
+                    "Client `{}` was taken over by a new connection",
+                    session.get_client_id().await
+                );
+                if protocol_version.supports_reason_codes() {
+                    let _ = self
+                        .connection
+                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                            reason: ReasonCode::SessionTakenOver,
+                            properties: Some(DisconnectProperties {
+                                reason_string: reason_string(
+                                    ReasonCode::SessionTakenOver,
+                                    session.client_maximum_packet_size().await,
+                                ),
+                                ..Default::default()
+                            }),
+                        }))
+                        .await;
+                }
+                Ok(Flow::Close)
+            }
+        }
+    }
+}
+
+/// A connection after its handshakes, with TLS or without.
+enum Secured<S> {
+    Plain(S),
+    Tls(Box<tokio_rustls::server::TlsStream<S>>),
+}
+
+/// What woke a connection up, beyond a message to send. Only exists
+/// between waking and the boxed handling, so its size costs nothing while
+/// idle, and boxing the packet would cost an allocation per packet.
+#[allow(clippy::large_enum_variant)]
+enum Wake {
+    Packet(Option<ControlPacket>),
+    KeepAliveExpired,
+    TakenOver,
+}
+
+/// The packets clients send most, handled without boxing.
+enum HotPacket {
+    Publish(PublishPacket),
+    PubAck(PubAckPacket),
+    PubRec(PubRecPacket),
+    PubRel(PubRelPacket),
+    PubComp(PubCompPacket),
+    PingReq,
+}
+
+impl HotPacket {
+    fn packet_id(&self) -> Option<u16> {
+        match self {
+            HotPacket::Publish(p) => p.packet_id,
+            HotPacket::PubAck(p) => Some(p.packet_id),
+            HotPacket::PubRec(p) => Some(p.packet_id),
+            HotPacket::PubRel(p) => Some(p.packet_id),
+            HotPacket::PubComp(p) => Some(p.packet_id),
+            HotPacket::PingReq => None,
+        }
+    }
+
+    /// The packet back, as read, when it isn't one of these: not an error,
+    /// just the other way, so its size doesn't matter.
+    #[allow(clippy::result_large_err)]
+    fn try_from(packet: Option<ControlPacket>) -> std::result::Result<Self, Option<ControlPacket>> {
+        Ok(match packet {
+            Some(ControlPacket::Publish(p)) => HotPacket::Publish(p),
+            Some(ControlPacket::PubAck(p)) => HotPacket::PubAck(p),
+            Some(ControlPacket::PubRec(p)) => HotPacket::PubRec(p),
+            Some(ControlPacket::PubRel(p)) => HotPacket::PubRel(p),
+            Some(ControlPacket::PubComp(p)) => HotPacket::PubComp(p),
+            Some(ControlPacket::PingReq(_)) => HotPacket::PingReq,
+            other => return Err(other),
+        })
+    }
+}
+
+/// A wake-up either handled already or to be handled.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Done(Flow),
+    Wake(Wake),
+}
+
+/// What a connection does once it handled what woke it.
+enum Flow {
+    Continue,
+    /// A packet came in, so the keep-alive deadline starts over
+    PacketHandled,
+    Close,
 }
 
 /// Explains `reason` to the client, unless the text would make the packet
