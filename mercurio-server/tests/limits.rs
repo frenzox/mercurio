@@ -289,3 +289,42 @@ async fn persistent_mqtt3_sessions_expire_when_configured() {
     sleep(Duration::from_millis(1500)).await;
     assert!(!connect().await, "session outlived its expiry");
 }
+
+/// SUBSCRIBE with the given filters at QoS 0, packet id 1; returns the
+/// SUBACK's reason codes.
+async fn subscribe(stream: &mut TcpStream, filters: &[&str]) -> Vec<u8> {
+    let mut body = vec![0x00, 0x01, 0x00];
+    for filter in filters {
+        body.extend((filter.len() as u16).to_be_bytes());
+        body.extend(filter.as_bytes());
+        body.push(0x00);
+    }
+    let mut packet = vec![0x82, body.len() as u8];
+    packet.extend(body);
+    stream.write_all(&packet).await.unwrap();
+
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.unwrap();
+    let mut suback = vec![0u8; header[1] as usize];
+    stream.read_exact(&mut suback).await.unwrap();
+    // Packet id, empty properties, then a reason code per filter
+    suback[3..].to_vec()
+}
+
+#[tokio::test]
+async fn subscriptions_beyond_the_limit_are_refused() {
+    let addr = start_broker(Limits {
+        max_subscriptions: Some(2),
+        ..Default::default()
+    })
+    .await;
+    let (mut stream, _) = connect(addr, b's').await;
+
+    // Quota exceeded for the third, new filter
+    assert_eq!(
+        subscribe(&mut stream, &["a", "b", "c"]).await,
+        [0x00, 0x00, 0x97]
+    );
+    // Replacing a subscription it holds doesn't count as a new one
+    assert_eq!(subscribe(&mut stream, &["a"]).await, [0x00]);
+}

@@ -20,7 +20,8 @@ pub struct QueueLimits {
     /// session whose client never returns can't grow without bound.
     pub max_messages: usize,
     /// Any message is dropped once the queued payloads take this many
-    /// bytes, when set.
+    /// bytes, when set. By default 100 MiB, as `max_messages` alone lets a
+    /// session hold that many of the largest packets.
     pub max_bytes: Option<usize>,
     /// Send messages at the QoS granted to the subscription even when they
     /// were published with a lower one, as mosquitto's
@@ -33,7 +34,7 @@ impl Default for QueueLimits {
         Self {
             max_qos0: 1000,
             max_messages: 10_000,
-            max_bytes: None,
+            max_bytes: Some(100 * 1024 * 1024),
             upgrade_qos: false,
         }
     }

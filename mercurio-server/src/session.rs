@@ -262,6 +262,7 @@ struct State {
     verified_user: Option<String>,
     /// Who may resume the session
     owner: SessionOwner,
+    max_subscriptions: Option<usize>,
 }
 
 impl From<Session> for SessionDropGuard {
@@ -316,6 +317,7 @@ impl Session {
                     auth_exchange: None,
                     verified_user: None,
                     owner: SessionOwner::default(),
+                    max_subscriptions: None,
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -431,6 +433,7 @@ impl Session {
             session.check_retain_source = limits.check_retain_source;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
+            session.max_subscriptions = limits.max_subscriptions;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
@@ -921,6 +924,20 @@ impl Session {
                     });
                     continue;
                 }
+            }
+
+            let at_limit = session
+                .max_subscriptions
+                .is_some_and(|max| session.subscriptions.len() >= max);
+            if at_limit && !session.subscriptions.contains_key(&sub.topic_filter) {
+                warn!(
+                    "Client `{}` holds the most subscriptions allowed",
+                    session.client_id
+                );
+                ack.payload.push(SubAckPayload {
+                    reason_code: ReasonCode::QuotaExceeded,
+                });
+                continue;
             }
 
             let granted_qos = if sub.subs_opt.qos as u8 > session.maximum_qos as u8 {

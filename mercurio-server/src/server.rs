@@ -71,6 +71,10 @@ pub struct AuthConfig {
     pub authorizer: Option<Arc<dyn Authorizer>>,
 }
 
+/// Subscriptions a session may hold unless configured otherwise: far more
+/// than clients need, far fewer than it takes to exhaust the broker.
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
+
 /// Tunable limits of the broker.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -104,6 +108,9 @@ pub struct Limits {
     /// Send a retained message to new subscribers only while the client
     /// that published it may still publish to its topic.
     pub check_retain_source: bool,
+    /// Subscriptions one session may hold; further ones are refused with
+    /// Quota Exceeded. Each costs memory and work on every message.
+    pub max_subscriptions: Option<usize>,
 }
 
 impl Default for Limits {
@@ -121,6 +128,7 @@ impl Default for Limits {
             retain_available: true,
             persistent_client_expiration: None,
             check_retain_source: false,
+            max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
         }
     }
 }

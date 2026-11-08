@@ -318,8 +318,9 @@ pub struct ServerConfig {
     pub max_queued_qos0_messages: usize,
 
     /// Payload bytes that may wait for one client before further messages
-    /// are dropped; unlimited when unset
-    pub max_queued_bytes: Option<usize>,
+    /// are dropped
+    #[serde(default = "default_max_queued_bytes")]
+    pub max_queued_bytes: usize,
 
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
@@ -330,6 +331,10 @@ pub struct ServerConfig {
     /// to their topic
     #[serde(default)]
     pub check_retain_source: bool,
+
+    /// Subscriptions one session may hold
+    #[serde(default = "default_max_subscriptions")]
+    pub max_subscriptions: usize,
 
     /// Seconds a new connection has to send CONNECT
     #[serde(default = "default_connect_timeout")]
@@ -400,9 +405,10 @@ impl Default for ServerConfig {
             max_packet_size: default_max_packet_size(),
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
-            max_queued_bytes: None,
+            max_queued_bytes: default_max_queued_bytes(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
+            max_subscriptions: default_max_subscriptions(),
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
@@ -549,6 +555,14 @@ fn default_max_queued_qos0_messages() -> usize {
     Limits::default().queue.max_qos0
 }
 
+fn default_max_queued_bytes() -> usize {
+    QueueLimits::default().max_bytes.unwrap_or(usize::MAX)
+}
+
+fn default_max_subscriptions() -> usize {
+    mercurio_server::server::DEFAULT_MAX_SUBSCRIPTIONS
+}
+
 fn default_connect_timeout() -> u64 {
     Limits::default().connect_timeout.as_secs()
 }
@@ -573,7 +587,7 @@ impl ServerConfig {
             queue: QueueLimits {
                 max_qos0: self.max_queued_qos0_messages,
                 max_messages: self.max_queued_messages,
-                max_bytes: self.max_queued_bytes,
+                max_bytes: Some(self.max_queued_bytes),
                 upgrade_qos: self.upgrade_outgoing_qos,
             },
             max_connections: Some(self.max_connections),
@@ -587,6 +601,7 @@ impl ServerConfig {
                 .persistent_client_expiration
                 .map(Duration::from_secs),
             check_retain_source: self.check_retain_source,
+            max_subscriptions: Some(self.max_subscriptions),
         })
     }
 }
