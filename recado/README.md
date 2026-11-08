@@ -1,23 +1,23 @@
-# Mercurio
+# recado
 
 MQTT command-line client for publishing and subscribing to topics.
 
 ## Installation
 
 ```bash
-cargo install --path mercurio
+cargo install --path recado
 ```
 
 Or build from the workspace root:
 
 ```bash
-cargo build --release --package mercurio
+cargo build --release --package recado
 ```
 
 ## Usage
 
 ```bash
-mercurio <COMMAND> [OPTIONS]
+recado <COMMAND> [OPTIONS]
 ```
 
 ### Commands
@@ -29,19 +29,19 @@ mercurio <COMMAND> [OPTIONS]
 
 ```bash
 # Publish a simple message
-mercurio pub -t test/topic -m "Hello, MQTT!"
+recado pub -t test/topic -m "Hello, MQTT!"
 
 # Publish with QoS 1 and retain flag
-mercurio pub -t sensor/temperature -m "23.5" -q 1 -r
+recado pub -t sensor/temperature -m "23.5" -q 1 -r
 
 # Read message from stdin
-echo "Hello from stdin" | mercurio pub -t test/topic
+echo "Hello from stdin" | recado pub -t test/topic
 
 # Publish to a remote broker with authentication
-mercurio pub -h broker.example.com -u myuser -P mypass -t test/topic -m "Hello"
+recado pub -h broker.example.com -u myuser -P mypass -t test/topic -m "Hello"
 
 # Use MQTT 3.1.1 protocol
-mercurio pub -V 311 -t test/topic -m "Hello"
+recado pub -V 311 -t test/topic -m "Hello"
 ```
 
 ### Publish Options
@@ -57,22 +57,22 @@ mercurio pub -V 311 -t test/topic -m "Hello"
 
 ```bash
 # Subscribe to a single topic
-mercurio sub -t test/topic
+recado sub -t test/topic
 
 # Subscribe to multiple topics
-mercurio sub -t "sensor/#" -t "device/+/status"
+recado sub -t "sensor/#" -t "device/+/status"
 
 # Print topic name with each message
-mercurio sub -t "sensor/#" -T
+recado sub -t "sensor/#" -T
 
 # Subscribe with QoS 1
-mercurio sub -t test/topic -q 1
+recado sub -t test/topic -q 1
 
 # Connect to a remote broker
-mercurio sub -h broker.example.com -p 1883 -t test/topic
+recado sub -h broker.example.com -p 1883 -t test/topic
 
 # With authentication
-mercurio sub -h broker.example.com -u myuser -P mypass -t test/topic
+recado sub -h broker.example.com -u myuser -P mypass -t test/topic
 ```
 
 ### Subscribe Options
@@ -111,30 +111,30 @@ The `-V` flag accepts:
 
 Terminal 1:
 ```bash
-mercurio sub -t test/hello
+recado sub -t test/hello
 ```
 
 Terminal 2:
 ```bash
-mercurio pub -t test/hello -m "Hello, World!"
+recado pub -t test/hello -m "Hello, World!"
 ```
 
 ### Wildcard subscriptions
 
 ```bash
 # Single-level wildcard (+)
-mercurio sub -t "sensor/+/temperature"
+recado sub -t "sensor/+/temperature"
 
 # Multi-level wildcard (#)
-mercurio sub -t "home/#"
+recado sub -t "home/#"
 ```
 
 ### Piping data
 
 ```bash
 # Publish file contents
-cat data.json | mercurio pub -t data/upload
+cat data.json | recado pub -t data/upload
 
 # Publish command output
-date | mercurio pub -t system/time
+date | recado pub -t system/time
 ```

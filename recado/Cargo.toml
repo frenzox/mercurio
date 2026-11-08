@@ -1,12 +1,12 @@
 [package]
-name = "mercurio"
+name = "recado"
 version = "0.1.0"
 edition = "2021"
 description = "MQTT command-line client for publishing and subscribing"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "mercurio"
+name = "recado"
 path = "src/main.rs"
 
 [dependencies]

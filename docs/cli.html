@@ -35,20 +35,20 @@
 </nav>
 <main>
 <h1>Command-line client</h1>
-<p class="lead"><code>mercurio pub</code> publishes a message, <code>mercurio sub</code> prints messages until interrupted. Both work with any MQTT broker.</p>
+<p class="lead"><code>recado pub</code> publishes a message, <code>recado sub</code> prints messages until interrupted. Both work with any MQTT broker.</p>
 
 <h2>Publishing</h2>
 <pre><span class="comment"># A message, at QoS 1</span>
-mercurio pub -t sensors/kitchen -m 21.5 -q 1
+recado pub -t sensors/kitchen -m 21.5 -q 1
 
 <span class="comment"># From standard input</span>
-echo '{"temp": 21.5}' | mercurio pub -t sensors/kitchen --content-type application/json
+echo '{"temp": 21.5}' | recado pub -t sensors/kitchen --content-type application/json
 
 <span class="comment"># Retained, so new subscribers get it at once</span>
-mercurio pub -t status/door -m open -r
+recado pub -t status/door -m open -r
 
 <span class="comment"># An MQTT 5 request, with properties</span>
-mercurio pub -t requests/lamp -m on --response-topic replies/me \
+recado pub -t requests/lamp -m on --response-topic replies/me \
     --correlation-data 42 --user-property source=cli --message-expiry 60</pre>
 <table>
 <tr><th>Option</th><th>Meaning</th></tr>
@@ -66,16 +66,16 @@ mercurio pub -t requests/lamp -m on --response-topic replies/me \
 
 <h2>Subscribing</h2>
 <pre><span class="comment"># Print payloads, with their topics</span>
-mercurio sub -t 'sensors/#' -T
+recado sub -t 'sensors/#' -T
 
 <span class="comment"># Several filters</span>
-mercurio sub -t 'sensors/#' -t 'alerts/#' -T
+recado sub -t 'sensors/#' -t 'alerts/#' -T
 
 <span class="comment"># A persistent subscriber that survives broker restarts and network loss</span>
-mercurio sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
+recado sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
 
 <span class="comment"># With a will, published if the subscriber disappears</span>
-mercurio sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-retain</pre>
+recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-retain</pre>
 <table>
 <tr><th>Option</th><th>Meaning</th></tr>
 <tr><td><code>-t, --topic</code></td><td>Topic filter; may be repeated (required)</td></tr>
@@ -108,10 +108,10 @@ mercurio sub -t 'cmd/#' --will-topic status/monitor --will-message offline --wil
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
 </table>
 <pre><span class="comment"># Over TLS, with credentials</span>
-mercurio sub -H broker.example.com -p 8883 --tls --cafile ca.crt -u alice -P secret -t '#'
+recado sub -H broker.example.com -p 8883 --tls --cafile ca.crt -u alice -P secret -t '#'
 
 <span class="comment"># MQTT 3.1.1</span>
-mercurio pub -V 311 -t test -m hello</pre>
+recado pub -V 311 -t test -m hello</pre>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>
 </body>

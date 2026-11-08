@@ -68,8 +68,8 @@ Start the broker with its default settings, which listen on
 Subscribe in one terminal, and publish from another:
 
 ```bash
-./target/release/mercurio sub -t 'sensors/#' -T
-./target/release/mercurio pub -t sensors/kitchen -m 21.5 -q 1
+./target/release/recado sub -t 'sensors/#' -T
+./target/release/recado pub -t sensors/kitchen -m 21.5 -q 1
 ```
 
 Any MQTT client works with the broker, mosquitto's included:
@@ -111,18 +111,18 @@ including TLS, WebSocket, limits, access control and the systemd unit in
 
 ## Command-line client
 
-`mercurio pub` publishes one message, read from `-m` or from standard
-input. `mercurio sub` prints messages until interrupted. Both accept the
+`recado pub` publishes one message, read from `-m` or from standard
+input. `recado sub` prints messages until interrupted. Both accept the
 connection options (`-H`, `-p`, `-u`, `-P`, `-V`, `--tls`, ...); run them
 with `--help` for the full list.
 
 ```bash
 # MQTT 5 request with properties
-mercurio pub -t requests/lamp -m on --response-topic replies/me \
+recado pub -t requests/lamp -m on --response-topic replies/me \
     --correlation-data 42 --user-property source=cli
 
 # Persistent subscriber that survives broker restarts
-mercurio sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
+recado sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
 ```
 
 ## Client library
@@ -167,7 +167,7 @@ in an enhanced authentication method.
 | [`mercurio-server`](mercurio-server) | The broker as a library, to embed or extend with custom authentication and authorization |
 | [`mercuriod`](mercuriod) | The broker daemon: configuration, logging, password files |
 | [`mercurio-client`](mercurio-client) | The async client library |
-| [`mercurio`](mercurio) | The `mercurio pub` and `mercurio sub` command-line client |
+| [`recado`](recado) | The `recado pub` and `recado sub` command-line client |
 
 ## Development
 

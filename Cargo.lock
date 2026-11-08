@@ -694,19 +694,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "mercurio"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clap",
- "mercurio-client",
- "mercurio-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "mercurio-client"
 version = "0.1.0"
 dependencies = [
@@ -1037,6 +1024,19 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "recado"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "mercurio-client",
+ "mercurio-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "redox_syscall"
