@@ -143,6 +143,9 @@ receive_maximum = 65535
 # Topics that may hold a retained message at once, about 20 of the broker's
 # own $SYS topics included; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000
+# Connections one client address may hold at once, counting the address a
+# PROXY header gives (unbounded by default, as NAT puts many behind one)
+# max_connections_per_ip = 100
 
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
@@ -254,6 +257,9 @@ allow_anonymous = false
 # host = "0.0.0.0"
 # port = 1884
 # proxy_protocol = true
+# Proxies allowed to send the header, as addresses or CIDR blocks; others
+# are closed, as their header could claim any address (any when empty)
+# proxy_from = ["10.0.0.0/8"]
 #
 # A tenant's listener: its clients only see topics under the mount point
 # and log in with their own password file. `[listeners.auth]` takes the

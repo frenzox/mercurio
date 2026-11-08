@@ -48,3 +48,65 @@ async fn proxied_connections_start_with_a_header() {
     }
     assert!(received.is_empty(), "{received:02x?}");
 }
+
+/// Whether a CONNECT sent after `header`, if any, is answered.
+async fn answered(addr: std::net::SocketAddr, header: Option<&str>) -> bool {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    if let Some(header) = header {
+        let _ = stream.write_all(header.as_bytes()).await;
+    }
+    let _ = stream.write_all(&CONNECT).await;
+    let mut first = [0u8; 1];
+    matches!(
+        timeout(Duration::from_secs(2), stream.read(&mut first)).await,
+        Ok(Ok(1)) if first[0] == 0x20
+    )
+}
+
+async fn start_proxied(proxy_from: &[&str], max_per_ip: Option<usize>) -> std::net::SocketAddr {
+    let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = proxied.local_addr().unwrap();
+    let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
+    listener.proxy_protocol = true;
+    listener.proxy_from = proxy_from.iter().map(|r| r.parse().unwrap()).collect();
+    let mut config = ServerConfig::default();
+    config.listeners.push(listener);
+    config.limits.max_connections_per_ip = max_per_ip;
+    tokio::spawn(mercurio_server::server::run_with_config(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        config,
+        std::future::pending::<()>(),
+    ));
+    addr
+}
+
+#[tokio::test]
+async fn only_trusted_proxies_may_send_the_header() {
+    let header = "PROXY TCP4 192.0.2.1 127.0.0.1 56324 1883\r\n";
+    let untrusted = start_proxied(&["10.0.0.0/8"], None).await;
+    assert!(!answered(untrusted, Some(header)).await);
+    let trusted = start_proxied(&["127.0.0.0/8"], None).await;
+    assert!(answered(trusted, Some(header)).await);
+}
+
+/// Behind a proxy, connections are counted by the address the header
+/// gives, not the proxy's.
+#[tokio::test]
+async fn connections_are_limited_per_client_address() {
+    let addr = start_proxied(&[], Some(1)).await;
+    let from = |ip: &str| format!("PROXY TCP4 {ip} 127.0.0.1 56324 1883\r\n");
+
+    let mut held = TcpStream::connect(addr).await.unwrap();
+    held.write_all(from("192.0.2.1").as_bytes()).await.unwrap();
+    held.write_all(&CONNECT).await.unwrap();
+    let mut first = [0u8; 1];
+    timeout(Duration::from_secs(2), held.read_exact(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The same client address again: closed
+    assert!(!answered(addr, Some(&from("192.0.2.1"))).await);
+    // Another address through the same proxy: served
+    assert!(answered(addr, Some(&from("192.0.2.2"))).await);
+}

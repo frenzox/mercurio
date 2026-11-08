@@ -158,6 +158,11 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
+    /// Addresses or CIDR blocks of the proxies allowed to send the header;
+    /// any when empty
+    #[serde(default)]
+    pub proxy_from: Vec<String>,
+
     /// Prefixed to every topic this listener's clients use
     pub mount_point: Option<String>,
 
@@ -395,6 +400,10 @@ pub struct ServerConfig {
     /// `$SYS` topics included; unbounded when unset
     pub max_retained_messages: Option<usize>,
 
+    /// Connections one client address may hold at once, the address a PROXY
+    /// header gives counted; unbounded when unset
+    pub max_connections_per_ip: Option<usize>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -432,6 +441,7 @@ impl Default for ServerConfig {
             persistent_client_expiration: None,
             max_session_expiry: None,
             max_retained_messages: None,
+            max_connections_per_ip: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -611,6 +621,7 @@ impl ServerConfig {
         limits.max_subscriptions = Some(self.max_subscriptions);
         limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
         limits.max_retained_messages = self.max_retained_messages;
+        limits.max_connections_per_ip = self.max_connections_per_ip;
         Ok(limits)
     }
 }
