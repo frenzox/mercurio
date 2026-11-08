@@ -27,6 +27,7 @@ use mercurio_core::{
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
+    topic::validate_publish_topic,
     Result,
 };
 use mercurio_packets::{
@@ -938,23 +939,6 @@ where
             verified_user = connect_packet.payload.user_name.clone();
         }
 
-        // A will is published on the client's behalf, so it needs the same
-        // permission as a PUBLISH
-        if let (Some(authorizer), Some(will_topic)) = (
-            &self.auth_config.authorizer,
-            &connect_packet.payload.will_topic,
-        ) {
-            let identity = ClientIdentity {
-                client_id: connect_packet.payload.client_id.clone(),
-                username: verified_user.clone(),
-            };
-            if !authorizer.authorize(&identity, will_topic, Access::Write) {
-                return self
-                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
-                    .await;
-            }
-        }
-
         if let Some(reason) = self.refused_will(&connect_packet) {
             return self.reject_connect(&connect_packet, reason).await;
         }
@@ -1001,6 +985,23 @@ where
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                 .await;
         }
+        // A will is published on the client's behalf, so it needs the same
+        // permission as a PUBLISH, checked once the client id is final
+        if let (Some(authorizer), Some(will_topic)) = (
+            &self.auth_config.authorizer,
+            &connect_packet.payload.will_topic,
+        ) {
+            let identity = ClientIdentity {
+                client_id: connect_packet.payload.client_id.clone(),
+                username: verified_user.clone(),
+            };
+            if !authorizer.authorize(&identity, will_topic, Access::Write) {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+        }
+
         // In-process clients don't reconnect, so a network client taking
         // over their id would end them for good
         let client_id = &connect_packet.payload.client_id;
@@ -1265,6 +1266,16 @@ where
         }
         if flags.will_retain && !self.limits.retain_available {
             return Some(ReasonCode::RetainNotSupported);
+        }
+        // A will is published like a PUBLISH, so its topic must be one;
+        // `$` topics belong to the broker
+        let topic = connect_packet
+            .payload
+            .will_topic
+            .as_deref()
+            .unwrap_or_default();
+        if validate_publish_topic(topic).is_err() || topic.starts_with('$') {
+            return Some(ReasonCode::TopicNameInvalid);
         }
         None
     }
