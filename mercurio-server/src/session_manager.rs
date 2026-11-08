@@ -606,7 +606,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     ) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Write::SaveSubscriptions(subscriptions))
+                .write_paced(client_id, Box::new(Write::SaveSubscriptions(subscriptions)))
                 .await;
         }
     }
@@ -621,7 +621,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn store_inflight(&self, client_id: &str, message: &InflightMessage) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Write::StoreInflight(message.clone()))
+                .write_paced(client_id, Box::new(Write::StoreInflight(message.clone())))
                 .await;
         }
     }
@@ -630,7 +630,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn release_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Write::ReleaseInflight(packet_id))
+                .write_paced(client_id, Box::new(Write::ReleaseInflight(packet_id)))
                 .await;
         }
     }
@@ -639,7 +639,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn remove_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Write::RemoveInflight(packet_id))
+                .write_paced(client_id, Box::new(Write::RemoveInflight(packet_id)))
                 .await;
         }
     }

@@ -14,6 +14,11 @@ use tracing::{error, warn};
 /// Most changes applied in one batch.
 const MAX_BATCH: usize = 256;
 
+/// How long a writer waits for more changes before stopping. Writers
+/// exist while there is something to write, so idle clients, most of them,
+/// keep no task, channel or buffer.
+const LINGER: Duration = Duration::from_secs(1);
+
 /// Attempts at a batch before its changes are given up.
 const ATTEMPTS: u32 = 5;
 
@@ -51,13 +56,13 @@ impl Writer {
     }
 
     /// Sends a change once fewer than `PENDING_LIMIT` are waiting for
-    /// storage.
-    pub(crate) async fn write_paced(&self, write: Write) {
+    /// storage. Boxed already, so the wait doesn't carry the whole change.
+    pub(crate) async fn write_paced(&self, write: Box<Write>) {
         let Ok(permit) = self.pending.acquire().await else {
             return;
         };
         permit.forget();
-        if self.ops.send(Op::Write(Box::new(write), true)).is_err() {
+        if self.ops.send(Op::Write(write, true)).is_err() {
             self.pending.add_permits(1);
         }
     }
@@ -150,7 +155,7 @@ impl<S: BatchStore + 'static> Writers<S> {
         self.get(client_id).write(write);
     }
 
-    pub(crate) async fn write_paced(&self, client_id: &str, write: Write) {
+    pub(crate) async fn write_paced(&self, client_id: &str, write: Box<Write>) {
         self.get(client_id).write_paced(write).await;
     }
 
@@ -200,7 +205,27 @@ async fn run<S: BatchStore>(
     }
     let mut batch = Vec::new();
     let mut flushed = Vec::new();
-    while let Some(op) = ops.recv().await {
+    loop {
+        let op = match tokio::time::timeout(LINGER, ops.recv()).await {
+            Ok(Some(op)) => op,
+            Ok(None) => break,
+            Err(_) => {
+                // Idle: stop, unless something besides the map, such as a
+                // queue's journal, still holds this writer. A later change
+                // starts a new one.
+                let mut entries = entries.lock().unwrap();
+                let only_the_map = entries
+                    .get(&client_id)
+                    .filter(|entry| entry.id == id)
+                    .and_then(|entry| entry.writer.as_ref())
+                    .is_some_and(|writer| writer.ops.strong_count() == 1);
+                if only_the_map && ops.is_empty() {
+                    entries.remove(&client_id);
+                    break;
+                }
+                continue;
+            }
+        };
         let mut next = Some(op);
         let mut permits = 0;
         while let Some(op) = next {
@@ -351,6 +376,33 @@ mod tests {
         writers.write("c", Write::DeleteSession);
         writers.settle("c").await;
         assert!(storage.load_session("c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_idle_writers_stop_and_start_again() {
+        let storage = Arc::new(MemoryStore::new());
+        let writers = Writers::new(Arc::clone(&storage));
+        writers.write("c", Write::SaveSubscriptions(Vec::new()));
+        writers.settle("c").await;
+        tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
+        assert!(writers.entries.lock().unwrap().is_empty());
+
+        // A later change starts a new writer
+        writers.write("c", Write::DeleteSession);
+        writers.settle("c").await;
+        assert!(storage.load_session("c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_writers_held_elsewhere_stay() {
+        let storage = Arc::new(MemoryStore::new());
+        let writers = Writers::new(Arc::clone(&storage));
+        // As a disconnected session's queue journal holds it
+        let held = writers.get("c");
+        tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
+        assert_eq!(writers.entries.lock().unwrap().len(), 1);
+        held.write(Write::DeleteWill);
+        held.flush().await;
     }
 
     #[tokio::test]
