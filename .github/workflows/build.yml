@@ -23,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -32,6 +33,9 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # Not workspace members: they build only for wasm32
+      - name: Lint the example plugins
+        run: cargo clippy --release --target wasm32-wasip2 --manifest-path examples/plugins/deny-topic/Cargo.toml --target-dir target/plugins -- -D warnings
 
   # The oldest Rust the crates declare they build with, rust-version
   msrv:
@@ -69,7 +73,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - name: Build the example plugins
+        run: for p in examples/plugins/*/; do cargo build --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins; done
       - name: Test
         run: cargo test --workspace --all-features
         env:

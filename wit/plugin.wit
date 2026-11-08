@@ -1,0 +1,93 @@
+package mercurio:plugin@0.1.0;
+
+interface types {
+  enum level { trace, debug, info, warn, error }
+  enum access { read, write, subscribe }
+  enum decision { allow, deny, defer }
+  enum qos { at-most-once, at-least-once, exactly-once }
+
+  /// `username` is set only for a user the broker verified.
+  record client-info {
+    client-id: string,
+    username: option<string>,
+    peer: option<string>,
+  }
+
+  /// A published message. The properties are MQTT 5's application
+  /// properties; MQTT 3.x messages have none.
+  record message {
+    topic: string,
+    payload: list<u8>,
+    qos: qos,
+    retain: bool,
+    payload-is-utf8: bool,
+    message-expiry: option<u32>,
+    content-type: option<string>,
+    response-topic: option<string>,
+    correlation-data: option<list<u8>>,
+    user-properties: list<tuple<string, string>>,
+  }
+
+  /// `replace` carries the whole changed message.
+  variant message-action { keep, drop, replace(message) }
+
+  record disconnected { client: client-info, reason: option<u8> }
+  record subscribed { client: client-info, filter: string, qos: qos }
+  record unsubscribed { client: client-info, filter: string }
+
+  variant event {
+    connected(client-info),
+    disconnected(disconnected),
+    subscribed(subscribed),
+    unsubscribed(unsubscribed),
+    session-expired(string),
+  }
+
+  /// The hooks a plugin implements; the broker calls no others.
+  flags hooks { authenticate, authorize, on-message, on-event, on-tick, on-control }
+
+  record registration {
+    hooks: hooks,
+    /// MQTT 5 enhanced authentication methods it answers `auth-step` for
+    auth-methods: list<string>,
+  }
+
+  /// One step of enhanced authentication. `continue` sends the challenge to
+  /// the client; the broker keeps `state` and passes it to the next step.
+  record challenge { data: list<u8>, state: list<u8> }
+  variant auth-step { %continue(challenge), success(option<string>), failed(u8) }
+}
+
+interface host {
+  use types.{level};
+
+  log: func(level: level, message: string);
+
+  /// A store shared by every copy of the plugin, kept in memory until the
+  /// broker stops.
+  kv-get: func(key: string) -> option<list<u8>>;
+  kv-set: func(key: string, value: list<u8>);
+  kv-delete: func(key: string);
+  kv-list: func(prefix: string) -> list<string>;
+}
+
+interface guest {
+  use types.{client-info, access, decision, message, message-action, event, registration};
+  // A function and a type can't share a name in one interface
+  use types.{auth-step as step};
+
+  init: func(config: list<tuple<string, string>>) -> result<registration, string>;
+  authenticate: func(client: client-info, username: string, password: list<u8>) -> decision;
+  /// `state` is None on the first step of an exchange.
+  auth-step: func(method: string, state: option<list<u8>>, data: option<list<u8>>) -> step;
+  authorize: func(client: client-info, topic: string, access: access) -> decision;
+  on-message: func(client: client-info, message: message) -> message-action;
+  on-event: func(event: event);
+  on-tick: func();
+  on-control: func(client: client-info, path: string, payload: list<u8>) -> option<list<u8>>;
+}
+
+world plugin {
+  import host;
+  export guest;
+}
