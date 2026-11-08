@@ -306,6 +306,15 @@ pub struct ConnectPayload {
 }
 
 impl ConnectPayload {
+    fn present_fields(&self) -> ConnectFlags {
+        ConnectFlags {
+            user_name: self.user_name.is_some(),
+            password: self.password.is_some(),
+            will_flag: self.will_topic.is_some(),
+            ..Default::default()
+        }
+    }
+
     /// Encode payload with version-specific handling.
     ///
     /// The will, user name and password are written only when `flags` says
@@ -371,37 +380,14 @@ impl ConnectPayload {
     }
 }
 
+/// Encodes the MQTT 5 form, with the fields that are set.
 impl Encoder for ConnectPayload {
     fn encode(&self, buffer: &mut BytesMut) {
-        // Default encoding assumes MQTT 5.0 with all optional fields
-        self.client_id.encode(buffer);
-
-        if self.will_properties.encoded_size() > 0 {
-            VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
-            self.will_properties.encode(buffer);
-        }
-
-        self.will_topic.encode(buffer);
-        self.will_payload.encode(buffer);
-        self.user_name.encode(buffer);
-        self.password.encode(buffer);
+        self.encode_for_version(buffer, ProtocolVersion::V5, &self.present_fields());
     }
 
     fn encoded_size(&self) -> usize {
-        let mut len = 0;
-
-        len += self.client_id.encoded_size();
-        if self.will_properties.encoded_size() > 0 {
-            len += VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
-            len += self.will_properties.encoded_size();
-        }
-
-        len += self.will_topic.encoded_size();
-        len += self.will_payload.encoded_size();
-        len += self.user_name.encoded_size();
-        len += self.password.encoded_size();
-
-        len
+        self.encoded_size_for_version(ProtocolVersion::V5, &self.present_fields())
     }
 }
 
@@ -536,6 +522,23 @@ impl Decoder for ConnectPacket {
 #[cfg(test)]
 mod tests {
     use crate::connect::*;
+
+    #[test]
+    fn test_payload_encoder_writes_empty_will_properties() {
+        let payload = ConnectPayload {
+            client_id: "c".into(),
+            will_topic: Some("t".into()),
+            will_payload: Some(Bytes::from_static(b"p")),
+            ..Default::default()
+        };
+        let mut encoded = BytesMut::new();
+        payload.encode(&mut encoded);
+        assert_eq!(
+            &encoded[..],
+            [0x00, 0x01, b'c', 0x00, 0x00, 0x01, b't', 0x00, 0x01, b'p']
+        );
+        assert_eq!(payload.encoded_size(), encoded.len());
+    }
 
     #[test]
     fn test_connect_packet_encoding() {
