@@ -15,7 +15,7 @@ async fn start_broker(allow_anonymous: bool) -> SocketAddr {
     let mut config = ServerConfig::default();
     config.auth.require_auth = true;
     config.auth.allow_anonymous = allow_anonymous;
-    config.auth.credential_validator = Some(Arc::new(SimpleCredentialValidator::new(credentials)));
+    config.plugins = vec![Arc::new(SimpleCredentialValidator::new(credentials))];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

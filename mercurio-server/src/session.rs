@@ -49,9 +49,9 @@ use mercurio_packets::{
 
 use crate::{
     acl::{Access, Authorizer, ClientIdentity},
-    auth::{AuthExchange, AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
+    plugin::{AuthExchange, AuthResult, Chain},
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
@@ -1108,13 +1108,8 @@ impl Session {
     async fn handle_auth(
         &mut self,
         packet: AuthPacket,
-        auth_manager: Option<&AuthManager>,
+        chain: &Chain,
     ) -> Result<Option<ControlPacket>> {
-        let Some(auth_manager) = auth_manager else {
-            // No auth manager configured - enhanced auth not supported
-            return Err(ReasonCode::BadAuthenticationMethod.into());
-        };
-
         let mut session = self.shared.state.lock().await;
 
         // Every AUTH must name the method the connection was authenticated
@@ -1133,10 +1128,10 @@ impl Session {
 
         let result = match packet.reason {
             ReasonCode::ReAuthenticate => {
-                let Some(mut exchange) = auth_manager.begin(&method) else {
+                let Some(mut exchange) = chain.begin_auth(&method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
                 };
-                let result = exchange.step(data.as_ref());
+                let result = chain.step(exchange.as_mut(), data.as_ref()).await;
                 session.auth_exchange = Some(exchange);
                 result
             }
@@ -1145,7 +1140,7 @@ impl Session {
                 let Some(exchange) = session.auth_exchange.as_mut() else {
                     return Err(ReasonCode::ProtocolError.into());
                 };
-                exchange.step(data.as_ref())
+                chain.step(exchange.as_mut(), data.as_ref()).await
             }
             _ => return Err(ReasonCode::ProtocolError.into()),
         };
@@ -1178,7 +1173,7 @@ impl Session {
         &mut self,
         packet: ControlPacket,
         broker: &Broker<S>,
-        auth_manager: Option<&AuthManager>,
+        chain: &Chain,
         authorizer: Option<&dyn Authorizer>,
     ) -> Result<Option<ControlPacket>> {
         // Packet identifiers are never 0 [MQTT-2.2.1-3]
@@ -1208,7 +1203,7 @@ impl Session {
             ControlPacket::Unsubscribe(packet) => self.handle_unsubscribe(packet, broker).await,
             ControlPacket::PingReq(_) => Ok(Some(ControlPacket::PingResp(PingRespPacket {}))),
             ControlPacket::Disconnect(packet) => Ok(Some(ControlPacket::Disconnect(packet))),
-            ControlPacket::Auth(packet) => self.handle_auth(packet, auth_manager).await,
+            ControlPacket::Auth(packet) => self.handle_auth(packet, chain).await,
 
             // Some packets are not supposed to be received by the server.
             // Namely: ConnAck, UnsubAck, PingResp
@@ -1491,6 +1486,10 @@ mod tests {
     };
     use mercurio_storage::memory::MemoryStore;
     use tokio::time::{timeout, Duration};
+
+    fn no_plugins() -> Chain {
+        Chain::new(Vec::new(), Duration::from_secs(5))
+    }
 
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
@@ -1852,7 +1851,7 @@ mod tests {
 
         for dup in [false, true] {
             let response = publisher
-                .process_incoming(qos2_publish("t", 5, dup), &broker, None, None)
+                .process_incoming(qos2_publish("t", 5, dup), &broker, &no_plugins(), None)
                 .await
                 .unwrap();
             assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
@@ -1874,13 +1873,13 @@ mod tests {
                     properties: None,
                 }),
                 &broker,
-                None,
+                &no_plugins(),
                 None,
             )
             .await
             .unwrap();
         publisher
-            .process_incoming(qos2_publish("t", 5, false), &broker, None, None)
+            .process_incoming(qos2_publish("t", 5, false), &broker, &no_plugins(), None)
             .await
             .unwrap();
         next_publish(&mut subscriber).await;
@@ -1893,14 +1892,19 @@ mod tests {
         let packet_id = send_qos2_to(&mut session, &broker).await;
 
         let pubrel = session
-            .process_incoming(pubrec(packet_id, ReasonCode::Success), &broker, None, None)
+            .process_incoming(
+                pubrec(packet_id, ReasonCode::Success),
+                &broker,
+                &no_plugins(),
+                None,
+            )
             .await
             .unwrap();
         assert!(
             matches!(pubrel, Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::Success)
         );
         session
-            .process_incoming(pubrel_packet(packet_id), &broker, None, None)
+            .process_incoming(pubrel_packet(packet_id), &broker, &no_plugins(), None)
             .await
             .unwrap();
 
@@ -1951,7 +1955,7 @@ mod tests {
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
         let pubcomp = session
-            .process_incoming(pubrel_packet(77), &broker, None, None)
+            .process_incoming(pubrel_packet(77), &broker, &no_plugins(), None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1960,7 +1964,12 @@ mod tests {
         ));
 
         let pubrel = session
-            .process_incoming(pubrec(78, ReasonCode::Success), &broker, None, None)
+            .process_incoming(
+                pubrec(78, ReasonCode::Success),
+                &broker,
+                &no_plugins(),
+                None,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -1980,7 +1989,7 @@ mod tests {
             .process_incoming(
                 pubrec(packet_id, ReasonCode::UnspecifiedError),
                 &broker,
-                None,
+                &no_plugins(),
                 None,
             )
             .await
@@ -2085,7 +2094,7 @@ mod tests {
             ..Default::default()
         });
         session
-            .process_incoming(publish, &broker, None, None)
+            .process_incoming(publish, &broker, &no_plugins(), None)
             .await
             .unwrap();
         assert!(nothing_queued(&session).await);
@@ -2096,7 +2105,7 @@ mod tests {
             ..Default::default()
         });
         other
-            .process_incoming(publish, &broker, None, None)
+            .process_incoming(publish, &broker, &no_plugins(), None)
             .await
             .unwrap();
         next_publish(&mut session).await;
@@ -2251,7 +2260,7 @@ mod tests {
         });
         assert!(matches!(
             session
-                .process_incoming(from_client, &broker, None, None)
+                .process_incoming(from_client, &broker, &no_plugins(), None)
                 .await,
             Err(mercurio_core::error::Error::MQTTReasonCode(
                 ReasonCode::ProtocolError
@@ -2284,7 +2293,7 @@ mod tests {
 
         for topic in ["a/b", ""] {
             publisher
-                .process_incoming(aliased_publish(topic, 1), &broker, None, None)
+                .process_incoming(aliased_publish(topic, 1), &broker, &no_plugins(), None)
                 .await
                 .unwrap();
             let publish = next_publish(&mut subscriber).await;
@@ -2299,7 +2308,7 @@ mod tests {
             ("", 2, ReasonCode::ProtocolError),
         ] {
             let result = publisher
-                .process_incoming(aliased_publish(topic, alias), &broker, None, None)
+                .process_incoming(aliased_publish(topic, alias), &broker, &no_plugins(), None)
                 .await;
             assert!(
                 matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
@@ -2412,7 +2421,9 @@ mod tests {
         ];
 
         for packet in packets {
-            let result = session.process_incoming(packet, &broker, None, None).await;
+            let result = session
+                .process_incoming(packet, &broker, &no_plugins(), None)
+                .await;
             assert!(matches!(
                 result,
                 Err(mercurio_core::error::Error::MQTTReasonCode(
@@ -2517,7 +2528,7 @@ mod tests {
         packet: ControlPacket,
     ) -> ReasonCode {
         match session
-            .process_incoming(packet, broker, None, None)
+            .process_incoming(packet, broker, &no_plugins(), None)
             .await
             .unwrap()
         {

@@ -3,7 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::auth::CredentialValidator;
+use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin};
 
 type Loader<T> = fn(&str) -> Result<T, String>;
 
@@ -63,9 +63,28 @@ impl<T: Authorizer> Authorizer for Reloadable<T> {
     }
 }
 
-impl<T: CredentialValidator> CredentialValidator for Reloadable<T> {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
-        self.get().validate(username, password)
+impl<T: Plugin> Plugin for Reloadable<T> {
+    fn name(&self) -> &str {
+        &self.path
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        let current = self.get();
+        Box::pin(async move { current.authenticate(client, credentials).await })
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+        access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        let current = self.get();
+        Box::pin(async move { current.authorize(client, topic, access).await })
     }
 }
 

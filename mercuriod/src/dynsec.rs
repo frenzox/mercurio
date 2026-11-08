@@ -17,7 +17,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
 use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::auth::CredentialValidator;
+use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision};
 use mercurio_server::server::LocalConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -667,8 +667,8 @@ impl Authorizer for DynamicSecurity {
     }
 }
 
-impl CredentialValidator for DynamicSecurity {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
+impl DynamicSecurity {
+    fn check_password(&self, username: &str, password: &[u8]) -> bool {
         // Copied out so Argon2, which is slow on purpose, runs without the lock
         let hash = {
             let data = self.data.read().unwrap();
@@ -683,6 +683,32 @@ impl CredentialValidator for DynamicSecurity {
         };
         PasswordHash::new(&hash)
             .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
+    }
+}
+
+impl mercurio_server::plugin::Plugin for DynamicSecurity {
+    fn name(&self) -> &str {
+        "dynamic-security"
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        // Hashes take tens of milliseconds of CPU; keep them off the runtime
+        let (username, password) = (
+            credentials.username.to_string(),
+            credentials.password.to_vec(),
+        );
+        Box::pin(async move {
+            let valid = tokio::task::block_in_place(|| self.check_password(&username, &password));
+            if valid {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        })
     }
 }
 
@@ -747,7 +773,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
-        assert!(security.validate("admin", b"secret"));
+        assert!(security.check_password("admin", b"secret"));
         assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
 
         let responses = run(
@@ -773,7 +799,7 @@ mod tests {
         assert_eq!(responses[5]["data"]["clients"], json!(["admin", "s1"]));
 
         let s1 = identity("s1");
-        assert!(security.validate("s1", b"pw"));
+        assert!(security.check_password("s1", b"pw"));
         assert!(security.authorize(&s1, "sensors/t1", Access::Write));
         assert!(!security.authorize(&s1, "sensors/secret", Access::Write));
         assert!(!security.authorize(&s1, "sensors/t1", Access::Subscribe));
@@ -820,11 +846,11 @@ mod tests {
             &security,
             json!([{ "command": "disableClient", "username": "s1" }]),
         );
-        assert!(!security.validate("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw"));
 
         // Saved, so a reload or a restart keeps the changes
         security.reload().unwrap();
-        assert!(!security.validate("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw"));
         run(
             &security,
             json!([{ "command": "enableClient", "username": "s1" }]),

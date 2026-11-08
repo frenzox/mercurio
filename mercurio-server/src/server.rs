@@ -52,10 +52,11 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
     acl::{Access, Authorizer, ClientIdentity},
-    auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
     connection::Connection,
-    http, proxy,
+    http,
+    plugin::{AuthResult, Chain, ClientInfo, Credentials, Decision, Plugin},
+    proxy,
     session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
@@ -73,10 +74,6 @@ pub struct AuthConfig {
     /// With authentication required, still accept clients that send no
     /// user name. Credentials that are sent are always checked.
     pub allow_anonymous: bool,
-    /// Optional credential validator for CONNECT username/password.
-    pub credential_validator: Option<Arc<dyn CredentialValidator>>,
-    /// Optional auth manager for MQTT 5.0 enhanced authentication.
-    pub auth_manager: Option<Arc<AuthManager>>,
     /// Decides which topics each client may publish and subscribe to; all
     /// of them when unset.
     pub authorizer: Option<Arc<dyn Authorizer>>,
@@ -179,6 +176,12 @@ pub struct ServerConfig {
     pub local_listener: Option<LocalListener>,
     /// How often to publish statistics under `$SYS/broker/`; never if unset.
     pub sys_interval: Option<Duration>,
+    /// Run in this order for the main listener, and listeners without
+    /// their own list; see [`crate::plugin`].
+    pub plugins: Vec<Arc<dyn Plugin>>,
+    /// Longest a plugin hook may take; one that takes longer denies, or
+    /// drops the message.
+    pub plugin_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -191,6 +194,8 @@ impl Default for ServerConfig {
             listeners: Vec::new(),
             local_listener: None,
             sys_interval: Some(Duration::from_secs(10)),
+            plugins: Vec::new(),
+            plugin_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -236,6 +241,8 @@ pub struct ListenerConfig {
     /// Replaces the broker's authentication and access control for the
     /// listener's clients.
     pub auth: Option<AuthConfig>,
+    /// Replaces the broker's plugins for the listener's clients.
+    pub plugins: Option<Vec<Arc<dyn Plugin>>>,
     /// Connections beyond this many on this listener are closed right after
     /// being accepted, on top of the broker-wide limit.
     pub max_connections: Option<usize>,
@@ -256,6 +263,7 @@ impl ListenerConfig {
             proxy_from: Vec::new(),
             mount_point: None,
             auth: None,
+            plugins: None,
             max_connections: None,
             http_dir: None,
         }
@@ -340,11 +348,12 @@ struct EndpointSettings {
     proxy_from: Arc<[AddressRange]>,
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
+    chain: Option<Chain>,
     http_dir: Option<Arc<PathBuf>>,
 }
 
 impl Endpoint {
-    fn new(config: ListenerConfig) -> std::result::Result<Self, ServerError> {
+    fn new(config: ListenerConfig, timeout: Duration) -> std::result::Result<Self, ServerError> {
         let username_from_certificate = config
             .tls
             .as_ref()
@@ -363,6 +372,7 @@ impl Endpoint {
                 proxy_from: config.proxy_from.into(),
                 mount_point: config.mount_point,
                 auth: config.auth.map(Arc::new),
+                chain: config.plugins.map(|p| Chain::new(p, timeout)),
                 http_dir: config.http_dir.map(Arc::new),
             },
         })
@@ -376,6 +386,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     shutdown: Shutdown,
     shutdown_complete: mpsc::Sender<()>,
     auth_config: Arc<AuthConfig>,
+    chain: Chain,
     policy: Arc<ConnectPolicy>,
     limits: Limits,
     stats: Arc<Stats>,
@@ -476,6 +487,9 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
+        if let Some(chain) = settings.chain {
+            self.chain = chain;
+        }
         let Some(acceptor) = settings.tls_acceptor else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
@@ -512,7 +526,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         match transport {
-            Transport::Mqtt => Box::pin(self.handle(Connection::new(stream))).await,
+            Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
@@ -532,7 +546,9 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // needs one larger than the largest packet
                 let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
                 match time::timeout_at(self.connect_deadline, handshake).await {
-                    Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
+                    Ok(Ok(websocket)) => {
+                        Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
+                    }
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
                     Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
                 }
@@ -540,7 +556,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
     }
 
-    async fn handle<S>(self, mut connection: Connection<S>)
+    async fn handle<S>(self, mut connection: Connection<S>, peer: Option<SocketAddr>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -552,6 +568,8 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             connection,
             shutdown: self.shutdown,
             auth_config: self.auth_config,
+            chain: self.chain,
+            peer,
             policy: self.policy,
             limits: self.limits,
             stats: self.stats,
@@ -609,6 +627,8 @@ struct Listener<St: MqttStore + 'static> {
     local_listener: Option<LocalListener>,
     /// Given to local connections instead of `auth_config`
     trusted_auth: Arc<AuthConfig>,
+    /// Given to local connections instead of `chain`
+    trusted_chain: Chain,
     /// Where the next accept starts looking, so a busy listener does not
     /// starve the others
     next_endpoint: usize,
@@ -618,6 +638,7 @@ struct Listener<St: MqttStore + 'static> {
     /// Cloned into every connection handler; see `Handler::_shutdown_complete`
     shutdown_complete: mpsc::Sender<()>,
     auth_config: Arc<AuthConfig>,
+    chain: Chain,
     policy: Arc<ConnectPolicy>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -637,6 +658,9 @@ where
     connection: Connection<S>,
     shutdown: Shutdown,
     auth_config: Arc<AuthConfig>,
+    chain: Chain,
+    /// The client's address, from the PROXY header when there is one
+    peer: Option<SocketAddr>,
     policy: Arc<ConnectPolicy>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -675,14 +699,12 @@ fn describe(packet: &ControlPacket) -> String {
     }
 }
 
-/// Checks credentials off the async threads, as password hashes take tens
-/// of milliseconds of CPU and validators may block on I/O, and at most one
-/// per core at a time, so a flood of logins queues instead of starving
-/// connections.
+/// Checks credentials, at most one login per core at a time, so a flood of
+/// logins queues instead of starving the broker of CPU for password hashes.
 async fn validate_credentials(
-    validator: &Arc<dyn CredentialValidator>,
-    username: &str,
-    password: &[u8],
+    chain: &Chain,
+    client: &ClientInfo,
+    credentials: &Credentials<'_>,
 ) -> bool {
     static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let checks = CHECKS.get_or_init(|| {
@@ -692,14 +714,7 @@ async fn validate_credentials(
     let Ok(_permit) = checks.acquire().await else {
         return false;
     };
-    let (validator, username, password) = (
-        Arc::clone(validator),
-        username.to_string(),
-        password.to_vec(),
-    );
-    tokio::task::spawn_blocking(move || validator.validate(&username, &password))
-        .await
-        .unwrap_or(false)
+    chain.authenticate(client, credentials).await == Decision::Allow
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -737,6 +752,8 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         listeners,
         local_listener,
         sys_interval,
+        plugins,
+        plugin_timeout,
     } = config;
     let stats = Arc::new(Stats::default());
     let policy = Arc::new(policy);
@@ -750,10 +767,11 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     };
     let endpoints = std::iter::once(main)
         .chain(listeners)
-        .map(Endpoint::new)
+        .map(|l| Endpoint::new(l, plugin_timeout))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let auth_config = Arc::new(auth_config);
+    let chain = Chain::new(plugins, plugin_timeout);
 
     let mut server = Listener {
         endpoints,
@@ -762,6 +780,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
             authorizer: Some(Arc::new(AllowAll)),
             ..Default::default()
         }),
+        trusted_chain: chain.trusted(),
         next_endpoint: 0,
         broker: Broker::new(Arc::clone(&storage)),
         session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
@@ -772,6 +791,7 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
         notify_shutdown,
         shutdown_complete,
         auth_config,
+        chain,
         policy,
         limits,
         stats,
@@ -880,6 +900,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 shutdown_complete: self.shutdown_complete.clone(),
                 auth_config: Arc::clone(&self.auth_config),
+                chain: self.chain.clone(),
                 policy: Arc::clone(&self.policy),
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
@@ -907,6 +928,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
                         auth_config: Arc::clone(&self.trusted_auth),
+                        chain: self.trusted_chain.clone(),
                         local: true,
                         ..parts
                     };
@@ -1085,16 +1107,17 @@ where
                 &connect_packet.payload.password,
             ) {
                 (Some(username), Some(password)) => {
-                    if let Some(validator) = &self.auth_config.credential_validator {
-                        let valid = validate_credentials(validator, username, password).await;
-                        if !valid {
-                            warn!("Authentication failed for user `{}`", username);
-                        }
-                        valid
-                    } else {
-                        // Auth required but no validator configured — reject
-                        false
+                    let client = ClientInfo {
+                        client_id: connect_packet.payload.client_id.clone(),
+                        username: Some(username.clone()),
+                        peer: self.peer,
+                    };
+                    let credentials = Credentials::new(username, password);
+                    let valid = validate_credentials(&self.chain, &client, &credentials).await;
+                    if !valid {
+                        warn!("Authentication failed for user `{}`", username);
                     }
+                    valid
                 }
                 (None, None) if self.auth_config.allow_anonymous => true,
                 _ => {
@@ -1318,11 +1341,7 @@ where
         connect_packet: &ConnectPacket,
         method: &str,
     ) -> Result<Option<Option<String>>> {
-        let exchange = self
-            .auth_config
-            .auth_manager
-            .as_ref()
-            .and_then(|manager| manager.begin(method));
+        let exchange = self.chain.begin_auth(method);
         let Some(mut exchange) = exchange else {
             self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
                 .await?;
@@ -1334,7 +1353,7 @@ where
             .as_ref()
             .and_then(|p| p.authentication_data.as_ref())
             .map(|d| &d.value);
-        let mut result = exchange.step(initial_data);
+        let mut result = self.chain.step(exchange.as_mut(), initial_data).await;
 
         loop {
             let challenge = match result {
@@ -1381,7 +1400,7 @@ where
             }
 
             let data = auth.properties.auth_data.map(|d| d.value);
-            result = exchange.step(data.as_ref());
+            result = self.chain.step(exchange.as_mut(), data.as_ref()).await;
         }
     }
 
@@ -1731,7 +1750,7 @@ where
                     .process_incoming(
                         packet,
                         &self.broker,
-                        self.auth_config.auth_manager.as_deref(),
+                        &self.chain,
                         self.auth_config.authorizer.as_deref(),
                     )
                     .await?;

@@ -1,7 +1,5 @@
-//! Authentication module for MQTT 5.0 enhanced authentication.
-//!
-//! This module provides an extensible authentication framework supporting
-//! challenge-response authentication flows as defined in MQTT 5.0.
+//! Built-in authentication plugins: PLAIN enhanced authentication and an
+//! in-memory user name and password check.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -9,34 +7,9 @@ use bytes::Bytes;
 
 use mercurio_core::reason::ReasonCode;
 
-/// Result of an authentication step.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AuthResult {
-    /// The client is authenticated, as `username` if the method identifies
-    /// users.
-    Success { username: Option<String> },
-    /// Authentication requires another round - send this challenge to client.
-    Continue(Bytes),
-    /// Authentication failed with the given reason.
-    Failed(ReasonCode),
-}
-
-/// An enhanced authentication method (e.g., PLAIN, SCRAM-SHA-256).
-pub trait AuthMethod: Send + Sync {
-    /// Returns the authentication method name (e.g., "PLAIN", "SCRAM-SHA-256").
-    fn name(&self) -> &str;
-
-    /// Begins authenticating one client.
-    fn begin(&self) -> Box<dyn AuthExchange>;
-}
-
-/// One client's authentication, carried out step by step. It keeps whatever
-/// the method needs between steps, such as the nonce of a challenge.
-pub trait AuthExchange: Send {
-    /// Processes the data the client sent in CONNECT or AUTH, if any.
-    fn step(&mut self, data: Option<&Bytes>) -> AuthResult;
-}
+use crate::plugin::{
+    ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+};
 
 /// PLAIN authentication method (RFC 4616).
 ///
@@ -79,15 +52,17 @@ fn parse_plain_data(data: &Bytes) -> Option<(String, String)> {
     Some((username.to_string(), password.to_string()))
 }
 
-impl AuthMethod for PlainAuth {
+impl Plugin for PlainAuth {
     fn name(&self) -> &str {
-        "PLAIN"
+        "plain"
     }
 
-    fn begin(&self) -> Box<dyn AuthExchange> {
-        Box::new(PlainExchange {
-            credentials: Arc::clone(&self.credentials),
-            done: false,
+    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+        (method == "PLAIN").then(|| {
+            Box::new(PlainExchange {
+                credentials: Arc::clone(&self.credentials),
+                done: false,
+            }) as Box<dyn AuthExchange>
         })
     }
 }
@@ -98,7 +73,13 @@ struct PlainExchange {
 }
 
 impl AuthExchange for PlainExchange {
-    fn step(&mut self, data: Option<&Bytes>) -> AuthResult {
+    fn step<'a>(&'a mut self, data: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
+        ready(self.check(data))
+    }
+}
+
+impl PlainExchange {
+    fn check(&mut self, data: Option<&Bytes>) -> AuthResult {
         // PLAIN is a single step
         if std::mem::replace(&mut self.done, true) {
             return AuthResult::Failed(ReasonCode::ProtocolError);
@@ -122,16 +103,6 @@ impl AuthExchange for PlainExchange {
     }
 }
 
-/// Trait for validating username/password credentials from CONNECT packets.
-///
-/// This is separate from the MQTT 5.0 Enhanced Authentication (AUTH packets).
-/// It validates the simple username/password fields in the CONNECT packet.
-pub trait CredentialValidator: Send + Sync {
-    /// Validate a username/password pair.
-    /// Returns true if the credentials are valid.
-    fn validate(&self, username: &str, password: &[u8]) -> bool;
-}
-
 /// Simple in-memory credential validator using a username -> password map.
 pub struct SimpleCredentialValidator {
     credentials: HashMap<String, String>,
@@ -144,57 +115,26 @@ impl SimpleCredentialValidator {
     }
 }
 
-impl CredentialValidator for SimpleCredentialValidator {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
-        let password_str = match std::str::from_utf8(password) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        self.credentials
-            .get(username)
-            .map(|stored| stored == password_str)
-            .unwrap_or(false)
-    }
-}
-
-/// Manages authentication methods and ongoing authentication sessions.
-pub struct AuthManager {
-    /// Available authentication methods by name.
-    methods: HashMap<String, Box<dyn AuthMethod>>,
-}
-
-impl Default for AuthManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AuthManager {
-    /// Create a new AuthManager with no authentication methods.
-    pub fn new() -> Self {
-        AuthManager {
-            methods: HashMap::new(),
-        }
+impl Plugin for SimpleCredentialValidator {
+    fn name(&self) -> &str {
+        "credentials"
     }
 
-    /// Register an authentication method.
-    pub fn register(&mut self, method: Box<dyn AuthMethod>) {
-        self.methods.insert(method.name().to_string(), method);
-    }
-
-    /// Check if an authentication method is supported.
-    pub fn supports_method(&self, method_name: &str) -> bool {
-        self.methods.contains_key(method_name)
-    }
-
-    /// Get the list of supported authentication method names.
-    pub fn supported_methods(&self) -> Vec<&str> {
-        self.methods.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Begins authenticating a client with `method_name`, if supported.
-    pub fn begin(&self, method_name: &str) -> Option<Box<dyn AuthExchange>> {
-        self.methods.get(method_name).map(|method| method.begin())
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        let valid = std::str::from_utf8(credentials.password).is_ok_and(|password| {
+            self.credentials
+                .get(credentials.username)
+                .is_some_and(|stored| stored == password)
+        });
+        ready(if valid {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
 }
 
@@ -211,125 +151,145 @@ mod tests {
         Bytes::from(data)
     }
 
-    #[test]
-    fn test_plain_auth_success() {
+    #[tokio::test]
+    async fn test_plain_auth_success() {
         let mut credentials = HashMap::new();
         credentials.insert("user".to_string(), "pass".to_string());
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("user", "pass");
         assert_eq!(
-            auth.begin().step(Some(&data)),
+            auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await,
             AuthResult::Success {
                 username: Some("user".into())
             }
         );
     }
 
-    #[test]
-    fn test_plain_auth_wrong_password() {
+    #[tokio::test]
+    async fn test_plain_auth_wrong_password() {
         let mut credentials = HashMap::new();
         credentials.insert("user".to_string(), "pass".to_string());
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("user", "wrongpass");
-        match auth.begin().step(Some(&data)) {
+        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
             AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_plain_auth_unknown_user() {
+    #[tokio::test]
+    async fn test_plain_auth_unknown_user() {
         let mut credentials = HashMap::new();
         credentials.insert("user".to_string(), "pass".to_string());
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("unknown", "pass");
-        match auth.begin().step(Some(&data)) {
+        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
             AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_plain_auth_no_data() {
+    #[tokio::test]
+    async fn test_plain_auth_no_data() {
         let credentials = HashMap::new();
         let auth = PlainAuth::new(credentials);
 
-        match auth.begin().step(None) {
+        match auth.begin_auth("PLAIN").unwrap().step(None).await {
             AuthResult::Failed(ReasonCode::BadAuthenticationMethod) => {}
             other => panic!("Expected BadAuthenticationMethod, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_plain_auth_malformed_data() {
+    #[tokio::test]
+    async fn test_plain_auth_malformed_data() {
         let credentials = HashMap::new();
         let auth = PlainAuth::new(credentials);
 
         // Missing initial NUL
         let data = Bytes::from("user\0pass");
-        match auth.begin().step(Some(&data)) {
+        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
             AuthResult::Failed(ReasonCode::MalformedPacket) => {}
             other => panic!("Expected MalformedPacket, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_auth_manager_unsupported_method() {
-        let manager = AuthManager::new();
-
-        assert!(manager.begin("UNKNOWN").is_none());
+    fn test_plain_auth_unsupported_method() {
+        assert!(PlainAuth::new(HashMap::new())
+            .begin_auth("UNKNOWN")
+            .is_none());
     }
 
-    #[test]
-    fn test_auth_manager_with_plain() {
-        let mut manager = AuthManager::new();
+    #[tokio::test]
+    async fn test_plain_auth_exchange_is_single_step() {
         let mut credentials = HashMap::new();
         credentials.insert("admin".to_string(), "secret".to_string());
-        manager.register(Box::new(PlainAuth::new(credentials)));
-
-        assert!(manager.supports_method("PLAIN"));
-        assert!(!manager.supports_method("SCRAM-SHA-256"));
+        let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("admin", "secret");
-        let mut exchange = manager.begin("PLAIN").unwrap();
+        let mut exchange = auth.begin_auth("PLAIN").unwrap();
         assert!(matches!(
-            exchange.step(Some(&data)),
+            exchange.step(Some(&data)).await,
             AuthResult::Success { .. }
         ));
         // A finished exchange accepts no more steps
         assert_eq!(
-            exchange.step(Some(&data)),
+            exchange.step(Some(&data)).await,
             AuthResult::Failed(ReasonCode::ProtocolError)
         );
     }
 
-    #[test]
-    fn test_credential_validator_success() {
+    #[tokio::test]
+    async fn test_credential_validator_success() {
         let mut creds = HashMap::new();
         creds.insert("user".to_string(), "pass".to_string());
         let validator = SimpleCredentialValidator::new(creds);
 
-        assert!(validator.validate("user", b"pass"));
+        assert_eq!(
+            validator
+                .authenticate(
+                    &ClientInfo::new("c", None),
+                    &Credentials::new("user", b"pass")
+                )
+                .await,
+            Decision::Allow
+        );
     }
 
-    #[test]
-    fn test_credential_validator_wrong_password() {
+    #[tokio::test]
+    async fn test_credential_validator_wrong_password() {
         let mut creds = HashMap::new();
         creds.insert("user".to_string(), "pass".to_string());
         let validator = SimpleCredentialValidator::new(creds);
 
-        assert!(!validator.validate("user", b"wrong"));
+        assert_eq!(
+            validator
+                .authenticate(
+                    &ClientInfo::new("c", None),
+                    &Credentials::new("user", b"wrong")
+                )
+                .await,
+            Decision::Deny
+        );
     }
 
-    #[test]
-    fn test_credential_validator_unknown_user() {
+    #[tokio::test]
+    async fn test_credential_validator_unknown_user() {
         let mut creds = HashMap::new();
         creds.insert("user".to_string(), "pass".to_string());
         let validator = SimpleCredentialValidator::new(creds);
 
-        assert!(!validator.validate("unknown", b"pass"));
+        assert_eq!(
+            validator
+                .authenticate(
+                    &ClientInfo::new("c", None),
+                    &Credentials::new("unknown", b"pass")
+                )
+                .await,
+            Decision::Deny
+        );
     }
 }

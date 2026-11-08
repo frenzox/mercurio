@@ -10,6 +10,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::{AclFile, Authorizer};
+use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
     ServerConfig, Socket, Transport,
@@ -298,16 +299,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             value.mount_point = extra.mount_point.clone();
             value.max_connections = extra.max_connections;
             value.http_dir = extra.http_dir.clone().map(Into::into);
-            value.auth = match &extra.auth {
-                Some(auth) => Some(build_auth(auth, &mut reloadable, None)?),
-                None => None,
-            };
+            if let Some(auth) = &extra.auth {
+                let (auth, plugins) = build_auth(auth, &mut reloadable, None)?;
+                value.auth = Some(auth);
+                value.plugins = Some(plugins);
+            }
             value
         });
     }
 
     let (connector, local_listener) = LocalConnector::new();
-    let auth_config = build_auth(&config.auth, &mut reloadable, Some(&connector))?;
+    let (auth_config, plugins) = build_auth(&config.auth, &mut reloadable, Some(&connector))?;
 
     for bridge in config.bridges {
         info!("Starting bridge {}", bridge.name);
@@ -317,6 +319,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut server_config = ServerConfig::default();
     server_config.tls = tls_config;
     server_config.auth = auth_config;
+    server_config.plugins = plugins;
     server_config.limits = limits;
     server_config.policy = policy;
     server_config.listeners = listeners;
@@ -437,13 +440,13 @@ async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
 }
 
-/// The authentication and access control of `config`, adding the files
-/// it loads to `reloadable`.
+/// The authentication and access control of `config`, and the plugins that
+/// check credentials, adding the files it loads to `reloadable`.
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
     connector: Option<&LocalConnector>,
-) -> Result<ServerAuthConfig, String> {
+) -> Result<(ServerAuthConfig, Vec<Arc<dyn Plugin>>), String> {
     if let Some(path) = &config.dynamic_security {
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
@@ -453,15 +456,11 @@ fn build_auth(
         info!("Loaded dynamic security from {}", path);
         reloadable.push(security.clone());
         Arc::clone(&security).serve(connector.clone());
-        return Ok({
-            let mut value = ServerAuthConfig::default();
-            value.require_auth = config.enabled;
-            value.allow_anonymous = config.allow_anonymous;
-            value.credential_validator = Some(security.clone());
-            value.auth_manager = None;
-            value.authorizer = Some(security);
-            value
-        });
+        let mut value = ServerAuthConfig::default();
+        value.require_auth = config.enabled;
+        value.allow_anonymous = config.allow_anonymous;
+        value.authorizer = Some(security.clone());
+        return Ok((value, vec![security]));
     }
 
     // The HTTP endpoints, each with the check it replaces
@@ -497,34 +496,24 @@ fn build_auth(
         None => None,
     };
     if !config.enabled {
-        return Ok({
-            let mut value = ServerAuthConfig::default();
-            value.authorizer = authorizer;
-            value
-        });
+        let mut value = ServerAuthConfig::default();
+        value.authorizer = authorizer;
+        return Ok((value, Vec::new()));
     }
 
-    let credential_validator = match &config.password_file {
-        _ if http_users.is_some() => {
-            http_users.map(|http| http as Arc<dyn mercurio_server::auth::CredentialValidator>)
-        }
-        Some(path) => {
-            let validator = Arc::new(Reloadable::load(path, load_credentials)?);
-            info!("Loaded credentials from {}", path);
-            reloadable.push(validator.clone());
-            Some(validator as Arc<dyn mercurio_server::auth::CredentialValidator>)
-        }
-        None => None,
-    };
-    Ok({
-        let mut value = ServerAuthConfig::default();
-        value.require_auth = true;
-        value.allow_anonymous = config.allow_anonymous;
-        value.credential_validator = credential_validator;
-        value.auth_manager = None;
-        value.authorizer = authorizer;
-        value
-    })
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if let Some(path) = &config.password_file {
+        let validator = Arc::new(Reloadable::load(path, load_credentials)?);
+        info!("Loaded credentials from {}", path);
+        reloadable.push(validator.clone());
+        plugins.push(validator);
+    }
+    plugins.extend(http_users.map(|http| http as Arc<dyn Plugin>));
+    let mut value = ServerAuthConfig::default();
+    value.require_auth = true;
+    value.allow_anonymous = config.allow_anonymous;
+    value.authorizer = authorizer;
+    Ok((value, plugins))
 }
 
 /// Rereads the ACL and password files on SIGHUP. ACL changes apply to every

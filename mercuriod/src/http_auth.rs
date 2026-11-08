@@ -15,7 +15,7 @@ use std::{
 };
 
 use mercurio_server::acl::{Access, Authorizer, ClientIdentity};
-use mercurio_server::auth::CredentialValidator;
+use mercurio_server::plugin::{ready, BoxFuture, ClientInfo, Credentials, Decision};
 use serde_json::json;
 use tracing::warn;
 
@@ -74,17 +74,29 @@ impl HttpAuth {
     }
 }
 
-impl CredentialValidator for HttpAuth {
-    fn validate(&self, username: &str, password: &[u8]) -> bool {
+impl mercurio_server::plugin::Plugin for HttpAuth {
+    fn name(&self) -> &str {
+        "http-auth"
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
         let Some(url) = &self.user_url else {
-            return false;
+            return ready(Decision::Defer);
         };
         let body = json!({
-            "username": username,
-            "password": String::from_utf8_lossy(password),
-            "clientid": "",
+            "username": credentials.username,
+            "password": String::from_utf8_lossy(credentials.password),
+            "clientid": client.client_id,
         });
-        self.allows(url, body)
+        ready(if self.allows(url, body) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
     }
 }
 
@@ -187,6 +199,12 @@ mod tests {
         (url, requests)
     }
 
+    async fn check(auth: &HttpAuth, password: &str) -> Decision {
+        let client = ClientInfo::new("c", None);
+        let credentials = Credentials::new("alice", password.as_bytes());
+        mercurio_server::plugin::Plugin::authenticate(auth, &client, &credentials).await
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_endpoints_decide_and_acl_answers_are_cached() {
         let (user_url, _) = serve("\"password\":\"secret\"");
@@ -198,8 +216,8 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        assert!(auth.validate("alice", b"secret"));
-        assert!(!auth.validate("alice", b"wrong"));
+        assert_eq!(check(&auth, "secret").await, Decision::Allow);
+        assert_eq!(check(&auth, "wrong").await, Decision::Deny);
 
         let alice = ClientIdentity::new("c", Some("alice".to_string()));
         assert!(auth.authorize(&alice, "allowed", Access::Write));
@@ -216,6 +234,6 @@ mod tests {
             Duration::from_secs(2),
             Duration::from_secs(60),
         );
-        assert!(!auth.validate("alice", b"secret"));
+        assert_eq!(check(&auth, "secret").await, Decision::Deny);
     }
 }

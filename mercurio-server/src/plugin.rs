@@ -218,7 +218,6 @@ pub trait Plugin: Send + Sync + 'static {
 /// Runs a hook within `limit`. None, logged, if it ran out of time or
 /// panicked. A hook that is ready at once, like most access checks, never
 /// touches the timer.
-#[allow(dead_code)] // used by the server from the next task on
 pub(crate) async fn guarded<T>(
     plugin: &str,
     hook: &str,
@@ -243,7 +242,7 @@ pub(crate) async fn guarded<T>(
 
 /// The plugins one connection runs, in order.
 #[derive(Clone)]
-#[allow(dead_code)] // used by the server from the next task on
+#[allow(dead_code)] // `trusted` is read by access control, from the next task on
 pub(crate) struct Chain {
     plugins: Arc<[Arc<dyn Plugin>]>,
     timeout: Duration,
@@ -252,7 +251,7 @@ pub(crate) struct Chain {
     trusted: bool,
 }
 
-#[allow(dead_code)] // used by the server from the next task on
+#[allow(dead_code)] // the other hooks are run from the next tasks on
 impl Chain {
     pub(crate) fn new(plugins: Vec<Arc<dyn Plugin>>, timeout: Duration) -> Chain {
         Chain {
