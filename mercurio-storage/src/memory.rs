@@ -295,6 +295,7 @@ mod tests {
             clean_start: false,
             expiry_interval: None,
             expires_at: None,
+            owner: Default::default(),
         };
 
         // Save and load

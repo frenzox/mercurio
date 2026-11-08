@@ -23,7 +23,7 @@ use crate::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
     BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -72,7 +72,9 @@ impl SqliteStore {
                 subscriptions TEXT NOT NULL,
                 clean_start INTEGER NOT NULL,
                 expiry_interval INTEGER,
-                expires_at INTEGER
+                expires_at INTEGER,
+                owner_username TEXT,
+                owner_mount_point TEXT
             );
 
             CREATE TABLE IF NOT EXISTS retained_messages (
@@ -139,6 +141,17 @@ impl SqliteStore {
             )?;
         }
 
+        // Databases created before sessions recorded their owner
+        let has_owner = conn
+            .prepare("SELECT owner_username FROM sessions LIMIT 0")
+            .is_ok();
+        if !has_owner {
+            conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN owner_username TEXT;
+                 ALTER TABLE sessions ADD COLUMN owner_mount_point TEXT;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -202,14 +215,17 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> Result<()> 
         Write::SaveSession(session) => {
             conn.execute(
                 "INSERT OR REPLACE INTO sessions
-                 (client_id, subscriptions, clean_start, expiry_interval, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (client_id, subscriptions, clean_start, expiry_interval, expires_at,
+                  owner_username, owner_mount_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     client_id,
                     encode_subscriptions(&session.subscriptions),
                     session.clean_start,
                     session.expiry_interval,
-                    session.expires_at.map(|t| t as i64)
+                    session.expires_at.map(|t| t as i64),
+                    session.owner.username,
+                    session.owner.mount_point
                 ],
             )?;
         }
@@ -363,7 +379,8 @@ impl SessionStore for SqliteStore {
 
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT subscriptions, clean_start, expiry_interval, expires_at
+                "SELECT subscriptions, clean_start, expiry_interval, expires_at,
+                        owner_username, owner_mount_point
                  FROM sessions WHERE client_id = ?1",
             )?;
 
@@ -376,6 +393,10 @@ impl SessionStore for SqliteStore {
                         clean_start: row.get(1)?,
                         expiry_interval: row.get(2)?,
                         expires_at: row.get::<_, Option<i64>>(3)?.map(|t| t as u64),
+                        owner: SessionOwner {
+                            username: row.get(4)?,
+                            mount_point: row.get(5)?,
+                        },
                     })
                 })
                 .optional()?;
@@ -778,6 +799,33 @@ mod tests {
     }
 
     #[test]
+    fn test_older_databases_gain_the_owner_columns() {
+        let path = std::env::temp_dir().join(format!("mercurio-owner-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    client_id TEXT PRIMARY KEY, subscriptions TEXT NOT NULL,
+                    clean_start INTEGER NOT NULL, expiry_interval INTEGER, expires_at INTEGER
+                );
+                INSERT INTO sessions VALUES ('old', '', 0, NULL, NULL);",
+            )
+            .unwrap();
+
+        let store = SqliteStore::new(&path).unwrap();
+        let loaded = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(store.load_session("old"))
+            .unwrap()
+            .unwrap();
+        // Sessions from before owners were kept count as anonymous ones
+        assert_eq!(loaded.owner, SessionOwner::default());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn test_older_databases_gain_the_origin_columns() {
         let path = std::env::temp_dir().join(format!("mercurio-migrate-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -885,6 +933,10 @@ mod tests {
             clean_start: false,
             expiry_interval: Some(60),
             expires_at: Some(1_700_000_000_000),
+            owner: SessionOwner {
+                username: Some("alice".into()),
+                mount_point: Some("tenant/".into()),
+            },
         };
 
         // Save and load
@@ -893,6 +945,7 @@ mod tests {
         assert_eq!(loaded.subscriptions, session.subscriptions);
         assert_eq!(loaded.expiry_interval, Some(60));
         assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
+        assert_eq!(loaded.owner, session.owner);
 
         // List sessions
         let sessions = store.list_sessions().await.unwrap();
@@ -1054,6 +1107,7 @@ mod tests {
                 clean_start: false,
                 expiry_interval: None,
                 expires_at: None,
+                owner: Default::default(),
             };
             store
                 .save_session("persistent_client", &session)

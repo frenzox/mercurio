@@ -116,6 +116,10 @@ where
         self.mount_point = mount_point;
     }
 
+    pub(crate) fn mount_point(&self) -> Option<&str> {
+        self.mount_point.as_deref()
+    }
+
     pub fn set_max_packet_size(&mut self, max_packet_size: usize) {
         self.max_packet_size = max_packet_size;
     }

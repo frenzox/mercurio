@@ -32,7 +32,7 @@ use crate::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
     BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -53,7 +53,8 @@ const SCHEMA_LOCK_KEY: i64 = LOCK_KEY - 1;
 
 /// Schema changes, applied in order; the database records how many it has.
 /// Released entries never change: a new schema change is a new entry.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE sessions (
         client_id TEXT PRIMARY KEY,
         subscriptions BYTEA NOT NULL,
@@ -149,7 +150,12 @@ const MIGRATIONS: &[&str] = &["
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON queued_messages
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
-"];
+",
+    "
+    ALTER TABLE sessions ADD COLUMN owner_username TEXT;
+    ALTER TABLE sessions ADD COLUMN owner_mount_point TEXT;
+",
+];
 
 /// Brings the schema up to date, one broker at a time.
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -414,17 +420,22 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
     match write {
         Write::SaveSession(session) => vec![(
             "INSERT INTO sessions
-             (client_id, subscriptions, clean_start, expiry_interval, expires_at)
-             VALUES ($1, $2, $3, $4, $5)
+             (client_id, subscriptions, clean_start, expiry_interval, expires_at,
+              owner_username, owner_mount_point)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (client_id) DO UPDATE SET
              subscriptions = EXCLUDED.subscriptions, clean_start = EXCLUDED.clean_start,
-             expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at",
+             expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at,
+             owner_username = EXCLUDED.owner_username,
+             owner_mount_point = EXCLUDED.owner_mount_point",
             vec![
                 id(),
                 Box::new(encode_subscriptions(&session.subscriptions).into_bytes()),
                 Box::new(session.clean_start),
                 Box::new(session.expiry_interval.map(i64::from)),
                 Box::new(session.expires_at.map(|t| t as i64)),
+                Box::new(session.owner.username.clone()),
+                Box::new(session.owner.mount_point.clone()),
             ],
         )],
         Write::SaveSubscriptions(subscriptions) => vec![(
@@ -756,7 +767,8 @@ impl SessionStore for PostgresStore {
     async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
         let rows = self
             .query(
-                "SELECT subscriptions, clean_start, expiry_interval, expires_at
+                "SELECT subscriptions, clean_start, expiry_interval, expires_at,
+                        owner_username, owner_mount_point
                  FROM sessions WHERE client_id = $1",
                 &[&client_id],
             )
@@ -776,6 +788,10 @@ impl SessionStore for PostgresStore {
             expires_at: row
                 .try_get::<_, Option<i64>>("expires_at")?
                 .map(|t| t as u64),
+            owner: SessionOwner {
+                username: row.try_get("owner_username")?,
+                mount_point: row.try_get("owner_mount_point")?,
+            },
         }))
     }
 
@@ -1109,6 +1125,43 @@ mod tests {
         assert_eq!(topic_prefix_pattern("50%_off\\/+"), "50\\%\\_off\\\\%");
     }
 
+    /// A database created by 0.2.0, at schema version 1, keeps its
+    /// sessions when a newer broker migrates it.
+    #[tokio::test]
+    async fn test_migrates_a_version_1_database() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let client = store.client().await.unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+                 SET client_min_messages = warning;
+                 {}
+                 CREATE TABLE mercurio_schema (version INTEGER NOT NULL);
+                 INSERT INTO mercurio_schema VALUES (1);
+                 INSERT INTO sessions (client_id, subscriptions, clean_start)
+                 VALUES ('old', '', FALSE);",
+                MIGRATIONS[0]
+            ))
+            .await
+            .unwrap();
+        drop(client);
+
+        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let version: i32 = store
+            .client()
+            .await
+            .unwrap()
+            .query_one("SELECT version FROM mercurio_schema", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version as usize, MIGRATIONS.len());
+        let old = store.load_session("old").await.unwrap().unwrap();
+        assert_eq!(old.owner, SessionOwner::default());
+    }
+
     #[tokio::test]
     async fn test_round_trips_every_store() {
         let Some(url) = database_url() else { return };
@@ -1126,6 +1179,10 @@ mod tests {
             clean_start: false,
             expiry_interval: Some(u32::MAX),
             expires_at: Some(1),
+            owner: SessionOwner {
+                username: Some("alice".into()),
+                mount_point: Some("tenant/".into()),
+            },
         };
         store.save_session("c", &session).await.unwrap();
         store.save_session("c", &session).await.unwrap();
@@ -1133,6 +1190,7 @@ mod tests {
         assert_eq!(loaded.subscriptions[0], subscription);
         assert_eq!(loaded.subscriptions.len(), 2);
         assert_eq!(loaded.expiry_interval, Some(u32::MAX));
+        assert_eq!(loaded.owner, session.owner);
         assert_eq!(store.list_sessions().await.unwrap(), vec!["c".to_string()]);
         store.delete_session("c").await.unwrap();
         assert!(store.load_session("c").await.unwrap().is_none());

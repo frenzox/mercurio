@@ -36,7 +36,7 @@ use mercurio_packets::{
     disconnect::{DisconnectPacket, DisconnectProperties},
     ControlPacket,
 };
-use mercurio_storage::{memory::MemoryStore, MqttStore};
+use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
     acl::{Access, Authorizer, ClientIdentity},
@@ -976,7 +976,14 @@ where
             expiry = self.limits.persistent_client_expiration;
         }
 
-        let mut start_result = self.session_manager.start_session(connect_packet).await?;
+        let owner = SessionOwner {
+            username: verified_user.clone(),
+            mount_point: self.connection.mount_point().map(str::to_string),
+        };
+        let mut start_result = self
+            .session_manager
+            .start_session(connect_packet, owner)
+            .await?;
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;

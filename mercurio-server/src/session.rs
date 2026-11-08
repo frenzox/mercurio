@@ -57,7 +57,7 @@ use crate::{
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
-    InflightMessage, RetainedMessageStore, StoredSubscription, StoredWillMessage,
+    InflightMessage, RetainedMessageStore, SessionOwner, StoredSubscription, StoredWillMessage,
 };
 
 /// Will message to be published on abnormal client disconnect.
@@ -260,6 +260,8 @@ struct State {
     auth_exchange: Option<Box<dyn AuthExchange>>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
+    /// Who may resume the session
+    owner: SessionOwner,
 }
 
 impl From<Session> for SessionDropGuard {
@@ -314,6 +316,7 @@ impl Session {
                     will_message,
                     auth_exchange: None,
                     verified_user: None,
+                    owner: SessionOwner::default(),
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -792,6 +795,14 @@ impl Session {
     /// Records the user name authentication verified for this connection.
     pub(crate) async fn set_verified_user(&self, username: Option<String>) {
         self.shared.state.lock().await.verified_user = username;
+    }
+
+    pub(crate) async fn owner(&self) -> SessionOwner {
+        self.shared.state.lock().await.owner.clone()
+    }
+
+    pub(crate) async fn set_owner(&self, owner: SessionOwner) {
+        self.shared.state.lock().await.owner = owner;
     }
 
     async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {

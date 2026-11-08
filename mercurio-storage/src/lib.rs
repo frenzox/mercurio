@@ -74,6 +74,15 @@ pub struct SessionState {
     /// Unix time in milliseconds when the session expires, once its
     /// connection has ended
     pub expires_at: Option<u64>,
+    pub owner: SessionOwner,
+}
+
+/// Who a session belongs to. Only a client authenticated as the same user,
+/// on a listener with the same mount point, may resume it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionOwner {
+    pub username: Option<String>,
+    pub mount_point: Option<String>,
 }
 
 /// A subscription, the QoS granted for it and its MQTT 5 options.
@@ -274,6 +283,7 @@ pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
                         clean_start: false,
                         expiry_interval: None,
                         expires_at: None,
+                        owner: SessionOwner::default(),
                     });
                     state.subscriptions = subscriptions.clone();
                     self.save_session(client_id, &state).await?;

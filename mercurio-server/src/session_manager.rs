@@ -15,10 +15,10 @@ use mercurio_core::{message::unix_millis, protocol::ProtocolVersion, Result};
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
-    BatchStore, InflightMessage, RetainedMessageStore, SessionState, StoredSubscription,
-    StoredWillMessage, Write,
+    BatchStore, InflightMessage, RetainedMessageStore, SessionOwner, SessionState,
+    StoredSubscription, StoredWillMessage, Write,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     broker::Broker,
@@ -144,9 +144,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
     }
 
+    /// Starts or resumes the session of the client in `connect_packet`,
+    /// authenticated as `owner`. A session another owner left is never
+    /// resumed: it is discarded as if the client asked for a clean start.
     pub(crate) async fn start_session(
         &mut self,
         mut connect_packet: ConnectPacket,
+        owner: SessionOwner,
     ) -> Result<SessionStartResult> {
         // Clients without an identifier each get a unique one, so they never
         // share a session entry
@@ -178,7 +182,18 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let mut inflight_to_retry = Vec::new();
         let mut queue_to_restore = Vec::new();
 
-        if connect_packet.flags.clean_start {
+        let foreign = match manager.sessions.get(client_id) {
+            Some(existing) => existing.session().owner().await != owner,
+            None => false,
+        };
+        if foreign && !connect_packet.flags.clean_start {
+            warn!(
+                "Client `{}` connected as another user or on another mount point than its session's; starting a new session",
+                client_id
+            );
+        }
+
+        if connect_packet.flags.clean_start || foreign {
             if let Some(discarded) = manager.sessions.remove(client_id) {
                 discarded.session().stop_queue_journal();
                 discarded.session().unsubscribe_all().await;
@@ -197,12 +212,18 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 let storage_error = |e: mercurio_storage::StorageError| {
                     mercurio_core::error::Error::Storage(e.to_string())
                 };
-                if let Some(stored_session) = self
+                let stored = self
                     .storage
                     .load_session(client_id)
                     .await
-                    .map_err(storage_error)?
-                {
+                    .map_err(storage_error)?;
+                if stored.as_ref().is_some_and(|stored| stored.owner != owner) {
+                    warn!(
+                        "Client `{}` connected as another user or on another mount point than its stored session's; starting a new session",
+                        client_id
+                    );
+                    self.writers.write(client_id, Write::DeleteSession);
+                } else if let Some(stored_session) = stored {
                     info!(
                         "Restoring session for client `{}` with {} subscriptions",
                         client_id,
@@ -260,6 +281,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
         }
         session.set_generation(lease.generation).await;
+        session.set_owner(owner.clone()).await;
         if !queue_to_restore.is_empty() {
             session.restore_queue(queue_to_restore);
             self.writers.write(&client_id, Write::ClearQueue);
@@ -275,6 +297,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             clean_start: false,
             expiry_interval,
             expires_at: None,
+            owner,
         };
         self.writers
             .write(&client_id, Write::SaveSession(session_state));
@@ -468,6 +491,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             },
         };
         let mut session = SessionDropGuard::new(connect_packet, self.queue_limits).session();
+        session.set_owner(state.owner.clone()).await;
 
         if let Err(e) = session
             .restore_subscriptions(state.subscriptions, broker)
@@ -667,7 +691,10 @@ mod tests {
         let storage = create_test_storage();
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
 
-        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         storage
             .store_inflight(
                 "c",
@@ -705,7 +732,10 @@ mod tests {
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         let broker = crate::broker::Broker::new(storage.clone());
 
-        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         let mut session = started.session;
         session
             .process_incoming(
@@ -729,7 +759,10 @@ mod tests {
             .await;
         manager.end_connection(started.lease, None).await;
 
-        let resumed = manager.start_session(connect_packet("c")).await.unwrap();
+        let resumed = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         assert!(resumed.resume);
         manager.flush().await;
 
@@ -746,7 +779,10 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
         let broker = crate::broker::Broker::new(storage);
 
-        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         let mut session = started.session;
         session
             .process_incoming(
@@ -785,6 +821,7 @@ mod tests {
                     clean_start: false,
                     expiry_interval: None,
                     expires_at: None,
+                    owner: Default::default(),
                 },
             )
             .await
@@ -819,7 +856,10 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
         let mut connect = connect_packet("c");
         connect.flags.clean_start = false;
-        let started = manager.start_session(connect).await.unwrap();
+        let started = manager
+            .start_session(connect, SessionOwner::default())
+            .await
+            .unwrap();
         assert!(started.resume);
         started
             .session
@@ -847,6 +887,7 @@ mod tests {
                         clean_start: false,
                         expiry_interval: expires_at.map(|_| 60),
                         expires_at,
+                        owner: SessionOwner::default(),
                     },
                 )
                 .await
@@ -884,6 +925,7 @@ mod tests {
                     clean_start: false,
                     expiry_interval: Some(expiry),
                     expires_at: None,
+                    owner: Default::default(),
                 },
             )
             .await
@@ -896,7 +938,10 @@ mod tests {
         storage.store_will("c", &stored_will(0)).await.unwrap();
 
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
-        manager.start_session(connect_packet("c")).await.unwrap();
+        manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         manager.flush().await;
 
         assert!(storage.get_will("c").await.unwrap().is_none());
@@ -924,7 +969,10 @@ mod tests {
         // Reconnecting before the will is due cancels it
         let mut reconnect = connect_packet("b");
         reconnect.flags.clean_start = false;
-        manager.start_session(reconnect).await.unwrap();
+        manager
+            .start_session(reconnect, SessionOwner::default())
+            .await
+            .unwrap();
         assert!(manager.take_restored_will("a").await);
         assert!(!manager.take_restored_will("b").await);
     }
@@ -978,6 +1026,7 @@ mod tests {
             clean_start: false,
             expiry_interval: None,
             expires_at: None,
+            owner: Default::default(),
         };
         storage
             .save_session("client1", &session_state)
@@ -1040,6 +1089,7 @@ mod tests {
             clean_start: false,
             expiry_interval: None,
             expires_at: None,
+            owner: Default::default(),
         };
         storage
             .save_session("client1", &session_state)
@@ -1104,11 +1154,110 @@ mod tests {
         assert!(storage.get_all_inflight("c").await.unwrap().is_empty());
     }
 
+    fn owned_by(username: &str) -> SessionOwner {
+        SessionOwner {
+            username: Some(username.to_string()),
+            mount_point: None,
+        }
+    }
+
+    fn resuming(client_id: &str) -> ConnectPacket {
+        let mut connect = connect_packet(client_id);
+        connect.flags.clean_start = false;
+        connect
+    }
+
+    #[tokio::test]
+    async fn test_another_owner_never_resumes_a_session() {
+        let storage = durable_storage();
+        let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
+        let started = manager
+            .start_session(resuming("gw-01"), owned_by("alice"))
+            .await
+            .unwrap();
+        mark_persistent(&manager, "gw-01");
+        manager
+            .save_subscriptions(
+                "gw-01",
+                vec![StoredSubscription::new("alice/#", QoS::AtMostOnce)],
+            )
+            .await;
+        manager.end_connection(started.lease, None).await;
+
+        // The same client id, authenticated as someone else
+        let taken = manager
+            .start_session(resuming("gw-01"), owned_by("mallory"))
+            .await
+            .unwrap();
+        assert!(!taken.resume);
+        assert!(taken.session.get_subscriptions().await.is_empty());
+        manager.end_connection(taken.lease, None).await;
+
+        // And on a mounted listener, by the same user
+        let mounted = SessionOwner {
+            mount_point: Some("tenant/".into()),
+            ..owned_by("mallory")
+        };
+        let taken = manager
+            .start_session(resuming("gw-01"), mounted)
+            .await
+            .unwrap();
+        assert!(!taken.resume);
+        manager.end_connection(taken.lease, None).await;
+
+        let mut alice_again = manager
+            .start_session(resuming("gw-01"), owned_by("alice"))
+            .await
+            .unwrap();
+        assert!(!alice_again.resume, "the session was replaced");
+        manager.end_connection(alice_again.lease, None).await;
+        alice_again = manager
+            .start_session(resuming("gw-01"), owned_by("alice"))
+            .await
+            .unwrap();
+        assert!(alice_again.resume, "its own session resumes");
+    }
+
+    #[tokio::test]
+    async fn test_another_owner_never_resumes_a_stored_session() {
+        let storage = durable_storage();
+        storage
+            .save_session(
+                "gw-01",
+                &SessionState {
+                    client_id: "gw-01".into(),
+                    subscriptions: vec![StoredSubscription::new("alice/#", QoS::AtMostOnce)],
+                    clean_start: false,
+                    expiry_interval: None,
+                    expires_at: None,
+                    owner: owned_by("alice"),
+                },
+            )
+            .await
+            .unwrap();
+
+        // As after a restart, before restore_from_storage loads it
+        let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
+        let taken = manager
+            .start_session(resuming("gw-01"), owned_by("mallory"))
+            .await
+            .unwrap();
+        assert!(!taken.resume);
+        assert!(taken.subscriptions_to_restore.is_empty());
+        manager.flush().await;
+        let stored = storage.load_session("gw-01").await.unwrap().unwrap();
+        assert_eq!(stored.owner, owned_by("mallory"));
+        assert!(stored.subscriptions.is_empty());
+    }
+
     #[tokio::test]
     async fn test_clean_start_discards_after_the_previous_writes() {
         let storage = durable_storage();
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
-        let started = manager.start_session(connect_packet("c")).await.unwrap();
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
         mark_persistent(&manager, "c");
         manager
             .save_subscriptions("c", vec![StoredSubscription::new("a", QoS::AtMostOnce)])
@@ -1117,7 +1266,10 @@ mod tests {
 
         let mut fresh = connect_packet("c");
         fresh.flags.clean_start = true;
-        manager.start_session(fresh).await.unwrap();
+        manager
+            .start_session(fresh, SessionOwner::default())
+            .await
+            .unwrap();
         manager.flush().await;
 
         let stored = storage.load_session("c").await.unwrap().unwrap();
