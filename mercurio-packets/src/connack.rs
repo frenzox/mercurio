@@ -261,7 +261,7 @@ impl Decoder for ConnAckPacket {
 
         let flags = ConnAckFlags::decode(buffer)?;
         let reason_code = ReasonCode::decode(buffer)?;
-        let properties = Some(ConnAckProperties::decode(buffer)?);
+        let properties = crate::present(ConnAckProperties::decode(buffer)?);
 
         Ok(ConnAckPacket {
             protocol_version: ProtocolVersion::V5,
@@ -289,7 +289,8 @@ impl ConnAckPacket {
             0x03 => ReasonCode::ServerUnavailable,
             0x04 => ReasonCode::BadUserNameOrPassword,
             0x05 => ReasonCode::NotAuthorized,
-            _ => ReasonCode::UnspecifiedError,
+            // Reserved [MQTT-3.2.2.3]
+            _ => return Err(ReasonCode::MalformedPacket.into()),
         };
 
         Ok(ConnAckPacket {

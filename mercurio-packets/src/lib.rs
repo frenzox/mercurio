@@ -186,6 +186,22 @@ impl ControlPacket {
         let packet_type: u8 = src[0] >> 4;
         let flags = src[0] & 0x0f;
 
+        // In MQTT 3.x acknowledgements carry only a packet id, DISCONNECT and
+        // the pings nothing, and AUTH doesn't exist; MQTT 5 extended them
+        if !version.supports_properties() {
+            let body_len = match packet_type {
+                0x04..=0x07 => Some(2),
+                0x0c..=0x0e => Some(0),
+                0x0f => return Err(ReasonCode::MalformedPacket.into()),
+                _ => None,
+            };
+            let mut header = src.get(1..).unwrap_or_default();
+            let remaining_len = VariableByteInteger::decode(&mut header)?.0 as usize;
+            if body_len.is_some_and(|len| len != remaining_len) {
+                return Err(ReasonCode::MalformedPacket.into());
+            }
+        }
+
         // Fixed header flags are reserved except on PUBLISH, and must be
         // 0b0010 on PUBREL, SUBSCRIBE and UNSUBSCRIBE [MQTT-2.1.3-1]
         let expected_flags = match packet_type {
@@ -270,6 +286,12 @@ impl ControlPacket {
             p => p.encode(buffer),
         }
     }
+}
+
+/// A property block that sets nothing reads as no block at all: the two
+/// mean the same, and senders use either.
+pub(crate) fn present<P: Default + PartialEq>(properties: P) -> Option<P> {
+    (properties != P::default()).then_some(properties)
 }
 
 impl Encoder for ControlPacket {

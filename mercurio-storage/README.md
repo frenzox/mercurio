@@ -26,7 +26,9 @@ run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;
 Implement the traits to keep the broker's state anywhere else. The broker
 writes each client's changes through `BatchStore::apply`, in batches; its
 default applies them one at a time, and stores that can should apply a
-batch in one transaction.
+batch in one transaction. A store overriding it can pass the changes it
+has no batch form for, including kinds added in later versions, to
+`apply_each`.
 
 ## Features
 

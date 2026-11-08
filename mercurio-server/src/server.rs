@@ -27,6 +27,7 @@ use mercurio_core::{
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
+    topic::validate_publish_topic,
     Result,
 };
 use mercurio_packets::{
@@ -36,15 +37,14 @@ use mercurio_packets::{
     disconnect::{DisconnectPacket, DisconnectProperties},
     ControlPacket,
 };
-use mercurio_storage::{memory::MemoryStore, MqttStore};
+use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
     acl::{Access, Authorizer, ClientIdentity},
     auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
-    connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
+    connection::Connection,
     http, proxy,
-    queue::QueueLimits,
     session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
@@ -55,6 +55,7 @@ use crate::{
 
 /// Authentication configuration for the server.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct AuthConfig {
     /// Whether authentication is required.
     pub require_auth: bool,
@@ -70,8 +71,15 @@ pub struct AuthConfig {
     pub authorizer: Option<Arc<dyn Authorizer>>,
 }
 
+pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
+
+/// Subscriptions a session may hold unless configured otherwise: far more
+/// than clients need, far fewer than it takes to exhaust the broker.
+pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
+
 /// Tunable limits of the broker.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Limits {
     /// How long a new connection may take to complete the TLS handshake and
     /// send CONNECT before it is closed.
@@ -103,6 +111,9 @@ pub struct Limits {
     /// Send a retained message to new subscribers only while the client
     /// that published it may still publish to its topic.
     pub check_retain_source: bool,
+    /// Subscriptions one session may hold; further ones are refused with
+    /// Quota Exceeded. Each costs memory and work on every message.
+    pub max_subscriptions: Option<usize>,
 }
 
 impl Default for Limits {
@@ -120,11 +131,14 @@ impl Default for Limits {
             retain_available: true,
             persistent_client_expiration: None,
             check_retain_source: false,
+            max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
         }
     }
 }
 
-/// Broker configuration.
+/// Broker configuration. Start from `ServerConfig::default()` and set
+/// what differs; fields may be added in minor releases.
+#[non_exhaustive]
 pub struct ServerConfig {
     /// Serve TLS instead of plain TCP on the main listener when set.
     pub tls: Option<TlsConfig>,
@@ -154,6 +168,7 @@ impl Default for ServerConfig {
 }
 
 /// A socket to accept connections on.
+#[non_exhaustive]
 pub enum Socket {
     Tcp(TcpListener),
     #[cfg(unix)]
@@ -174,6 +189,7 @@ impl From<UnixListener> for Socket {
 }
 
 /// A listener with its own transport and TLS settings.
+#[non_exhaustive]
 pub struct ListenerConfig {
     pub listener: Socket,
     pub transport: Transport,
@@ -262,6 +278,7 @@ enum Accepted {
 
 /// How MQTT is carried on a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     Mqtt,
     WebSocket,
@@ -327,6 +344,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     cert_identity: Option<String>,
     mount_point: Option<String>,
     http_dir: Option<Arc<PathBuf>>,
+    /// An in-process connection, from the local listener
+    local: bool,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -359,8 +378,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
+        // Boxed, so each connection holds the state of its own path, plain
+        // or TLS, not that of the largest
         let Some(acceptor) = settings.tls_acceptor else {
-            return self.serve(socket, transport, peer_addr).await;
+            return Box::pin(self.serve(socket, transport, peer_addr)).await;
         };
         match time::timeout(self.limits.connect_timeout, acceptor.accept(socket)).await {
             Ok(Ok(tls_stream)) => {
@@ -375,7 +396,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         return;
                     }
                 }
-                self.serve(tls_stream, transport, peer_addr).await;
+                Box::pin(self.serve(tls_stream, transport, peer_addr)).await;
             }
             Ok(Err(e)) => error!("TLS handshake failed for {:?}: {}", peer_addr, e),
             Err(_) => warn!("TLS handshake timed out for {:?}", peer_addr),
@@ -389,7 +410,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         match transport {
-            Transport::Mqtt => self.handle(Connection::new(stream)).await,
+            Transport::Mqtt => Box::pin(self.handle(Connection::new(stream))).await,
             Transport::WebSocket => {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
@@ -405,9 +426,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     }
                     None => http::Rewind::new(stream, Vec::new()),
                 };
-                let handshake = websocket::accept(stream);
+                // An MQTT packet may span messages, but no honest client
+                // needs one larger than the largest packet
+                let handshake = websocket::accept(stream, self.limits.max_packet_size);
                 match time::timeout(self.limits.connect_timeout, handshake).await {
-                    Ok(Ok(websocket)) => self.handle(Connection::new(websocket)).await,
+                    Ok(Ok(websocket)) => Box::pin(self.handle(Connection::new(websocket))).await,
                     Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
                     Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
                 }
@@ -431,6 +454,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             limits: self.limits,
             stats: self.stats,
             cert_identity: self.cert_identity,
+            local: self.local,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -439,6 +463,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
 
 /// What the broker tells clients when they connect, beyond limits.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConnectPolicy {
     /// Returned to MQTT 5 clients that ask for Response Information, with
     /// `%c` replaced by their client id: a topic prefix they may use for the
@@ -457,6 +482,7 @@ pub struct ConnectPolicy {
 
 /// Where clients are sent instead of being served.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Redirect {
     /// The server clients should use, in the form MQTT 5 clients expect,
     /// such as `host:port`
@@ -464,6 +490,15 @@ pub struct Redirect {
     /// Whether the move is permanent (Server Moved) or temporary (Use Another
     /// Server)
     pub permanent: bool,
+}
+
+impl Redirect {
+    pub fn new(server_reference: impl Into<String>, permanent: bool) -> Self {
+        Redirect {
+            server_reference: server_reference.into(),
+            permanent,
+        }
+    }
 }
 
 struct Listener<St: MqttStore + 'static> {
@@ -501,8 +536,64 @@ where
     stats: Arc<Stats>,
     limits: Limits,
     cert_identity: Option<String>,
+    /// An in-process connection, from the local listener
+    local: bool,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
+}
+
+/// A packet for logs: its type, and for a PUBLISH its topic and size,
+/// never the payload, which may carry secrets such as the passwords of
+/// dynamic security commands.
+fn describe(packet: &ControlPacket) -> String {
+    match packet {
+        ControlPacket::Publish(publish) => format!(
+            "PUBLISH on `{}` ({} bytes)",
+            publish.topic_name,
+            publish.payload.as_ref().map_or(0, |p| p.len())
+        ),
+        ControlPacket::Connect(_) => "CONNECT".into(),
+        ControlPacket::ConnAck(_) => "CONNACK".into(),
+        ControlPacket::PubAck(_) => "PUBACK".into(),
+        ControlPacket::PubRec(_) => "PUBREC".into(),
+        ControlPacket::PubRel(_) => "PUBREL".into(),
+        ControlPacket::PubComp(_) => "PUBCOMP".into(),
+        ControlPacket::Subscribe(_) => "SUBSCRIBE".into(),
+        ControlPacket::SubAck(_) => "SUBACK".into(),
+        ControlPacket::Unsubscribe(_) => "UNSUBSCRIBE".into(),
+        ControlPacket::UnsubAck(_) => "UNSUBACK".into(),
+        ControlPacket::PingReq(_) => "PINGREQ".into(),
+        ControlPacket::PingResp(_) => "PINGRESP".into(),
+        ControlPacket::Disconnect(_) => "DISCONNECT".into(),
+        ControlPacket::Auth(_) => "AUTH".into(),
+    }
+}
+
+/// Checks credentials off the async threads, as password hashes take tens
+/// of milliseconds of CPU and validators may block on I/O, and at most one
+/// per core at a time, so a flood of logins queues instead of starving
+/// connections.
+async fn validate_credentials(
+    validator: &Arc<dyn CredentialValidator>,
+    username: &str,
+    password: &[u8],
+) -> bool {
+    static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let checks = CHECKS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Arc::new(tokio::sync::Semaphore::new(cores))
+    });
+    let Ok(_permit) = checks.acquire().await else {
+        return false;
+    };
+    let (validator, username, password) = (
+        Arc::clone(validator),
+        username.to_string(),
+        password.to_vec(),
+    );
+    tokio::task::spawn_blocking(move || validator.validate(&username, &password))
+        .await
+        .unwrap_or(false)
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -688,6 +779,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 cert_identity: None,
                 mount_point: None,
                 http_dir: None,
+                local: false,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -702,6 +794,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
                         auth_config: Arc::clone(&self.trusted_auth),
+                        local: true,
                         ..parts
                     };
                     tokio::spawn(async move {
@@ -874,8 +967,8 @@ where
                 &connect_packet.payload.password,
             ) {
                 (Some(username), Some(password)) => {
-                    if let Some(ref validator) = self.auth_config.credential_validator {
-                        let valid = validator.validate(username, password);
+                    if let Some(validator) = &self.auth_config.credential_validator {
+                        let valid = validate_credentials(validator, username, password).await;
                         if !valid {
                             warn!("Authentication failed for user `{}`", username);
                         }
@@ -898,23 +991,6 @@ where
                     .await;
             }
             verified_user = connect_packet.payload.user_name.clone();
-        }
-
-        // A will is published on the client's behalf, so it needs the same
-        // permission as a PUBLISH
-        if let (Some(authorizer), Some(will_topic)) = (
-            &self.auth_config.authorizer,
-            &connect_packet.payload.will_topic,
-        ) {
-            let identity = ClientIdentity {
-                client_id: connect_packet.payload.client_id.clone(),
-                username: verified_user.clone(),
-            };
-            if !authorizer.authorize(&identity, will_topic, Access::Write) {
-                return self
-                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
-                    .await;
-            }
         }
 
         if let Some(reason) = self.refused_will(&connect_packet) {
@@ -963,6 +1039,32 @@ where
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                 .await;
         }
+        // A will is published on the client's behalf, so it needs the same
+        // permission as a PUBLISH, checked once the client id is final
+        if let (Some(authorizer), Some(will_topic)) = (
+            &self.auth_config.authorizer,
+            &connect_packet.payload.will_topic,
+        ) {
+            let identity = ClientIdentity {
+                client_id: connect_packet.payload.client_id.clone(),
+                username: verified_user.clone(),
+            };
+            if !authorizer.authorize(&identity, will_topic, Access::Write) {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+        }
+
+        // In-process clients don't reconnect, so a network client taking
+        // over their id would end them for good
+        let client_id = &connect_packet.payload.client_id;
+        if !self.local && self.session_manager.is_held_locally(client_id) {
+            warn!("Client id `{}` belongs to an in-process client", client_id);
+            return self
+                .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                .await;
+        }
 
         let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
@@ -976,10 +1078,24 @@ where
             expiry = self.limits.persistent_client_expiration;
         }
 
-        let mut start_result = self.session_manager.start_session(connect_packet).await?;
+        let owner = SessionOwner {
+            username: verified_user.clone(),
+            mount_point: self.connection.mount_point().map(str::to_string),
+        };
+        let mut start_result = self
+            .session_manager
+            .start_session(connect_packet, owner)
+            .await?;
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
+        let held_locally = match self.local {
+            true => Some(session.get_client_id().await),
+            false => None,
+        };
+        if let Some(client_id) = &held_locally {
+            self.session_manager.hold_locally(client_id);
+        }
 
         session.set_verified_user(verified_user).await;
 
@@ -1067,6 +1183,9 @@ where
             }
         }
 
+        if let Some(client_id) = &held_locally {
+            self.session_manager.release_locally(client_id);
+        }
         self.session_manager.end_connection(lease, expiry).await;
 
         result
@@ -1201,6 +1320,16 @@ where
         }
         if flags.will_retain && !self.limits.retain_available {
             return Some(ReasonCode::RetainNotSupported);
+        }
+        // A will is published like a PUBLISH, so its topic must be one;
+        // `$` topics belong to the broker
+        let topic = connect_packet
+            .payload
+            .will_topic
+            .as_deref()
+            .unwrap_or_default();
+        if validate_publish_topic(topic).is_err() || topic.starts_with('$') {
+            return Some(ReasonCode::TopicNameInvalid);
         }
         None
     }
@@ -1344,7 +1473,7 @@ where
                     }
 
                     if let Some(res) = maybe_res {
-                        tracing::debug!("Sending response packet:{:#?} to client {:?}", res, session.get_client_id().await);
+                        debug!("Sending {} to client {:?}", describe(&res), session.get_client_id().await);
                         self.connection.write_packet(res).await?;
                     }
 
@@ -1369,7 +1498,7 @@ where
                     let Some(outgoing) = session.prepare_publish(message).await else {
                         continue;
                     };
-                    tracing::debug!("Sending outgoing packet: {:#?} to client {:?}", outgoing.packet, session.get_client_id().await);
+                    debug!("Sending {} to client {:?}", describe(&outgoing.packet), session.get_client_id().await);
 
                     if let Some(inflight) = outgoing.inflight {
                         let client_id = session.get_client_id().await;

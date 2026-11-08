@@ -29,6 +29,16 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # The oldest Rust the crates declare they build with, rust-version
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - name: Check with the minimum supported Rust
+        run: cargo check --workspace --all-features
+
   # The workspace build lends crates each other's features; release-plz and
   # crates.io build each crate on its own
   features:

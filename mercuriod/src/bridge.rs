@@ -48,6 +48,17 @@ impl Route {
     }
 }
 
+/// The topic to forward `topic` to through `route`, if any. A remote
+/// broker may send any topic with any subscription id, so only what the
+/// route covers is forwarded, and nothing into this broker's own `$`
+/// topics, such as `$CONTROL` commands.
+fn forwarded_topic(route: Option<&Route>, topic: &str, outbound: bool) -> Option<String> {
+    route
+        .filter(|route| topic_matches_filter(topic, &route.filter))
+        .and_then(|route| route.rename(topic))
+        .filter(|renamed| outbound || !renamed.starts_with('$'))
+}
+
 /// The routes of the local side (outbound) and of the remote side (inbound).
 fn routes(config: &BridgeConfig) -> Result<(Vec<Route>, Vec<Route>), String> {
     let mut outbound = Vec::new();
@@ -282,7 +293,11 @@ impl Bridge {
                             .iter()
                             .find(|r| topic_matches_filter(&topic, &r.filter)),
                     };
-                    let Some(renamed) = route.and_then(|route| route.rename(&topic)) else {
+                    let Some(renamed) = forwarded_topic(route, &topic, outbound) else {
+                        warn!(
+                            "Bridge {}: dropping `{}`, which no route covers",
+                            self.name, topic
+                        );
                         continue;
                     };
                     if let Some(echoes) = &self.echoes {
@@ -312,6 +327,7 @@ impl Bridge {
                 Event::Disconnected { reason } => {
                     warn!("Bridge {} disconnected: {:?}", self.name, reason);
                 }
+                _ => {}
             }
         }
     }
@@ -319,7 +335,7 @@ impl Bridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{routes, Route};
+    use super::{forwarded_topic, routes, Route};
     use crate::config::Config;
     use mercurio_client::QoS;
 
@@ -341,6 +357,40 @@ mod tests {
                 ("2001:db8::1".to_string(), 1883)
             ]
         );
+    }
+
+    #[test]
+    fn test_inbound_topics_stay_within_their_route() {
+        let route = Route {
+            filter: "remote/sensors/#".into(),
+            qos: QoS::AtMostOnce,
+            strip: "remote/".into(),
+            add: String::new(),
+        };
+        assert_eq!(
+            forwarded_topic(Some(&route), "remote/sensors/t", false).as_deref(),
+            Some("sensors/t")
+        );
+        // Sent under the route's subscription id, but outside its filter
+        assert_eq!(forwarded_topic(Some(&route), "remote/admin", false), None);
+
+        let unprefixed = Route {
+            filter: "#".into(),
+            qos: QoS::AtMostOnce,
+            strip: String::new(),
+            add: String::new(),
+        };
+        assert_eq!(
+            forwarded_topic(Some(&unprefixed), "$CONTROL/dynamic-security/v1", false),
+            None
+        );
+        // Outbound, `$` topics a route names are the remote's business
+        let sys = Route {
+            filter: "$SYS/#".into(),
+            ..unprefixed
+        };
+        assert!(forwarded_topic(Some(&sys), "$SYS/x", true).is_some());
+        assert!(forwarded_topic(Some(&sys), "$SYS/x", false).is_none());
     }
 
     #[test]

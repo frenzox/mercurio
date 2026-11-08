@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mercurio_server::server::{Limits, ServerConfig};
+use mercurio_server::server::ServerConfig;
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
@@ -11,13 +11,8 @@ use tokio::{
 async fn connection_without_connect_is_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        limits: Limits {
-            connect_timeout: Duration::from_millis(200),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.limits.connect_timeout = Duration::from_millis(200);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

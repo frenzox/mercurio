@@ -32,7 +32,7 @@ use crate::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
     BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -53,7 +53,8 @@ const SCHEMA_LOCK_KEY: i64 = LOCK_KEY - 1;
 
 /// Schema changes, applied in order; the database records how many it has.
 /// Released entries never change: a new schema change is a new entry.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE sessions (
         client_id TEXT PRIMARY KEY,
         subscriptions BYTEA NOT NULL,
@@ -149,7 +150,12 @@ const MIGRATIONS: &[&str] = &["
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON queued_messages
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
-"];
+",
+    "
+    ALTER TABLE sessions ADD COLUMN owner_username TEXT;
+    ALTER TABLE sessions ADD COLUMN owner_mount_point TEXT;
+",
+];
 
 /// Brings the schema up to date, one broker at a time.
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -160,17 +166,20 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
              SELECT pg_advisory_xact_lock({SCHEMA_LOCK_KEY});
              CREATE TABLE IF NOT EXISTS mercurio_schema (version INTEGER NOT NULL);"
         ))
-        .await?;
+        .await
+        .db()?;
     let result = async {
         let version: i32 = match client
             .query_opt("SELECT version FROM mercurio_schema", &[])
-            .await?
+            .await
+            .db()?
         {
-            Some(row) => row.try_get(0)?,
+            Some(row) => row.try_get(0).db()?,
             None => {
                 client
                     .execute("INSERT INTO mercurio_schema VALUES (0)", &[])
-                    .await?;
+                    .await
+                    .db()?;
                 0
             }
         };
@@ -181,21 +190,35 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
             ))
         })?;
         for migration in pending {
-            client.batch_execute(migration).await?;
+            client.batch_execute(migration).await.db()?;
         }
         client
             .execute(
                 "UPDATE mercurio_schema SET version = $1",
                 &[&(MIGRATIONS.len() as i32)],
             )
-            .await?;
+            .await
+            .db()?;
         Ok(())
     }
     .await;
     client
         .batch_execute(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })
-        .await?;
+        .await
+        .db()?;
     result
+}
+
+/// Turns tokio-postgres errors into the crate's, keeping its types out of
+/// the API.
+trait Db<T> {
+    fn db(self) -> Result<T>;
+}
+
+impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
+    fn db(self) -> Result<T> {
+        self.map_err(StorageError::database)
+    }
 }
 
 /// PostgreSQL storage backend implementing all storage traits, over a pool
@@ -270,7 +293,7 @@ impl PostgresStore {
 
         // The lock belongs to a connection of its own, outside the pool, so
         // it lasts as long as that connection
-        let (client, connection) = config.connect(tls.clone()).await?;
+        let (client, connection) = config.connect(tls.clone()).await.db()?;
         let (lost_tx, lost) = watch::channel(false);
         let closed = lost_tx.clone();
         tokio::spawn(async move {
@@ -286,7 +309,8 @@ impl PostgresStore {
                  SET tcp_keepalives_count = 3;
                  SET tcp_user_timeout = 10000;",
             )
-            .await?;
+            .await
+            .db()?;
         migrate(&client).await?;
 
         let sql = if wait {
@@ -294,7 +318,13 @@ impl PostgresStore {
         } else {
             "SELECT pg_try_advisory_lock($1)"
         };
-        if !client.query_one(sql, &[&LOCK_KEY]).await?.try_get(0)? {
+        if !client
+            .query_one(sql, &[&LOCK_KEY])
+            .await
+            .db()?
+            .try_get(0)
+            .db()?
+        {
             return Ok(None);
         }
         // Waits for writes of the previous holder already past their check
@@ -305,8 +335,10 @@ impl PostgresStore {
                  RETURNING epoch",
                 &[],
             )
-            .await?
-            .try_get(0)?;
+            .await
+            .db()?
+            .try_get(0)
+            .db()?;
 
         let heartbeat = tokio::spawn(async move {
             loop {
@@ -355,15 +387,15 @@ impl PostgresStore {
 
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
         let client = self.client().await?;
-        let statement = client.prepare_cached(sql).await?;
-        Ok(client.query(&statement, params).await?)
+        let statement = client.prepare_cached(sql).await.db()?;
+        client.query(&statement, params).await.db()
     }
 }
 
 /// The connection settings in `url`, with the timeouts and keepalives the
 /// broker needs where the URL sets none.
 fn base_config(url: &str) -> Result<tokio_postgres::Config> {
-    let mut config: tokio_postgres::Config = url.parse()?;
+    let mut config: tokio_postgres::Config = url.parse().db()?;
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(TIMEOUT);
     }
@@ -414,17 +446,22 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
     match write {
         Write::SaveSession(session) => vec![(
             "INSERT INTO sessions
-             (client_id, subscriptions, clean_start, expiry_interval, expires_at)
-             VALUES ($1, $2, $3, $4, $5)
+             (client_id, subscriptions, clean_start, expiry_interval, expires_at,
+              owner_username, owner_mount_point)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (client_id) DO UPDATE SET
              subscriptions = EXCLUDED.subscriptions, clean_start = EXCLUDED.clean_start,
-             expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at",
+             expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at,
+             owner_username = EXCLUDED.owner_username,
+             owner_mount_point = EXCLUDED.owner_mount_point",
             vec![
                 id(),
                 Box::new(encode_subscriptions(&session.subscriptions).into_bytes()),
                 Box::new(session.clean_start),
                 Box::new(session.expiry_interval.map(i64::from)),
                 Box::new(session.expires_at.map(|t| t as i64)),
+                Box::new(session.owner.username.clone()),
+                Box::new(session.owner.mount_point.clone()),
             ],
         )],
         Write::SaveSubscriptions(subscriptions) => vec![(
@@ -663,11 +700,11 @@ impl BatchStore for PostgresStore {
                 .iter()
                 .map(|p| p.as_ref() as &(dyn ToSql + Sync))
                 .collect();
-            prepared.push((client.prepare_cached(sql).await?, params));
+            prepared.push((client.prepare_cached(sql).await.db()?, params));
         }
 
         if let [(statement, params)] = prepared.as_slice() {
-            client.execute(statement, params).await?;
+            client.execute(statement, params).await.db()?;
             return Ok(());
         }
         // Requests go out in the order the futures are first polled, which
@@ -681,11 +718,11 @@ impl BatchStore for PostgresStore {
         );
         let commit = client.batch_execute("COMMIT");
         let (begun, executed, committed) = futures_util::join!(begin, executes, commit);
-        begun?;
+        begun.db()?;
         for result in executed {
-            result?;
+            result.db()?;
         }
-        committed?;
+        committed.db()?;
         Ok(())
     }
 }
@@ -732,17 +769,20 @@ fn topic_prefix_pattern(filter: &str) -> String {
 
 fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
     Ok(InflightMessage {
-        packet_id: row.try_get::<_, i32>("packet_id")? as u16,
-        topic: row.try_get("topic")?,
+        packet_id: row.try_get::<_, i32>("packet_id").db()? as u16,
+        topic: row.try_get("topic").db()?,
         payload: row
-            .try_get::<_, Option<Vec<u8>>>("payload")?
+            .try_get::<_, Option<Vec<u8>>>("payload")
+            .db()?
             .map(Bytes::from),
-        qos: int_to_qos(row.try_get("qos")?),
-        dup: row.try_get("dup")?,
-        sequence: row.try_get::<_, i64>("sequence")? as u64,
-        released: row.try_get("released")?,
-        properties: decode_properties(row.try_get("properties")?)?,
-        subscription_identifiers: decode_identifiers(row.try_get("subscription_identifiers")?)?,
+        qos: int_to_qos(row.try_get("qos").db()?),
+        dup: row.try_get("dup").db()?,
+        sequence: row.try_get::<_, i64>("sequence").db()? as u64,
+        released: row.try_get("released").db()?,
+        properties: decode_properties(row.try_get("properties").db()?)?,
+        subscription_identifiers: decode_identifiers(
+            row.try_get("subscription_identifiers").db()?,
+        )?,
     })
 }
 
@@ -756,7 +796,8 @@ impl SessionStore for PostgresStore {
     async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
         let rows = self
             .query(
-                "SELECT subscriptions, clean_start, expiry_interval, expires_at
+                "SELECT subscriptions, clean_start, expiry_interval, expires_at,
+                        owner_username, owner_mount_point
                  FROM sessions WHERE client_id = $1",
                 &[&client_id],
             )
@@ -764,18 +805,24 @@ impl SessionStore for PostgresStore {
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let subscriptions = String::from_utf8(row.try_get("subscriptions")?)
+        let subscriptions = String::from_utf8(row.try_get("subscriptions").db()?)
             .map_err(|e| StorageError::SerializationError(e.to_string()))?;
         Ok(Some(SessionState {
             client_id: client_id.to_string(),
             subscriptions: decode_subscriptions(&subscriptions),
-            clean_start: row.try_get("clean_start")?,
+            clean_start: row.try_get("clean_start").db()?,
             expiry_interval: row
-                .try_get::<_, Option<i64>>("expiry_interval")?
+                .try_get::<_, Option<i64>>("expiry_interval")
+                .db()?
                 .map(|i| i as u32),
             expires_at: row
-                .try_get::<_, Option<i64>>("expires_at")?
+                .try_get::<_, Option<i64>>("expires_at")
+                .db()?
                 .map(|t| t as u64),
+            owner: SessionOwner {
+                username: row.try_get("owner_username").db()?,
+                mount_point: row.try_get("owner_mount_point").db()?,
+            },
         }))
     }
 
@@ -783,8 +830,9 @@ impl SessionStore for PostgresStore {
         let client = self.client().await?;
         let statement = client
             .prepare_cached("DELETE FROM sessions WHERE client_id = $1")
-            .await?;
-        client.execute(&statement, &[&client_id]).await?;
+            .await
+            .db()?;
+        client.execute(&statement, &[&client_id]).await.db()?;
         Ok(())
     }
 
@@ -792,7 +840,7 @@ impl SessionStore for PostgresStore {
         self.query("SELECT client_id FROM sessions", &[])
             .await?
             .iter()
-            .map(|row| Ok(row.try_get(0)?))
+            .map(|row| row.try_get(0).db())
             .collect()
     }
 }
@@ -804,8 +852,9 @@ impl RetainedMessageStore for PostgresStore {
         let Some(msg) = message else {
             let statement = client
                 .prepare_cached("DELETE FROM retained_messages WHERE topic = $1")
-                .await?;
-            client.execute(&statement, &[&topic]).await?;
+                .await
+                .db()?;
+            client.execute(&statement, &[&topic]).await.db()?;
             return Ok(());
         };
         let origin = msg.origin.as_deref();
@@ -821,7 +870,8 @@ impl RetainedMessageStore for PostgresStore {
                  origin_client_id = EXCLUDED.origin_client_id,
                  origin_username = EXCLUDED.origin_username",
             )
-            .await?;
+            .await
+            .db()?;
         client
             .execute(
                 &statement,
@@ -836,7 +886,8 @@ impl RetainedMessageStore for PostgresStore {
                     &origin.and_then(|o| o.username.as_deref()),
                 ],
             )
-            .await?;
+            .await
+            .db()?;
         Ok(())
     }
 
@@ -858,31 +909,34 @@ impl RetainedMessageStore for PostgresStore {
 
         let mut messages = Vec::new();
         for row in rows {
-            let topic: String = row.try_get("topic")?;
+            let topic: String = row.try_get("topic").db()?;
             if !topic_matches_filter(&topic, topic_filter) {
                 continue;
             }
             let origin = row
-                .try_get::<_, Option<String>>("origin_client_id")?
+                .try_get::<_, Option<String>>("origin_client_id")
+                .db()?
                 .map(|client_id| -> Result<_> {
                     Ok(Arc::new(MessageOrigin {
                         client_id,
-                        username: row.try_get("origin_username")?,
+                        username: row.try_get("origin_username").db()?,
                     }))
                 })
                 .transpose()?;
             messages.push(Message {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
-                dup: row.try_get("dup")?,
-                qos: int_to_qos(row.try_get("qos")?),
+                dup: row.try_get("dup").db()?,
+                qos: int_to_qos(row.try_get("qos").db()?),
                 retain: true,
                 payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")?
+                    .try_get::<_, Option<Vec<u8>>>("payload")
+                    .db()?
                     .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties")?)?,
+                properties: decode_properties(row.try_get("properties").db()?)?,
                 expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")?
+                    .try_get::<_, Option<i64>>("expires_at")
+                    .db()?
                     .map(|t| t as u64),
                 subscription_identifiers: Vec::new(),
                 origin,
@@ -895,7 +949,8 @@ impl RetainedMessageStore for PostgresStore {
         self.client()
             .await?
             .execute("DELETE FROM retained_messages", &[])
-            .await?;
+            .await
+            .db()?;
         Ok(())
     }
 
@@ -903,7 +958,7 @@ impl RetainedMessageStore for PostgresStore {
         let rows = self
             .query("SELECT COUNT(*) FROM retained_messages", &[])
             .await?;
-        Ok(rows[0].try_get::<_, i64>(0)? as usize)
+        Ok(rows[0].try_get::<_, i64>(0).db()? as usize)
     }
 }
 
@@ -926,12 +981,12 @@ impl WillStore for PostgresStore {
             return Ok(None);
         };
         Ok(Some(StoredWillMessage {
-            topic: row.try_get("topic")?,
-            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload")?),
-            qos: int_to_qos(row.try_get("qos")?),
-            retain: row.try_get("retain")?,
-            delay_secs: row.try_get::<_, i64>("delay_secs")? as u32,
-            properties: decode_properties(row.try_get("properties")?)?,
+            topic: row.try_get("topic").db()?,
+            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").db()?),
+            qos: int_to_qos(row.try_get("qos").db()?),
+            retain: row.try_get("retain").db()?,
+            delay_secs: row.try_get::<_, i64>("delay_secs").db()? as u32,
+            properties: decode_properties(row.try_get("properties").db()?)?,
         }))
     }
 
@@ -1008,26 +1063,28 @@ impl QueueStore for PostgresStore {
         .await?
         .iter()
         .map(|row| {
-            let topic: String = row.try_get("topic")?;
+            let topic: String = row.try_get("topic").db()?;
             let message = Message {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
                 dup: false,
-                qos: int_to_qos(row.try_get("qos")?),
-                retain: row.try_get("retain")?,
+                qos: int_to_qos(row.try_get("qos").db()?),
+                retain: row.try_get("retain").db()?,
                 payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")?
+                    .try_get::<_, Option<Vec<u8>>>("payload")
+                    .db()?
                     .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties")?)?,
+                properties: decode_properties(row.try_get("properties").db()?)?,
                 expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")?
+                    .try_get::<_, Option<i64>>("expires_at")
+                    .db()?
                     .map(|t| t as u64),
                 subscription_identifiers: decode_identifiers(
-                    row.try_get("subscription_identifiers")?,
+                    row.try_get("subscription_identifiers").db()?,
                 )?,
                 origin: None,
             };
-            Ok((row.try_get::<_, i64>("sequence")? as u64, message))
+            Ok((row.try_get::<_, i64>("sequence").db()? as u64, message))
         })
         .collect()
     }
@@ -1109,6 +1166,43 @@ mod tests {
         assert_eq!(topic_prefix_pattern("50%_off\\/+"), "50\\%\\_off\\\\%");
     }
 
+    /// A database created by 0.2.0, at schema version 1, keeps its
+    /// sessions when a newer broker migrates it.
+    #[tokio::test]
+    async fn test_migrates_a_version_1_database() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let client = store.client().await.unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+                 SET client_min_messages = warning;
+                 {}
+                 CREATE TABLE mercurio_schema (version INTEGER NOT NULL);
+                 INSERT INTO mercurio_schema VALUES (1);
+                 INSERT INTO sessions (client_id, subscriptions, clean_start)
+                 VALUES ('old', '', FALSE);",
+                MIGRATIONS[0]
+            ))
+            .await
+            .unwrap();
+        drop(client);
+
+        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let version: i32 = store
+            .client()
+            .await
+            .unwrap()
+            .query_one("SELECT version FROM mercurio_schema", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version as usize, MIGRATIONS.len());
+        let old = store.load_session("old").await.unwrap().unwrap();
+        assert_eq!(old.owner, SessionOwner::default());
+    }
+
     #[tokio::test]
     async fn test_round_trips_every_store() {
         let Some(url) = database_url() else { return };
@@ -1126,6 +1220,10 @@ mod tests {
             clean_start: false,
             expiry_interval: Some(u32::MAX),
             expires_at: Some(1),
+            owner: SessionOwner {
+                username: Some("alice".into()),
+                mount_point: Some("tenant/".into()),
+            },
         };
         store.save_session("c", &session).await.unwrap();
         store.save_session("c", &session).await.unwrap();
@@ -1133,6 +1231,7 @@ mod tests {
         assert_eq!(loaded.subscriptions[0], subscription);
         assert_eq!(loaded.subscriptions.len(), 2);
         assert_eq!(loaded.expiry_interval, Some(u32::MAX));
+        assert_eq!(loaded.owner, session.owner);
         assert_eq!(store.list_sessions().await.unwrap(), vec!["c".to_string()]);
         store.delete_session("c").await.unwrap();
         assert!(store.load_session("c").await.unwrap().is_none());

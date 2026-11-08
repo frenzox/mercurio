@@ -1,7 +1,7 @@
 //! Load generator for comparing brokers:
 //!
 //! ```text
-//! cargo run --release --example bench -- <port> [fan-in-qos0|fan-in-qos1|fan-in-qos1-persistent|fan-out|latency]
+//! cargo run --release --example bench -- <port> [fan-in-qos0|fan-in-qos1|fan-in-qos1-persistent|fan-out|latency|connections [count]]
 //! ```
 //!
 //! Every scenario uses MQTT 5 clients on 127.0.0.1 and prints one line.
@@ -112,6 +112,64 @@ async fn fan_out(port: u16, subscribers: u64, count: u64) {
     );
 }
 
+/// `count` clients connect and each subscribes to a topic of its own; then
+/// one message is published to every topic. Prints how fast they connected
+/// and pauses in between, so the broker's memory can be read.
+async fn connections(port: u16, count: u64) {
+    let started = Instant::now();
+    let mut clients = Vec::with_capacity(count as usize);
+    // A few hundred handshakes at a time, as a burst of thousands would
+    // overflow the listen backlog
+    for batch in (0..count).collect::<Vec<_>>().chunks(500) {
+        let mut connecting = tokio::task::JoinSet::new();
+        for &i in batch {
+            connecting.spawn(async move {
+                let client = client(port, format!("bench-conn-{i}")).await;
+                client
+                    .subscribe(&[(format!("conn/{i}").as_str(), QoS::AtMostOnce)])
+                    .await
+                    .unwrap();
+                client
+            });
+        }
+        clients.extend(connecting.join_all().await);
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    println!(
+        "connections: {count} connected and subscribed in {seconds:.2}s, {:.0}/s",
+        count as f64 / seconds
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let publisher = client(port, "bench-conn-pub".into()).await;
+    let started = Instant::now();
+    for i in 0..count {
+        publisher
+            .publish(&format!("conn/{i}"), "x", QoS::AtMostOnce)
+            .await
+            .unwrap();
+    }
+    let mut receiving = tokio::task::JoinSet::new();
+    for client in clients {
+        receiving.spawn(async move {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(30), client.recv()).await,
+                Ok(Some(Event::Message { .. }))
+            )
+        });
+    }
+    let received = receiving
+        .join_all()
+        .await
+        .into_iter()
+        .filter(|&r| r)
+        .count();
+    println!(
+        "connections: {received} of {count} received their message in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
 fn now_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -168,6 +226,10 @@ async fn main() {
         "fan-in-qos1-persistent" => fan_in(port, QoS::AtLeastOnce, 10, 20_000, true).await,
         "fan-out" => fan_out(port, 50, 10_000).await,
         "latency" => latency(port, 1000, 10_000).await,
+        "connections" => {
+            let count = args.next().map_or(10_000, |n| n.parse().expect("count"));
+            connections(port, count).await
+        }
         other => panic!("unknown scenario {other}"),
     }
 }

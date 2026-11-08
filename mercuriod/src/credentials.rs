@@ -24,6 +24,9 @@ impl HashedCredentialValidator {
 impl CredentialValidator for HashedCredentialValidator {
     fn validate(&self, username: &str, password: &[u8]) -> bool {
         let Some(stored) = self.credentials.get(username) else {
+            // As slow as a wrong password, so timing doesn't tell which
+            // users exist
+            let _ = Argon2::default().verify_password(password, &unknown_user_hash());
             return false;
         };
 
@@ -39,11 +42,7 @@ impl CredentialValidator for HashedCredentialValidator {
                 .is_ok()
         } else {
             // Plaintext fallback for backwards compatibility
-            let password_str = match std::str::from_utf8(password) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            stored == password_str
+            constant_time_eq(stored.as_bytes(), password)
         }
     }
 }
@@ -81,8 +80,27 @@ fn mosquitto_hash_matches(stored: &str, password: &[u8]) -> bool {
             .finalize()
             .to_vec(),
     };
-    // Compared in constant time, so timing tells nothing about the hash
-    hash.len() == expected.len() && hash.iter().zip(&expected).fold(0, |d, (a, b)| d | (a ^ b)) == 0
+    constant_time_eq(&hash, &expected)
+}
+
+/// Compares in time independent of where the two differ, so timing tells
+/// nothing about the secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |d, (a, b)| d | (a ^ b)) == 0
+}
+
+/// An argon2 hash of a password no one has, checked for unknown users.
+fn unknown_user_hash() -> PasswordHash<'static> {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let hash = HASH.get_or_init(|| {
+        use argon2::{password_hash::SaltString, PasswordHasher};
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        Argon2::default()
+            .hash_password(b"unknown user", &salt)
+            .expect("argon2 hashes with its default parameters")
+            .to_string()
+    });
+    PasswordHash::new(hash).expect("a hash argon2 wrote parses")
 }
 
 #[cfg(test)]

@@ -21,11 +21,10 @@ const ATTEMPTS: u32 = 5;
 /// waits too, so a broker never runs ahead of its storage.
 const PENDING_LIMIT: usize = 10_000;
 
-// Nearly every op is a write, so boxing it would only add an allocation
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum Op {
-    /// With whether it holds a pending-change permit
-    Write(Write, bool),
+    /// With whether it holds a pending-change permit. Boxed: the channel
+    /// allocates its slots ahead, and every client has one.
+    Write(Box<Write>, bool),
     /// Answered once every change sent before it is applied
     Flush(oneshot::Sender<()>),
 }
@@ -48,7 +47,7 @@ impl Writer {
     /// Sends a change without waiting, for those bounded by other limits,
     /// such as the queue's.
     pub(crate) fn write(&self, write: Write) {
-        let _ = self.ops.send(Op::Write(write, false));
+        let _ = self.ops.send(Op::Write(Box::new(write), false));
     }
 
     /// Sends a change once fewer than `PENDING_LIMIT` are waiting for
@@ -58,7 +57,7 @@ impl Writer {
             return;
         };
         permit.forget();
-        if self.ops.send(Op::Write(write, true)).is_err() {
+        if self.ops.send(Op::Write(Box::new(write), true)).is_err() {
             self.pending.add_permits(1);
         }
     }
@@ -207,7 +206,7 @@ async fn run<S: BatchStore>(
         while let Some(op) = next {
             match op {
                 Op::Write(write, paced) => {
-                    batch.push(write);
+                    batch.push(*write);
                     permits += usize::from(paced);
                 }
                 Op::Flush(done) => flushed.push(done),

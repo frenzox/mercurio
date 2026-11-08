@@ -124,14 +124,19 @@ impl Decoder for DisconnectPacket {
         let min_len_properties = 2;
 
         let remaining_len = VariableByteInteger::decode(buffer)?; //Remaining length
+                                                                  // 0x00 is "Normal disconnection" in DISCONNECT, whether it is sent
+                                                                  // or left out
         let reason = match remaining_len.0.cmp(&min_len_reason) {
             core::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
-            _ => ReasonCode::decode(buffer)?,
+            _ => match ReasonCode::decode(buffer)? {
+                ReasonCode::Success => ReasonCode::NormalDisconnection,
+                reason => reason,
+            },
         };
 
         let properties = match remaining_len.0.cmp(&min_len_properties) {
             core::cmp::Ordering::Less => None,
-            _ => Some(DisconnectProperties::decode(buffer)?),
+            _ => crate::present(DisconnectProperties::decode(buffer)?),
         };
 
         Ok(DisconnectPacket { reason, properties })
@@ -141,6 +146,27 @@ impl Decoder for DisconnectPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reason_zero_reads_the_same_sent_or_left_out() {
+        use crate::ControlPacket;
+        use mercurio_core::protocol::ProtocolVersion;
+
+        for encoded in [&[0xe0, 0x00][..], &[0xe0, 0x01, 0x00]] {
+            let packet = ControlPacket::parse_with_version(
+                &mut BytesMut::from(encoded),
+                ProtocolVersion::V5,
+            )
+            .unwrap();
+            assert_eq!(
+                packet,
+                ControlPacket::Disconnect(DisconnectPacket {
+                    reason: ReasonCode::NormalDisconnection,
+                    properties: None,
+                })
+            );
+        }
+    }
 
     #[test]
     fn test_round_trip_with_properties() {

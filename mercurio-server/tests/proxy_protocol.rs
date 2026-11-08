@@ -17,13 +17,12 @@ const CONNECT: [u8; 16] = [
 async fn proxied_connections_start_with_a_header() {
     let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = proxied.local_addr().unwrap();
-    let config = ServerConfig {
-        listeners: vec![ListenerConfig {
-            proxy_protocol: true,
-            ..ListenerConfig::new(proxied, Transport::Mqtt)
-        }],
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.listeners = vec![{
+        let mut value = ListenerConfig::new(proxied, Transport::Mqtt);
+        value.proxy_protocol = true;
+        value
+    }];
     tokio::spawn(mercurio_server::server::run_with_config(
         TcpListener::bind("127.0.0.1:0").await.unwrap(),
         config,

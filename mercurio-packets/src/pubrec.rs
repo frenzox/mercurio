@@ -127,7 +127,7 @@ impl Decoder for PubRecPacket {
         let reason = ReasonCode::decode(buffer)?;
         // The property length is omitted when there are none [MQTT-3.4.2.2]
         let properties = if remaining_len.0 > 3 {
-            Some(PubRecProperties::decode(buffer)?)
+            crate::present(PubRecProperties::decode(buffer)?)
         } else {
             None
         };
@@ -148,7 +148,7 @@ mod tests {
         reason::ReasonCode,
     };
 
-    use crate::pubrec::{PubRecPacket, PubRecProperties};
+    use crate::pubrec::PubRecPacket;
 
     #[test]
     fn test_pubrec_packet_encode_decode() {
@@ -157,7 +157,7 @@ mod tests {
         let packet = PubRecPacket {
             packet_id: 1,
             reason: ReasonCode::NoMatchingSubscribers,
-            properties: PubRecProperties::default().into(),
+            properties: None,
         };
 
         let mut encoded = BytesMut::new();

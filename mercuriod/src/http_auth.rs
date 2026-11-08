@@ -97,6 +97,8 @@ impl Authorizer for HttpAuth {
             Access::Read => 1,
             Access::Write => 2,
             Access::Subscribe => 4,
+            // A kind of access added later is denied until handled
+            _ => return false,
         };
         let key = (
             client.username.clone(),
@@ -118,8 +120,17 @@ impl Authorizer for HttpAuth {
         });
         let allowed = self.allows(url, body);
         let mut cache = self.cache.lock().unwrap();
+        // Making room one entry at a time: clearing it all would let one
+        // client, publishing to many topics, send every other client's
+        // checks back to the HTTP service
         if cache.len() >= CACHE_LIMIT {
-            cache.clear();
+            cache.retain(|_, (_, at)| at.elapsed() < self.cache_for);
+        }
+        if cache.len() >= CACHE_LIMIT {
+            // ponytail: an arbitrary entry, an LRU if hit rates ever matter
+            if let Some(evicted) = cache.keys().next().cloned() {
+                cache.remove(&evicted);
+            }
         }
         cache.insert(key, (allowed, Instant::now()));
         allowed
@@ -190,10 +201,7 @@ mod tests {
         assert!(auth.validate("alice", b"secret"));
         assert!(!auth.validate("alice", b"wrong"));
 
-        let alice = ClientIdentity {
-            client_id: "c".to_string(),
-            username: Some("alice".to_string()),
-        };
+        let alice = ClientIdentity::new("c", Some("alice".to_string()));
         assert!(auth.authorize(&alice, "allowed", Access::Write));
         assert!(!auth.authorize(&alice, "other", Access::Write));
         assert!(auth.authorize(&alice, "allowed", Access::Write));

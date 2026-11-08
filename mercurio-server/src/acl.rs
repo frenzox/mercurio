@@ -19,10 +19,11 @@
 
 use std::collections::HashMap;
 
-use mercurio_core::topic::topic_matches_filter;
+use mercurio_core::topic::{topic_matches_filter, validate_subscribe_filter};
 
 /// What a client wants to do with a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Access {
     /// Receive a message published to it
     Read,
@@ -34,9 +35,19 @@ pub enum Access {
 
 /// Who is asking for access.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientIdentity {
     pub client_id: String,
     pub username: Option<String>,
+}
+
+impl ClientIdentity {
+    pub fn new(client_id: impl Into<String>, username: Option<String>) -> Self {
+        ClientIdentity {
+            client_id: client_id.into(),
+            username,
+        }
+    }
 }
 
 /// Decides which topics a client may read and write.
@@ -135,10 +146,22 @@ impl AclFile {
             if pattern.filter.contains("%u") && client.username.is_none() {
                 continue;
             }
+            let username = client.username.as_deref().unwrap_or_default();
+            // An identity with wildcards or levels in it would widen the
+            // pattern, `+` as a client id granting every client's topics
+            // (mosquitto's CVE-2017-7650). Denials stay, as widening one
+            // only denies more.
+            let widens = |identity: &str| identity.contains(['+', '#', '/']);
+            if pattern.grant != Grant::Deny
+                && ((pattern.filter.contains("%c") && widens(&client.client_id))
+                    || (pattern.filter.contains("%u") && widens(username)))
+            {
+                continue;
+            }
             let filter = pattern
                 .filter
                 .replace("%c", &client.client_id)
-                .replace("%u", client.username.as_deref().unwrap_or_default());
+                .replace("%u", username);
             rules.push(Rule {
                 grant: pattern.grant,
                 filter,
@@ -161,9 +184,12 @@ fn parse_rule(rest: &str) -> Result<Rule, String> {
         Some(("deny", filter)) => (Grant::Deny, filter),
         _ => (Grant::ReadWrite, rest),
     };
+    let filter = filter.trim();
+    // A misplaced wildcard, as in `a/#/b`, would match more than it reads
+    validate_subscribe_filter(filter).map_err(|e| format!("invalid topic `{filter}`: {e}"))?;
     Ok(Rule {
         grant,
-        filter: filter.trim().to_string(),
+        filter: filter.to_string(),
     })
 }
 
@@ -236,6 +262,31 @@ mod tests {
         assert!(!acl.authorize(&client("dev7", None), "devices/dev8/status", Access::Write));
         assert!(acl.authorize(&client("x", Some("bob")), "users/bob/inbox", Access::Read));
         assert!(!acl.authorize(&client("x", None), "users//inbox", Access::Read));
+    }
+
+    #[test]
+    fn test_identities_with_wildcards_or_levels_gain_nothing_from_patterns() {
+        let acl = AclFile::parse(ACL).unwrap();
+
+        for client_id in ["+", "#", "dev7/../dev8", "a/b"] {
+            let client = client(client_id, None);
+            assert!(!acl.authorize(&client, "devices/dev8/status", Access::Write));
+            assert!(!acl.authorize(&client, "devices/a/b/status", Access::Write));
+        }
+        let bob = client("x", Some("+"));
+        assert!(!acl.authorize(&bob, "users/alice/inbox", Access::Read));
+
+        // A pattern's denial still applies, however wide it becomes
+        let acl =
+            AclFile::parse("topic readwrite devices/#\npattern deny devices/%c/secret").unwrap();
+        assert!(!acl.authorize(&client("+", None), "devices/dev8/secret", Access::Read));
+        assert!(acl.authorize(&client("+", None), "devices/dev8/status", Access::Read));
+    }
+
+    #[test]
+    fn test_rules_with_misplaced_wildcards_are_refused() {
+        assert!(AclFile::parse("topic read devices/#/status").is_err());
+        assert!(AclFile::parse("pattern write devices/a+/status").is_err());
     }
 
     #[test]

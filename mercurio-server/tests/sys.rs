@@ -15,10 +15,8 @@ use tokio::{
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        sys_interval: Some(Duration::from_millis(100)),
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.sys_interval = Some(Duration::from_millis(100));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,

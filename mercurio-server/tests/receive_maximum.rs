@@ -15,10 +15,8 @@ use tokio::{
 async fn start_broker(limits: Limits) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        limits,
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.limits = limits;
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -144,9 +142,10 @@ async fn qos0_messages_are_not_held_back_by_a_full_window() {
 
 #[tokio::test]
 async fn client_exceeding_the_broker_receive_maximum_is_disconnected() {
-    let addr = start_broker(Limits {
-        receive_maximum: 1,
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.receive_maximum = 1;
+        value
     })
     .await;
     let mut client = connect(addr, b'c', None).await;

@@ -454,7 +454,7 @@ impl Decoder for ConnectPacket {
 
         // Properties only exist in MQTT 5.0
         let properties = if protocol_version.supports_properties() {
-            Some(ConnectProperties::decode(buffer)?)
+            crate::present(ConnectProperties::decode(buffer)?)
         } else {
             None
         };
@@ -464,7 +464,7 @@ impl Decoder for ConnectPacket {
         if flags.will_flag {
             // Will properties only exist in MQTT 5.0
             if protocol_version.supports_properties() {
-                payload.will_properties = Some(WillProperties::decode(buffer)?);
+                payload.will_properties = crate::present(WillProperties::decode(buffer)?);
             }
             payload.will_topic = Some(String::decode(buffer)?);
             payload.will_payload = Some(Bytes::decode(buffer)?);

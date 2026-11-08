@@ -17,10 +17,8 @@ async fn start_broker(
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let extra = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addrs = (main.local_addr().unwrap(), extra.local_addr().unwrap());
-    let config = ServerConfig {
-        listeners: vec![settings(ListenerConfig::new(extra, Transport::Mqtt))],
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.listeners = vec![settings(ListenerConfig::new(extra, Transport::Mqtt))];
     tokio::spawn(mercurio_server::server::run_with_config(
         main,
         config,
@@ -78,9 +76,10 @@ async fn received_topic(stream: &mut TcpStream) -> String {
 
 #[tokio::test]
 async fn mount_points_confine_clients_to_their_topics() {
-    let (main, mounted) = start_broker(|listener| ListenerConfig {
-        mount_point: Some("tenant1/".to_string()),
-        ..listener
+    let (main, mounted) = start_broker(|listener| {
+        let mut value = listener;
+        value.mount_point = Some("tenant1/".to_string());
+        value
     })
     .await;
 
@@ -106,13 +105,15 @@ async fn mount_points_confine_clients_to_their_topics() {
 
 #[tokio::test]
 async fn listeners_can_require_their_own_authentication() {
-    let (main, secured) = start_broker(|listener| ListenerConfig {
-        auth: Some(AuthConfig {
-            require_auth: true,
-            allow_anonymous: false,
-            ..Default::default()
-        }),
-        ..listener
+    let (main, secured) = start_broker(|listener| {
+        let mut value = listener;
+        value.auth = Some({
+            let mut value = AuthConfig::default();
+            value.require_auth = true;
+            value.allow_anonymous = false;
+            value
+        });
+        value
     })
     .await;
 
@@ -123,9 +124,10 @@ async fn listeners_can_require_their_own_authentication() {
 
 #[tokio::test]
 async fn listeners_can_limit_their_connections() {
-    let (main, limited) = start_broker(|listener| ListenerConfig {
-        max_connections: Some(1),
-        ..listener
+    let (main, limited) = start_broker(|listener| {
+        let mut value = listener;
+        value.max_connections = Some(1);
+        value
     })
     .await;
 

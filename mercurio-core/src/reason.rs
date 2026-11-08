@@ -7,6 +7,7 @@ use crate::codec::{Decoder, Encoder};
 
 /// MQTT reason code used in various packets to indicate success or failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ReasonCode {
     #[default]
     Success,

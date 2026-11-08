@@ -70,7 +70,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has to complete TLS and send CONNECT.</td></tr>
 <tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>Messages that may wait for one client, any QoS, before further ones are dropped.</td></tr>
 <tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
-<tr><td><code>max_queued_bytes</code></td><td>unlimited</td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
+<tr><td><code>max_queued_bytes</code></td><td><code>104857600</code></td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
 <tr><td><code>receive_maximum</code></td><td><code>65535</code></td><td>QoS 2 messages an MQTT 5 client may have awaiting PUBREL at once.</td></tr>
 <tr><td><code>max_topic_alias</code></td><td><code>10</code></td><td>Highest topic alias MQTT 5 clients may use; <code>0</code> disables aliases.</td></tr>
 <tr><td><code>max_keepalive</code></td><td></td><td>Longest keep-alive, in seconds, MQTT 5 clients may use. Clients asking for more, or for none, are told to use this one.</td></tr>
@@ -91,6 +91,7 @@ mount_point = "tenant1/"</pre>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>upgrade_outgoing_qos</code></td><td><code>false</code></td><td>Send messages at the QoS of the subscription even when published with a lower one. Goes beyond the MQTT specification.</td></tr>
+<tr><td><code>max_subscriptions</code></td><td><code>10000</code></td><td>Subscriptions one session may hold. Further ones are refused with Quota Exceeded; replacing one it holds is allowed.</td></tr>
 <tr><td><code>check_retain_source</code></td><td><code>false</code></td><td>Send a retained message to new subscribers only while the client that published it may still publish to its topic.</td></tr>
 <tr><td><code>send_topic_aliases</code></td><td><code>false</code></td><td>Replace repeated topics with aliases for MQTT 5 clients that accept them. Off by default because some client libraries announce alias support they don't implement.</td></tr>
 <tr><td><code>response_information</code></td><td></td><td>Topic prefix given to MQTT 5 clients that request Response Information; <code>%c</code> is replaced by the client id, as in <code>"responses/%c"</code>.</td></tr>
@@ -143,7 +144,7 @@ mount_point = "tenant1/"</pre>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate.</td></tr>
-<tr><td><code>allow_anonymous</code></td><td><code>true</code></td><td>With authentication enabled, still accept clients that send no user name.</td></tr>
+<tr><td><code>allow_anonymous</code></td><td><code>false</code></td><td>With authentication enabled, still accept clients that send no user name.</td></tr>
 <tr><td><code>password_file</code></td><td></td><td>User names and password hashes.</td></tr>
 <tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>
 <tr><td><code>dynamic_security</code></td><td></td><td>Dynamic security state file; replaces <code>password_file</code> and <code>acl_file</code>. Only in <code>[auth]</code>.</td></tr>
@@ -167,7 +168,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
-<tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use.</td></tr>
+<tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use. Must end with <code>/</code>.</td></tr>
 <tr><td><code>max_connections</code></td><td></td><td>Concurrent connections on this listener, on top of the broker-wide limit.</td></tr>
 <tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this interface. Linux only.</td></tr>
 <tr><td><code>[listeners.tls]</code></td><td></td><td>Same options as <code>[server.tls]</code>.</td></tr>

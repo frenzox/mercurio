@@ -1,0 +1,32 @@
+[package]
+name = "mercurio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+mercurio-core = { path = "../mercurio-core" }
+mercurio-packets = { path = "../mercurio-packets" }
+
+# Kept out of the main workspace, as it builds on nightly with sanitizers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topic"
+path = "fuzz_targets/topic.rs"
+test = false
+doc = false
+bench = false

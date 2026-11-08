@@ -253,7 +253,7 @@ impl SubscribePacket {
 
         let packet_id = u16::decode(buffer)?;
         let properties = if with_properties {
-            Some(SubscribeProperties::decode(buffer)?)
+            crate::present(SubscribeProperties::decode(buffer)?)
         } else {
             None
         };

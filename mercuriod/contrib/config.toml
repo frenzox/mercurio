@@ -42,7 +42,7 @@ max_queued_messages = 10000
 max_queued_qos0_messages = 1000
 
 # Payload bytes that may wait for one client before further messages are
-# dropped, whatever their QoS (unlimited by default)
+# dropped, whatever their QoS
 # max_queued_bytes = 104857600
 
 # Send messages at the QoS of the subscription even when they were published
@@ -53,6 +53,8 @@ max_queued_qos0_messages = 1000
 # published it may still publish to its topic, so access revoked in the ACL
 # also stops its retained messages
 # check_retain_source = false
+# Subscriptions one session may hold; further ones get Quota Exceeded
+# max_subscriptions = 10000
 
 # Seconds a new connection has to complete TLS and send CONNECT
 connect_timeout = 10
@@ -149,7 +151,7 @@ backend = "memory"
 enabled = false
 
 # Allow clients that send no user name (when auth is enabled)
-allow_anonymous = true
+allow_anonymous = false
 
 # User names and Argon2 password hashes, managed with `mercuriod passwd`
 # password_file = "/etc/mercurio/passwd"

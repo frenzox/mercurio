@@ -7,8 +7,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    queue::QueueLimits,
-    server::{Limits, Transport},
+    server::{Limits, QueueLimits, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 
@@ -235,7 +234,26 @@ impl Config {
                 merge(&mut table, read_table(&file)?);
             }
         }
-        Ok(Config::deserialize(table)?)
+        let config = Config::deserialize(table)?;
+        config.check()?;
+        Ok(config)
+    }
+}
+
+impl Config {
+    /// Refuses settings that parse but would be unsafe.
+    fn check(&self) -> Result<(), String> {
+        for listener in &self.listeners {
+            // `tenantA` would also let clients reach `tenantAB/...`
+            if let Some(mount_point) = &listener.mount_point {
+                if !mount_point.ends_with('/') {
+                    return Err(format!(
+                        "mount_point `{mount_point}` must end with `/`, or its clients reach the topics of every mount point it is a prefix of"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -299,8 +317,9 @@ pub struct ServerConfig {
     pub max_queued_qos0_messages: usize,
 
     /// Payload bytes that may wait for one client before further messages
-    /// are dropped; unlimited when unset
-    pub max_queued_bytes: Option<usize>,
+    /// are dropped
+    #[serde(default = "default_max_queued_bytes")]
+    pub max_queued_bytes: usize,
 
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
@@ -311,6 +330,10 @@ pub struct ServerConfig {
     /// to their topic
     #[serde(default)]
     pub check_retain_source: bool,
+
+    /// Subscriptions one session may hold
+    #[serde(default = "default_max_subscriptions")]
+    pub max_subscriptions: usize,
 
     /// Seconds a new connection has to send CONNECT
     #[serde(default = "default_connect_timeout")]
@@ -381,9 +404,10 @@ impl Default for ServerConfig {
             max_packet_size: default_max_packet_size(),
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
-            max_queued_bytes: None,
+            max_queued_bytes: default_max_queued_bytes(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
+            max_subscriptions: default_max_subscriptions(),
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
@@ -530,6 +554,14 @@ fn default_max_queued_qos0_messages() -> usize {
     Limits::default().queue.max_qos0
 }
 
+fn default_max_queued_bytes() -> usize {
+    QueueLimits::default().max_bytes.unwrap_or(usize::MAX)
+}
+
+fn default_max_subscriptions() -> usize {
+    mercurio_server::server::DEFAULT_MAX_SUBSCRIPTIONS
+}
+
 fn default_connect_timeout() -> u64 {
     Limits::default().connect_timeout.as_secs()
 }
@@ -548,27 +580,25 @@ impl ServerConfig {
         if maximum_qos == QoS::Invalid {
             return Err(format!("max_qos must be 0, 1 or 2, not {}", self.max_qos));
         }
-        Ok(Limits {
-            connect_timeout: Duration::from_secs(self.connect_timeout),
-            max_packet_size: self.max_packet_size,
-            queue: QueueLimits {
-                max_qos0: self.max_queued_qos0_messages,
-                max_messages: self.max_queued_messages,
-                max_bytes: self.max_queued_bytes,
-                upgrade_qos: self.upgrade_outgoing_qos,
-            },
-            max_connections: Some(self.max_connections),
-            topic_alias_maximum: self.max_topic_alias,
-            receive_maximum: self.receive_maximum,
-            max_keepalive: self.max_keepalive,
-            send_topic_aliases: self.send_topic_aliases,
-            maximum_qos,
-            retain_available: self.retain_available,
-            persistent_client_expiration: self
-                .persistent_client_expiration
-                .map(Duration::from_secs),
-            check_retain_source: self.check_retain_source,
-        })
+        let mut limits = Limits::default();
+        limits.connect_timeout = Duration::from_secs(self.connect_timeout);
+        limits.max_packet_size = self.max_packet_size;
+        limits.queue.max_qos0 = self.max_queued_qos0_messages;
+        limits.queue.max_messages = self.max_queued_messages;
+        limits.queue.max_bytes = Some(self.max_queued_bytes);
+        limits.queue.upgrade_qos = self.upgrade_outgoing_qos;
+        limits.max_connections = Some(self.max_connections);
+        limits.topic_alias_maximum = self.max_topic_alias;
+        limits.receive_maximum = self.receive_maximum;
+        limits.max_keepalive = self.max_keepalive;
+        limits.send_topic_aliases = self.send_topic_aliases;
+        limits.maximum_qos = maximum_qos;
+        limits.retain_available = self.retain_available;
+        limits.persistent_client_expiration =
+            self.persistent_client_expiration.map(Duration::from_secs);
+        limits.check_retain_source = self.check_retain_source;
+        limits.max_subscriptions = Some(self.max_subscriptions);
+        Ok(limits)
     }
 }
 
@@ -670,8 +700,10 @@ impl Default for AuthConfig {
     }
 }
 
+/// Enabling authentication refuses clients without credentials unless
+/// they are explicitly allowed, as in mosquitto 2.
 fn default_allow_anonymous() -> bool {
-    true
+    false
 }
 
 #[cfg(test)]
@@ -727,6 +759,18 @@ mod tests {
         let ports: Vec<_> = config.listeners.iter().map(|l| l.port).collect();
         assert_eq!(ports, [Some(2), Some(4)]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_mount_points_must_end_a_level() {
+        let config = |mount_point: &str| -> Config {
+            toml::from_str(&format!(
+                "[[listeners]]\nport = 1884\nmount_point = \"{mount_point}\"\n"
+            ))
+            .unwrap()
+        };
+        assert!(config("tenantA").check().is_err());
+        assert!(config("tenantA/").check().is_ok());
     }
 
     #[test]

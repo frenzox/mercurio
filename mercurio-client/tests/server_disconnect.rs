@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use mercurio_client::{ClientError, ConnectOptions, DisconnectReason, Event, MqttClient};
 use mercurio_core::reason::ReasonCode;
-use mercurio_server::server::{ConnectPolicy, Redirect, ServerConfig};
+use mercurio_server::server::{Redirect, ServerConfig};
 use tokio::{net::TcpListener, time::timeout};
 
 async fn start_broker(config: ServerConfig) -> u16 {
@@ -47,15 +47,10 @@ async fn server_disconnect_ends_the_connection_with_its_reason() {
 
 #[tokio::test]
 async fn redirection_names_the_other_server() {
-    let port = start_broker(ServerConfig {
-        policy: ConnectPolicy {
-            redirect: Some(Redirect {
-                server_reference: "elsewhere:1883".into(),
-                permanent: true,
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
+    let port = start_broker({
+        let mut value = ServerConfig::default();
+        value.policy.redirect = Some(Redirect::new("elsewhere:1883", true));
+        value
     })
     .await;
 

@@ -172,6 +172,16 @@ impl Data {
     }
 
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
+        // A client disabled while connected loses its access at once
+        if let Some(username) = username {
+            if self
+                .clients
+                .iter()
+                .any(|c| c.username == username && c.disabled)
+            {
+                return false;
+            }
+        }
         let decision = self
             .roles_of(username)
             .into_iter()
@@ -189,6 +199,8 @@ impl Data {
                 Access::Write => self.default_acl_access.publish_client_send,
                 Access::Read => self.default_acl_access.publish_client_receive,
                 Access::Subscribe => self.default_acl_access.subscribe,
+                // A kind of access added later is denied until handled
+                _ => false,
             },
         }
     }
@@ -550,8 +562,10 @@ impl DynamicSecurity {
             .cloned()
             .unwrap_or_default();
 
-        let mut data = self.data.write().unwrap();
-        let before = data.clone();
+        // Applied to a copy, so hashing passwords doesn't hold the lock every
+        // authorization takes; only this client sends commands, so nothing
+        // changes the state in between
+        let mut data = self.data.read().unwrap().clone();
         let mut changed = false;
         let mut responses = Vec::new();
         for args in &commands {
@@ -572,10 +586,12 @@ impl DynamicSecurity {
             responses.push(response);
         }
         if changed {
-            if let Err(e) = write(&self.path, &data) {
-                error!("Dynamic security: {e}");
-                *data = before;
-                responses = vec![json!({ "error": "Failed to save the changes" })];
+            match write(&self.path, &data) {
+                Ok(()) => *self.data.write().unwrap() = data,
+                Err(e) => {
+                    error!("Dynamic security: {e}");
+                    responses = vec![json!({ "error": "Failed to save the changes" })];
+                }
             }
         }
         json!({ "responses": responses })
@@ -631,7 +647,15 @@ fn read(path: &str) -> Result<Data, String> {
 fn write(path: &str, data: &Data) -> Result<(), String> {
     let temporary = format!("{path}.new");
     let contents = serde_json::to_string_pretty(data).expect("serializable");
-    std::fs::write(&temporary, contents)
+    // A leftover from a crash would keep its own permissions
+    let _ = std::fs::remove_file(&temporary);
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create(true).truncate(true);
+    // It holds password hashes: for the broker's user only
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    file.open(&temporary)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
         .and_then(|()| std::fs::rename(&temporary, path))
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
@@ -678,16 +702,42 @@ mod tests {
     use super::*;
 
     fn identity(username: &str) -> ClientIdentity {
-        ClientIdentity {
-            client_id: "c".to_string(),
-            username: Some(username.to_string()),
-        }
+        ClientIdentity::new("c", Some(username.to_string()))
     }
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
         let request = json!({ "commands": commands }).to_string();
         let response = security.handle(request.as_bytes());
         response["responses"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn test_disabled_clients_lose_access_and_the_file_stays_private() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-off-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "s1", "password": "pw" },
+                { "command": "disableClient", "username": "s1" },
+            ]),
+        );
+
+        // Still connected, it may no longer even receive by default
+        assert!(!security.authorize(&identity("s1"), "anything", Access::Read));
+        assert!(security.authorize(&identity("admin"), COMMAND_TOPIC, Access::Write));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -735,10 +785,7 @@ mod tests {
 
         // Groups give their roles to members, and to anonymous clients when
         // set as the anonymous group
-        let anonymous = ClientIdentity {
-            client_id: "a".to_string(),
-            username: None,
-        };
+        let anonymous = ClientIdentity::new("a", None);
         let responses = run(
             &security,
             json!([
@@ -777,6 +824,11 @@ mod tests {
 
         // Saved, so a reload or a restart keeps the changes
         security.reload().unwrap();
+        assert!(!security.validate("s1", b"pw"));
+        run(
+            &security,
+            json!([{ "command": "enableClient", "username": "s1" }]),
+        );
         assert!(security.authorize(&s1, "sensors/t1", Access::Write));
         std::fs::remove_file(path).unwrap();
     }

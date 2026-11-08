@@ -57,7 +57,7 @@ use crate::{
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
-    InflightMessage, RetainedMessageStore, StoredSubscription, StoredWillMessage,
+    InflightMessage, RetainedMessageStore, SessionOwner, StoredSubscription, StoredWillMessage,
 };
 
 /// Will message to be published on abnormal client disconnect.
@@ -260,6 +260,9 @@ struct State {
     auth_exchange: Option<Box<dyn AuthExchange>>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
+    /// Who may resume the session
+    owner: SessionOwner,
+    max_subscriptions: Option<usize>,
 }
 
 impl From<Session> for SessionDropGuard {
@@ -297,9 +300,8 @@ impl Session {
                     client_id,
                     subscriptions: HashMap::new(),
                     topics: None,
-                    // Pre-allocate with reasonable capacity for typical usage
-                    unacknowledged_messages: HashMap::with_capacity(16),
-                    pubrecs: HashMap::with_capacity(16),
+                    unacknowledged_messages: HashMap::new(),
+                    pubrecs: HashMap::new(),
                     next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
@@ -314,6 +316,8 @@ impl Session {
                     will_message,
                     auth_exchange: None,
                     verified_user: None,
+                    owner: SessionOwner::default(),
+                    max_subscriptions: None,
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -379,15 +383,22 @@ impl Session {
 
         session.topics = Some(broker.topics());
         for subscription in subscriptions {
+            // Stored by an older version that accepted it, such as one
+            // deeper than the level limit
+            if let Err(e) = validate_subscribe_filter(&subscription.topic_filter) {
+                warn!(
+                    "Dropping stored subscription of `{}` to an invalid filter: {}",
+                    session.client_id, e
+                );
+                continue;
+            }
             // Retained messages are only sent for a new SUBSCRIBE, not when an
             // existing subscription is resumed [MQTT-3.3.1-9]
-            broker
-                .subscribe(
-                    &subscription.topic_filter,
-                    self.shared.subscriber_id,
-                    self.subscriber(&subscription),
-                )
-                .await?;
+            broker.subscribe(
+                &subscription.topic_filter,
+                self.shared.subscriber_id,
+                self.subscriber(&subscription),
+            );
             session
                 .subscriptions
                 .insert(subscription.topic_filter.clone(), subscription);
@@ -422,6 +433,7 @@ impl Session {
             session.check_retain_source = limits.check_retain_source;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
+            session.max_subscriptions = limits.max_subscriptions;
 
             // Set protocol version from the CONNECT packet
             ack.protocol_version = session.connect_packet.protocol_version;
@@ -785,6 +797,14 @@ impl Session {
         self.shared.state.lock().await.verified_user = username;
     }
 
+    pub(crate) async fn owner(&self) -> SessionOwner {
+        self.shared.state.lock().await.owner.clone()
+    }
+
+    pub(crate) async fn set_owner(&self, owner: SessionOwner) {
+        self.shared.state.lock().await.owner = owner;
+    }
+
     async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         // O(1) removal instead of O(n) search + remove
@@ -906,6 +926,20 @@ impl Session {
                 }
             }
 
+            let at_limit = session
+                .max_subscriptions
+                .is_some_and(|max| session.subscriptions.len() >= max);
+            if at_limit && !session.subscriptions.contains_key(&sub.topic_filter) {
+                warn!(
+                    "Client `{}` holds the most subscriptions allowed",
+                    session.client_id
+                );
+                ack.payload.push(SubAckPayload {
+                    reason_code: ReasonCode::QuotaExceeded,
+                });
+                continue;
+            }
+
             let granted_qos = if sub.subs_opt.qos as u8 > session.maximum_qos as u8 {
                 session.maximum_qos
             } else {
@@ -920,13 +954,11 @@ impl Session {
             };
             let subscriber = self.subscriber(&subscription);
             let existed = session.subscriptions.contains_key(&sub.topic_filter);
-            let retained_messages = broker
-                .subscribe(
-                    &sub.topic_filter,
-                    self.shared.subscriber_id,
-                    subscriber.clone(),
-                )
-                .await?;
+            broker.subscribe(
+                &sub.topic_filter,
+                self.shared.subscriber_id,
+                subscriber.clone(),
+            );
 
             // Shared subscriptions are never sent retained messages
             let shared = parse_shared_subscription(&sub.topic_filter).is_some();
@@ -937,7 +969,7 @@ impl Session {
                     _ => false,
                 };
             if send_retained {
-                for message in retained_messages {
+                for message in broker.retained(&sub.topic_filter).await? {
                     if session.check_retain_source && !publisher_may_write(authorizer, &message) {
                         continue;
                     }

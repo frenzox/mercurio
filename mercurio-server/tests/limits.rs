@@ -12,10 +12,8 @@ use tokio::{
 async fn start_broker(limits: Limits) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        limits,
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.limits = limits;
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -48,9 +46,10 @@ async fn read_until_closed(stream: &mut TcpStream) -> Vec<u8> {
 
 #[tokio::test]
 async fn configured_packet_size_is_advertised_and_enforced() {
-    let addr = start_broker(Limits {
-        max_packet_size: 64,
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_packet_size = 64;
+        value
     })
     .await;
 
@@ -74,9 +73,10 @@ async fn configured_packet_size_is_advertised_and_enforced() {
 
 #[tokio::test]
 async fn connections_beyond_the_limit_are_refused() {
-    let addr = start_broker(Limits {
-        max_connections: Some(1),
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_connections = Some(1);
+        value
     })
     .await;
 
@@ -93,9 +93,10 @@ async fn connections_beyond_the_limit_are_refused() {
 
 #[tokio::test]
 async fn keep_alive_is_capped_for_mqtt5_clients() {
-    let addr = start_broker(Limits {
-        max_keepalive: Some(1),
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_keepalive = Some(1);
+        value
     })
     .await;
 
@@ -123,13 +124,8 @@ async fn keep_alive_is_capped_for_mqtt5_clients() {
 async fn response_information_is_given_to_clients_that_ask() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        policy: mercurio_server::server::ConnectPolicy {
-            response_information: Some("responses/%c".into()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.policy.response_information = Some("responses/%c".into());
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -160,16 +156,8 @@ async fn response_information_is_given_to_clients_that_ask() {
 async fn clients_are_redirected_when_configured() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = ServerConfig {
-        policy: mercurio_server::server::ConnectPolicy {
-            redirect: Some(mercurio_server::server::Redirect {
-                server_reference: "other:1883".into(),
-                permanent: true,
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let mut config = ServerConfig::default();
+    config.policy.redirect = Some(mercurio_server::server::Redirect::new("other:1883", true));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -197,9 +185,10 @@ async fn clients_are_redirected_when_configured() {
 
 #[tokio::test]
 async fn maximum_qos_is_advertised_and_enforced() {
-    let addr = start_broker(Limits {
-        maximum_qos: mercurio_core::qos::QoS::AtLeastOnce,
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.maximum_qos = mercurio_core::qos::QoS::AtLeastOnce;
+        value
     })
     .await;
 
@@ -229,9 +218,10 @@ async fn maximum_qos_is_advertised_and_enforced() {
 
 #[tokio::test]
 async fn unavailable_retain_is_advertised_and_enforced() {
-    let addr = start_broker(Limits {
-        retain_available: false,
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.retain_available = false;
+        value
     })
     .await;
 
@@ -263,9 +253,10 @@ async fn unavailable_retain_is_advertised_and_enforced() {
 
 #[tokio::test]
 async fn persistent_mqtt3_sessions_expire_when_configured() {
-    let addr = start_broker(Limits {
-        persistent_client_expiration: Some(Duration::from_secs(1)),
-        ..Default::default()
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.persistent_client_expiration = Some(Duration::from_secs(1));
+        value
     })
     .await;
 
@@ -288,4 +279,44 @@ async fn persistent_mqtt3_sessions_expire_when_configured() {
     assert!(connect().await, "session gone before it expired");
     sleep(Duration::from_millis(1500)).await;
     assert!(!connect().await, "session outlived its expiry");
+}
+
+/// SUBSCRIBE with the given filters at QoS 0, packet id 1; returns the
+/// SUBACK's reason codes.
+async fn subscribe(stream: &mut TcpStream, filters: &[&str]) -> Vec<u8> {
+    let mut body = vec![0x00, 0x01, 0x00];
+    for filter in filters {
+        body.extend((filter.len() as u16).to_be_bytes());
+        body.extend(filter.as_bytes());
+        body.push(0x00);
+    }
+    let mut packet = vec![0x82, body.len() as u8];
+    packet.extend(body);
+    stream.write_all(&packet).await.unwrap();
+
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.unwrap();
+    let mut suback = vec![0u8; header[1] as usize];
+    stream.read_exact(&mut suback).await.unwrap();
+    // Packet id, empty properties, then a reason code per filter
+    suback[3..].to_vec()
+}
+
+#[tokio::test]
+async fn subscriptions_beyond_the_limit_are_refused() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_subscriptions = Some(2);
+        value
+    })
+    .await;
+    let (mut stream, _) = connect(addr, b's').await;
+
+    // Quota exceeded for the third, new filter
+    assert_eq!(
+        subscribe(&mut stream, &["a", "b", "c"]).await,
+        [0x00, 0x00, 0x97]
+    );
+    // Replacing a subscription it holds doesn't count as a new one
+    assert_eq!(subscribe(&mut stream, &["a"]).await, [0x00]);
 }

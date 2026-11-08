@@ -330,6 +330,8 @@ async fn run_subscribe(
                             }
                         }
                     }
+                    // Events added in later versions of the client
+                    Some(_) => {}
                     None => {
                         break;
                     }

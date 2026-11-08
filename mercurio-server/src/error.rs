@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Server-specific errors.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ServerError {
     /// TLS configuration or connection error.
     #[error("TLS error: {0}")]

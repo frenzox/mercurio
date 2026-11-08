@@ -193,6 +193,7 @@ def_prop!(SharedSubscriptionAvailable {
 
 #[derive(PartialEq, Eq, Debug)]
 #[allow(clippy::enum_variant_names)] // Warns because of UserProperty
+#[non_exhaustive]
 pub enum Property {
     PayloadFormatIndicator(PayloadFormatIndicator),
     MessageExpiryInterval(MessageExpiryInterval),
