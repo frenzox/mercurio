@@ -31,6 +31,8 @@ mod http_auth;
 mod reload;
 #[cfg(unix)]
 mod syslog;
+#[cfg(feature = "wasm")]
+mod wasm;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;

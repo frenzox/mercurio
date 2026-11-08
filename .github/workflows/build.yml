@@ -47,7 +47,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - name: Check with the minimum supported Rust
-        run: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features --exclude mercuriod
+
+  # mercuriod follows wasmtime, which needs a recent Rust
+  msrv-mercuriod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - uses: Swatinem/rust-cache@v2
+      - name: Check mercuriod with its minimum supported Rust
+        run: cargo check -p mercuriod --all-features
 
   # The workspace build lends crates each other's features; release-plz and
   # crates.io build each crate on its own
