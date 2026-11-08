@@ -467,11 +467,16 @@ the database, so
 clients with persistent sessions resume where they left off after a
 restart.
 
+Changes are written in the background within milliseconds, so a crash loses
+only the changes of its last moments; a shutdown writes everything first.
+
 Only one broker serves from a PostgreSQL database at a time. Another one
 started on it exits, or, with `standby = true`, waits without listening and
-takes over within seconds once the serving broker stops. A broker that loses
-its connection to the database stops and exits with an error, as a standby
-may have taken over.
+takes over as soon as the serving broker's process stops, or about 11
+seconds after its host goes down. A broker that can't reach the database for
+about 7 seconds stops and exits with an error, as a standby may take over;
+the database refuses writes from a broker that was taken over. PostgreSQL
+needs version 12 or later, connected to directly, without PgBouncer.
 
 ### Statistics
 

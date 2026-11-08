@@ -9,9 +9,9 @@ implementations:
 - `memory::MemoryStore`: everything in memory, lost on restart.
 - `sqlite::SqliteStore`: a SQLite database, behind the `sqlite` feature.
 - `postgres::PostgresStore`: a PostgreSQL database, behind the `postgres`
-  feature, opened with `PostgresStore::connect(url, ca_path).await`, over
-  TLS when the server supports it. `try_lock` and `lock` keep brokers
-  sharing the database from serving at the same time.
+  feature, over TLS when the server supports it. A broker serving from it
+  opens it with `PostgresStore::connect_exclusive(url, ca_path, wait)`,
+  which keeps any other broker from writing to the database meanwhile.
 
 ```rust,ignore
 use std::sync::Arc;
@@ -23,13 +23,17 @@ let storage = Arc::new(SqliteStore::new("/var/lib/myapp/mqtt.db")?);
 run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;
 ```
 
-Implement the traits to keep the broker's state anywhere else.
+Implement the traits to keep the broker's state anywhere else. The broker
+writes each client's changes through `BatchStore::apply`, in batches; its
+default applies them one at a time, and stores that can should apply a
+batch in one transaction.
 
 ## Features
 
 - `std` (default): standard library support.
 - `sqlite`: the SQLite store, with schema migrations applied on open.
-- `postgres`: the PostgreSQL store, which creates its tables on connect.
+- `postgres`: the PostgreSQL store, for PostgreSQL 12 or later, which
+  creates and updates its tables on connect.
 
 ## License
 
