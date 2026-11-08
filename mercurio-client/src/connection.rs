@@ -64,7 +64,7 @@ impl Connection {
     /// Uses version-aware parsing based on the configured protocol version.
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
-            match ControlPacket::check(&mut self.read_buffer) {
+            match ControlPacket::check(&self.read_buffer) {
                 Ok(()) => {
                     let buffered = self.read_buffer.len();
                     let packet = ControlPacket::parse_with_version(

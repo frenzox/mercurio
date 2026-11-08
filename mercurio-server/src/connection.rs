@@ -235,7 +235,7 @@ where
             return Err(ReasonCode::PacketTooLarge.into());
         }
 
-        match ControlPacket::check(&mut self.read_buffer) {
+        match ControlPacket::check(&self.read_buffer) {
             Ok(_) => {
                 let packet = ControlPacket::parse_with_version(
                     &mut self.read_buffer,

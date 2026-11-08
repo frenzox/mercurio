@@ -115,7 +115,7 @@ impl ControlPacket {
     ///
     /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
     /// if more data is needed.
-    pub fn check(src: &mut BytesMut) -> crate::Result<()> {
+    pub fn check(src: &[u8]) -> crate::Result<()> {
         if src.len() >= Self::frame_len(src)? {
             Ok(())
         } else {
@@ -490,7 +490,7 @@ mod robustness_tests {
         for version in [ProtocolVersion::V5, ProtocolVersion::V3_1_1] {
             let mut buffer = BytesMut::from(bytes);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                while ControlPacket::check(&mut buffer).is_ok() {
+                while ControlPacket::check(&buffer).is_ok() {
                     if ControlPacket::parse_with_version(&mut buffer, version).is_err() {
                         break;
                     }

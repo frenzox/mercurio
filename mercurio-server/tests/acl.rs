@@ -94,7 +94,7 @@ impl Client {
 
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
-            if ControlPacket::check(&mut self.buffer).is_ok() {
+            if ControlPacket::check(&self.buffer).is_ok() {
                 let packet =
                     ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5);
                 return Some(packet.unwrap());

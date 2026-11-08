@@ -52,7 +52,7 @@ async fn statistics(addr: SocketAddr) -> HashMap<String, String> {
     // Every statistic is retained, so a new subscriber gets them all
     timeout(Duration::from_secs(2), async {
         while values.len() < 28 {
-            if ControlPacket::check(&mut buffer).is_ok() {
+            if ControlPacket::check(&buffer).is_ok() {
                 if let ControlPacket::Publish(publish) =
                     ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
                 {
