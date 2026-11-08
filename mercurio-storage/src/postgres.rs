@@ -680,7 +680,7 @@ impl BatchStore for PostgresStore {
                 .map(|(statement, params)| client.execute(statement, params)),
         );
         let commit = client.batch_execute("COMMIT");
-        let (begun, executed, committed) = tokio::join!(begin, executes, commit);
+        let (begun, executed, committed) = futures_util::join!(begin, executes, commit);
         begun?;
         for result in executed {
             result?;
