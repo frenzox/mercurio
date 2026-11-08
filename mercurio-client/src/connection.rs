@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use mercurio_core::codec::MAX_PACKET_SIZE;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_core::reason::ReasonCode;
 use mercurio_packets::ControlPacket;
@@ -47,10 +48,10 @@ impl Connection {
     pub async fn write_packet(&mut self, packet: ControlPacket) -> Result<()> {
         let mut buffer = BytesMut::new();
         packet.encode_with_version(&mut buffer, self.protocol_version);
-        if self
+        let max = self
             .max_packet_size
-            .is_some_and(|max| buffer.len() > max as usize)
-        {
+            .map_or(MAX_PACKET_SIZE, |max| max as usize);
+        if buffer.len() > max {
             return Err(ClientError::PacketTooLarge);
         }
         self.stream.write_all(&buffer).await?;

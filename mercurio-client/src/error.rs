@@ -27,9 +27,15 @@ pub enum ClientError {
     },
 
     /// A packet the client was to send exceeds the Maximum Packet Size
-    /// the broker announced; nothing was sent.
+    /// the broker announced, or the largest packet MQTT can frame; nothing
+    /// was sent.
     #[error("Packet larger than the broker accepts")]
     PacketTooLarge,
+
+    /// This string or binary value is longer than the 65,535 bytes MQTT
+    /// can carry; nothing was sent.
+    #[error("{0} is longer than 65,535 bytes")]
+    TooLong(&'static str),
 
     /// The broker announced it lacks what the request needs: a QoS above
     /// its maximum, retained messages, or subscription identifiers.

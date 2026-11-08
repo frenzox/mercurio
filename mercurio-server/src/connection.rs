@@ -8,10 +8,11 @@ use tokio::{
 };
 
 use mercurio_core::{
-    error::Error, protocol::ProtocolVersion, reason::ReasonCode, topic::parse_shared_subscription,
-    Result,
+    codec::MAX_PACKET_SIZE, error::Error, protocol::ProtocolVersion, reason::ReasonCode,
+    topic::parse_shared_subscription, Result,
 };
 use mercurio_packets::ControlPacket;
+use tracing::warn;
 
 use crate::sys::Stats;
 
@@ -180,6 +181,12 @@ where
         }
 
         packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
+        // Only a forwarded PUBLISH can grow this large, by the properties
+        // added to a message that already filled a whole packet
+        if self.write_buffer.len() > MAX_PACKET_SIZE {
+            warn!("Dropping a packet too large for MQTT to frame");
+            self.write_buffer.clear();
+        }
         self.send_encoded()
     }
 
