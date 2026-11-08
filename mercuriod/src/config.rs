@@ -235,7 +235,26 @@ impl Config {
                 merge(&mut table, read_table(&file)?);
             }
         }
-        Ok(Config::deserialize(table)?)
+        let config = Config::deserialize(table)?;
+        config.check()?;
+        Ok(config)
+    }
+}
+
+impl Config {
+    /// Refuses settings that parse but would be unsafe.
+    fn check(&self) -> Result<(), String> {
+        for listener in &self.listeners {
+            // `tenantA` would also let clients reach `tenantAB/...`
+            if let Some(mount_point) = &listener.mount_point {
+                if !mount_point.ends_with('/') {
+                    return Err(format!(
+                        "mount_point `{mount_point}` must end with `/`, or its clients reach the topics of every mount point it is a prefix of"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -727,6 +746,18 @@ mod tests {
         let ports: Vec<_> = config.listeners.iter().map(|l| l.port).collect();
         assert_eq!(ports, [Some(2), Some(4)]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_mount_points_must_end_a_level() {
+        let config = |mount_point: &str| -> Config {
+            toml::from_str(&format!(
+                "[[listeners]]\nport = 1884\nmount_point = \"{mount_point}\"\n"
+            ))
+            .unwrap()
+        };
+        assert!(config("tenantA").check().is_err());
+        assert!(config("tenantA/").check().is_ok());
     }
 
     #[test]

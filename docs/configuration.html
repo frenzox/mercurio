@@ -167,7 +167,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
-<tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use.</td></tr>
+<tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use. Must end with <code>/</code>.</td></tr>
 <tr><td><code>max_connections</code></td><td></td><td>Concurrent connections on this listener, on top of the broker-wide limit.</td></tr>
 <tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this interface. Linux only.</td></tr>
 <tr><td><code>[listeners.tls]</code></td><td></td><td>Same options as <code>[server.tls]</code>.</td></tr>

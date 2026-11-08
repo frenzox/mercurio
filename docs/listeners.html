@@ -110,7 +110,7 @@ host = "0.0.0.0"
 port = 1885
 mount_point = "tenant1/"</pre>
 <p>A client on that listener publishing <code>sensors/t1</code> publishes <code>tenant1/sensors/t1</code>, and subscribing to <code>#</code> subscribes to <code>tenant1/#</code>. The messages it receives carry their topics without the prefix. Shared subscriptions are mounted too: <code>$share/g/jobs</code> becomes <code>$share/g/tenant1/jobs</code>. Clients of other listeners see the full topics.</p>
-<p>ACL rules see the full topic, mount point included.</p>
+<p>ACL rules see the full topic, mount point included. A mount point must end with <code>/</code>: <code>tenant1</code> alone would also let clients reach <code>tenant10/...</code>.</p>
 
 <h2 id="auth">Per-listener authentication</h2>
 <p><code>[listeners.auth]</code> replaces <code>[auth]</code> for a listener's clients, with the same options except dynamic security. Here local services connect freely, while the public listener requires passwords and has its own ACL:</p>

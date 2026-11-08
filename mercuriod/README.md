@@ -425,7 +425,8 @@ messages.
 `mount_point` puts a listener's clients in their own part of the topic
 tree: a client publishing `sensors/t1` on a listener mounted at
 `tenant1/` publishes `tenant1/sensors/t1`, and it is sent topics without
-the prefix. `[listeners.auth]` gives a listener its own authentication and
+the prefix. A mount point must end with `/`, as `tenant1` alone would
+also reach `tenant10/...`. `[listeners.auth]` gives a listener its own authentication and
 `acl_file`, which `SIGHUP` reloads like the main ones. ACL rules see the
 full topic, mount point included.
 
