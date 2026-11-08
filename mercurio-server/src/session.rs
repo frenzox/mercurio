@@ -507,7 +507,7 @@ impl Session {
         Ok(())
     }
 
-    async fn handle_publish<S: RetainedMessageStore>(
+    pub(crate) async fn handle_publish<S: RetainedMessageStore>(
         &mut self,
         mut packet: PublishPacket,
         broker: &Broker<S>,
@@ -805,14 +805,20 @@ impl Session {
         self.shared.state.lock().await.owner = owner;
     }
 
-    async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_puback(
+        &mut self,
+        packet: PubAckPacket,
+    ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         // O(1) removal instead of O(n) search + remove
         session.unacknowledged_messages.remove(&packet.packet_id);
         Ok(None)
     }
 
-    async fn handle_pubrec(&mut self, packet: PubRecPacket) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubrec(
+        &mut self,
+        packet: PubRecPacket,
+    ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
         let sequence = match session.unacknowledged_messages.remove(&packet_id) {
@@ -840,14 +846,20 @@ impl Session {
         })))
     }
 
-    async fn handle_pubcomp(&mut self, packet: PubCompPacket) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubcomp(
+        &mut self,
+        packet: PubCompPacket,
+    ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         // O(1) removal
         session.pubrecs.remove(&packet.packet_id);
         Ok(None)
     }
 
-    async fn handle_pubrel(&mut self, packet: PubRelPacket) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubrel(
+        &mut self,
+        packet: PubRelPacket,
+    ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let reason = if session.incoming_qos2.remove(&packet.packet_id) {
             ReasonCode::Success
