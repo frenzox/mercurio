@@ -91,3 +91,43 @@ async fn control_puback_reason<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stre
     assert_eq!(puback[0], 0x40, "expected PUBACK");
     puback[4]
 }
+
+/// In-process clients don't reconnect, so a network client taking their
+/// client id over would stop them for good.
+#[tokio::test]
+async fn network_clients_cant_take_an_in_process_client_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (connector, local_listener) = LocalConnector::new();
+    let config = ServerConfig {
+        local_listener: Some(local_listener),
+        ..Default::default()
+    };
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let mut local = connector.connect().unwrap();
+    assert_eq!(connack_reason(&mut local).await, 0x00);
+
+    // Same client id, `l`: Not authorized
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(connack_reason(&mut tcp).await, 0x87);
+
+    // The in-process client is still connected: it answers a PINGREQ
+    local.write_all(&[0xc0, 0x00]).await.unwrap();
+    let mut pingresp = [0u8; 2];
+    timeout(Duration::from_secs(2), local.read_exact(&mut pingresp))
+        .await
+        .expect("in-process client was disconnected")
+        .unwrap();
+    assert_eq!(pingresp, [0xd0, 0x00]);
+
+    // Once it leaves, the id is free again
+    drop(local);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(connack_reason(&mut tcp).await, 0x00);
+}

@@ -327,6 +327,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     cert_identity: Option<String>,
     mount_point: Option<String>,
     http_dir: Option<Arc<PathBuf>>,
+    /// An in-process connection, from the local listener
+    local: bool,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -431,6 +433,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             limits: self.limits,
             stats: self.stats,
             cert_identity: self.cert_identity,
+            local: self.local,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -501,6 +504,8 @@ where
     stats: Arc<Stats>,
     limits: Limits,
     cert_identity: Option<String>,
+    /// An in-process connection, from the local listener
+    local: bool,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -688,6 +693,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 cert_identity: None,
                 mount_point: None,
                 http_dir: None,
+                local: false,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -702,6 +708,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
                         auth_config: Arc::clone(&self.trusted_auth),
+                        local: true,
                         ..parts
                     };
                     tokio::spawn(async move {
@@ -963,6 +970,15 @@ where
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                 .await;
         }
+        // In-process clients don't reconnect, so a network client taking
+        // over their id would end them for good
+        let client_id = &connect_packet.payload.client_id;
+        if !self.local && self.session_manager.is_held_locally(client_id) {
+            warn!("Client id `{}` belongs to an in-process client", client_id);
+            return self
+                .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                .await;
+        }
 
         let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
@@ -987,6 +1003,13 @@ where
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
+        let held_locally = match self.local {
+            true => Some(session.get_client_id().await),
+            false => None,
+        };
+        if let Some(client_id) = &held_locally {
+            self.session_manager.hold_locally(client_id);
+        }
 
         session.set_verified_user(verified_user).await;
 
@@ -1074,6 +1097,9 @@ where
             }
         }
 
+        if let Some(client_id) = &held_locally {
+            self.session_manager.release_locally(client_id);
+        }
         self.session_manager.end_connection(lease, expiry).await;
 
         result

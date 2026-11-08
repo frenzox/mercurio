@@ -56,6 +56,8 @@ struct Shared {
     /// subscriptions and in-flight messages in storage, as others' are
     /// discarded when the connection ends.
     persistent: std::sync::Mutex<HashSet<String>>,
+    /// Client ids in-process clients are connected with
+    local: std::sync::Mutex<HashSet<String>>,
     /// Sessions ended by their expiry
     expired: std::sync::atomic::AtomicU64,
 }
@@ -133,6 +135,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 restored_wills: HashSet::new(),
             }),
             persistent: Default::default(),
+            local: Default::default(),
             expired: Default::default(),
         });
 
@@ -572,6 +575,23 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers.write(client_id, Write::DeleteSession);
         self.writers.close(client_id);
         true
+    }
+
+    pub(crate) fn hold_locally(&self, client_id: &str) {
+        self.shared
+            .local
+            .lock()
+            .unwrap()
+            .insert(client_id.to_string());
+    }
+
+    pub(crate) fn release_locally(&self, client_id: &str) {
+        self.shared.local.lock().unwrap().remove(client_id);
+    }
+
+    /// Whether an in-process client is connected with `client_id`.
+    pub(crate) fn is_held_locally(&self, client_id: &str) -> bool {
+        self.shared.local.lock().unwrap().contains(client_id)
     }
 
     fn is_persistent(&self, client_id: &str) -> bool {
