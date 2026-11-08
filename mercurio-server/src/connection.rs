@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     time,
 };
@@ -20,12 +20,12 @@ use crate::sys::Stats;
 /// every connection holds one.
 const READ_BUFFER_CAPACITY: usize = 1024;
 
-/// Capacity of the buffer collecting writes before they go out; larger
-/// writes bypass it.
-const WRITE_BUFFER_SIZE: usize = 2048;
+/// Initial capacity of the buffer packets are encoded into before writing.
+const WRITE_BUFFER_CAPACITY: usize = 256;
 
-/// Default capacity for write buffer (512 bytes - typical packet size)
-const WRITE_BUFFER_CAPACITY: usize = 512;
+/// A buffer grown past this for a large packet is released once empty,
+/// rather than held for the rest of the connection.
+const RELEASE_ABOVE: usize = 64 * 1024;
 
 /// Largest packet accepted from a client unless configured otherwise, fixed
 /// header included. 1 MiB, the same default as EMQX.
@@ -39,7 +39,7 @@ pub struct Connection<S = TcpStream>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream: BufWriter<S>,
+    stream: S,
     /// Reusable read buffer - avoids allocation per read
     read_buffer: BytesMut,
     /// Reusable write buffer - avoids allocation per write
@@ -103,7 +103,7 @@ where
     /// Speaks MQTT over `stream`: plain TCP, TLS or a WebSocket.
     pub fn new(stream: S) -> Connection<S> {
         Connection {
-            stream: BufWriter::with_capacity(WRITE_BUFFER_SIZE, stream),
+            stream,
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             write_buffer: BytesMut::with_capacity(WRITE_BUFFER_CAPACITY),
             protocol_version: ProtocolVersion::V5,
@@ -140,6 +140,9 @@ where
                 if let Some(mount_point) = &self.mount_point {
                     mount(&mut packet, mount_point);
                 }
+                if self.read_buffer.is_empty() && self.read_buffer.capacity() > RELEASE_ABOVE {
+                    self.read_buffer = BytesMut::with_capacity(READ_BUFFER_CAPACITY);
+                }
                 return Ok(Some(packet));
             }
 
@@ -157,7 +160,14 @@ where
         }
     }
 
-    pub async fn write_packet(&mut self, mut packet: ControlPacket) -> Result<()> {
+    /// Sends `packet`. It is encoded before the returned future is first
+    /// polled, so the future holds only the bytes to write, not the packet:
+    /// awaited in a connection's loop, a large future would take room in
+    /// every connection's state.
+    pub fn write_packet(
+        &mut self,
+        mut packet: ControlPacket,
+    ) -> impl std::future::Future<Output = Result<()>> + '_ {
         // Clear and reuse the write buffer instead of allocating a new one
         self.write_buffer.clear();
 
@@ -170,11 +180,18 @@ where
         }
 
         packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
+        self.send_encoded()
+    }
 
+    async fn send_encoded(&mut self) -> Result<()> {
+        // Each packet is encoded whole first, so it goes out in one write
         self.stream.write_all(&self.write_buffer).await?;
         self.stream.flush().await?;
         if let Some(stats) = &self.stats {
             Stats::add_n(&stats.bytes_sent, self.write_buffer.len() as u64);
+        }
+        if self.write_buffer.capacity() > RELEASE_ABOVE {
+            self.write_buffer = BytesMut::with_capacity(WRITE_BUFFER_CAPACITY);
         }
 
         Ok(())
