@@ -6,7 +6,10 @@
 //! A client's roles are its own and those of its groups; clients without a
 //! user name get the roles of the anonymous group, when one is set.
 
-use std::{path::Path, sync::RwLock};
+use std::{
+    path::Path,
+    sync::{Mutex, RwLock},
+};
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -496,6 +499,9 @@ fn hash_password(password: &str) -> Result<String, String> {
 pub struct DynamicSecurity {
     path: String,
     data: RwLock<Data>,
+    /// Held while a batch runs, so concurrent batches don't overwrite each
+    /// other's changes or the temporary file
+    commands: Mutex<()>,
 }
 
 impl DynamicSecurity {
@@ -503,6 +509,7 @@ impl DynamicSecurity {
         Ok(Self {
             path: path.to_string(),
             data: RwLock::new(read(path)?),
+            commands: Mutex::new(()),
         })
     }
 
@@ -556,8 +563,9 @@ impl DynamicSecurity {
             .unwrap_or_default();
 
         // Applied to a copy, so hashing passwords doesn't hold the lock every
-        // authorization takes; only this client sends commands, so nothing
-        // changes the state in between
+        // authorization takes; batches are serialized so nothing else changes
+        // the state in between
+        let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         let mut data = self.data.read().unwrap().clone();
         let mut changed = false;
         let mut responses = Vec::new();
@@ -731,6 +739,34 @@ mod tests {
             .on_control(&ClientInfo::new("c", None), "v2", Bytes::new())
             .await
             .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_concurrent_batches_keep_every_change() {
+        let path = std::env::temp_dir().join(format!(
+            "mercuriod-dynsec-concurrent-{}",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let security = &security;
+                scope.spawn(move || {
+                    let name = format!("c{n}");
+                    run(
+                        security,
+                        json!([{ "command": "createClient", "username": name, "password": "p" }]),
+                    );
+                });
+            }
+        });
+        let listed = run(&security, json!([{ "command": "listClients" }]));
+        assert_eq!(listed[0]["data"]["totalCount"], 9);
         let _ = std::fs::remove_file(path);
     }
 
