@@ -312,27 +312,29 @@ async fn test_webhook_audit_posts_events() {
         loop {
             let (mut socket, _) = hook.accept().await.unwrap();
             let recorded = Arc::clone(&recorded);
+            let index = {
+                let mut recorded = recorded.lock().unwrap();
+                recorded.push(String::new());
+                recorded.len() - 1
+            };
             tokio::spawn(async move {
-                let mut request = Vec::new();
+                let mut seen = Vec::new();
                 let mut buffer = [0u8; 1024];
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match socket.read(&mut buffer).await {
-                        Ok(n) if n > 0 => request.extend_from_slice(&buffer[..n]),
-                        _ => return,
+                let mut answered = false;
+                // The body is chunked and may arrive in several reads
+                while let Ok(n) = socket.read(&mut buffer).await {
+                    if n == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&buffer[..n]);
+                    recorded.lock().unwrap()[index] = String::from_utf8_lossy(&seen).into_owned();
+                    if !answered && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        answered = true;
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                            .await;
                     }
                 }
-                // The body may arrive after the headers
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if let Ok(n) = socket.try_read(&mut buffer) {
-                    request.extend_from_slice(&buffer[..n]);
-                }
-                recorded
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).into_owned());
-                let _ = socket
-                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                    .await;
             });
         }
     });

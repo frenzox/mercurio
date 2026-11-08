@@ -24,6 +24,7 @@ impl Plugin for WebhookAudit {
 
     fn on_event(event: Event) {
         let Some(url) = host::kv_get("url").and_then(|url| String::from_utf8(url).ok()) else {
+            host::log(Level::Warn, "the stored `url` is missing");
             return;
         };
         let body = match event {
@@ -63,6 +64,7 @@ fn escape(text: &str) -> String {
     escaped
 }
 
+/// Parses the URL minimally: `http://authority/path`, without a bare query.
 fn post(url: &str, body: &[u8]) -> Result<(), String> {
     let rest = url.strip_prefix("http://").ok_or("http:// only")?;
     let (authority, path) = rest
@@ -71,10 +73,18 @@ fn post(url: &str, body: &[u8]) -> Result<(), String> {
     let headers = Fields::from_list(&[("content-type".to_string(), b"application/json".to_vec())])
         .map_err(|e| format!("headers: {e:?}"))?;
     let request = OutgoingRequest::new(headers);
-    request.set_method(&Method::Post).unwrap();
-    request.set_scheme(Some(&Scheme::Http)).unwrap();
-    request.set_authority(Some(authority)).unwrap();
-    request.set_path_with_query(Some(&path)).unwrap();
+    request
+        .set_method(&Method::Post)
+        .map_err(|()| "invalid method")?;
+    request
+        .set_scheme(Some(&Scheme::Http))
+        .map_err(|()| "invalid scheme")?;
+    request
+        .set_authority(Some(authority))
+        .map_err(|()| "invalid authority")?;
+    request
+        .set_path_with_query(Some(&path))
+        .map_err(|()| "invalid path")?;
     let out = request.body().map_err(|()| "no request body")?;
     {
         let stream = out.write().map_err(|()| "no body stream")?;
