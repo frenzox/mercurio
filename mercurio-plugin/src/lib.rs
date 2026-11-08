@@ -1,16 +1,21 @@
 #![doc = include_str!("../README.md")]
 
-wit_bindgen::generate!({
-    path: "wit",
-    world: "plugin",
-    pub_export_macro: true,
-    default_bindings_module: "mercurio_plugin",
-    export_macro_name: "export_guest",
-});
+/// The generated bindings, which [`export_plugin!`] wraps.
+#[doc(hidden)]
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "plugin",
+        pub_export_macro: true,
+        default_bindings_module: "mercurio_plugin::bindings",
+        export_macro_name: "export_guest",
+    });
+}
 
-pub use exports::mercurio::plugin::guest::Guest;
-pub use mercurio::plugin::host;
-pub use mercurio::plugin::types::{
+#[doc(hidden)]
+pub use bindings::exports::mercurio::plugin::guest::Guest;
+pub use bindings::mercurio::plugin::host;
+pub use bindings::mercurio::plugin::types::{
     Access, AuthResult, Challenge, ClientInfo, Decision, Disconnected, Event, Hooks, Level,
     Message, MessageAction, Qos, Registration, Subscribed, Unsubscribed,
 };
@@ -186,7 +191,7 @@ macro_rules! export_plugin {
                 }
             }
 
-    $crate::export_guest!(__MercurioGuest with_types_in $crate);
+    $crate::bindings::export_guest!(__MercurioGuest with_types_in $crate::bindings);
         };
     };
 }
