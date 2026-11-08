@@ -43,6 +43,12 @@ const TABLES: usize = 32;
 const MEMORIES: usize = 8;
 const TABLE_ELEMENTS: usize = 100_000;
 
+/// How many host resources, such as sockets, streams and HTTP requests, one
+/// copy may hold at once. A copy keeps its resources between calls, so
+/// without a limit it could hold sockets until the broker runs out of file
+/// descriptors.
+const RESOURCES: usize = 4096;
+
 /// A plugin's key-value store, shared by its copies.
 pub(crate) struct Kv {
     entries: Mutex<Entries>,
@@ -144,11 +150,14 @@ impl Allowed {
 impl State {
     pub(crate) fn new(name: Arc<str>, allowed: &Allowed, memory: usize, kv: Arc<Kv>) -> State {
         let sockets = Arc::clone(&allowed.sockets);
+        // Creating a socket opens it before any address is checked, so a
+        // plugin with no allowed address may not create one at all
+        let networked = !sockets.is_empty();
         // Standard input, output and error stay closed: a plugin logs
         // through the host
         let wasi = WasiCtxBuilder::new()
-            .allow_tcp(true)
-            .allow_udp(true)
+            .allow_tcp(networked)
+            .allow_udp(networked)
             .socket_addr_check(move |addr, use_| {
                 let allowed = match use_ {
                     // A connect binds to the wildcard address first, so
@@ -161,6 +170,8 @@ impl State {
                 Box::pin(std::future::ready(allowed))
             })
             .build();
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(RESOURCES);
         State {
             wasi,
             http: WasiHttpCtx::new(),
@@ -168,7 +179,7 @@ impl State {
                 hosts: Arc::clone(&allowed.http),
                 name: Arc::clone(&name),
             },
-            table: ResourceTable::new(),
+            table,
             limits: StoreLimitsBuilder::new()
                 .memory_size(memory)
                 .instances(INSTANCES)

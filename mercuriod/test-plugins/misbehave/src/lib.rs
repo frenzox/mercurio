@@ -3,9 +3,12 @@
 use std::time::Duration;
 
 use mercurio_plugin::{export_plugin, host, ClientInfo, Hooks, Plugin, Registration};
-use wasip2::http::{
-    outgoing_handler,
-    types::{Fields, Method, OutgoingRequest, Scheme},
+use wasip2::{
+    http::{
+        outgoing_handler,
+        types::{Fields, Method, OutgoingRequest, Scheme},
+    },
+    sockets::{network::IpAddressFamily, tcp_create_socket::create_tcp_socket},
 };
 
 struct Misbehave;
@@ -46,6 +49,29 @@ impl Plugin for Misbehave {
                     .map(drop)
                     .map_err(|e| format!("{e} ({:?})", e.kind())),
             )),
+            "sockets" => {
+                let most: usize = text.parse().ok()?;
+                let mut held = Vec::new();
+                let error = loop {
+                    if held.len() == most {
+                        break "none".to_string();
+                    }
+                    match create_tcp_socket(IpAddressFamily::Ipv4) {
+                        Ok(socket) => held.push(socket),
+                        Err(error) => break format!("{error:?}"),
+                    }
+                };
+                let count = held.len();
+                // Kept open, so the copy goes back to the pool holding them
+                std::mem::forget(held);
+                Some(format!("{count} {error}").into_bytes())
+            }
+            "fields" => {
+                let most: usize = text.parse().ok()?;
+                let held: Vec<_> = (0..most).map(|_| Fields::new()).collect();
+                std::mem::forget(held);
+                Some(most.to_string().into_bytes())
+            }
             "kv-count" => {
                 let count = host::kv_get("count")
                     .and_then(|v| String::from_utf8(v).ok())

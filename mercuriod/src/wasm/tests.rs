@@ -207,6 +207,35 @@ async fn test_sockets_outside_the_allowlist_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_sockets_need_an_allowlist() {
+    let plugin = misbehave(|_| ()).await;
+    let made = control(&plugin, "sockets", b"20000").await.unwrap();
+    assert!(made.starts_with("0 "), "{made}");
+    assert!(made.contains("access-denied"), "{made}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_cant_hold_sockets_without_end() {
+    let plugin = misbehave(|s| {
+        s.allow_sockets = vec!["127.0.0.1:9".into()];
+        s.instances = 1;
+    })
+    .await;
+    // Past the resource table's capacity the call traps and the copy, with
+    // its sockets, is dropped
+    assert_eq!(control(&plugin, "sockets", b"20000").await, None);
+    let made = control(&plugin, "sockets", b"100").await.unwrap();
+    assert_eq!(made, "100 none");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http_resources_share_the_resource_limit() {
+    let plugin = misbehave(|s| s.instances = 1).await;
+    assert_eq!(control(&plugin, "fields", b"20000").await, None);
+    assert_eq!(control(&plugin, "fields", b"100").await.unwrap(), "100");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_kv_is_shared_by_instances() {
     let plugin = misbehave(|s| s.instances = 2).await;
     let (a, b, c, d) = tokio::join!(
