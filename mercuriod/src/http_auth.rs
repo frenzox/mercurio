@@ -130,18 +130,18 @@ impl Plugin for HttpAuth {
             topic.to_string(),
             acc,
         );
-        let body = json!({
-            "username": client.username,
-            "clientid": client.client_id,
-            "topic": topic,
-            "acc": acc,
-        });
         Box::pin(async move {
             if let Some((allowed, at)) = self.cache.lock().unwrap().get(&key) {
                 if at.elapsed() < self.cache_for {
                     return decision(*allowed);
                 }
             }
+            let body = json!({
+                "username": client.username,
+                "clientid": client.client_id,
+                "topic": topic,
+                "acc": acc,
+            });
             let allowed = self.allows(url, body).await;
             let mut cache = self.cache.lock().unwrap();
             // Making room one entry at a time: clearing it all would let one
