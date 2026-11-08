@@ -22,7 +22,7 @@ pub mod unsubscribe;
 
 use core::convert::{TryFrom, TryInto};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
@@ -291,11 +291,21 @@ impl ControlPacket {
             return self.encode(buffer);
         }
 
+        // MQTT 3.x acknowledgements carry only the packet id: a reason code
+        // or properties would make them malformed there
+        let ack = |buffer: &mut BytesMut, first_byte: u8, packet_id: u16| {
+            buffer.put_slice(&[first_byte, 0x02]);
+            buffer.put_u16(packet_id);
+        };
         match self {
             Publish(p) => p.encode_v3(buffer),
             Subscribe(p) => p.encode_v3(buffer),
             Unsubscribe(p) => p.encode_v3(buffer),
             Disconnect(p) => p.encode_v3(buffer),
+            PubAck(p) => ack(buffer, 0x40, p.packet_id),
+            PubRec(p) => ack(buffer, 0x50, p.packet_id),
+            PubRel(p) => ack(buffer, 0x62, p.packet_id),
+            PubComp(p) => ack(buffer, 0x70, p.packet_id),
             p => p.encode(buffer),
         }
     }
@@ -395,6 +405,18 @@ mod tests {
         ];
         let mut buffer = BytesMut::from(&wire[..]);
         assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+    }
+
+    #[test]
+    fn test_v3_acks_carry_only_the_packet_id() {
+        let packet = ControlPacket::PubRel(pubrel::PubRelPacket {
+            packet_id: 7,
+            reason: ReasonCode::PacketIdentifierNotFound,
+            properties: None,
+        });
+        let mut encoded = BytesMut::new();
+        packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
+        assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
     }
 
     #[test]
