@@ -9,13 +9,9 @@ homepage = "https://frenzox.github.io/mercurio/"
 keywords = ["mqtt", "mqtt5", "client", "iot", "tokio"]
 categories = ["network-programming", "asynchronous"]
 
-[features]
-default = ["std"]
-std = ["mercurio-core/std", "mercurio-packets/std"]
-
 [dependencies]
-mercurio-core = { path = "../mercurio-core", version = "0.1.0", default-features = false }
-mercurio-packets = { path = "../mercurio-packets", version = "0.1.0", default-features = false }
+mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
+mercurio-packets = { path = "../mercurio-packets", version = "0.1.0" }
 
 bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
