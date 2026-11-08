@@ -297,7 +297,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let session_state = SessionState {
             client_id: client_id.clone(),
             subscriptions,
-            clean_start: false,
             expiry_interval,
             expires_at: None,
             owner,
@@ -838,7 +837,6 @@ mod tests {
                 &SessionState {
                     client_id: "c".to_string(),
                     subscriptions: vec![],
-                    clean_start: false,
                     expiry_interval: None,
                     expires_at: None,
                     owner: Default::default(),
@@ -904,7 +902,6 @@ mod tests {
                     &SessionState {
                         client_id: client_id.to_string(),
                         subscriptions: vec![],
-                        clean_start: false,
                         expiry_interval: expires_at.map(|_| 60),
                         expires_at,
                         owner: SessionOwner::default(),
@@ -942,7 +939,6 @@ mod tests {
                 &SessionState {
                     client_id: client_id.to_string(),
                     subscriptions: vec![],
-                    clean_start: false,
                     expiry_interval: Some(expiry),
                     expires_at: None,
                     owner: Default::default(),
@@ -1043,7 +1039,6 @@ mod tests {
         let session_state = SessionState {
             client_id: "client1".to_string(),
             subscriptions: vec![StoredSubscription::new("topic/a", QoS::AtLeastOnce)],
-            clean_start: false,
             expiry_interval: None,
             expires_at: None,
             owner: Default::default(),
@@ -1106,7 +1101,6 @@ mod tests {
         let session_state = SessionState {
             client_id: "client1".to_string(),
             subscriptions: vec![],
-            clean_start: false,
             expiry_interval: None,
             expires_at: None,
             owner: Default::default(),
@@ -1247,7 +1241,6 @@ mod tests {
                 &SessionState {
                     client_id: "gw-01".into(),
                     subscriptions: vec![StoredSubscription::new("alice/#", QoS::AtMostOnce)],
-                    clean_start: false,
                     expiry_interval: None,
                     expires_at: None,
                     owner: owned_by("alice"),

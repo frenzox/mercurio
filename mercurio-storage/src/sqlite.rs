@@ -226,7 +226,8 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 params![
                     client_id,
                     encode_subscriptions(&session.subscriptions),
-                    session.clean_start,
+                    // No longer used; kept for databases that require it
+                    false,
                     session.expiry_interval,
                     session.expires_at.map(|t| t as i64),
                     session.owner.username,
@@ -395,7 +396,6 @@ impl SessionStore for SqliteStore {
                     Ok(SessionState {
                         client_id: client_id.clone(),
                         subscriptions: decode_subscriptions(&subs),
-                        clean_start: row.get(1)?,
                         expiry_interval: row.get(2)?,
                         expires_at: row.get::<_, Option<i64>>(3)?.map(|t| t as u64),
                         owner: SessionOwner {
@@ -935,7 +935,6 @@ mod tests {
                     ..StoredSubscription::new("topic/+:x", QoS::ExactlyOnce)
                 },
             ],
-            clean_start: false,
             expiry_interval: Some(60),
             expires_at: Some(1_700_000_000_000),
             owner: SessionOwner {
@@ -1109,7 +1108,6 @@ mod tests {
             let session = SessionState {
                 client_id: "persistent_client".to_string(),
                 subscriptions: vec![StoredSubscription::new("topic/test", QoS::AtMostOnce)],
-                clean_start: false,
                 expiry_interval: None,
                 expires_at: None,
                 owner: Default::default(),

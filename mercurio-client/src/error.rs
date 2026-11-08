@@ -8,21 +8,31 @@ pub enum ClientError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The connection couldn't be opened, or the broker closed it before
+    /// answering CONNECT.
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
 
+    /// The broker answered CONNECT with this failure, such as bad
+    /// credentials. Reconnecting doesn't retry after it.
     #[error("Connection refused: {0:?}")]
     ConnectionRefused(ReasonCode),
 
+    /// The broker refused the connection and named another server to use
+    /// instead, `reason` saying whether the move is for good.
     #[error("Connection refused ({reason:?}), use {server_reference} instead")]
     Redirected {
         reason: ReasonCode,
         server_reference: String,
     },
 
+    /// A packet the client was to send exceeds the Maximum Packet Size
+    /// the broker announced; nothing was sent.
     #[error("Packet larger than the broker accepts")]
     PacketTooLarge,
 
+    /// The broker announced it lacks what the request needs: a QoS above
+    /// its maximum, retained messages, or subscription identifiers.
     #[error("Not supported by the broker: {0}")]
     NotSupported(&'static str),
 
@@ -31,38 +41,42 @@ pub enum ClientError {
     #[error("Broker violated the protocol: {0:?}")]
     BrokerViolation(ReasonCode),
 
+    /// The enhanced authentication exchange failed, on the client's side
+    /// or the broker's.
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// The broker answered a QoS 1 or 2 publish with this failure, such as
+    /// Not Authorized; the message wasn't accepted.
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 
-    #[error("Not connected")]
-    NotConnected,
-
-    #[error("Already connected")]
-    AlreadyConnected,
-
+    /// The broker sent a packet the client didn't expect at that point.
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// A packet from the broker couldn't be decoded.
     #[error("Packet error: {0}")]
     Packet(#[from] mercurio_core::error::Error),
 
+    /// Connecting took longer than `connect_timeout`.
     #[error("Timeout")]
     Timeout,
 
+    /// The connection ended before the request completed, or a QoS 0
+    /// publish was made while disconnected; QoS 1 and 2 publishes wait for
+    /// the reconnection instead.
     #[error("Client disconnected")]
     Disconnected,
 
-    #[error("Invalid topic: {0}")]
-    InvalidTopic(String),
-
+    /// The client has stopped for good, so the request couldn't be sent.
     #[error("Send error")]
     SendError,
 
+    /// The TLS configuration couldn't be used, or the handshake failed.
     #[error("TLS error: {0}")]
     Tls(String),
 }
 
+/// The client's result type.
 pub type Result<T> = std::result::Result<T, ClientError>;
