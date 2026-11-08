@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For a command-line client built on this library, see
 [`recado`](https://crates.io/crates/recado). The
-[client guide](https://github.com/frenzox/mercurio/blob/master/docs/client.html)
+[client guide](https://frenzox.github.io/mercurio/client.html)
 covers every option.
 
 ## License

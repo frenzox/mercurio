@@ -5,6 +5,7 @@ edition = "2021"
 description = "MQTT command-line client for publishing and subscribing, from the Mercurio project"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frenzox/mercurio"
+homepage = "https://frenzox.github.io/mercurio/"
 keywords = ["mqtt", "mqtt5", "cli", "iot", "pubsub"]
 categories = ["command-line-utilities", "network-programming"]
 

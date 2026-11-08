@@ -30,7 +30,7 @@ It supports:
   topic aliases, message expiry and `$SYS` statistics.
 - In-process client connections, without TCP.
 
-The [embedding guide](https://github.com/frenzox/mercurio/blob/master/docs/embedding.html)
+The [embedding guide](https://frenzox.github.io/mercurio/embedding.html)
 covers each of these with examples.
 
 ## License
