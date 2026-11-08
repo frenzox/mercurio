@@ -129,6 +129,18 @@ pub enum Event {
     SessionExpired { client_id: String },
 }
 
+impl Event {
+    fn kind(&self) -> &'static str {
+        match self {
+            Event::Connected { .. } => "Connected",
+            Event::Disconnected { .. } => "Disconnected",
+            Event::Subscribed { .. } => "Subscribed",
+            Event::Unsubscribed { .. } => "Unsubscribed",
+            Event::SessionExpired { .. } => "SessionExpired",
+        }
+    }
+}
+
 /// Result of an authentication step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -207,6 +219,9 @@ pub trait Plugin: Send + Sync + 'static {
     /// expiry is reported separately: it may interleave with the events of
     /// other connections, run concurrently with them, and isn't ordered
     /// relative to the `Disconnected` of the same client.
+    ///
+    /// Events wait in a bounded queue; when plugins can't keep up with
+    /// them, new events are dropped.
     fn on_event<'a>(&'a self, _event: &'a Event) -> BoxFuture<'a, ()> {
         ready(())
     }
@@ -271,9 +286,20 @@ pub(crate) struct Chain {
     /// In-process connections: every topic is allowed, `$SYS` and
     /// `$CONTROL` included, and nothing is authenticated
     trusted: bool,
+    /// Shared by the clones of a chain.
+    events: Arc<Events>,
+}
+
+/// How many events may wait for the plugins before new ones are dropped.
+const EVENT_QUEUE: usize = 10_000;
+
+#[derive(Default)]
+struct Events {
     /// Feeds the task that hands events to the plugins, started by the
-    /// first event. Shared by the clones of a chain.
-    events: Arc<std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Event>>>,
+    /// first event.
+    sender: std::sync::OnceLock<tokio::sync::mpsc::Sender<Event>>,
+    /// Whether the last event was dropped, so a run of drops is logged once
+    dropping: std::sync::atomic::AtomicBool,
 }
 
 impl Chain {
@@ -392,13 +418,11 @@ impl Chain {
         if self.plugins.is_empty() {
             return;
         }
-        let sender = self.events.get_or_init(|| {
+        let sender = self.events.sender.get_or_init(|| {
             // One task per chain hands events to the plugins in the order
-            // they happened
-            // ponytail: unbounded, so a plugin slower than the event rate
-            // grows the queue; bound it and drop events if that becomes a
-            // problem
-            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Event>();
+            // they happened. The queue is bounded, so plugins slower than
+            // the event rate lose events instead of growing it without end.
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(EVENT_QUEUE);
             let (plugins, timeout) = (Arc::clone(&self.plugins), self.timeout);
             tokio::spawn(async move {
                 while let Some(event) = receiver.recv().await {
@@ -412,7 +436,19 @@ impl Chain {
             });
             sender
         });
-        let _ = sender.send(event);
+        use std::sync::atomic::Ordering::Relaxed;
+        match sender.try_send(event) {
+            Ok(()) => self.events.dropping.store(false, Relaxed),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                if !self.events.dropping.swap(true, Relaxed) {
+                    warn!(
+                        "Plugins can't keep up with events; dropping them, from a {} event",
+                        event.kind()
+                    );
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     pub(crate) async fn control(
@@ -653,6 +689,23 @@ mod tests {
         assert_eq!(counter.wait_for(1).await, 1);
         chain.emit(expired("b"));
         assert_eq!(counter.wait_for(2).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_events_beyond_the_queue_are_dropped() {
+        let counter = Arc::new(Counter::default());
+        let chain = chain(vec![counter.clone()]);
+        // The current-thread runtime runs the event task only once this
+        // test yields, so the queue fills up first
+        for _ in 0..EVENT_QUEUE + 5 {
+            chain.emit(expired("a"));
+        }
+        assert_eq!(counter.wait_for(EVENT_QUEUE).await, EVENT_QUEUE);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::Relaxed),
+            EVENT_QUEUE
+        );
     }
 
     #[tokio::test]
