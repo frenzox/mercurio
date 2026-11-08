@@ -30,6 +30,7 @@
 </ul>
 <h2>Guides</h2>
 <ul>
+<li><a href="plugins.html">WebAssembly plugins</a></li>
 <li><a href="migrating.html">Migrating from mosquitto</a></li>
 </ul>
 </nav>
@@ -95,7 +96,7 @@ config.listeners.push(tls_listener);</pre>
 <p>One <code>Plugin</code> trait covers authentication, MQTT 5 enhanced authentication, topic access control, message hooks, lifecycle events, periodic work and <code>$CONTROL</code> commands. A plugin implements the hooks it needs; every other one does nothing. The broker runs its plugins as a chain, in the order configured:</p>
 <ul>
 <li><code>Plugin::authenticate</code> and <code>Plugin::authorize</code>: the first <code>Decision::Allow</code> or <code>Decision::Deny</code> decides, and <code>Decision::Defer</code> asks the next plugin. When every plugin defers, a client with credentials is refused, an anonymous one follows <code>allow_anonymous</code>, and access is allowed, except publishing to <code>$CONTROL</code>, which needs an explicit <code>Allow</code>.</li>
-<li><code>Plugin::on_message</code>: every plugin, each seeing the changes of the ones before; the first <code>MessageAction::Drop</code> drops the message. Changes are trusted: a new topic isn't checked against access control, and a changed <code>retain</code> or <code>qos</code> isn't checked against the retain and QoS limits.</li>
+<li><code>Plugin::on_message</code>: every plugin, each seeing the changes of the ones before; the first <code>MessageAction::Drop</code> drops the message. Changes are trusted: a new topic isn't checked against access control, and a changed <code>retain</code> or <code>qos</code> isn't checked against the retain and QoS limits. The exception is a message moved to a different topic that starts with <code>$</code>, such as <code>$SYS/...</code> or <code>$CONTROL/...</code>: it is dropped, still acknowledged, with a warning in the log.</li>
 <li><code>Plugin::on_event</code> and <code>Plugin::on_tick</code>: every plugin.</li>
 </ul>
 <p>Each hook call has a time limit, <code>ServerConfig::plugin_timeout</code>. A hook that runs out of time or panics denies, for authentication and access control, and drops, for messages. A listener can have its own chain in <code>ListenerConfig::plugins</code>; <code>ListenerConfig::auth</code> only sets <code>require_auth</code> and <code>allow_anonymous</code> for it.</p>
@@ -153,7 +154,7 @@ config.plugins = vec![Arc::new(OwnTopics)];</pre>
 </ul>
 
 <h3>Enhanced authentication</h3>
-<p>A plugin takes part in MQTT 5 enhanced authentication by returning an <code>AuthExchange</code> from <code>Plugin::begin_auth</code> for the methods it knows. The broker calls <code>step</code> once per message from the client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. <code>auth::PlainAuth</code> is a complete example: add it to <code>ServerConfig::plugins</code> to accept the <code>PLAIN</code> method.</p>
+<p>A plugin takes part in MQTT 5 enhanced authentication by returning an <code>AuthExchange</code> from <code>Plugin::begin_auth</code> for the methods it knows. <code>begin_auth</code> gets the client: during CONNECT its user name is the one the client claims, if any; on re-authentication it is the verified user. The broker calls <code>step</code> once per message from the client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. <code>auth::PlainAuth</code> is a complete example: add it to <code>ServerConfig::plugins</code> to accept the <code>PLAIN</code> method.</p>
 
 <h2>Storage</h2>
 <pre>use std::sync::Arc;

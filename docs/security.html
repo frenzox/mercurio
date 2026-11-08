@@ -30,6 +30,7 @@
 </ul>
 <h2>Guides</h2>
 <ul>
+<li><a href="plugins.html">WebAssembly plugins</a></li>
 <li><a href="migrating.html">Migrating from mosquitto</a></li>
 </ul>
 </nav>
@@ -220,6 +221,9 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <li>If a file fails to load, the broker logs the error and keeps the previous version, so a typo never locks everyone out.</li>
 <li>Other settings need a restart.</li>
 </ul>
+
+<h2 id="plugin-sandbox">Plugin sandbox</h2>
+<p>WebAssembly plugins run with no files, no environment and no network, except the HTTP hosts and socket addresses listed in <code>allow_http</code> and <code>allow_sockets</code>. Their standard output and error are discarded; they log through the broker, and a Rust plugin's panic messages are logged at error level. Each call has a time limit and each copy a memory limit. A plugin that fails or runs out of time denies, for authentication and access control, and drops, for messages. See <a href="plugins.html#sandbox">WebAssembly plugins</a>.</p>
 
 <h2 id="per-listener">Per-listener authentication</h2>
 <p>A listener can have its own <code>[listeners.auth]</code>, replacing <code>[auth]</code> for its clients: for example, open access on a localhost listener and passwords on the public one. See <a href="listeners.html#auth">Listeners</a>.</p>

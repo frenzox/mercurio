@@ -1,6 +1,8 @@
 //! Configuration file handling for mercuriod.
 
 use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -36,6 +38,11 @@ pub struct Config {
     /// Connections to other brokers that topics are forwarded through
     #[serde(default)]
     pub bridges: Vec<BridgeConfig>,
+
+    /// WebAssembly plugins, run in this order after the built-in
+    /// authentication and access control
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
 
     /// Directory of extra `*.toml` files merged into this configuration
     pub include_dir: Option<String>,
@@ -179,6 +186,70 @@ pub struct ListenerConfig {
     /// Authentication and access control for this listener's clients,
     /// replacing `[auth]`
     pub auth: Option<AuthConfig>,
+
+    /// Names of the `[[plugins]]` this listener's clients go through; all
+    /// of them when unset
+    pub plugins: Option<Vec<String>>,
+}
+
+/// A WebAssembly plugin, run after the built-in authentication and access
+/// control, in the order the tables appear. A reload on SIGHUP rereads its
+/// file; its other settings only change on restart.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+// Without WebAssembly support only the table's presence is checked
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+pub struct PluginConfig {
+    pub path: PathBuf,
+
+    /// Defaults to the file name without `.wasm`
+    pub name: Option<String>,
+
+    /// Passed to the plugin's `init`
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
+
+    /// Hosts it may send HTTP requests to, `host` (HTTPS) or `host:port`
+    #[serde(default)]
+    pub allow_http: Vec<String>,
+
+    /// Addresses it may open sockets to, `address:port`
+    #[serde(default)]
+    pub allow_sockets: Vec<String>,
+
+    /// Copies run at once; defaults to the number of CPUs
+    pub instances: Option<usize>,
+
+    /// Longest one call may run; defaults to `plugin_timeout`'s 5 seconds
+    pub timeout_ms: Option<u64>,
+
+    /// Memory each copy may use
+    #[serde(default = "default_plugin_memory_mb")]
+    pub memory_mb: usize,
+}
+
+impl PluginConfig {
+    pub fn name(&self) -> Cow<'_, str> {
+        match &self.name {
+            Some(name) => name.into(),
+            None => self.path.file_stem().unwrap_or_default().to_string_lossy(),
+        }
+    }
+}
+
+/// The names of the broker's own plugins, which `$CONTROL/<name>/...`
+/// topics and logs already use.
+const BUILT_IN_PLUGINS: [&str; 6] = [
+    "dynamic-security",
+    "password-file",
+    "http-auth",
+    "acl-file",
+    "plain",
+    "credentials",
+];
+
+fn default_plugin_memory_mb() -> usize {
+    64
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -256,6 +327,35 @@ impl Config {
                         "mount_point `{mount_point}` must end with `/`, or its clients reach the topics of every mount point it is a prefix of"
                     ));
                 }
+            }
+        }
+        let mut names = HashSet::new();
+        for plugin in &self.plugins {
+            let name = plugin.name();
+            // The name is a topic level of `$CONTROL/<name>/...`
+            if name.is_empty() || name.contains(['/', '+', '#']) {
+                return Err(format!(
+                    "[[plugins]] name `{name}` must be a non-empty topic level, without `/`, `+` or `#`"
+                ));
+            }
+            if BUILT_IN_PLUGINS.contains(&&*name) {
+                return Err(format!(
+                    "[[plugins]] name `{name}` is taken by a built-in plugin; set a different `name`"
+                ));
+            }
+            if !names.insert(name.clone()) {
+                return Err(format!(
+                    "Two [[plugins]] are named `{name}`; give one a different `name`"
+                ));
+            }
+        }
+        for name in self
+            .listeners
+            .iter()
+            .flat_map(|l| l.plugins.iter().flatten())
+        {
+            if !names.contains(name.as_str()) {
+                return Err(format!("No [[plugins]] entry is named `{name}`"));
             }
         }
         Ok(())
@@ -795,6 +895,85 @@ mod tests {
         };
         assert!(config("tenantA").check().is_err());
         assert!(config("tenantA/").check().is_ok());
+    }
+
+    #[test]
+    fn test_parse_plugins() {
+        let config: Config = toml::from_str(
+            r#"
+            [[plugins]]
+            path = "/etc/mercurio/plugins/audit.wasm"
+            config = { webhook = "https://audit.example.com/mqtt" }
+            allow_http = ["audit.example.com"]
+            allow_sockets = ["10.0.0.5:5432"]
+            instances = 4
+            timeout_ms = 500
+            memory_mb = 32
+
+            [[plugins]]
+            path = "deny.wasm"
+            name = "deny"
+
+            [[listeners]]
+            port = 1884
+            plugins = ["deny"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.plugins.len(), 2);
+        assert_eq!(config.plugins[0].name(), "audit");
+        assert_eq!(config.plugins[0].instances, Some(4));
+        assert_eq!(config.plugins[1].name(), "deny");
+        assert_eq!(
+            config.listeners[0].plugins.as_deref(),
+            Some(&["deny".to_string()][..])
+        );
+        assert!(config.check().is_ok());
+    }
+
+    #[test]
+    fn test_plugin_config_values_are_strings() {
+        let error =
+            toml::from_str::<Config>("[[plugins]]\npath = \"a.wasm\"\nconfig = { retries = 3 }\n")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("retries"), "{error}");
+    }
+
+    #[test]
+    fn test_plugin_names_must_be_unique_and_known() {
+        let config = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        let duplicate =
+            config("[[plugins]]\npath = \"a/deny.wasm\"\n[[plugins]]\npath = \"b/deny.wasm\"\n");
+        assert!(duplicate.check().unwrap_err().contains("`deny`"));
+        let unknown = config("[[plugins]]\npath = \"deny.wasm\"\n[[listeners]]\nport = 1884\nplugins = [\"audit\"]\n");
+        assert!(unknown.check().unwrap_err().contains("`audit`"));
+    }
+
+    #[test]
+    fn test_plugin_names_must_be_usable_in_topics_and_not_built_in() {
+        let named = |name: &str| -> Config {
+            toml::from_str(&format!(
+                "[[plugins]]\npath = \"a.wasm\"\nname = \"{name}\"\n"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "",
+            "a/b",
+            "a+",
+            "#",
+            "dynamic-security",
+            "acl-file",
+            "plain",
+        ] {
+            let error = named(bad).check().unwrap_err();
+            assert!(error.contains(&format!("`{bad}`")), "{bad}: {error}");
+        }
+        assert!(named("audit").check().is_ok());
+        // A file name counts as the name too
+        let file: Config = toml::from_str("[[plugins]]\npath = \"http-auth.wasm\"\n").unwrap();
+        assert!(file.check().is_err());
     }
 
     #[test]

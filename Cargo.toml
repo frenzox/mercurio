@@ -7,8 +7,10 @@ members = [
     "mercurio-packets",
     "mercurio-server",
     "mercurio-storage",
+    "mercurio-plugin",
     "mercuriod",
 ]
+exclude = ["examples/plugins", "mercuriod/test-plugins"]
 
 [profile.release]
 debug = true  # Enable debug symbols for profiling

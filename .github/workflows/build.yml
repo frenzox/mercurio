@@ -23,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -32,6 +33,11 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # Not workspace members: they build only for wasm32
+      - name: Format the example plugins
+        run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo fmt --manifest-path "$p/Cargo.toml" -- --check; done
+      - name: Lint the example plugins
+        run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo clippy --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins -- -D warnings; done
 
   # The oldest Rust the crates declare they build with, rust-version
   msrv:
@@ -41,7 +47,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - name: Check with the minimum supported Rust
-        run: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features --exclude mercuriod
+
+  # mercuriod follows wasmtime, which needs a recent Rust
+  msrv-mercuriod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+      - uses: Swatinem/rust-cache@v2
+      - name: Check mercuriod with its minimum supported Rust
+        run: cargo check -p mercuriod --all-features
 
   # The workspace build lends crates each other's features; release-plz and
   # crates.io build each crate on its own
@@ -69,7 +85,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
+      - name: Build the example plugins
+        run: for p in examples/plugins/*/; do cargo build --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins; done
       - name: Test
         run: cargo test --workspace --all-features
         env:

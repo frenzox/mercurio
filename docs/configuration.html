@@ -30,6 +30,7 @@
 </ul>
 <h2>Guides</h2>
 <ul>
+<li><a href="plugins.html">WebAssembly plugins</a></li>
 <li><a href="migrating.html">Migrating from mosquitto</a></li>
 </ul>
 </nav>
@@ -176,6 +177,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>max_connections</code></td><td></td><td>Concurrent connections on this listener, on top of the broker-wide limit.</td></tr>
 <tr><td><code>bind_interface</code></td><td></td><td>Only accept connections arriving on this interface. Linux only.</td></tr>
 <tr><td><code>[listeners.tls]</code></td><td></td><td>Same options as <code>[server.tls]</code>.</td></tr>
+<tr><td><code>plugins</code></td><td>all</td><td>Names of the <code>[[plugins]]</code> this listener's clients go through, such as <code>["deny"]</code>. An unknown name is an error.</td></tr>
 <tr><td><code>[listeners.auth]</code></td><td></td><td>Same options as <code>[auth]</code>, except <code>dynamic_security</code>. Replaces <code>[auth]</code> for this listener.</td></tr>
 </table>
 
@@ -201,6 +203,21 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>local_prefix</code></td><td><code>""</code></td><td>Where <code>pattern</code> sits on this broker.</td></tr>
 <tr><td><code>remote_prefix</code></td><td><code>""</code></td><td>Where <code>pattern</code> sits on the remote broker.</td></tr>
 </table>
+<h2 id="plugins">[[plugins]]</h2>
+<p>Each entry loads a WebAssembly plugin, run in the order written, after the built-in authentication and access control. See <a href="plugins.html">WebAssembly plugins</a>. Two plugins can't have the same name.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>path</code></td><td>required</td><td>The component, a <code>.wasm</code> file. SIGHUP rereads it.</td></tr>
+<tr><td><code>name</code></td><td>file name without <code>.wasm</code></td><td>Names the plugin in logs, in <code>$CONTROL/&lt;name&gt;/...</code> and in listener <code>plugins</code>. It can't be empty, contain <code>/</code>, <code>+</code> or <code>#</code>, or be the name of a built-in plugin: <code>dynamic-security</code>, <code>password-file</code>, <code>http-auth</code>, <code>acl-file</code>, <code>plain</code> or <code>credentials</code>.</td></tr>
+<tr><td><code>config</code></td><td><code>{}</code></td><td>Table of strings passed to the plugin's <code>init</code>.</td></tr>
+<tr><td><code>allow_http</code></td><td><code>[]</code></td><td>Hosts it may send HTTP requests to, as <code>"host"</code> (port 443) or <code>"host:port"</code>. The scheme isn't checked, so a plain-HTTP endpoint on the default port needs <code>"host:80"</code>.</td></tr>
+<tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may open sockets to, as <code>"address:port"</code>.</td></tr>
+<tr><td><code>instances</code></td><td>number of CPUs</td><td>Copies that run calls at once.</td></tr>
+<tr><td><code>timeout_ms</code></td><td><code>5000</code></td><td>Longest one call, or <code>init</code>, may run. A hook call is also bound by the broker's own 5-second limit, so for hooks a larger value acts as 5000; <code>init</code> at load gets the full value.</td></tr>
+<tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Memory each copy may use.</td></tr>
+</table>
+<p>Only the file at <code>path</code> is reread on SIGHUP; other changes need a restart.</p>
+
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>
 </body>

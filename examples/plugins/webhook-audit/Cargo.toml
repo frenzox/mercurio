@@ -1,0 +1,15 @@
+[package]
+name = "webhook-audit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mercurio-plugin = { path = "../../../mercurio-plugin" }
+wasip2 = "2.0.1"
+
+[profile.release]
+opt-level = "s"

@@ -31,6 +31,8 @@ mod http_auth;
 mod reload;
 #[cfg(unix)]
 mod syslog;
+#[cfg(feature = "wasm")]
+mod wasm;
 
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
@@ -279,6 +281,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .collect();
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
+    let (auth_config, builtins) = build_auth(&config.auth, &mut reloadable, true)?;
+    let wasm = load_plugins(&config.plugins, &mut reloadable).await?;
+    // Listeners naming plugins share these copies of `[auth]`'s built-ins
+    // and of the plugins with the broker's chain
+    let chain = |builtins: &[Arc<dyn Plugin>], names: Option<&[String]>| {
+        let named = wasm
+            .iter()
+            .filter(|(name, _)| names.is_none_or(|names| names.contains(name)))
+            .map(|(_, plugin)| Arc::clone(plugin));
+        builtins.iter().cloned().chain(named).collect::<Vec<_>>()
+    };
     for extra in &config.listeners {
         let (listener, addr) = bind_listener(extra).await?;
         info!(
@@ -299,17 +312,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             value.mount_point = extra.mount_point.clone();
             value.max_connections = extra.max_connections;
             value.http_dir = extra.http_dir.clone().map(Into::into);
+            let names = extra.plugins.as_deref();
             if let Some(auth) = &extra.auth {
                 let (auth, plugins) = build_auth(auth, &mut reloadable, false)?;
                 value.auth = Some(auth);
-                value.plugins = Some(plugins);
+                value.plugins = Some(chain(&plugins, names));
+            } else if names.is_some() {
+                value.plugins = Some(chain(&builtins, names));
             }
             value
         });
     }
 
     let (connector, local_listener) = LocalConnector::new();
-    let (auth_config, plugins) = build_auth(&config.auth, &mut reloadable, true)?;
+    let plugins = chain(&builtins, None);
 
     for bridge in config.bridges {
         info!("Starting bridge {}", bridge.name);
@@ -506,8 +522,67 @@ fn build_auth(
     Ok((value, plugins))
 }
 
-/// Rereads the ACL and password files on SIGHUP. ACL changes apply to every
-/// later publish and subscribe; password changes apply to later connections.
+/// Loads the `[[plugins]]` in order, with their names, adding each to
+/// `reloadable`.
+#[cfg(feature = "wasm")]
+async fn load_plugins(
+    plugins: &[config::PluginConfig],
+    reloadable: &mut Vec<Arc<dyn Reload>>,
+) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
+    if plugins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let runtime =
+        wasm::Runtime::new().map_err(|e| format!("Failed to start WebAssembly: {e:#}"))?;
+    let cpus = std::thread::available_parallelism().map_or(1, Into::into);
+    let mut loaded = Vec::new();
+    for plugin in plugins {
+        let name = plugin.name().into_owned();
+        let settings = wasm::PluginSettings {
+            name: name.clone(),
+            path: plugin.path.clone(),
+            config: plugin.config.clone().into_iter().collect(),
+            allow_http: plugin.allow_http.clone(),
+            allow_sockets: plugin.allow_sockets.clone(),
+            instances: plugin.instances.unwrap_or(cpus),
+            timeout: plugin.timeout_ms.map_or(
+                ServerConfig::default().plugin_timeout,
+                Duration::from_millis,
+            ),
+            memory: plugin.memory_mb << 20,
+        };
+        let loaded_plugin = wasm::WasmPlugin::load(&runtime, settings)
+            .await
+            .map_err(|e| format!("Failed to load plugin `{name}`: {e:#}"))?;
+        info!("Loaded plugin `{}` from {}", name, plugin.path.display());
+        reloadable.push(Arc::new(wasm::Reloader::new(
+            Arc::clone(&loaded_plugin),
+            runtime.clone(),
+        )));
+        loaded.push((name, loaded_plugin as Arc<dyn Plugin>));
+    }
+    Ok(loaded)
+}
+
+#[cfg(not(feature = "wasm"))]
+async fn load_plugins(
+    plugins: &[config::PluginConfig],
+    _reloadable: &mut Vec<Arc<dyn Reload>>,
+) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
+    if plugins.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err(
+            "[[plugins]] is configured, but this mercuriod was built without \
+             WebAssembly plugin support"
+                .to_string(),
+        )
+    }
+}
+
+/// Rereads the ACL and password files and the WebAssembly plugins on
+/// SIGHUP. ACL and plugin changes apply to every later check or call;
+/// password changes apply to later connections.
 #[cfg(unix)]
 async fn reload_on_sighup(files: Vec<Arc<dyn Reload>>) {
     let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())

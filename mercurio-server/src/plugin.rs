@@ -95,7 +95,8 @@ impl<'a> Credentials<'a> {
 /// A message a client published, as [`Plugin::on_message`] may change it.
 /// The changes are trusted: a new topic isn't checked against access
 /// control, and a changed `retain` or `qos` isn't checked against the
-/// retain and QoS limits.
+/// retain and QoS limits. A message moved to a different topic starting
+/// with `$` is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PluginMessage {
@@ -212,9 +213,14 @@ pub trait Plugin: Send + Sync + 'static {
         ready(Decision::Defer)
     }
 
-    /// Starts MQTT 5 enhanced authentication with `method`, if the plugin
-    /// implements it.
-    fn begin_auth(&self, _method: &str) -> Option<Box<dyn AuthExchange>> {
+    /// Starts MQTT 5 enhanced authentication of `client` with `method`, if
+    /// the plugin implements it.
+    ///
+    /// During CONNECT, `client.username` is the user name the client
+    /// claims, if any, and `client.client_id` is empty when the server is
+    /// to assign one. When a connected client re-authenticates, they are
+    /// its client identifier and verified user.
+    fn begin_auth(&self, _client: &ClientInfo, _method: &str) -> Option<Box<dyn AuthExchange>> {
         None
     }
 
@@ -235,7 +241,9 @@ pub trait Plugin: Send + Sync + 'static {
     ///
     /// Changes are trusted: a new topic isn't checked against access
     /// control, and a changed `retain` or `qos` isn't checked against the
-    /// retain and QoS limits.
+    /// retain and QoS limits. The one exception is a topic changed to one
+    /// starting with `$`, such as `$SYS/...` or `$CONTROL/...`: the broker
+    /// drops such a message, still acknowledging it, and logs a warning.
     ///
     /// Will messages aren't passed to this hook.
     fn on_message<'a>(
@@ -367,6 +375,12 @@ impl Chain {
         self.plugins.is_empty()
     }
 
+    /// The plugins' names, for logs: `a, b`.
+    pub(crate) fn names(&self) -> String {
+        let names: Vec<&str> = self.plugins.iter().map(|p| p.name()).collect();
+        names.join(", ")
+    }
+
     pub(crate) async fn authenticate(
         &self,
         client: &ClientInfo,
@@ -386,13 +400,14 @@ impl Chain {
         Decision::Defer
     }
 
-    pub(crate) fn begin_auth(&self, method: &str) -> Option<Exchange> {
+    pub(crate) fn begin_auth(&self, client: &ClientInfo, method: &str) -> Option<Exchange> {
         self.plugins.iter().find_map(|plugin| {
-            let steps = std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(method)))
-                .unwrap_or_else(|_| {
-                    error!("Plugin `{}` panicked in begin_auth", plugin.name());
-                    None
-                })?;
+            let steps =
+                std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(client, method)))
+                    .unwrap_or_else(|_| {
+                        error!("Plugin `{}` panicked in begin_auth", plugin.name());
+                        None
+                    })?;
             Some(Exchange {
                 plugin: Arc::clone(plugin),
                 steps,
@@ -663,7 +678,7 @@ mod tests {
             "panics-at-once"
         }
 
-        fn begin_auth(&self, _: &str) -> Option<Box<dyn AuthExchange>> {
+        fn begin_auth(&self, _: &ClientInfo, _: &str) -> Option<Box<dyn AuthExchange>> {
             panic!("broken plugin")
         }
 
@@ -721,7 +736,7 @@ mod tests {
             panics.authorize(&client(), "t", Access::Read).await,
             Decision::Deny
         );
-        assert!(panics.begin_auth("PLAIN").is_none());
+        assert!(panics.begin_auth(&client(), "PLAIN").is_none());
     }
 
     #[tokio::test]

@@ -316,3 +316,61 @@ async fn plugins_tick() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(echo.0.load(std::sync::atomic::Ordering::Relaxed) >= 3);
 }
+
+/// Moves messages to the topic in their payload, and counts the control
+/// requests it gets.
+#[derive(Default)]
+struct Redirect(std::sync::atomic::AtomicU32);
+
+impl Plugin for Redirect {
+    fn name(&self) -> &str {
+        "x"
+    }
+
+    fn on_message<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        message: &'a mut PluginMessage,
+    ) -> BoxFuture<'a, MessageAction> {
+        message.topic = String::from_utf8_lossy(&message.payload).into_owned();
+        ready(MessageAction::Continue)
+    }
+
+    fn on_control<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a str,
+        _: Bytes,
+    ) -> BoxFuture<'a, Option<Bytes>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ready(Some(Bytes::from_static(b"done")))
+    }
+}
+
+#[tokio::test]
+async fn message_hook_cant_move_messages_to_reserved_topics() {
+    let redirect = Arc::new(Redirect::default());
+    let addr = start_broker(vec![redirect.clone()]).await;
+    let mut subscriber = Client::connect(addr, "sub").await;
+    subscriber.subscribe("$CONTROL/x/#").await;
+    subscriber.subscribe("$SYS/x").await;
+    subscriber.subscribe("plain/#").await;
+    let mut publisher = Client::connect(addr, "pub").await;
+
+    // Dropped, yet acknowledged as accepted
+    assert_eq!(
+        publisher.publish("a", b"$CONTROL/x/v1").await,
+        ReasonCode::Success
+    );
+    assert_eq!(publisher.publish("a", b"$SYS/x").await, ReasonCode::Success);
+    assert_eq!(
+        publisher.publish("a", b"plain/x").await,
+        ReasonCode::Success
+    );
+    let Some(ControlPacket::Publish(delivered)) = subscriber.receive().await else {
+        panic!("Expected the message moved to a plain topic");
+    };
+    assert_eq!(delivered.topic_name, "plain/x");
+    assert!(subscriber.receive().await.is_none());
+    assert_eq!(redirect.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}

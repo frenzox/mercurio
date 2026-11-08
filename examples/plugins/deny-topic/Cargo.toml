@@ -1,0 +1,14 @@
+[package]
+name = "deny-topic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mercurio-plugin = { path = "../../../mercurio-plugin" }
+
+[profile.release]
+opt-level = "s"
