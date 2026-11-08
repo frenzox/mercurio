@@ -120,11 +120,11 @@ impl Plugin for OwnTopics {
         credentials: &amp;'a Credentials&lt;'a&gt;,
     ) -&gt; BoxFuture&lt;'a, Decision&gt; {
         // A real plugin would check a database here, and could await it
-        ready(if credentials.password == b"secret" {
-            Decision::Allow
-        } else {
-            Decision::Deny
-        })
+        let known = matches!(
+            (credentials.username, credentials.password),
+            ("alice", b"alice-secret") | ("bob", b"bob-secret")
+        );
+        ready(if known { Decision::Allow } else { Decision::Deny })
     }
 
     fn authorize&lt;'a&gt;(
