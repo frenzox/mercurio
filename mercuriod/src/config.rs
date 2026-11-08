@@ -237,6 +237,17 @@ impl PluginConfig {
     }
 }
 
+/// The names of the broker's own plugins, which `$CONTROL/<name>/...`
+/// topics and logs already use.
+const BUILT_IN_PLUGINS: [&str; 6] = [
+    "dynamic-security",
+    "password-file",
+    "http-auth",
+    "acl-file",
+    "plain",
+    "credentials",
+];
+
 fn default_plugin_memory_mb() -> usize {
     64
 }
@@ -321,6 +332,17 @@ impl Config {
         let mut names = HashSet::new();
         for plugin in &self.plugins {
             let name = plugin.name();
+            // The name is a topic level of `$CONTROL/<name>/...`
+            if name.is_empty() || name.contains(['/', '+', '#']) {
+                return Err(format!(
+                    "[[plugins]] name `{name}` must be a non-empty topic level, without `/`, `+` or `#`"
+                ));
+            }
+            if BUILT_IN_PLUGINS.contains(&&*name) {
+                return Err(format!(
+                    "[[plugins]] name `{name}` is taken by a built-in plugin; set a different `name`"
+                ));
+            }
             if !names.insert(name.clone()) {
                 return Err(format!(
                     "Two [[plugins]] are named `{name}`; give one a different `name`"
@@ -926,6 +948,32 @@ mod tests {
         assert!(duplicate.check().unwrap_err().contains("`deny`"));
         let unknown = config("[[plugins]]\npath = \"deny.wasm\"\n[[listeners]]\nport = 1884\nplugins = [\"audit\"]\n");
         assert!(unknown.check().unwrap_err().contains("`audit`"));
+    }
+
+    #[test]
+    fn test_plugin_names_must_be_usable_in_topics_and_not_built_in() {
+        let named = |name: &str| -> Config {
+            toml::from_str(&format!(
+                "[[plugins]]\npath = \"a.wasm\"\nname = \"{name}\"\n"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "",
+            "a/b",
+            "a+",
+            "#",
+            "dynamic-security",
+            "acl-file",
+            "plain",
+        ] {
+            let error = named(bad).check().unwrap_err();
+            assert!(error.contains(&format!("`{bad}`")), "{bad}: {error}");
+        }
+        assert!(named("audit").check().is_ok());
+        // A file name counts as the name too
+        let file: Config = toml::from_str("[[plugins]]\npath = \"http-auth.wasm\"\n").unwrap();
+        assert!(file.check().is_err());
     }
 
     #[test]

@@ -208,7 +208,7 @@ mount_point = "tenant1/"</pre>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>path</code></td><td>required</td><td>The component, a <code>.wasm</code> file. SIGHUP rereads it.</td></tr>
-<tr><td><code>name</code></td><td>file name without <code>.wasm</code></td><td>Names the plugin in logs, in <code>$CONTROL/&lt;name&gt;/...</code> and in listener <code>plugins</code>.</td></tr>
+<tr><td><code>name</code></td><td>file name without <code>.wasm</code></td><td>Names the plugin in logs, in <code>$CONTROL/&lt;name&gt;/...</code> and in listener <code>plugins</code>. It can't be empty, contain <code>/</code>, <code>+</code> or <code>#</code>, or be the name of a built-in plugin: <code>dynamic-security</code>, <code>password-file</code>, <code>http-auth</code>, <code>acl-file</code>, <code>plain</code> or <code>credentials</code>.</td></tr>
 <tr><td><code>config</code></td><td><code>{}</code></td><td>Table of strings passed to the plugin's <code>init</code>.</td></tr>
 <tr><td><code>allow_http</code></td><td><code>[]</code></td><td>Hosts it may send HTTP requests to, as <code>"host"</code> (port 443) or <code>"host:port"</code>. The scheme isn't checked.</td></tr>
 <tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may open sockets to, as <code>"address:port"</code>.</td></tr>
