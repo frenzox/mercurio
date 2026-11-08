@@ -92,6 +92,9 @@ impl<'a> Credentials<'a> {
 }
 
 /// A message a client published, as [`Plugin::on_message`] may change it.
+/// The changes are trusted: a new topic isn't checked against access
+/// control, and a changed `retain` or `qos` isn't checked against the
+/// retain and QoS limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PluginMessage {
@@ -155,6 +158,9 @@ pub trait Plugin: Send + Sync + 'static {
 
     /// Checks the user name and password of a CONNECT, when the broker
     /// requires authentication.
+    ///
+    /// `client.client_id` is empty when the client asked the server to
+    /// assign one, because assignment happens after authentication.
     fn authenticate<'a>(
         &'a self,
         _client: &'a ClientInfo,
@@ -182,7 +188,11 @@ pub trait Plugin: Send + Sync + 'static {
 
     /// Sees each message a client publishes, once it may publish it and
     /// before it is retained or sent on. It may change the message or
-    /// drop it; a new topic isn't checked against access control again.
+    /// drop it.
+    ///
+    /// Changes are trusted: a new topic isn't checked against access
+    /// control, and a changed `retain` or `qos` isn't checked against the
+    /// retain and QoS limits.
     fn on_message<'a>(
         &'a self,
         _client: &'a ClientInfo,
@@ -210,6 +220,10 @@ pub trait Plugin: Send + Sync + 'static {
     /// client may publish there. A response is published to
     /// `$CONTROL/<name>/<path>/response`. Such messages aren't sent on to
     /// subscribers.
+    ///
+    /// A client publishing to `$CONTROL/<name>/x/response` reaches this
+    /// hook with path `"x/response"`, so a plugin that only answers
+    /// requests should ignore such paths.
     fn on_control<'a>(
         &'a self,
         _client: &'a ClientInfo,

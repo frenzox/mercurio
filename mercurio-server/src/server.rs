@@ -238,8 +238,9 @@ pub struct ListenerConfig {
     /// Prefixed to every topic the listener's clients use, so they only see
     /// their own part of the topic tree.
     pub mount_point: Option<String>,
-    /// Replaces the broker's authentication and access control for the
-    /// listener's clients.
+    /// Replaces the broker's `require_auth` and `allow_anonymous` for the
+    /// listener's clients. The checks themselves come from
+    /// [`ListenerConfig::plugins`].
     pub auth: Option<AuthConfig>,
     /// Replaces the broker's plugins for the listener's clients.
     pub plugins: Option<Vec<Arc<dyn Plugin>>>,

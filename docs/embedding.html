@@ -67,10 +67,13 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <table>
 <tr><th>Field</th><th>Holds</th></tr>
 <tr><td><code>tls</code></td><td><code>Option&lt;TlsConfig&gt;</code> for the main listener</td></tr>
-<tr><td><code>auth</code></td><td><code>AuthConfig</code>: whether authentication is required, the credential validator, enhanced authentication methods and the authorizer</td></tr>
+<tr><td><code>auth</code></td><td><code>AuthConfig</code>: whether authentication is required and anonymous clients are allowed</td></tr>
+<tr><td><code>plugins</code></td><td><code>Vec&lt;Arc&lt;dyn Plugin&gt;&gt;</code>: the plugin chain, see <a href="#auth">below</a></td></tr>
+<tr><td><code>plugin_timeout</code></td><td>Longest a plugin hook may take, 5 seconds by default</td></tr>
+<tr><td><code>plugin_tick_interval</code></td><td>How often <code>Plugin::on_tick</code> runs, 1 second by default</td></tr>
 <tr><td><code>limits</code></td><td><code>Limits</code>: connection, packet, queue and QoS limits</td></tr>
 <tr><td><code>policy</code></td><td><code>ConnectPolicy</code>: client id rules, redirection, response information</td></tr>
-<tr><td><code>listeners</code></td><td>Extra <code>ListenerConfig</code>s: TCP or Unix sockets, MQTT or WebSocket, with their own TLS, mount point, auth and limits</td></tr>
+<tr><td><code>listeners</code></td><td>Extra <code>ListenerConfig</code>s: TCP or Unix sockets, MQTT or WebSocket, with their own TLS, mount point, auth, plugins and limits</td></tr>
 <tr><td><code>local_listener</code></td><td>In-process connections, see <a href="#local">below</a></td></tr>
 <tr><td><code>sys_interval</code></td><td>How often <code>$SYS</code> statistics are published</td></tr>
 </table>
@@ -88,65 +91,69 @@ let mut config = ServerConfig::default();
 config.listeners.push(tls_listener);</pre>
 <p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
 
-<h2 id="auth">Authentication and access control</h2>
-<p>Two traits cover most needs. A <code>CredentialValidator</code> checks user names and passwords; an <code>Authorizer</code> decides topic access:</p>
+<h2 id="auth">Plugins</h2>
+<p>One <code>Plugin</code> trait covers authentication, MQTT 5 enhanced authentication, topic access control, message hooks, lifecycle events, periodic work and <code>$CONTROL</code> commands. A plugin implements the hooks it needs; every other one does nothing. The broker runs its plugins as a chain, in the order configured:</p>
+<ul>
+<li><code>Plugin::authenticate</code> and <code>Plugin::authorize</code>: the first <code>Decision::Allow</code> or <code>Decision::Deny</code> decides, and <code>Decision::Defer</code> asks the next plugin. When every plugin defers, a client with credentials is refused, an anonymous one follows <code>allow_anonymous</code>, and access is allowed, except publishing to <code>$CONTROL</code>, which needs an explicit <code>Allow</code>.</li>
+<li><code>Plugin::on_message</code>: every plugin, each seeing the changes of the ones before; the first <code>MessageAction::Drop</code> drops the message. Changes are trusted: a new topic isn't checked against access control, and a changed <code>retain</code> or <code>qos</code> isn't checked against the retain and QoS limits.</li>
+<li><code>Plugin::on_event</code> and <code>Plugin::on_tick</code>: every plugin.</li>
+</ul>
+<p>Each hook call has a time limit, <code>ServerConfig::plugin_timeout</code>. A hook that runs out of time or panics denies, for authentication and access control, and drops, for messages. A listener can have its own chain in <code>ListenerConfig::plugins</code>; <code>ListenerConfig::auth</code> only sets <code>require_auth</code> and <code>allow_anonymous</code> for it.</p>
 <pre>use std::sync::Arc;
 
 use mercurio_server::{
-    acl::{Access, Authorizer, ClientIdentity},
-    auth::CredentialValidator,
+    plugin::{ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin},
     server::ServerConfig,
 };
 
-struct Users;
-
-impl CredentialValidator for Users {
-    fn validate(&amp;self, username: &amp;str, password: &amp;[u8]) -&gt; bool {
-        // Look the user up in your database
-        username == "alice" &amp;&amp; password == b"secret"
-    }
-}
-
+/// Lets each user use the topics under their own name.
 struct OwnTopics;
 
-impl Authorizer for OwnTopics {
-    fn authorize(&amp;self, client: &amp;ClientIdentity, topic: &amp;str, access: Access) -&gt; bool {
-        let Some(user) = &amp;client.username else {
-            return access == Access::Read;
-        };
-        topic.starts_with(&amp;format!("users/{user}/"))
+impl Plugin for OwnTopics {
+    fn name(&amp;self) -&gt; &amp;str {
+        "own-topics"
+    }
+
+    fn authenticate&lt;'a&gt;(
+        &amp;'a self,
+        _: &amp;'a ClientInfo,
+        credentials: &amp;'a Credentials&lt;'a&gt;,
+    ) -&gt; BoxFuture&lt;'a, Decision&gt; {
+        // A real plugin would check a database here, and could await it
+        ready(if credentials.password == b"secret" {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
+    }
+
+    fn authorize&lt;'a&gt;(
+        &amp;'a self,
+        client: &amp;'a ClientInfo,
+        topic: &amp;'a str,
+        _: Access,
+    ) -&gt; BoxFuture&lt;'a, Decision&gt; {
+        let own = client
+            .username
+            .as_deref()
+            .is_some_and(|user| topic.starts_with(&amp;format!("{user}/")));
+        ready(if own { Decision::Allow } else { Decision::Deny })
     }
 }
 
 let mut config = ServerConfig::default();
 config.auth.require_auth = true;
-config.auth.allow_anonymous = false;
-config.auth.credential_validator = Some(Arc::new(Users));
-config.auth.authorizer = Some(Arc::new(OwnTopics));</pre>
+config.plugins = vec![Arc::new(OwnTopics)];</pre>
 <ul>
 <li><code>Access</code> is <code>Write</code> to publish, <code>Subscribe</code> to subscribe, with the topic filter, and <code>Read</code> to receive a message.</li>
-<li><code>ClientIdentity::username</code> is only set for users the broker verified.</li>
-<li>The traits are synchronous and called for every message, so keep them fast; cache answers that need I/O.</li>
-<li><code>acl::AclFile::parse</code> reads mosquitto's ACL format, if you want that from your own code.</li>
+<li><code>ClientInfo::username</code> is only set for users the broker verified. <code>client_id</code> is empty in <code>authenticate</code> when the client asked the server to assign one.</li>
+<li><code>authorize</code> runs for every message, so keep it fast; a hook that is ready at once, as above, costs no timer. Cache answers that need I/O.</li>
+<li>A client publishing to <code>$CONTROL/&lt;name&gt;/x/response</code> reaches <code>Plugin::on_control</code> with path <code>x/response</code>; plugins that only answer requests should ignore such paths.</li>
+<li><code>auth::SimpleCredentialValidator</code> checks a list of users, and <code>acl::AclFile::parse</code> reads mosquitto's ACL format, if you want those from your own code.</li>
 </ul>
 
 <h3>Enhanced authentication</h3>
-<p>MQTT 5 enhanced authentication methods implement <code>AuthMethod</code>, which starts an <code>AuthExchange</code> per client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. Register them with an <code>AuthManager</code>:</p>
-<pre>use std::{collections::HashMap, sync::Arc};
-
-use mercurio_server::{
-    auth::{AuthManager, PlainAuth},
-    server::AuthConfig,
-};
-
-let mut methods = AuthManager::new();
-methods.register(Box::new(PlainAuth::new(HashMap::from([(
-    "alice".to_string(),
-    "secret".to_string(),
-)]))));
-let mut auth = AuthConfig::default();
-auth.require_auth = true;
-auth.auth_manager = Some(Arc::new(methods));</pre>
+<p>A plugin takes part in MQTT 5 enhanced authentication by returning an <code>AuthExchange</code> from <code>Plugin::begin_auth</code> for the methods it knows. The broker calls <code>step</code> once per message from the client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. <code>auth::PlainAuth</code> is a complete example: add it to <code>ServerConfig::plugins</code> to accept the <code>PLAIN</code> method.</p>
 
 <h2>Storage</h2>
 <pre>use std::sync::Arc;
