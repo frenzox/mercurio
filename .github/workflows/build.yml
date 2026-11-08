@@ -35,9 +35,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       # Not workspace members: they build only for wasm32
       - name: Format the example plugins
-        run: for p in examples/plugins/*/; do cargo fmt --manifest-path "$p/Cargo.toml" -- --check; done
+        run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo fmt --manifest-path "$p/Cargo.toml" -- --check; done
       - name: Lint the example plugins
-        run: for p in examples/plugins/*/; do cargo clippy --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins -- -D warnings; done
+        run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo clippy --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins -- -D warnings; done
 
   # The oldest Rust the crates declare they build with, rust-version
   msrv:
