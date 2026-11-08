@@ -617,7 +617,7 @@ impl Session {
         let control = packet.topic_name == "$CONTROL" || packet.topic_name.starts_with("$CONTROL/");
         // A trusted chain allows everything, and an empty one only refuses
         // $CONTROL, so the session lock is taken only when needed
-        if control || !chain.is_empty() {
+        if control || (!chain.is_empty() && !chain.is_trusted()) {
             let identity = self.identity().await;
             let decision = chain
                 .authorize(&identity, &packet.topic_name, Access::Write)
@@ -1021,7 +1021,7 @@ impl Session {
                 continue;
             }
 
-            if !chain.is_empty() {
+            if !chain.is_empty() && !chain.is_trusted() {
                 let identity = ClientInfo {
                     client_id: session.client_id.clone(),
                     username: session.verified_user.clone(),
