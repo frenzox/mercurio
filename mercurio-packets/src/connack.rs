@@ -241,7 +241,8 @@ impl From<ReasonCode> for ConnAckReturnCode {
 pub struct ConnAckPacket {
     /// Selects the wire format on encode: in MQTT 3.x a return code and no
     /// properties. `decode` sets `V5`, and `decode_v3` sets `V3_1_1` for both
-    /// 3.1 and 3.1.1.
+    /// 3.1 and 3.1.1. [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
+    /// sets the version it is given.
     pub protocol_version: ProtocolVersion,
     pub flags: ConnAckFlags,
     pub reason_code: ReasonCode,

@@ -227,7 +227,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     ConnAck(ConnAckPacket::decode(src)?)
                 } else {
-                    ConnAck(ConnAckPacket::decode_v3(src)?)
+                    ConnAck(ConnAckPacket {
+                        protocol_version: version,
+                        ..ConnAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::Publish => {
@@ -252,7 +255,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     SubAck(SubAckPacket::decode(src)?)
                 } else {
-                    SubAck(SubAckPacket::decode_v3(src)?)
+                    SubAck(SubAckPacket {
+                        protocol_version: version,
+                        ..SubAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::Unsubscribe => {
@@ -266,7 +272,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     UnsubAck(UnsubAckPacket::decode(src)?)
                 } else {
-                    UnsubAck(UnsubAckPacket::decode_v3(src)?)
+                    UnsubAck(UnsubAckPacket {
+                        protocol_version: version,
+                        ..UnsubAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::PingReq => PingReq(PingReqPacket::decode(src)?),
@@ -417,6 +426,17 @@ mod tests {
         let mut encoded = BytesMut::new();
         packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
         assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn test_v3_1_acks_keep_their_version() {
+        let mut buffer = BytesMut::from(&[0x90, 0x03, 0x00, 0x01, 0x01][..]);
+        let ControlPacket::SubAck(suback) =
+            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1).unwrap()
+        else {
+            panic!("Expected SubAck");
+        };
+        assert_eq!(suback.protocol_version, ProtocolVersion::V3_1);
     }
 
     #[test]

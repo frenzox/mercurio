@@ -101,6 +101,8 @@ impl Decoder for UnsubAckPayload {
 pub struct UnsubAckPacket {
     /// Selects the wire format on encode. `decode` sets `V5`, and
     /// `decode_v3` sets `V3_1_1`.
+    /// [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
+    /// sets the version it is given.
     pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
     pub properties: Option<UnsubAckProperties>,
