@@ -95,7 +95,8 @@ impl<'a> Credentials<'a> {
 /// A message a client published, as [`Plugin::on_message`] may change it.
 /// The changes are trusted: a new topic isn't checked against access
 /// control, and a changed `retain` or `qos` isn't checked against the
-/// retain and QoS limits.
+/// retain and QoS limits. A message moved to a different topic starting
+/// with `$` is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PluginMessage {
@@ -235,7 +236,9 @@ pub trait Plugin: Send + Sync + 'static {
     ///
     /// Changes are trusted: a new topic isn't checked against access
     /// control, and a changed `retain` or `qos` isn't checked against the
-    /// retain and QoS limits.
+    /// retain and QoS limits. The one exception is a topic changed to one
+    /// starting with `$`, such as `$SYS/...` or `$CONTROL/...`: the broker
+    /// drops such a message, still acknowledging it, and logs a warning.
     ///
     /// Will messages aren't passed to this hook.
     fn on_message<'a>(
@@ -365,6 +368,12 @@ impl Chain {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    /// The plugins' names, for logs: `a, b`.
+    pub(crate) fn names(&self) -> String {
+        let names: Vec<&str> = self.plugins.iter().map(|p| p.name()).collect();
+        names.join(", ")
     }
 
     pub(crate) async fn authenticate(

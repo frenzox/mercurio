@@ -45,7 +45,7 @@
 <tr><td><code>authenticate</code></td><td>For a client that sends a username and password. Returns allow, deny or defer.</td></tr>
 <tr><td><code>auth-step</code></td><td>For each step of MQTT 5 enhanced authentication, for the methods the plugin lists in <code>init</code>.</td></tr>
 <tr><td><code>authorize</code></td><td>When a client publishes, subscribes or receives a topic (<code>write</code>, <code>subscribe</code>, <code>read</code>). Returns allow, deny or defer.</td></tr>
-<tr><td><code>on-message</code></td><td>For each published message. Returns keep, drop or a replacement message.</td></tr>
+<tr><td><code>on-message</code></td><td>For each published message. Returns keep, drop or a replacement message. A replacement moved to a different topic that starts with <code>$</code>, such as <code>$SYS/...</code> or <code>$CONTROL/...</code>, is dropped and logged.</td></tr>
 <tr><td><code>on-event</code></td><td>When a client connects, disconnects, subscribes or unsubscribes, and when a session expires.</td></tr>
 <tr><td><code>on-tick</code></td><td>Once a second, for periodic work.</td></tr>
 <tr><td><code>on-control</code></td><td>For a publish to <code>$CONTROL/&lt;plugin name&gt;/...</code>. It may return a response payload.</td></tr>

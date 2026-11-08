@@ -76,7 +76,10 @@ pub trait Plugin {
     ///
     /// Changes are trusted: a new topic isn't checked against access
     /// control, and a changed `retain` or `qos` isn't checked against the
-    /// retain and QoS limits. Will messages aren't passed to this hook.
+    /// retain and QoS limits. The one exception is a topic changed to one
+    /// starting with `$`, such as `$SYS/...` or `$CONTROL/...`: the broker
+    /// drops such a message, still acknowledging it, and logs a warning.
+    /// Will messages aren't passed to this hook.
     fn on_message(_client: ClientInfo, _message: Message) -> MessageAction {
         MessageAction::Keep
     }

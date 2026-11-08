@@ -738,6 +738,12 @@ impl Session {
             // Acknowledged whatever the plugins decide, so a dropped message
             // isn't sent again
             let identity = self.identity().await;
+            // Access to `$` topics was checked against the topic the client
+            // named, so a plugin may not move a message to another one
+            let reserved = packet
+                .topic_name
+                .starts_with('$')
+                .then(|| packet.topic_name.clone());
             let mut message = PluginMessage {
                 topic: std::mem::take(&mut packet.topic_name),
                 payload: packet.payload.take().unwrap_or_default(),
@@ -751,6 +757,14 @@ impl Session {
             if validate_publish_topic(&message.topic).is_err() {
                 warn!(
                     "A plugin set the invalid topic `{}`, dropping the message",
+                    message.topic
+                );
+                return response;
+            }
+            if message.topic.starts_with('$') && reserved.as_deref() != Some(&message.topic) {
+                warn!(
+                    "Plugins {} moved a message to the reserved topic `{}`, dropping it",
+                    chain.names(),
                     message.topic
                 );
                 return response;
