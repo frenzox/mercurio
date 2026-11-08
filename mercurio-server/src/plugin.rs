@@ -331,7 +331,6 @@ impl Chain {
         self.authorize(client, topic, access).await != Decision::Deny
     }
 
-    #[allow(dead_code)] // used from Task 4
     pub(crate) async fn on_message(
         &self,
         client: &ClientInfo,

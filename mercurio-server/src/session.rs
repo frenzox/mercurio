@@ -52,7 +52,7 @@ use crate::{
     acl::Access,
     broker::Broker,
     connection::Connection,
-    plugin::{AuthExchange, AuthResult, Chain, ClientInfo, Decision},
+    plugin::{AuthExchange, AuthResult, Chain, ClientInfo, Decision, MessageAction, PluginMessage},
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
@@ -731,6 +731,35 @@ impl Session {
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
+        let mut hooked_properties = None;
+        if !chain.is_empty() {
+            // Acknowledged whatever the plugins decide, so a dropped message
+            // isn't sent again
+            let identity = self.identity().await;
+            let mut message = PluginMessage {
+                topic: std::mem::take(&mut packet.topic_name),
+                payload: packet.payload.take().unwrap_or_default(),
+                qos: packet.qos_level,
+                retain: packet.retain,
+                properties: message_properties(packet.properties.as_ref()),
+            };
+            if chain.on_message(&identity, &mut message).await == MessageAction::Drop {
+                return response;
+            }
+            if validate_publish_topic(&message.topic).is_err() {
+                warn!(
+                    "A plugin set the invalid topic `{}`, dropping the message",
+                    message.topic
+                );
+                return response;
+            }
+            packet.topic_name = message.topic;
+            packet.payload = (!message.payload.is_empty()).then_some(message.payload);
+            packet.qos_level = message.qos;
+            packet.retain = message.retain;
+            hooked_properties = Some(message.properties);
+        }
+
         // Only retained messages are checked against their publisher later
         let origin = match packet.retain {
             true => {
@@ -745,7 +774,8 @@ impl Session {
 
         // Publish to broker - convert topic to Arc<str> for cheap cloning to subscribers
         let topic: Arc<str> = packet.topic_name.into();
-        let properties = message_properties(packet.properties.as_ref());
+        let properties =
+            hooked_properties.unwrap_or_else(|| message_properties(packet.properties.as_ref()));
         let message = Message {
             packet_id: packet.packet_id,
             topic: Arc::clone(&topic),

@@ -1,0 +1,178 @@
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+use bytes::{Bytes, BytesMut};
+use mercurio_core::{
+    codec::Encoder, properties::UserProperty, protocol::ProtocolVersion, qos::QoS,
+    reason::ReasonCode,
+};
+use mercurio_packets::{
+    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    publish::PublishPacket,
+    subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
+    ControlPacket,
+};
+use mercurio_server::{
+    plugin::{ready, BoxFuture, ClientInfo, MessageAction, Plugin, PluginMessage},
+    server::ServerConfig,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
+
+async fn start_broker(plugins: Vec<Arc<dyn Plugin>>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = plugins;
+    config.sys_interval = None;
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+    addr
+}
+
+struct Client {
+    stream: TcpStream,
+    buffer: BytesMut,
+}
+
+impl Client {
+    async fn connect(addr: SocketAddr, client_id: &str) -> Client {
+        let mut client = Client {
+            stream: TcpStream::connect(addr).await.unwrap(),
+            buffer: BytesMut::new(),
+        };
+        client
+            .send(ControlPacket::Connect(ConnectPacket {
+                protocol_version: ProtocolVersion::V5,
+                flags: ConnectFlags {
+                    clean_start: true,
+                    ..Default::default()
+                },
+                keepalive: 60,
+                properties: Some(ConnectProperties::default()),
+                payload: ConnectPayload {
+                    client_id: client_id.into(),
+                    ..Default::default()
+                },
+            }))
+            .await;
+        let Some(ControlPacket::ConnAck(connack)) = client.receive().await else {
+            panic!("Expected CONNACK");
+        };
+        assert_eq!(connack.reason_code, ReasonCode::Success);
+        client
+    }
+
+    async fn send(&mut self, packet: ControlPacket) {
+        let mut encoded = BytesMut::new();
+        packet.encode(&mut encoded);
+        self.stream.write_all(&encoded).await.unwrap();
+    }
+
+    async fn receive(&mut self) -> Option<ControlPacket> {
+        loop {
+            if let Ok(packet) =
+                ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5)
+            {
+                return Some(packet);
+            }
+            let read = timeout(
+                Duration::from_millis(500),
+                self.stream.read_buf(&mut self.buffer),
+            )
+            .await;
+            match read {
+                Ok(Ok(n)) if n > 0 => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    async fn subscribe(&mut self, filter: &str) {
+        self.send(ControlPacket::Subscribe(SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![SubscribePayload {
+                topic_filter: filter.into(),
+                subs_opt: SubscriptionOptions {
+                    qos: QoS::AtLeastOnce,
+                    ..Default::default()
+                },
+            }],
+        }))
+        .await;
+        assert!(matches!(
+            self.receive().await,
+            Some(ControlPacket::SubAck(_))
+        ));
+    }
+
+    /// Publishes at QoS 1 and returns the PUBACK reason.
+    async fn publish(&mut self, topic: &str, payload: &'static [u8]) -> ReasonCode {
+        self.send(ControlPacket::Publish(PublishPacket {
+            topic_name: topic.into(),
+            packet_id: Some(7),
+            qos_level: QoS::AtLeastOnce,
+            payload: Some(Bytes::from_static(payload)),
+            ..Default::default()
+        }))
+        .await;
+        match self.receive().await {
+            Some(ControlPacket::PubAck(ack)) => ack.reason,
+            other => panic!("Expected PUBACK, got {other:?}"),
+        }
+    }
+}
+
+/// Tags every message, and drops empty ones.
+struct Rewrite;
+
+impl Plugin for Rewrite {
+    fn name(&self) -> &str {
+        "rewrite"
+    }
+
+    fn on_message<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        message: &'a mut PluginMessage,
+    ) -> BoxFuture<'a, MessageAction> {
+        if message.payload.as_ref() == b"drop" {
+            return ready(MessageAction::Drop);
+        }
+        message.topic = format!("rewritten/{}", message.topic);
+        message.properties.user_property = Some(vec![UserProperty::new(
+            "publisher".into(),
+            client.client_id.clone(),
+        )]);
+        ready(MessageAction::Continue)
+    }
+}
+
+#[tokio::test]
+async fn message_hook_rewrites_and_drops() {
+    let addr = start_broker(vec![Arc::new(Rewrite)]).await;
+    let mut subscriber = Client::connect(addr, "sub").await;
+    subscriber.subscribe("rewritten/#").await;
+    let mut publisher = Client::connect(addr, "pub").await;
+
+    assert_eq!(publisher.publish("a", b"hello").await, ReasonCode::Success);
+    let Some(ControlPacket::Publish(delivered)) = subscriber.receive().await else {
+        panic!("Expected the rewritten message");
+    };
+    assert_eq!(delivered.topic_name, "rewritten/a");
+    let tag = delivered.properties.unwrap().user_property.unwrap();
+    assert_eq!(
+        (tag[0].key.as_str(), tag[0].value.as_str()),
+        ("publisher", "pub")
+    );
+
+    // Dropped, yet acknowledged as accepted
+    assert_eq!(publisher.publish("a", b"drop").await, ReasonCode::Success);
+    assert!(subscriber.receive().await.is_none());
+}
