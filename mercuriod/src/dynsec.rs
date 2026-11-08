@@ -499,8 +499,9 @@ fn hash_password(password: &str) -> Result<String, String> {
 pub struct DynamicSecurity {
     path: String,
     data: RwLock<Data>,
-    /// Held while a batch runs, so concurrent batches don't overwrite each
-    /// other's changes or the temporary file
+    /// Held while a batch or a reload runs, so concurrent batches don't
+    /// overwrite each other's changes or the temporary file, and a reload
+    /// doesn't land between a batch's copy of the state and its save
     commands: Mutex<()>,
 }
 
@@ -701,6 +702,7 @@ impl Plugin for DynamicSecurity {
 
 impl Reload for DynamicSecurity {
     fn reload(&self) -> Result<(), String> {
+        let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         *self.data.write().unwrap() = read(&self.path)?;
         Ok(())
     }
