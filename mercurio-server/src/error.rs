@@ -16,4 +16,8 @@ pub enum ServerError {
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// The broker's state couldn't be read from storage.
+    #[error("Storage error: {0}")]
+    Storage(#[from] mercurio_storage::StorageError),
 }

@@ -10,7 +10,7 @@ use crate::CONNECTIONS;
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc::UnboundedSender, Mutex},
+    sync::Mutex,
     time::Duration,
 };
 use tracing::{info, warn};
@@ -52,7 +52,7 @@ use crate::{
     auth::{AuthExchange, AuthManager, AuthResult},
     broker::Broker,
     connection::Connection,
-    queue::{JournalEvent, MessageQueue, QueueLimits, Subscriber},
+    queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
     topic_tree::TopicTree,
 };
@@ -761,7 +761,7 @@ impl Session {
     }
 
     /// Starts keeping the queue on disk while the client is away.
-    pub(crate) fn start_queue_journal(&self, journal: UnboundedSender<JournalEvent>) {
+    pub(crate) fn start_queue_journal(&self, journal: crate::writer::Writer) {
         self.shared.queue.start_journal(journal);
     }
 
