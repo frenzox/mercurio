@@ -6,28 +6,20 @@
 //! A client's roles are its own and those of its groups; clients without a
 //! user name get the roles of the anonymous group, when one is set.
 
-use std::{
-    path::Path,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{path::Path, sync::RwLock};
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+use bytes::Bytes;
 use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
 };
-use mercurio_server::server::LocalConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::error;
 
 use crate::reload::Reload;
-
-const COMMAND_TOPIC: &str = "$CONTROL/dynamic-security/v1";
-const RESPONSE_TOPIC: &str = "$CONTROL/dynamic-security/v1/response";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -597,44 +589,6 @@ impl DynamicSecurity {
         }
         json!({ "responses": responses })
     }
-
-    /// Answers commands sent to `$CONTROL/dynamic-security/v1`, through an
-    /// in-process connection to the broker.
-    pub fn serve(self: Arc<Self>, connector: LocalConnector) {
-        let options = ConnectOptions::new("localhost", 0)
-            .client_id("mercurio-dynamic-security")
-            .connector(move || connector.connect());
-        tokio::spawn(async move {
-            let client = loop {
-                match MqttClient::connect(options.clone()).await {
-                    Ok(client) => break client,
-                    Err(e) => warn!("Dynamic security: connecting failed, retrying: {e}"),
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            };
-            if let Err(e) = client.subscribe(&[(COMMAND_TOPIC, QoS::AtLeastOnce)]).await {
-                return error!("Dynamic security: subscribing failed: {e}");
-            }
-            info!("Dynamic security listening on {COMMAND_TOPIC}");
-            while let Some(event) = client.recv().await {
-                if let Event::Message { payload, .. } = event {
-                    // Hashing passwords takes a while; keep it off the runtime
-                    let security = Arc::clone(&self);
-                    let handled = tokio::task::spawn_blocking(move || security.handle(&payload));
-                    let Ok(response) = handled.await else {
-                        continue;
-                    };
-                    let response = response.to_string();
-                    let published = client
-                        .publish(RESPONSE_TOPIC, response, QoS::AtLeastOnce)
-                        .await;
-                    if let Err(e) = published {
-                        warn!("Dynamic security: answering failed: {e}");
-                    }
-                }
-            }
-        });
-    }
 }
 
 fn read(path: &str) -> Result<Data, String> {
@@ -683,6 +637,22 @@ impl DynamicSecurity {
 impl Plugin for DynamicSecurity {
     fn name(&self) -> &str {
         "dynamic-security"
+    }
+
+    fn on_control<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        path: &'a str,
+        payload: Bytes,
+    ) -> BoxFuture<'a, Option<Bytes>> {
+        if path != "v1" {
+            return ready(None);
+        }
+        Box::pin(async move {
+            // Hashing passwords takes a while; keep it off the runtime
+            let response = tokio::task::block_in_place(|| self.handle(&payload));
+            Some(Bytes::from(response.to_string()))
+        })
     }
 
     fn authenticate<'a>(
@@ -735,6 +705,34 @@ impl Reload for DynamicSecurity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMMAND_TOPIC: &str = "$CONTROL/dynamic-security/v1";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_commands_arrive_through_control() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-control-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+
+        let request = br#"{"commands":[{"command":"listClients"}]}"#;
+        let answer = security
+            .on_control(
+                &ClientInfo::new("c", Some("admin".into())),
+                "v1",
+                Bytes::from_static(request),
+            )
+            .await
+            .expect("an answer");
+        assert!(String::from_utf8_lossy(&answer).contains("listClients"));
+        assert!(security
+            .on_control(&ClientInfo::new("c", None), "v2", Bytes::new())
+            .await
+            .is_none());
+        let _ = std::fs::remove_file(path);
+    }
 
     fn identity(username: &str) -> ClientInfo {
         ClientInfo::new("c", Some(username.to_string()))

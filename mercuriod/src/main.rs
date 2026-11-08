@@ -300,7 +300,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             value.max_connections = extra.max_connections;
             value.http_dir = extra.http_dir.clone().map(Into::into);
             if let Some(auth) = &extra.auth {
-                let (auth, plugins) = build_auth(auth, &mut reloadable, None)?;
+                let (auth, plugins) = build_auth(auth, &mut reloadable, false)?;
                 value.auth = Some(auth);
                 value.plugins = Some(plugins);
             }
@@ -309,7 +309,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (connector, local_listener) = LocalConnector::new();
-    let (auth_config, plugins) = build_auth(&config.auth, &mut reloadable, Some(&connector))?;
+    let (auth_config, plugins) = build_auth(&config.auth, &mut reloadable, true)?;
 
     for bridge in config.bridges {
         info!("Starting bridge {}", bridge.name);
@@ -445,17 +445,18 @@ async fn shutdown_signal() {
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
-    connector: Option<&LocalConnector>,
+    main: bool,
 ) -> Result<(ServerAuthConfig, Vec<Arc<dyn Plugin>>), String> {
     if let Some(path) = &config.dynamic_security {
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
         }
-        let connector = connector.ok_or("dynamic_security is only supported in [auth]")?;
+        if !main {
+            return Err("dynamic_security is only supported in [auth]".to_string());
+        }
         let security = Arc::new(DynamicSecurity::load(path)?);
         info!("Loaded dynamic security from {}", path);
         reloadable.push(security.clone());
-        Arc::clone(&security).serve(connector.clone());
         let mut value = ServerAuthConfig::default();
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
