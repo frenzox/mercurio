@@ -48,7 +48,7 @@ Connection options, for both commands:
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification | |
 
 Run `recado pub --help` or `recado sub --help` for every option, or see
-the [CLI guide](https://github.com/frenzox/mercurio/blob/master/docs/cli.html).
+the [CLI guide](https://frenzox.github.io/mercurio/cli.html).
 
 ## License
 

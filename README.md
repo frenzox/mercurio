@@ -43,12 +43,11 @@ top of tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
 
 ## Documentation
 
-The [`docs/`](docs/index.html) directory holds the full documentation as
-HTML pages: installation, every configuration option, authentication,
-listeners, bridges, operations, the command-line client, the client and
-server libraries, and a migration guide from mosquitto. Open
-`docs/index.html` in a browser, or publish the directory with GitHub
-Pages.
+The [documentation](https://frenzox.github.io/mercurio/) covers installation, every configuration
+option, authentication, listeners, bridges, operations, the command-line
+client, the client and server libraries, and a migration guide from
+mosquitto. Its source is the [`docs/`](docs) directory, published with
+GitHub Pages.
 
 ## Quick start
 
