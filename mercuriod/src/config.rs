@@ -7,8 +7,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    queue::QueueLimits,
-    server::{Limits, Transport},
+    server::{Limits, QueueLimits, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 

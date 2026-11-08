@@ -1,14 +1,14 @@
 pub mod acl;
 pub mod auth;
 mod broker;
-pub mod connection;
+mod connection;
 pub mod error;
 mod http;
 mod proxy;
-pub mod queue;
+mod queue;
 pub mod server;
 mod session;
-pub mod session_manager;
+mod session_manager;
 mod shutdown;
 mod sys;
 pub mod tls;

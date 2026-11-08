@@ -43,9 +43,8 @@ use crate::{
     acl::{Access, Authorizer, ClientIdentity},
     auth::{AuthManager, AuthResult, CredentialValidator},
     broker::Broker,
-    connection::{Connection, DEFAULT_MAX_PACKET_SIZE},
+    connection::Connection,
     http, proxy,
-    queue::QueueLimits,
     session::{effective_keepalive, Session, WillMessage},
     session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
     shutdown::Shutdown,
@@ -70,6 +69,8 @@ pub struct AuthConfig {
     /// of them when unset.
     pub authorizer: Option<Arc<dyn Authorizer>>,
 }
+
+pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
 
 /// Subscriptions a session may hold unless configured otherwise: far more
 /// than clients need, far fewer than it takes to exhaust the broker.
