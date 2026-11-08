@@ -86,6 +86,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>clientid_prefixes</code></td><td><code>[]</code></td><td>When not empty, only client ids starting with one of these are accepted; others are refused as not authorized.</td></tr>
 <tr><td><code>persistent_client_expiration</code></td><td>never</td><td>Seconds the session of an MQTT 3.x client connected without clean session outlives its connection. MQTT 5 clients choose their own expiry.</td></tr>
 <tr><td><code>max_session_expiry</code></td><td>unbounded</td><td>Most seconds any session may outlive its connection. MQTT 5 clients asking for longer, or for no expiry, are told to use this; it also bounds <code>persistent_client_expiration</code>. Worth setting where clients aren't trusted, as each stored session takes memory and storage.</td></tr>
+<tr><td><code>max_retained_messages</code></td><td>unbounded</td><td>Topics that may hold a retained message at once, about 20 of the broker's own <code>$SYS</code> topics included. Retaining a message on another topic is refused with Quota Exceeded; updating or clearing a retained topic is always allowed.</td></tr>
 </table>
 
 <h3>Delivery</h3>

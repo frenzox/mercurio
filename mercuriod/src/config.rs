@@ -390,6 +390,10 @@ pub struct ServerConfig {
     /// asking for longer are told to use this. Unbounded when unset
     pub max_session_expiry: Option<u64>,
 
+    /// Topics that may hold a retained message at once, the broker's own
+    /// `$SYS` topics included; unbounded when unset
+    pub max_retained_messages: Option<usize>,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -426,6 +430,7 @@ impl Default for ServerConfig {
             clientid_prefixes: Vec::new(),
             persistent_client_expiration: None,
             max_session_expiry: None,
+            max_retained_messages: None,
             tls: TlsServerConfig::default(),
         }
     }
@@ -604,6 +609,7 @@ impl ServerConfig {
         limits.check_retain_source = self.check_retain_source;
         limits.max_subscriptions = Some(self.max_subscriptions);
         limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
+        limits.max_retained_messages = self.max_retained_messages;
         Ok(limits)
     }
 }

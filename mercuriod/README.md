@@ -139,6 +139,9 @@ receive_maximum = 65535
 # Most seconds any session may outlive its connection, MQTT 5 clients
 # included; worth setting where clients aren't trusted (unbounded by default)
 # max_session_expiry = 2592000
+# Topics that may hold a retained message at once, about 20 of the broker's
+# own $SYS topics included; further ones get Quota Exceeded (unbounded)
+# max_retained_messages = 100000
 
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.

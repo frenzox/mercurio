@@ -125,6 +125,10 @@ pub struct Limits {
     /// for longer, or for no expiry, are told to use this; it also bounds
     /// `persistent_client_expiration`. Unbounded when unset.
     pub max_session_expiry: Option<Duration>,
+    /// Topics that may hold a retained message at once, the broker's own
+    /// `$SYS` statistics included; retaining a message on another topic is
+    /// then refused with Quota Exceeded. Unbounded when unset.
+    pub max_retained_messages: Option<usize>,
 }
 
 impl Default for Limits {
@@ -144,6 +148,7 @@ impl Default for Limits {
             check_retain_source: false,
             max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
             max_session_expiry: None,
+            max_retained_messages: None,
         }
     }
 }
