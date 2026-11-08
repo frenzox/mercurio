@@ -1,4 +1,5 @@
-//! Drops empty messages and tags the others with the id of their publisher.
+//! Drops empty messages, unless retained, and tags the others with the id
+//! of their publisher.
 
 use mercurio_plugin::{
     export_plugin, ClientInfo, Hooks, Message, MessageAction, Plugin, Registration,
@@ -15,7 +16,8 @@ impl Plugin for PayloadRewrite {
     }
 
     fn on_message(client: ClientInfo, mut message: Message) -> MessageAction {
-        if message.payload.is_empty() {
+        // An empty retained message clears the topic's retained message
+        if message.payload.is_empty() && !message.retain {
             return MessageAction::Drop;
         }
         message

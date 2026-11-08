@@ -346,17 +346,17 @@ async fn test_payload_rewrite_tags_and_drops() {
         .await
         .unwrap();
     let client = ClientInfo::new("tagger", None);
-    let message = |payload: &'static [u8]| {
+    let message = |payload: &'static [u8], retain: bool| {
         PluginMessage::new(
             "t",
             bytes::Bytes::from_static(payload),
             QoS::AtMostOnce,
-            false,
+            retain,
             MessageProperties::default(),
         )
     };
 
-    let mut tagged = message(b"hello");
+    let mut tagged = message(b"hello", false);
     assert_eq!(
         plugin.on_message(&client, &mut tagged).await,
         MessageAction::Continue
@@ -367,11 +367,19 @@ async fn test_payload_rewrite_tags_and_drops() {
     assert_eq!(properties[0].value, "tagger");
     assert_eq!(tagged.payload.as_ref(), b"hello");
 
-    let mut empty = message(b"");
+    let mut empty = message(b"", false);
     assert_eq!(
         plugin.on_message(&client, &mut empty).await,
         MessageAction::Drop
     );
+
+    // An empty retained message clears the topic's retained message
+    let mut clear = message(b"", true);
+    assert_eq!(
+        plugin.on_message(&client, &mut clear).await,
+        MessageAction::Continue
+    );
+    assert!(clear.retain && clear.payload.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
