@@ -88,3 +88,136 @@ async fn test_init_errors_refuse_the_plugin() {
         .unwrap();
     assert!(error.to_string().contains("missing `prefix`"), "{error}");
 }
+
+async fn control(plugin: &WasmPlugin, path: &str, payload: &[u8]) -> Option<String> {
+    let client = ClientInfo::new("c", None);
+    let payload = bytes::Bytes::copy_from_slice(payload);
+    plugin
+        .on_control(&client, path, payload)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn control_within(plugin: &WasmPlugin, path: &str, payload: &[u8]) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(2), control(plugin, path, payload))
+        .await
+        .expect("the call was not stopped in time")
+}
+
+async fn misbehave(adjust: impl FnOnce(&mut PluginSettings)) -> std::sync::Arc<WasmPlugin> {
+    let mut settings = settings("misbehave", &[]);
+    adjust(&mut settings);
+    WasmPlugin::load(&Runtime::new().unwrap(), settings)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_stuck_in_a_loop_is_stopped() {
+    let plugin = misbehave(|s| s.timeout = Duration::from_millis(200)).await;
+    assert_eq!(control_within(&plugin, "spin", b"").await, None);
+    assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_stuck_in_a_host_call_is_stopped() {
+    let plugin = misbehave(|s| s.timeout = Duration::from_millis(200)).await;
+    assert_eq!(control_within(&plugin, "sleep", b"").await, None);
+    assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_that_sleeps_in_init_fails_to_load() {
+    let mut settings = settings("misbehave", &[("init_sleep_ms", "120000")]);
+    settings.timeout = Duration::from_millis(200);
+    let runtime = Runtime::new().unwrap();
+    let loading = WasmPlugin::load(&runtime, settings);
+    // Compiling the plugin counts too, and takes seconds when many tests
+    // compile at once; a hang would last the two minutes of the sleep
+    let result = tokio::time::timeout(Duration::from_secs(30), loading)
+        .await
+        .expect("loading hung");
+    assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_memory_beyond_the_limit_traps() {
+    let plugin = misbehave(|s| s.memory = 16 << 20).await;
+    assert_eq!(control(&plugin, "grow", b"4").await.unwrap(), "4194304");
+    assert_eq!(control(&plugin, "grow", b"64").await, None);
+    assert!(control(&plugin, "kv-count", b"").await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http_outside_the_allowlist_is_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let allowed = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    let other = free_port().await;
+    let plugin = misbehave(|s| s.allow_http = vec![allowed.to_string()]).await;
+    let url = |port: u16| format!("http://127.0.0.1:{port}/");
+    assert_eq!(
+        control(&plugin, "http", url(allowed.port()).as_bytes())
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let refused = control(&plugin, "http", url(other).as_bytes())
+        .await
+        .unwrap();
+    assert!(refused.contains("HttpRequestDenied"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sockets_outside_the_allowlist_are_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let allowed = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let _ = listener.accept().await;
+        }
+    });
+    let other = free_port().await;
+    let plugin = misbehave(|s| s.allow_sockets = vec![allowed.to_string()]).await;
+    assert_eq!(
+        control(&plugin, "tcp", allowed.to_string().as_bytes())
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let refused = control(&plugin, "tcp", format!("127.0.0.1:{other}").as_bytes())
+        .await
+        .unwrap();
+    assert!(refused.contains("PermissionDenied"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kv_is_shared_by_instances() {
+    let plugin = misbehave(|s| s.instances = 2).await;
+    let (a, b, c, d) = tokio::join!(
+        control(&plugin, "kv-count", b""),
+        control(&plugin, "kv-count", b""),
+        control(&plugin, "kv-count", b""),
+        control(&plugin, "kv-count", b""),
+    );
+    let mut counts: Vec<_> = [a, b, c, d].into_iter().map(Option::unwrap).collect();
+    counts.sort();
+    assert_eq!(counts, ["1", "2", "3", "4"]);
+}
+
+async fn free_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
