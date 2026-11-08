@@ -53,7 +53,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     plugin::{
-        AuthExchange, AuthResult, Chain, ClientInfo, Decision, Event, MessageAction, PluginMessage,
+        AuthResult, Chain, ClientInfo, Decision, Event, Exchange, MessageAction, PluginMessage,
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
@@ -299,7 +299,7 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Re-authentication in progress, if any
-    auth_exchange: Option<Box<dyn AuthExchange>>,
+    auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
     /// The client's address, None for in-process clients
@@ -1219,7 +1219,7 @@ impl Session {
                 let Some(mut exchange) = chain.begin_auth(&method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
                 };
-                let result = chain.step(exchange.as_mut(), data.as_ref()).await;
+                let result = chain.step(&mut exchange, data.as_ref()).await;
                 session.auth_exchange = Some(exchange);
                 result
             }
@@ -1228,7 +1228,7 @@ impl Session {
                 let Some(exchange) = session.auth_exchange.as_mut() else {
                     return Err(ReasonCode::ProtocolError.into());
                 };
-                chain.step(exchange.as_mut(), data.as_ref()).await
+                chain.step(exchange, data.as_ref()).await
             }
             _ => return Err(ReasonCode::ProtocolError.into()),
         };

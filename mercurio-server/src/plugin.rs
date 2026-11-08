@@ -290,6 +290,12 @@ pub(crate) struct Chain {
     events: Arc<Events>,
 }
 
+/// An enhanced authentication in progress, with the plugin carrying it out.
+pub(crate) struct Exchange {
+    plugin: Arc<dyn Plugin>,
+    steps: Box<dyn AuthExchange>,
+}
+
 /// How many events may wait for the plugins before new ones are dropped.
 const EVENT_QUEUE: usize = 10_000;
 
@@ -346,25 +352,28 @@ impl Chain {
         Decision::Defer
     }
 
-    pub(crate) fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+    pub(crate) fn begin_auth(&self, method: &str) -> Option<Exchange> {
         self.plugins.iter().find_map(|plugin| {
-            std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(method))).unwrap_or_else(
-                |_| {
+            let steps = std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(method)))
+                .unwrap_or_else(|_| {
                     error!("Plugin `{}` panicked in begin_auth", plugin.name());
                     None
-                },
-            )
+                })?;
+            Some(Exchange {
+                plugin: Arc::clone(plugin),
+                steps,
+            })
         })
     }
 
-    pub(crate) async fn step(
-        &self,
-        exchange: &mut dyn AuthExchange,
-        data: Option<&Bytes>,
-    ) -> AuthResult {
-        guarded("enhanced authentication", "step", self.timeout, || {
-            exchange.step(data)
-        })
+    pub(crate) async fn step(&self, exchange: &mut Exchange, data: Option<&Bytes>) -> AuthResult {
+        let Exchange { plugin, steps } = exchange;
+        guarded(
+            plugin.name(),
+            "enhanced authentication",
+            self.timeout,
+            || steps.step(data),
+        )
         .await
         .unwrap_or(AuthResult::Failed(ReasonCode::NotAuthorized))
     }

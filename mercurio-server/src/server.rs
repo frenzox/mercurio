@@ -1390,7 +1390,7 @@ where
             .as_ref()
             .and_then(|p| p.authentication_data.as_ref())
             .map(|d| &d.value);
-        let mut result = self.chain.step(exchange.as_mut(), initial_data).await;
+        let mut result = self.chain.step(&mut exchange, initial_data).await;
 
         loop {
             let challenge = match result {
@@ -1437,7 +1437,7 @@ where
             }
 
             let data = auth.properties.auth_data.map(|d| d.value);
-            result = self.chain.step(exchange.as_mut(), data.as_ref()).await;
+            result = self.chain.step(&mut exchange, data.as_ref()).await;
         }
     }
 
