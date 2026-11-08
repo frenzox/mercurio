@@ -47,6 +47,7 @@ pub enum Decision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageAction {
     Continue,
     /// Drop the message. A QoS 1 or 2 publisher is still acknowledged.
@@ -105,27 +106,50 @@ pub struct PluginMessage {
     pub properties: MessageProperties,
 }
 
+impl PluginMessage {
+    pub fn new(
+        topic: impl Into<String>,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+        properties: MessageProperties,
+    ) -> Self {
+        PluginMessage {
+            topic: topic.into(),
+            payload: payload.into(),
+            qos,
+            retain,
+            properties,
+        }
+    }
+}
+
 /// Something that happened to a client, for [`Plugin::on_event`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
     /// The client was accepted.
+    #[non_exhaustive]
     Connected { client: ClientInfo },
     /// The connection ended; `reason` is the DISCONNECT reason the server
     /// sent, if any.
+    #[non_exhaustive]
     Disconnected {
         client: ClientInfo,
         reason: Option<ReasonCode>,
     },
     /// A subscription was granted at `qos`.
+    #[non_exhaustive]
     Subscribed {
         client: ClientInfo,
         filter: String,
         qos: QoS,
     },
     /// A subscription was removed.
+    #[non_exhaustive]
     Unsubscribed { client: ClientInfo, filter: String },
     /// A session ended because its expiry interval passed.
+    #[non_exhaustive]
     SessionExpired { client_id: String },
 }
 
@@ -552,13 +576,13 @@ mod tests {
     }
 
     fn message() -> PluginMessage {
-        PluginMessage {
-            topic: "t".into(),
-            payload: Bytes::from_static(b"p"),
-            qos: QoS::AtMostOnce,
-            retain: false,
-            properties: MessageProperties::default(),
-        }
+        PluginMessage::new(
+            "t",
+            Bytes::from_static(b"p"),
+            QoS::AtMostOnce,
+            false,
+            MessageProperties::default(),
+        )
     }
 
     #[tokio::test]

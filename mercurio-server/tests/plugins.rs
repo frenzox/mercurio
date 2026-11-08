@@ -189,15 +189,15 @@ impl Plugin for Recorder {
     fn on_event<'a>(&'a self, event: &'a mercurio_server::plugin::Event) -> BoxFuture<'a, ()> {
         use mercurio_server::plugin::Event::*;
         let line = match event {
-            Connected { client } => format!("connected {}", client.client_id),
+            Connected { client, .. } => format!("connected {}", client.client_id),
             Disconnected { client, .. } => format!("disconnected {}", client.client_id),
             Subscribed { client, filter, .. } => {
                 format!("subscribed {} {filter}", client.client_id)
             }
-            Unsubscribed { client, filter } => {
+            Unsubscribed { client, filter, .. } => {
                 format!("unsubscribed {} {filter}", client.client_id)
             }
-            SessionExpired { client_id } => format!("expired {client_id}"),
+            SessionExpired { client_id, .. } => format!("expired {client_id}"),
             _ => "other".into(),
         };
         self.0.lock().unwrap().push(line);
