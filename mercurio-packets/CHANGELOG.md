@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-packets-v0.1.1...mercurio-packets-v0.2.0) - 2026-11-08
+
+### Fixed
+
+- *(packets)* write the will properties length from the payload encoder
+- *(packets)* keep MQTT 3.1 as the version of acks parsed from it
+- *(packets)* let callers set the properties of acknowledgements
+- *(packets)* encode MQTT 3.x acknowledgements without a reason code
+- *(packets)* reject packets the spec calls malformed
+- *(packets)* refuse reserved MQTT 3.x CONNACK return codes
+- *(packets)* refuse MQTT 3.x packets with MQTT 5 bodies
+- *(packets)* read DISCONNECT reason 0x00 the same, sent or left out
+
+### Other
+
+- *(packets)* [**breaking**] take a shared slice in ControlPacket::check
+- document the crates' APIs
+- declare Rust 1.89 as the minimum supported version
+
 ## [0.1.1](https://github.com/frenzox/mercurio/compare/mercurio-packets-v0.1.0...mercurio-packets-v0.1.1) - 2026-11-08
 
 ### Other

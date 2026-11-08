@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.2.0...mercuriod-v0.3.0) - 2026-11-08
+
+### Added
+
+- limit connections per client address, and who may send PROXY
+- cap how many topics may hold a retained message
+- cap how long sessions outlive their connection
+- *(mercuriod)* [**breaking**] refuse anonymous clients once authentication is on
+
+### Fixed
+
+- *(server)* give the whole handshake one deadline
+- *(mercuriod)* evict HTTP auth answers one at a time
+- bound the subscriptions and queued bytes of each session
+- *(mercuriod)* tighten dynamic security
+- *(mercuriod)* require mount points to end with a slash
+- *(mercuriod)* forward from bridges only what their routes cover
+- check passwords off the async threads, unknown users as slowly
+
+### Other
+
+- declare Rust 1.89 as the minimum supported version
+- [**breaking**] mark the enums that may grow as non-exhaustive
+- *(server)* [**breaking**] let configuration grow without breaking users
+- *(server)* [**breaking**] make the internal modules private
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.1.0...mercuriod-v0.2.0) - 2026-11-08
 
 ### Added

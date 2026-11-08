@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.2.0...mercurio-server-v0.3.0) - 2026-11-08
+
+### Added
+
+- limit connections per client address, and who may send PROXY
+- cap how many topics may hold a retained message
+- cap how long sessions outlive their connection
+
+### Fixed
+
+- refuse values too long for MQTT instead of truncating them
+- *(server)* give the whole handshake one deadline
+- bound the subscriptions and queued bytes of each session
+- *(server)* keep payloads out of debug logs
+- *(server)* refuse wills that couldn't be published
+- check passwords off the async threads, unknown users as slowly
+- *(server)* cap WebSocket messages at the largest MQTT packet
+- *(server)* keep network clients from taking in-process client ids
+- *(server)* resume a session only for the user and listener it belongs to
+- *(server)* keep wildcards in client ids from widening ACL patterns
+- *(server)* cap topic levels so a deep filter can't overflow the stack
+
+### Other
+
+- *(packets)* [**breaking**] take a shared slice in ControlPacket::check
+- [**breaking**] remove API the crates never used
+- document the crates' APIs
+- *(server)* keep an idle connection's state small
+- *(server)* stop storage writers once their client goes quiet
+- *(server)* drop the redundant write buffer, release grown buffers
+- declare Rust 1.89 as the minimum supported version
+- [**breaking**] mark the enums that may grow as non-exhaustive
+- *(server)* [**breaking**] let configuration grow without breaking users
+- *(server)* [**breaking**] make the internal modules private
+- *(server)* cut the memory each connection holds from 44 KB to 25 KB
+- *(server)* look retained messages up only for those that get them
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.1.0...mercurio-server-v0.2.0) - 2026-11-08
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "recado"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "MQTT command-line client for publishing and subscribing, from the Mercurio project"
@@ -15,8 +15,8 @@ name = "recado"
 path = "src/main.rs"
 
 [dependencies]
-mercurio-client = { path = "../mercurio-client", version = "0.2.0" }
-mercurio-core = { path = "../mercurio-core", version = "0.1.1" }
+mercurio-client = { path = "../mercurio-client", version = "0.3.0" }
+mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
