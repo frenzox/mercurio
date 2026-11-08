@@ -22,6 +22,7 @@ use thiserror::Error;
 
 /// Error type for storage operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum StorageError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
@@ -35,18 +36,21 @@ pub enum StorageError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
-    #[cfg(feature = "sqlite")]
-    #[error("Database error: {0}")]
-    DatabaseError(#[from] rusqlite::Error),
+    /// The database refused or failed an operation. Boxed, so the database
+    /// libraries' own types stay out of this crate's API.
+    #[error("Database: {}", error_chain(.0.as_ref()))]
+    Database(Box<dyn std::error::Error + Send + Sync>),
+}
 
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL: {}", error_chain(.0))]
-    Postgres(#[from] tokio_postgres::Error),
+impl StorageError {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) fn database(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        StorageError::Database(Box::new(error))
+    }
 }
 
 /// An error with its causes, which tokio-postgres and deadpool leave out
 /// of their messages, such as the server's reason for refusing a query.
-#[cfg(feature = "postgres")]
 pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
@@ -246,6 +250,7 @@ pub trait QueueStore: Send + Sync {
 
 /// A change to what is stored for one client.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Write {
     SaveSession(SessionState),
     /// Replace the session's subscriptions, creating the session if needed
@@ -273,11 +278,27 @@ pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
     /// again after a failure, so applying one twice must be harmless.
     /// Stores that can should apply the batch atomically.
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
-        for write in writes {
-            match write {
-                Write::SaveSession(state) => self.save_session(client_id, state).await?,
-                Write::SaveSubscriptions(subscriptions) => {
-                    let mut state = self.load_session(client_id).await?.unwrap_or(SessionState {
+        apply_each(self, client_id, writes).await
+    }
+}
+
+/// Applies `writes` one at a time through the store's other methods: what
+/// `BatchStore::apply` does unless a store overrides it. A store that does
+/// can hand it the changes it has no batch form for, such as kinds of
+/// change added in later versions.
+pub async fn apply_each<S: BatchStore + ?Sized>(
+    store: &S,
+    client_id: &str,
+    writes: &[Write],
+) -> Result<()> {
+    for write in writes {
+        match write {
+            Write::SaveSession(state) => store.save_session(client_id, state).await?,
+            Write::SaveSubscriptions(subscriptions) => {
+                let mut state = store
+                    .load_session(client_id)
+                    .await?
+                    .unwrap_or(SessionState {
                         client_id: client_id.to_string(),
                         subscriptions: Vec::new(),
                         clean_start: false,
@@ -285,47 +306,47 @@ pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
                         expires_at: None,
                         owner: SessionOwner::default(),
                     });
-                    state.subscriptions = subscriptions.clone();
-                    self.save_session(client_id, &state).await?;
+                state.subscriptions = subscriptions.clone();
+                store.save_session(client_id, &state).await?;
+            }
+            Write::SetExpiry {
+                interval,
+                expires_at,
+            } => {
+                if let Some(mut state) = store.load_session(client_id).await? {
+                    state.expiry_interval = Some(*interval);
+                    state.expires_at = Some(*expires_at);
+                    store.save_session(client_id, &state).await?;
                 }
-                Write::SetExpiry {
-                    interval,
-                    expires_at,
-                } => {
-                    if let Some(mut state) = self.load_session(client_id).await? {
-                        state.expiry_interval = Some(*interval);
-                        state.expires_at = Some(*expires_at);
-                        self.save_session(client_id, &state).await?;
-                    }
-                }
-                Write::StoreWill(will) => self.store_will(client_id, will).await?,
-                Write::DeleteWill => self.delete_will(client_id).await?,
-                Write::StoreInflight(message) => {
-                    self.store_inflight(client_id, message.packet_id, message)
-                        .await?
-                }
-                Write::ReleaseInflight(packet_id) => {
-                    self.release_inflight(client_id, *packet_id).await?
-                }
-                Write::RemoveInflight(packet_id) => {
-                    self.remove_inflight(client_id, *packet_id).await?
-                }
-                Write::Enqueue(sequence, message) => {
-                    self.enqueue(client_id, *sequence, message).await?
-                }
-                Write::ClearQueue => self.clear_queue(client_id).await?,
-                Write::DeleteSession => {
-                    self.delete_session(client_id).await?;
-                    self.delete_will(client_id).await?;
-                    self.clear_queue(client_id).await?;
-                    for message in self.get_all_inflight(client_id).await? {
-                        self.remove_inflight(client_id, message.packet_id).await?;
-                    }
+            }
+            Write::StoreWill(will) => store.store_will(client_id, will).await?,
+            Write::DeleteWill => store.delete_will(client_id).await?,
+            Write::StoreInflight(message) => {
+                store
+                    .store_inflight(client_id, message.packet_id, message)
+                    .await?
+            }
+            Write::ReleaseInflight(packet_id) => {
+                store.release_inflight(client_id, *packet_id).await?
+            }
+            Write::RemoveInflight(packet_id) => {
+                store.remove_inflight(client_id, *packet_id).await?
+            }
+            Write::Enqueue(sequence, message) => {
+                store.enqueue(client_id, *sequence, message).await?
+            }
+            Write::ClearQueue => store.clear_queue(client_id).await?,
+            Write::DeleteSession => {
+                store.delete_session(client_id).await?;
+                store.delete_will(client_id).await?;
+                store.clear_queue(client_id).await?;
+                for message in store.get_all_inflight(client_id).await? {
+                    store.remove_inflight(client_id, message.packet_id).await?;
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// Combined trait for full MQTT storage functionality.

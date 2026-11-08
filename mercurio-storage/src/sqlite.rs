@@ -40,7 +40,7 @@ impl SqliteStore {
     ///
     /// Creates the database file and tables if they don't exist.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).map_err(StorageError::database)?;
         let store = SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -50,7 +50,7 @@ impl SqliteStore {
 
     /// Create an in-memory SQLite store (useful for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open_in_memory().map_err(StorageError::database)?;
         let store = SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -64,9 +64,32 @@ impl SqliteStore {
             .conn
             .lock()
             .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        create_schema(&conn).map_err(StorageError::database)
+    }
 
-        conn.execute_batch(
-            "
+    /// Execute a blocking operation on the tokio runtime.
+    async fn blocking<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+            f(&conn).map_err(StorageError::database)
+        })
+        .await
+        .map_err(|e| StorageError::OperationFailed(e.to_string()))?
+    }
+}
+
+/// Creates the tables, and adds the columns databases from older versions
+/// lack.
+fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
             CREATE TABLE IF NOT EXISTS sessions (
                 client_id TEXT PRIMARY KEY,
                 subscriptions TEXT NOT NULL,
@@ -128,49 +151,31 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_inflight_client
                 ON inflight_messages(client_id);
             ",
-        )?;
+    )?;
 
-        // Databases created before retained messages kept their publisher
-        let has_origin = conn
-            .prepare("SELECT origin_client_id FROM retained_messages LIMIT 0")
-            .is_ok();
-        if !has_origin {
-            conn.execute_batch(
-                "ALTER TABLE retained_messages ADD COLUMN origin_client_id TEXT;
+    // Databases created before retained messages kept their publisher
+    let has_origin = conn
+        .prepare("SELECT origin_client_id FROM retained_messages LIMIT 0")
+        .is_ok();
+    if !has_origin {
+        conn.execute_batch(
+            "ALTER TABLE retained_messages ADD COLUMN origin_client_id TEXT;
                  ALTER TABLE retained_messages ADD COLUMN origin_username TEXT;",
-            )?;
-        }
+        )?;
+    }
 
-        // Databases created before sessions recorded their owner
-        let has_owner = conn
-            .prepare("SELECT owner_username FROM sessions LIMIT 0")
-            .is_ok();
-        if !has_owner {
-            conn.execute_batch(
-                "ALTER TABLE sessions ADD COLUMN owner_username TEXT;
+    // Databases created before sessions recorded their owner
+    let has_owner = conn
+        .prepare("SELECT owner_username FROM sessions LIMIT 0")
+        .is_ok();
+    if !has_owner {
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN owner_username TEXT;
                  ALTER TABLE sessions ADD COLUMN owner_mount_point TEXT;",
-            )?;
-        }
-
-        Ok(())
+        )?;
     }
 
-    /// Execute a blocking operation on the tokio runtime.
-    async fn blocking<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-            f(&conn)
-        })
-        .await
-        .map_err(|e| StorageError::OperationFailed(e.to_string()))?
-    }
+    Ok(())
 }
 
 /// Fails like any other unreadable column if the stored properties can't
@@ -210,7 +215,7 @@ impl FromSql for Identifiers {
 }
 
 /// Applies one change; the caller holds the transaction.
-fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> Result<()> {
+fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::Result<()> {
     match write {
         Write::SaveSession(session) => {
             conn.execute(
@@ -1059,7 +1064,7 @@ mod tests {
         assert_eq!(&*retained[0].topic, "new");
         let count: i64 = store
             .blocking(|conn| {
-                Ok(conn.query_row("SELECT COUNT(*) FROM retained_messages", [], |r| r.get(0))?)
+                conn.query_row("SELECT COUNT(*) FROM retained_messages", [], |r| r.get(0))
             })
             .await
             .unwrap();
