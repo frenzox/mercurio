@@ -190,6 +190,9 @@ pub trait AuthExchange: Send {
 /// so a plugin implements only the ones it needs.
 pub trait Plugin: Send + Sync + 'static {
     /// Names the plugin in logs and in `$CONTROL/<name>/...` topics.
+    ///
+    /// Publishes to `$CONTROL/<name>/...` go to the plugin with that name,
+    /// see [`Plugin::on_control`], so pick a name no client topic needs.
     fn name(&self) -> &str;
 
     /// Checks the user name and password of a CONNECT, when the broker
@@ -197,6 +200,10 @@ pub trait Plugin: Send + Sync + 'static {
     ///
     /// `client.client_id` is empty when the client asked the server to
     /// assign one, because assignment happens after authentication.
+    ///
+    /// The user name in `credentials`, and in `client.username` here, is
+    /// the one the client claims; it becomes the verified user only when
+    /// the chain answers [`Decision::Allow`].
     fn authenticate<'a>(
         &'a self,
         _client: &'a ClientInfo,
@@ -229,6 +236,8 @@ pub trait Plugin: Send + Sync + 'static {
     /// Changes are trusted: a new topic isn't checked against access
     /// control, and a changed `retain` or `qos` isn't checked against the
     /// retain and QoS limits.
+    ///
+    /// Will messages aren't passed to this hook.
     fn on_message<'a>(
         &'a self,
         _client: &'a ClientInfo,
@@ -258,7 +267,8 @@ pub trait Plugin: Send + Sync + 'static {
     /// Handles a message published to `$CONTROL/<name>/<path>`, once the
     /// client may publish there. A response is published to
     /// `$CONTROL/<name>/<path>/response`. Such messages aren't sent on to
-    /// subscribers.
+    /// subscribers, even when the plugin named `<name>` doesn't implement
+    /// this hook.
     ///
     /// A client publishing to `$CONTROL/<name>/x/response` reaches this
     /// hook with path `"x/response"`, so a plugin that only answers
