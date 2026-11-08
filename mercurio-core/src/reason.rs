@@ -6,15 +6,36 @@ use core::fmt;
 use crate::codec::{Decoder, Encoder};
 
 /// MQTT reason code used in various packets to indicate success or failure.
+///
+/// One enum covers the reason codes of every packet type (section 2.4).
+/// Codes below 0x80 report success and codes from 0x80 report failure. A
+/// few variants share a numeric code; see [`get_code`](ReasonCode::get_code).
+///
+/// The [`Decoder`] cannot know the packet type, so it reads 0x00 as
+/// [`Success`](ReasonCode::Success). The DISCONNECT decoder maps it to
+/// [`NormalDisconnection`](ReasonCode::NormalDisconnection), and the MQTT 3.x
+/// SUBACK decoder maps return codes itself. An unknown code is a
+/// [`MalformedPacket`](ReasonCode::MalformedPacket).
+///
+/// It is also the error type of protocol failures, through
+/// [`Error::MQTTReasonCode`](crate::error::Error::MQTTReasonCode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ReasonCode {
+    /// 0x00 in CONNACK, PUBACK, PUBREC, PUBREL, PUBCOMP, UNSUBACK and AUTH.
     #[default]
     Success,
+    /// 0x00 in DISCONNECT: the connection closes without publishing the
+    /// will message.
     NormalDisconnection,
+    /// 0x00 in SUBACK.
     GrantedQoS0,
+    /// 0x01 in SUBACK.
     GrantedQoS1,
+    /// 0x02 in SUBACK.
     GrantedQoS2,
+    /// 0x04 in DISCONNECT: the client closes the connection and asks the
+    /// server to publish its will message.
     DisconnectWithWillMessage,
     NoMatchingSubscribers,
     NoSubscriptionExisted,
@@ -115,6 +136,12 @@ impl fmt::Display for ReasonCode {
 impl std::error::Error for ReasonCode {}
 
 impl ReasonCode {
+    /// The byte that encodes this reason code.
+    ///
+    /// [`Success`](ReasonCode::Success),
+    /// [`NormalDisconnection`](ReasonCode::NormalDisconnection) and
+    /// [`GrantedQoS0`](ReasonCode::GrantedQoS0) are all 0x00, so the code
+    /// alone does not tell them apart.
     pub fn get_code(&self) -> u8 {
         use ReasonCode::*;
 

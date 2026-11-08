@@ -1,8 +1,4 @@
-//! Storage abstraction layer for Mercurio MQTT broker.
-//!
-//! This crate provides traits for persistent storage of MQTT broker state,
-//! allowing different storage backends (in-memory, SQLite, PostgreSQL).
-
+#![doc = include_str!("../README.md")]
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod encoding;
 pub mod memory;
@@ -24,12 +20,12 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum StorageError {
-    #[error("Session not found: {0}")]
-    SessionNotFound(String),
-
+    /// The store couldn't carry out an operation, such as when its lock
+    /// is poisoned or a connection to the database can't be had.
     #[error("Storage operation failed: {0}")]
     OperationFailed(String),
 
+    /// Stored data couldn't be decoded, such as a message's properties.
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
@@ -72,7 +68,6 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 pub struct SessionState {
     pub client_id: String,
     pub subscriptions: Vec<StoredSubscription>,
-    pub clean_start: bool,
     /// Seconds the session outlives its connection; None means forever
     pub expiry_interval: Option<u32>,
     /// Unix time in milliseconds when the session expires, once its
@@ -85,7 +80,9 @@ pub struct SessionState {
 /// on a listener with the same mount point, may resume it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionOwner {
+    /// The user the client authenticated as; None for anonymous clients
     pub username: Option<String>,
+    /// The mount point of the listener the client connected to
     pub mount_point: Option<String>,
 }
 
@@ -132,6 +129,7 @@ pub struct StoredWillMessage {
 pub struct InflightMessage {
     pub packet_id: u16,
     pub topic: String,
+    /// None once `released`, when only PUBREL remains to be sent
     pub payload: Option<Bytes>,
     pub qos: QoS,
     pub dup: bool,
@@ -141,6 +139,7 @@ pub struct InflightMessage {
     /// what remains to be sent
     pub released: bool,
     pub properties: MessageProperties,
+    /// Identifiers of the subscriptions the message matched, sent with it
     pub subscription_identifiers: Vec<u32>,
 }
 
@@ -240,11 +239,14 @@ pub trait QueueStore: Send + Sync {
         true
     }
 
+    /// Stores `message` at position `sequence` of the client's queue,
+    /// replacing what is stored there.
     async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()>;
 
     /// The client's queued messages, in sequence order.
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
 
+    /// Removes the client's stored queue.
     async fn clear_queue(&self, client_id: &str) -> Result<()>;
 }
 
@@ -252,20 +254,30 @@ pub trait QueueStore: Send + Sync {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Write {
+    /// Store the session, replacing what was stored for the client
     SaveSession(SessionState),
     /// Replace the session's subscriptions, creating the session if needed
     SaveSubscriptions(Vec<StoredSubscription>),
     /// Record when the session expires, if it is stored
     SetExpiry {
+        /// Seconds the session outlives its connection
         interval: u32,
+        /// Unix time in milliseconds when it expires
         expires_at: u64,
     },
     StoreWill(StoredWillMessage),
     DeleteWill,
+    /// Store a QoS 1 or 2 message sent and not yet acknowledged
     StoreInflight(InflightMessage),
+    /// The client sent PUBREC for this packet id: keep the record, drop the
+    /// payload
     ReleaseInflight(u16),
+    /// The client acknowledged this packet id for good
     RemoveInflight(u16),
+    /// Store a message queued for a disconnected client, at this position
+    /// in its queue
     Enqueue(u64, Message),
+    /// Drop the stored queue, once the client took it
     ClearQueue,
     /// Remove the session and everything stored with it
     DeleteSession,
@@ -301,7 +313,6 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
                     .unwrap_or(SessionState {
                         client_id: client_id.to_string(),
                         subscriptions: Vec::new(),
-                        clean_start: false,
                         expiry_interval: None,
                         expires_at: None,
                         owner: SessionOwner::default(),

@@ -1,3 +1,5 @@
+//! PUBACK, the acknowledgement of a QoS 1 PUBLISH (section 3.4).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -12,8 +14,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubAckProperties {
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for PubAckProperties {
@@ -69,6 +71,8 @@ impl Decoder for PubAckProperties {
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubAckPacket {
     pub packet_id: u16,
+    /// Decodes as `Success` when left out. Left out on encode when `Success`
+    /// with no properties, which is the only form MQTT 3.x has.
     pub reason: ReasonCode,
     pub properties: Option<PubAckProperties>,
 }

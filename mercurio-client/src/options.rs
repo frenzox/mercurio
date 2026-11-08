@@ -13,6 +13,18 @@ use mercurio_packets::publish::PublishProperties;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::connection::Stream;
+use crate::error::ClientError;
+
+/// MQTT strings and binary data have a two-byte length (section 1.5.4).
+pub(crate) fn check_length(
+    field: &'static str,
+    value: impl AsRef<[u8]>,
+) -> crate::error::Result<()> {
+    if value.as_ref().len() > u16::MAX as usize {
+        return Err(ClientError::TooLong(field));
+    }
+    Ok(())
+}
 
 /// MQTT 5 properties of an application message. MQTT 3.x ignores them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,11 +33,13 @@ pub struct MessageProperties {
     pub payload_is_utf8: bool,
     /// Seconds the broker keeps the message for subscribers yet to get it
     pub message_expiry: Option<u32>,
+    /// Describes the payload, such as a MIME type; free-form
     pub content_type: Option<String>,
     /// Where a request's reply should be published
     pub response_topic: Option<String>,
     /// Matches a reply to its request
     pub correlation_data: Option<Bytes>,
+    /// Name and value pairs, delivered as published; a name may repeat
     pub user_properties: Vec<(String, String)>,
 }
 
@@ -48,6 +62,23 @@ impl MessageProperties {
             }),
             ..Default::default()
         })
+    }
+
+    pub(crate) fn check(&self) -> crate::error::Result<()> {
+        if let Some(content_type) = &self.content_type {
+            check_length("content type", content_type)?;
+        }
+        if let Some(response_topic) = &self.response_topic {
+            check_length("response topic", response_topic)?;
+        }
+        if let Some(correlation_data) = &self.correlation_data {
+            check_length("correlation data", correlation_data)?;
+        }
+        for (key, value) in &self.user_properties {
+            check_length("user property", key)?;
+            check_length("user property", value)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn from_publish(properties: Option<PublishProperties>) -> Self {
@@ -82,6 +113,12 @@ pub struct Will {
 }
 
 impl Will {
+    fn check(&self) -> crate::error::Result<()> {
+        check_length("will topic", &self.topic)?;
+        check_length("will payload", &self.payload)?;
+        self.properties.check()
+    }
+
     pub(crate) fn to_properties(&self) -> WillProperties {
         let p = self.properties.to_publish().unwrap_or_default();
         WillProperties {
@@ -98,6 +135,8 @@ impl Will {
 }
 
 impl Will {
+    /// A will publishing `payload` on `topic`: QoS 0, not retained, and
+    /// without delay, until set otherwise.
     pub fn new(topic: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         Self {
             topic: topic.into(),
@@ -221,6 +260,22 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
+    pub(crate) fn check(&self) -> crate::error::Result<()> {
+        if let Some(client_id) = &self.client_id {
+            check_length("client id", client_id)?;
+        }
+        if let Some(username) = &self.username {
+            check_length("user name", username)?;
+        }
+        if let Some(password) = &self.password {
+            check_length("password", password)?;
+        }
+        if let Some(authenticator) = &self.authenticator {
+            check_length("authentication method", authenticator.lock().method())?;
+        }
+        self.will.as_ref().map_or(Ok(()), Will::check)
+    }
+
     /// Create new connection options for the given host and port.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
@@ -394,5 +449,24 @@ impl ConnectOptions {
     pub fn connect_timeout(mut self, seconds: u64) -> Self {
         self.connect_timeout_secs = seconds;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_overlong_values_are_refused() {
+        let will = Will::new("t", "p").properties(MessageProperties {
+            user_properties: vec![("k".into(), "v".repeat(65_536))],
+            ..Default::default()
+        });
+        let options = ConnectOptions::new("localhost", 1883).will(will);
+        assert!(matches!(
+            options.check(),
+            Err(ClientError::TooLong("user property"))
+        ));
+        assert!(ConnectOptions::new("localhost", 1883).check().is_ok());
     }
 }

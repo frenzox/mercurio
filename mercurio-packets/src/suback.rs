@@ -1,3 +1,6 @@
+//! SUBACK, the server's answer to SUBSCRIBE, with one result per topic
+//! filter (section 3.9).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -13,8 +16,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for SubAckProperties {
@@ -69,6 +72,9 @@ impl Decoder for SubAckProperties {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct SubAckPayload {
+    /// Result for the topic filter at the same position in the SUBSCRIBE. In
+    /// MQTT 3.x every failure is encoded as 0x80, and decoded as
+    /// `UnspecifiedError`.
     pub reason_code: ReasonCode,
 }
 
@@ -88,7 +94,11 @@ impl Encoder for SubAckPayload {
 
 impl Decoder for SubAckPayload {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reason_code = ReasonCode::decode(buffer)?;
+        // 0x00 is "Granted QoS 0" in SUBACK
+        let reason_code = match ReasonCode::decode(buffer)? {
+            ReasonCode::Success => ReasonCode::GrantedQoS0,
+            reason => reason,
+        };
 
         Ok(SubAckPayload { reason_code })
     }
@@ -96,6 +106,10 @@ impl Decoder for SubAckPayload {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct SubAckPacket {
+    /// Selects the wire format on encode. `decode` sets `V5`, and
+    /// `decode_v3` sets `V3_1_1`.
+    /// [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
+    /// sets the version it is given.
     pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
     pub properties: Option<SubAckProperties>,
@@ -202,7 +216,8 @@ impl SubAckPacket {
                 0x01 => ReasonCode::GrantedQoS1,
                 0x02 => ReasonCode::GrantedQoS2,
                 0x80 => ReasonCode::UnspecifiedError,
-                _ => ReasonCode::UnspecifiedError,
+                // Reserved [MQTT-3.9.3-2]
+                _ => return Err(ReasonCode::MalformedPacket.into()),
             };
             payload.push(SubAckPayload { reason_code });
         }
@@ -242,6 +257,13 @@ mod tests {
     use bytes::{Bytes, BytesMut};
 
     use crate::suback::*;
+
+    #[test]
+    fn test_v5_decode_reads_0x00_as_granted_qos_0() {
+        let mut bytes = Bytes::from_static(&[0x90, 0x04, 0x00, 0x01, 0x00, 0x00]);
+        let packet = SubAckPacket::decode(&mut bytes).unwrap();
+        assert_eq!(packet.payload[0].reason_code, ReasonCode::GrantedQoS0);
+    }
 
     #[test]
     fn test_suback_packet_encode_decode() {

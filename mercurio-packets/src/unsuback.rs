@@ -1,3 +1,5 @@
+//! UNSUBACK, the server's answer to UNSUBSCRIBE (section 3.11).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -13,8 +15,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct UnsubAckProperties {
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for UnsubAckProperties {
@@ -69,6 +71,7 @@ impl Decoder for UnsubAckProperties {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubAckPayload {
+    /// Result for the topic filter at the same position in the UNSUBSCRIBE.
     pub reason_code: ReasonCode,
 }
 
@@ -96,9 +99,15 @@ impl Decoder for UnsubAckPayload {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UnsubAckPacket {
+    /// Selects the wire format on encode. `decode` sets `V5`, and
+    /// `decode_v3` sets `V3_1_1`.
+    /// [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
+    /// sets the version it is given.
     pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
     pub properties: Option<UnsubAckProperties>,
+    /// MQTT 5 only. A 3.x UNSUBACK has no payload, so this is empty after
+    /// `decode_v3` and not encoded.
     pub payload: Vec<UnsubAckPayload>,
 }
 

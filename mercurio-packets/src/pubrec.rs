@@ -1,3 +1,5 @@
+//! PUBREC, the first answer to a QoS 2 PUBLISH (section 3.5).
+
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
@@ -12,8 +14,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubRecProperties {
-    reason_string: Option<ReasonString>,
-    user_property: Option<Vec<UserProperty>>,
+    pub reason_string: Option<ReasonString>,
+    pub user_property: Option<Vec<UserProperty>>,
 }
 
 impl Encoder for PubRecProperties {
@@ -69,6 +71,8 @@ impl Decoder for PubRecProperties {
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubRecPacket {
     pub packet_id: u16,
+    /// Decodes as `Success` when left out. Left out on encode when `Success`
+    /// with no properties, which is the only form MQTT 3.x has.
     pub reason: ReasonCode,
     pub properties: Option<PubRecProperties>,
 }

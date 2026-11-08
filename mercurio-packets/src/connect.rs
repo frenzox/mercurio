@@ -1,3 +1,6 @@
+//! CONNECT, the first packet a client sends: who it is, its will, its
+//! credentials and, in MQTT 5, its limits (section 3.1).
+
 use core::mem;
 
 #[cfg(not(feature = "std"))]
@@ -15,12 +18,23 @@ use mercurio_core::{
 };
 
 #[derive(Default, Debug, PartialEq, Eq)]
+/// The Connect Flags byte (section 3.1.2.3). The flags decide which
+/// optional fields of the payload are encoded and decoded.
 pub struct ConnectFlags {
+    /// The payload has a user name.
     pub user_name: bool,
+    /// The payload has a password. MQTT 3.x doesn't allow one without a user
+    /// name [MQTT-3.1.2-22].
     pub password: bool,
+    /// Publish the will message as a retained message.
     pub will_retain: bool,
+    /// QoS of the will message. Encoded only when `will_flag` is set.
     pub will_qos: QoS,
+    /// The payload has a will message, which the server publishes when the
+    /// connection closes without a normal DISCONNECT (section 3.1.2.5).
     pub will_flag: bool,
+    /// Discard any existing session. MQTT 3.x calls it Clean Session, and
+    /// there it also ends the session when the connection closes.
     pub clean_start: bool,
 }
 
@@ -95,14 +109,28 @@ impl Decoder for ConnectFlags {
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
+/// MQTT 5 only.
 pub struct ConnectProperties {
+    /// Seconds the session outlives the connection. Absent means 0, the
+    /// session ends with the connection. `u32::MAX` means it never expires.
     pub session_expiry_interval: Option<SessionExpiryInterval>,
+    /// QoS 1 and 2 PUBLISH packets the client handles at once. Absent means
+    /// 65,535.
     pub receive_maximum: Option<ReceiveMaximum>,
+    /// Largest packet, in bytes, the client accepts. Absent means no limit
+    /// beyond the protocol's.
     pub maximum_packet_size: Option<MaximumPacketSize>,
+    /// Highest topic alias the client accepts from the server. Absent means
+    /// 0: the server may not use topic aliases.
     pub topic_alias_maximum: Option<TopicAliasMaximum>,
+    /// 1 asks the server for Response Information in the CONNACK.
     pub request_response_information: Option<RequestResponseInformation>,
+    /// 0 asks the server to send reason strings and user properties only on
+    /// PUBLISH, CONNACK and DISCONNECT. Absent means 1.
     pub request_problem_information: Option<RequestProblemInformation>,
     pub user_property: Option<Vec<UserProperty>>,
+    /// Set to start enhanced authentication, continued with AUTH packets
+    /// (section 4.12).
     pub authentication_method: Option<AuthenticationMethod>,
     pub authentication_data: Option<AuthenticationData>,
 }
@@ -183,7 +211,11 @@ impl Decoder for ConnectProperties {
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
+/// Properties of the will message (section 3.1.3.2). MQTT 5 only.
 pub struct WillProperties {
+    /// Seconds the server waits after the connection closes before it
+    /// publishes the will. Absent means 0. If the session resumes in that
+    /// time, the will is not published.
     pub will_delay_interval: Option<WillDelayInterval>,
     pub payload_format_indicator: Option<PayloadFormatIndicator>,
     pub message_expiry_interval: Option<MessageExpiryInterval>,
@@ -261,16 +293,32 @@ impl Decoder for WillProperties {
 
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct ConnectPayload {
+    /// May be empty, and the server then assigns one (section 3.1.3.1).
     pub client_id: String,
+    /// MQTT 5 only.
     pub will_properties: Option<WillProperties>,
+    /// Set when `ConnectFlags::will_flag` is.
     pub will_topic: Option<String>,
+    /// Set when `ConnectFlags::will_flag` is.
     pub will_payload: Option<Bytes>,
     pub user_name: Option<String>,
     pub password: Option<Bytes>,
 }
 
 impl ConnectPayload {
+    fn present_fields(&self) -> ConnectFlags {
+        ConnectFlags {
+            user_name: self.user_name.is_some(),
+            password: self.password.is_some(),
+            will_flag: self.will_topic.is_some(),
+            ..Default::default()
+        }
+    }
+
     /// Encode payload with version-specific handling.
+    ///
+    /// The will, user name and password are written only when `flags` says
+    /// the payload has them, and the will properties only in MQTT 5.
     pub fn encode_for_version(
         &self,
         buffer: &mut BytesMut,
@@ -298,7 +346,8 @@ impl ConnectPayload {
         }
     }
 
-    /// Calculate encoded size with version-specific handling.
+    /// Calculate encoded size with version-specific handling, matching
+    /// [`Self::encode_for_version`].
     pub fn encoded_size_for_version(
         &self,
         version: ProtocolVersion,
@@ -331,37 +380,14 @@ impl ConnectPayload {
     }
 }
 
+/// Encodes the MQTT 5 form, with the fields that are set.
 impl Encoder for ConnectPayload {
     fn encode(&self, buffer: &mut BytesMut) {
-        // Default encoding assumes MQTT 5.0 with all optional fields
-        self.client_id.encode(buffer);
-
-        if self.will_properties.encoded_size() > 0 {
-            VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
-            self.will_properties.encode(buffer);
-        }
-
-        self.will_topic.encode(buffer);
-        self.will_payload.encode(buffer);
-        self.user_name.encode(buffer);
-        self.password.encode(buffer);
+        self.encode_for_version(buffer, ProtocolVersion::V5, &self.present_fields());
     }
 
     fn encoded_size(&self) -> usize {
-        let mut len = 0;
-
-        len += self.client_id.encoded_size();
-        if self.will_properties.encoded_size() > 0 {
-            len += VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
-            len += self.will_properties.encoded_size();
-        }
-
-        len += self.will_topic.encoded_size();
-        len += self.will_payload.encoded_size();
-        len += self.user_name.encoded_size();
-        len += self.password.encoded_size();
-
-        len
+        self.encoded_size_for_version(ProtocolVersion::V5, &self.present_fields())
     }
 }
 
@@ -378,9 +404,14 @@ impl Decoder for ConnectPayload {
 
 #[derive(Eq, PartialEq, Debug)]
 pub struct ConnectPacket {
+    /// Read from the protocol name and level. Selects the wire format on
+    /// encode.
     pub protocol_version: ProtocolVersion,
     pub flags: ConnectFlags,
+    /// Longest time, in seconds, between two packets from the client. 0 turns
+    /// keep alive off (section 3.1.2.10).
     pub keepalive: u16,
+    /// MQTT 5 only.
     pub properties: Option<ConnectProperties>,
     pub payload: ConnectPayload,
 }
@@ -491,6 +522,23 @@ impl Decoder for ConnectPacket {
 #[cfg(test)]
 mod tests {
     use crate::connect::*;
+
+    #[test]
+    fn test_payload_encoder_writes_empty_will_properties() {
+        let payload = ConnectPayload {
+            client_id: "c".into(),
+            will_topic: Some("t".into()),
+            will_payload: Some(Bytes::from_static(b"p")),
+            ..Default::default()
+        };
+        let mut encoded = BytesMut::new();
+        payload.encode(&mut encoded);
+        assert_eq!(
+            &encoded[..],
+            [0x00, 0x01, b'c', 0x00, 0x00, 0x01, b't', 0x00, 0x01, b'p']
+        );
+        assert_eq!(payload.encoded_size(), encoded.len());
+    }
 
     #[test]
     fn test_connect_packet_encoding() {

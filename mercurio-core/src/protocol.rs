@@ -61,14 +61,17 @@ impl ProtocolVersion {
     }
 }
 
-impl From<u8> for ProtocolVersion {
-    fn from(level: u8) -> Self {
+/// The version of a protocol level, or the level itself when no version
+/// has it.
+impl TryFrom<u8> for ProtocolVersion {
+    type Error = u8;
+
+    fn try_from(level: u8) -> Result<Self, u8> {
         match level {
-            3 => ProtocolVersion::V3_1,
-            4 => ProtocolVersion::V3_1_1,
-            5 => ProtocolVersion::V5,
-            // Default to V5 for unknown versions (will be rejected at connection time)
-            _ => ProtocolVersion::V5,
+            3 => Ok(ProtocolVersion::V3_1),
+            4 => Ok(ProtocolVersion::V3_1_1),
+            5 => Ok(ProtocolVersion::V5),
+            _ => Err(level),
         }
     }
 }
@@ -89,9 +92,10 @@ mod tests {
 
     #[test]
     fn test_protocol_version_from_u8() {
-        assert_eq!(ProtocolVersion::from(3), ProtocolVersion::V3_1);
-        assert_eq!(ProtocolVersion::from(4), ProtocolVersion::V3_1_1);
-        assert_eq!(ProtocolVersion::from(5), ProtocolVersion::V5);
+        assert_eq!(ProtocolVersion::try_from(3), Ok(ProtocolVersion::V3_1));
+        assert_eq!(ProtocolVersion::try_from(4), Ok(ProtocolVersion::V3_1_1));
+        assert_eq!(ProtocolVersion::try_from(5), Ok(ProtocolVersion::V5));
+        assert_eq!(ProtocolVersion::try_from(6), Err(6));
     }
 
     #[test]

@@ -292,7 +292,6 @@ mod tests {
                 StoredSubscription::new("topic/a", QoS::AtMostOnce),
                 StoredSubscription::new("topic/b", QoS::AtLeastOnce),
             ],
-            clean_start: false,
             expiry_interval: None,
             expires_at: None,
             owner: Default::default(),

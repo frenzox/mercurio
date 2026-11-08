@@ -1,8 +1,4 @@
-//! MQTT packet encoding and decoding for all MQTT versions.
-//!
-//! This crate provides packet types for MQTT 3.1, 3.1.1, and 5.0 and is
-//! `no_std` compatible when the `std` feature is disabled.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
@@ -26,7 +22,7 @@ pub mod unsubscribe;
 
 use core::convert::{TryFrom, TryInto};
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
@@ -45,6 +41,7 @@ use crate::{
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug)]
+/// Any MQTT control packet, as decoded from or encoded to the wire.
 pub enum ControlPacket {
     Connect(ConnectPacket),
     ConnAck(ConnAckPacket),
@@ -64,6 +61,8 @@ pub enum ControlPacket {
 }
 
 #[repr(C)]
+/// The packet type, the high four bits of the first byte of the fixed
+/// header (section 2.1.2).
 pub enum PacketType {
     Connect = 0x01,
     ConnAck,
@@ -116,7 +115,7 @@ impl ControlPacket {
     ///
     /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
     /// if more data is needed.
-    pub fn check(src: &mut BytesMut) -> crate::Result<()> {
+    pub fn check(src: &[u8]) -> crate::Result<()> {
         if src.len() >= Self::frame_len(src)? {
             Ok(())
         } else {
@@ -150,6 +149,9 @@ impl ControlPacket {
         Ok(header_len + remaining_len.0 as usize)
     }
 
+    /// Same as [`Self::parse_with_version`] with MQTT 5.0. Several packets
+    /// have a different shape in MQTT 3.x, so this misreads them on a 3.x
+    /// connection.
     pub fn parse(src: &mut BytesMut) -> crate::Result<ControlPacket> {
         // Default to MQTT 5.0 parsing
         Self::parse_with_version(src, ProtocolVersion::V5)
@@ -157,6 +159,12 @@ impl ControlPacket {
 
     /// Parse a control packet with version-specific decoding.
     /// Use this when the protocol version is known (e.g., after CONNECT).
+    ///
+    /// Removes the packet from `src` and leaves any bytes after it. Returns
+    /// `Error::PacketIncomplete`, with `src` untouched, until the whole
+    /// packet is there. A packet that is malformed, or that doesn't use all
+    /// its own bytes, is still removed from `src` and gives a reason code
+    /// error, usually `MalformedPacket`.
     pub fn parse_with_version(
         src: &mut BytesMut,
         version: ProtocolVersion,
@@ -219,7 +227,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     ConnAck(ConnAckPacket::decode(src)?)
                 } else {
-                    ConnAck(ConnAckPacket::decode_v3(src)?)
+                    ConnAck(ConnAckPacket {
+                        protocol_version: version,
+                        ..ConnAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::Publish => {
@@ -244,7 +255,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     SubAck(SubAckPacket::decode(src)?)
                 } else {
-                    SubAck(SubAckPacket::decode_v3(src)?)
+                    SubAck(SubAckPacket {
+                        protocol_version: version,
+                        ..SubAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::Unsubscribe => {
@@ -258,7 +272,10 @@ impl ControlPacket {
                 if version.supports_properties() {
                     UnsubAck(UnsubAckPacket::decode(src)?)
                 } else {
-                    UnsubAck(UnsubAckPacket::decode_v3(src)?)
+                    UnsubAck(UnsubAckPacket {
+                        protocol_version: version,
+                        ..UnsubAckPacket::decode_v3(src)?
+                    })
                 }
             }
             PacketType::PingReq => PingReq(PingReqPacket::decode(src)?),
@@ -271,6 +288,11 @@ impl ControlPacket {
     }
 
     /// Encode a control packet in the wire format of the given protocol version.
+    ///
+    /// CONNACK, SUBACK and UNSUBACK use their own `protocol_version` field
+    /// instead of `version`. PUBACK, PUBREC, PUBREL and PUBCOMP are only
+    /// valid in MQTT 3.x with reason `Success` and no properties, since they
+    /// are then encoded without either.
     pub fn encode_with_version(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
         use ControlPacket::*;
 
@@ -278,11 +300,21 @@ impl ControlPacket {
             return self.encode(buffer);
         }
 
+        // MQTT 3.x acknowledgements carry only the packet id: a reason code
+        // or properties would make them malformed there
+        let ack = |buffer: &mut BytesMut, first_byte: u8, packet_id: u16| {
+            buffer.put_slice(&[first_byte, 0x02]);
+            buffer.put_u16(packet_id);
+        };
         match self {
             Publish(p) => p.encode_v3(buffer),
             Subscribe(p) => p.encode_v3(buffer),
             Unsubscribe(p) => p.encode_v3(buffer),
             Disconnect(p) => p.encode_v3(buffer),
+            PubAck(p) => ack(buffer, 0x40, p.packet_id),
+            PubRec(p) => ack(buffer, 0x50, p.packet_id),
+            PubRel(p) => ack(buffer, 0x62, p.packet_id),
+            PubComp(p) => ack(buffer, 0x70, p.packet_id),
             p => p.encode(buffer),
         }
     }
@@ -385,6 +417,29 @@ mod tests {
     }
 
     #[test]
+    fn test_v3_acks_carry_only_the_packet_id() {
+        let packet = ControlPacket::PubRel(pubrel::PubRelPacket {
+            packet_id: 7,
+            reason: ReasonCode::PacketIdentifierNotFound,
+            properties: None,
+        });
+        let mut encoded = BytesMut::new();
+        packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
+        assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn test_v3_1_acks_keep_their_version() {
+        let mut buffer = BytesMut::from(&[0x90, 0x03, 0x00, 0x01, 0x01][..]);
+        let ControlPacket::SubAck(suback) =
+            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1).unwrap()
+        else {
+            panic!("Expected SubAck");
+        };
+        assert_eq!(suback.protocol_version, ProtocolVersion::V3_1);
+    }
+
+    #[test]
     fn test_v3_unsubscribe_decode() {
         // UNSUBSCRIBE packet id 2, "a/#"
         let wire = [0xa2, 0x07, 0x00, 0x02, 0x00, 0x03, b'a', b'/', b'#'];
@@ -455,7 +510,7 @@ mod robustness_tests {
         for version in [ProtocolVersion::V5, ProtocolVersion::V3_1_1] {
             let mut buffer = BytesMut::from(bytes);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                while ControlPacket::check(&mut buffer).is_ok() {
+                while ControlPacket::check(&buffer).is_ok() {
                     if ControlPacket::parse_with_version(&mut buffer, version).is_err() {
                         break;
                     }
@@ -561,7 +616,7 @@ mod robustness_tests {
 
     #[test]
     fn test_reserved_flags_are_malformed() {
-        let malformed: [(&[u8], ProtocolVersion); 6] = [
+        let malformed: [(&[u8], ProtocolVersion); 9] = [
             // PINGREQ with a reserved flag set
             (&[0xc1, 0x00], ProtocolVersion::V5),
             // SUBSCRIBE without the mandatory 0b0010 flags
@@ -590,6 +645,18 @@ mod robustness_tests {
                     0x10, 0x10, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x42, 0x00, 0x3c, 0x00,
                     0x01, b'c', 0x00, 0x01, b'p',
                 ],
+                ProtocolVersion::V3_1_1,
+            ),
+            // SUBSCRIBE with a reserved option bit set
+            (
+                &[0x82, 0x08, 0x00, 0x01, 0x00, 0x00, 0x02, b'a', b'#', 0x41],
+                ProtocolVersion::V5,
+            ),
+            // MQTT 3.1.1 SUBACK with a reserved return code
+            (&[0x90, 0x03, 0x00, 0x01, 0x03], ProtocolVersion::V3_1_1),
+            // PUBLISH whose topic holds U+0000
+            (
+                &[0x30, 0x04, 0x00, 0x02, b'a', 0x00],
                 ProtocolVersion::V3_1_1,
             ),
         ];

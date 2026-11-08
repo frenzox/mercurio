@@ -21,10 +21,17 @@ use crate::{
 /// - `payload` uses `Bytes` which is also reference-counted
 #[derive(Clone, Debug)]
 pub struct Message {
+    /// Packet identifier of the PUBLISH the message arrived in. `None` at
+    /// QoS 0 and for messages the broker creates itself, such as will
+    /// messages. Each delivery to a subscriber uses its own identifier.
     pub packet_id: Option<u16>,
-    /// Topic name - uses Arc<str> for cheap cloning when broadcasting to multiple subscribers
+    /// Topic name - uses `Arc<str>` for cheap cloning when broadcasting to multiple subscribers
     pub topic: Arc<str>,
+    /// DUP flag of the PUBLISH the message arrived in: the sender may have
+    /// sent it before (section 3.3.1.1).
     pub dup: bool,
+    /// The publisher's QoS. The server adjusts it per delivery to the QoS
+    /// granted to the matching subscription [MQTT-3.8.4-8].
     pub qos: QoS,
     pub retain: bool,
     /// Payload data - Bytes is already reference-counted for cheap cloning
@@ -57,6 +64,8 @@ impl Message {
             .map(|interval| unix_millis() + u64::from(interval.value) * 1000)
     }
 
+    /// Whether `expires_at` has passed. A message without a deadline never
+    /// expires.
     pub fn is_expired(&self) -> bool {
         self.expires_at
             .is_some_and(|deadline| unix_millis() >= deadline)

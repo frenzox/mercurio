@@ -1,3 +1,5 @@
+//! PINGRESP, the server's answer to PINGREQ (section 3.13).
+
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};

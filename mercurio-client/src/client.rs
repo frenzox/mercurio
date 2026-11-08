@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
-use crate::options::{ConnectOptions, MessageProperties, SharedAuthenticator, Will};
+use crate::options::{check_length, ConnectOptions, MessageProperties, SharedAuthenticator, Will};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
@@ -68,6 +68,7 @@ pub struct MqttClient {
 impl MqttClient {
     /// Connect to an MQTT broker with the given options.
     pub async fn connect(mut options: ConnectOptions) -> Result<Self> {
+        options.check()?;
         let (connection, session) = Self::open(&options).await?;
         // Reconnecting must present the same identity to find the session
         options.client_id = Some(session.client_id.clone());
@@ -140,7 +141,7 @@ impl MqttClient {
         connection: &mut Connection,
         options: &ConnectOptions,
     ) -> Result<Session> {
-        let connect_packet = Self::build_connect_packet(options);
+        let connect_packet = Self::build_connect_packet(options)?;
         connection
             .write_packet(ControlPacket::Connect(connect_packet))
             .await?;
@@ -236,7 +237,7 @@ impl MqttClient {
     }
 
     /// Build a CONNECT packet from options.
-    fn build_connect_packet(options: &ConnectOptions) -> ConnectPacket {
+    fn build_connect_packet(options: &ConnectOptions) -> Result<ConnectPacket> {
         let authentication = options.authenticator.as_ref().map(|a| {
             let mut authenticator = a.lock();
             (authenticator.method(), authenticator.start())
@@ -263,7 +264,7 @@ impl MqttClient {
             password: options.password.clone(),
         };
 
-        ConnectPacket {
+        Ok(ConnectPacket {
             protocol_version: options.protocol_version,
             flags,
             keepalive: options.keep_alive,
@@ -282,13 +283,11 @@ impl MqttClient {
                 authentication_method: authentication
                     .as_ref()
                     .map(|(method, _)| AuthenticationMethod::new(method.clone())),
-                authentication_data: authentication
-                    .and_then(|(_, data)| data)
-                    .map(AuthenticationData::new),
+                authentication_data: auth_data(authentication.and_then(|(_, data)| data))?,
                 ..Default::default()
             }),
             payload,
-        }
+        })
     }
 
     /// Runs the client until it disconnects for good: with reconnection
@@ -393,6 +392,8 @@ impl MqttClient {
         retain: bool,
         properties: MessageProperties,
     ) -> Result<()> {
+        check_length("topic", topic)?;
+        properties.check()?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Publish(PublishRequest {
@@ -431,6 +432,9 @@ impl MqttClient {
         topics: &[(&str, SubscriptionOptions)],
         subscription_id: Option<u32>,
     ) -> Result<Vec<SubscribeResult>> {
+        for (topic, _) in topics {
+            check_length("topic filter", topic)?;
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Subscribe {
@@ -447,6 +451,9 @@ impl MqttClient {
     /// Unsubscribe from one or more topics. MQTT 3.x brokers report
     /// success for every topic.
     pub async fn unsubscribe(&self, topics: &[&str]) -> Result<Vec<UnsubscribeResult>> {
+        for topic in topics {
+            check_length("topic filter", topic)?;
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Unsubscribe {
@@ -501,6 +508,13 @@ impl MqttClient {
     }
 }
 
+fn auth_data(data: Option<Bytes>) -> Result<Option<AuthenticationData>> {
+    data.map(|data| {
+        check_length("authentication data", &data).map(|()| AuthenticationData::new(data))
+    })
+    .transpose()
+}
+
 /// AUTH answering a broker challenge, or an error if the authenticator
 /// gives up.
 fn auth_answer(
@@ -508,12 +522,12 @@ fn auth_answer(
     challenge: Option<Bytes>,
 ) -> std::result::Result<ControlPacket, String> {
     let mut authenticator = authenticator.lock();
-    let data = authenticator.respond(challenge)?;
+    let data = auth_data(authenticator.respond(challenge)?).map_err(|e| e.to_string())?;
     Ok(ControlPacket::Auth(AuthPacket {
         reason: ReasonCode::ContinueAuthentication,
         properties: AuthProperties {
             auth_method: Some(AuthenticationMethod::new(authenticator.method())),
-            auth_data: data.map(AuthenticationData::new),
+            auth_data: data,
             ..Default::default()
         },
     }))
@@ -765,11 +779,18 @@ impl EventLoop {
         }
         let packet = {
             let mut authenticator = authenticator.lock();
+            let auth_data = match auth_data(authenticator.start()) {
+                Ok(data) => data,
+                Err(e) => {
+                    let _ = response.send(Err(e));
+                    return;
+                }
+            };
             ControlPacket::Auth(AuthPacket {
                 reason: ReasonCode::ReAuthenticate,
                 properties: AuthProperties {
                     auth_method: Some(AuthenticationMethod::new(authenticator.method())),
-                    auth_data: authenticator.start().map(AuthenticationData::new),
+                    auth_data,
                     ..Default::default()
                 },
             })

@@ -1,3 +1,6 @@
+//! SUBSCRIBE, a client's request for the messages of some topic filters,
+//! with their options (section 3.8).
+
 use core::mem;
 
 #[cfg(not(feature = "std"))]
@@ -13,7 +16,10 @@ use mercurio_core::{
 };
 
 #[derive(Default, Debug, PartialEq, Eq)]
+/// MQTT 5 only.
 pub struct SubscribeProperties {
+    /// Number the server adds to each PUBLISH it sends for these
+    /// subscriptions (section 3.8.2.1.2).
     pub subscription_id: Option<SubscriptionIdentifier>,
     pub user_property: Option<Vec<UserProperty>>,
 }
@@ -71,11 +77,15 @@ impl Decoder for SubscribeProperties {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[derive(Default)]
+/// Whether the server sends retained messages when the subscription is
+/// made (section 3.8.3.1). MQTT 5 only. MQTT 3.x always sends them.
 pub enum RetainHandling {
     #[default]
     SendRetained = 0x00,
+    /// Send them only if the subscription didn't exist already.
     SendRetainedIfNonExisting = 0x01,
     DoNotSendRetained = 0x02,
+    /// Any value above 2. Decoding rejects it as a protocol error.
     Invalid = 0xff,
 }
 
@@ -91,9 +101,17 @@ impl From<u8> for RetainHandling {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// The Subscription Options byte (section 3.8.3.1). MQTT 3.x has only
+/// `qos`: decoding rejects the other fields, and encoding leaves them out.
 pub struct SubscriptionOptions {
+    /// Highest QoS the server uses to send messages for this subscription.
     pub qos: QoS,
+    /// Don't send this client the messages it published itself. A protocol
+    /// error on a shared subscription.
     pub no_local: bool,
+    /// Keep the RETAIN flag of forwarded messages as the publisher set it.
+    /// When false the server clears it, except on retained messages sent
+    /// because of a new subscription.
     pub retain_as_pub: bool,
     pub retain_handling: RetainHandling,
 }
@@ -123,6 +141,11 @@ impl Encoder for SubscriptionOptions {
 impl Decoder for SubscriptionOptions {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let opt = u8::decode(buffer)?;
+
+        // Bits 6 and 7 are reserved [MQTT-3.8.3-5]
+        if opt & 0b1100_0000 != 0 {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
 
         let qos: QoS = (opt & 0b0000_0011).into();
 
@@ -185,6 +208,7 @@ impl Decoder for SubscribePayload {
 pub struct SubscribePacket {
     pub packet_id: u16,
     pub properties: Option<SubscribeProperties>,
+    /// At least one entry. An empty list decodes as a protocol error.
     pub payload: Vec<SubscribePayload>,
 }
 

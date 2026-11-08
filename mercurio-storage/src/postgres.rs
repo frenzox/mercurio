@@ -243,6 +243,7 @@ impl DatabaseLock {
         let _ = self.lost.clone().wait_for(|lost| *lost).await;
     }
 
+    /// Whether `lost` has completed.
     pub fn is_lost(&self) -> bool {
         *self.lost.borrow()
     }
@@ -457,7 +458,8 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
             vec![
                 id(),
                 Box::new(encode_subscriptions(&session.subscriptions).into_bytes()),
-                Box::new(session.clean_start),
+                // No longer used; kept for databases that require it
+                Box::new(false),
                 Box::new(session.expiry_interval.map(i64::from)),
                 Box::new(session.expires_at.map(|t| t as i64)),
                 Box::new(session.owner.username.clone()),
@@ -810,7 +812,6 @@ impl SessionStore for PostgresStore {
         Ok(Some(SessionState {
             client_id: client_id.to_string(),
             subscriptions: decode_subscriptions(&subscriptions),
-            clean_start: row.try_get("clean_start").db()?,
             expiry_interval: row
                 .try_get::<_, Option<i64>>("expiry_interval")
                 .db()?
@@ -1217,7 +1218,6 @@ mod tests {
                 subscription.clone(),
                 StoredSubscription::new("b", QoS::AtMostOnce),
             ],
-            clean_start: false,
             expiry_interval: Some(u32::MAX),
             expires_at: Some(1),
             owner: SessionOwner {

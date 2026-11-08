@@ -1,3 +1,5 @@
+//! CONNACK, the server's answer to CONNECT (section 3.2).
+
 use core::mem;
 
 #[cfg(not(feature = "std"))]
@@ -15,6 +17,8 @@ use mercurio_core::{
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
+    /// Whether the server resumed a session it already held for this client.
+    /// Always false after a CONNECT with clean start [MQTT-3.2.2-2].
     pub session_present: bool,
 }
 
@@ -44,21 +48,41 @@ impl Decoder for ConnAckFlags {
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
+/// MQTT 5 only.
 pub struct ConnAckProperties {
+    /// Set when the server uses a session expiry other than the one the
+    /// client asked for.
     pub session_expiry_interval: Option<SessionExpiryInterval>,
+    /// QoS 1 and 2 PUBLISH packets the server handles at once. Absent means
+    /// 65,535.
     pub receive_maximum: Option<ReceiveMaximum>,
+    /// Absent means the server supports QoS 2.
     pub maximum_qos: Option<MaximumQoS>,
+    /// Absent means retained messages are supported.
     pub retain_available: Option<RetainAvailable>,
+    /// Largest packet, in bytes, the server accepts. Absent means no limit
+    /// beyond the protocol's.
     pub maximum_packet_size: Option<MaximumPacketSize>,
+    /// The client ID the server chose, sent when the CONNECT had an empty one.
     pub assigned_client_id: Option<AssignedClientIdentifier>,
+    /// Highest topic alias the server accepts from the client. Absent means
+    /// 0: the client may not use topic aliases.
     pub topic_alias_max: Option<TopicAliasMaximum>,
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
+    /// Absent means wildcard subscriptions are supported.
     pub wildcard_subscription_available: Option<WildcardSubscriptionAvailable>,
+    /// Absent means subscription identifiers are supported.
     pub subscription_identifier_available: Option<SubscriptionIdentifierAvailable>,
+    /// Absent means shared subscriptions are supported.
     pub shared_subscription_available: Option<SharedSubscriptionAvailable>,
+    /// Keep alive, in seconds, the client must use in place of the one it
+    /// sent in CONNECT.
     pub server_keepalive: Option<ServerKeepAlive>,
+    /// Basis for response topics, sent when the client set Request Response
+    /// Information.
     pub response_information: Option<ResponseInformation>,
+    /// Another server the client may use (section 4.11).
     pub server_reference: Option<ServerReference>,
     pub authentication_method: Option<AuthenticationMethod>,
     pub authentication_data: Option<AuthenticationData>,
@@ -167,15 +191,23 @@ impl Decoder for ConnAckProperties {
 
 /// MQTT 3.x return codes for CONNACK.
 /// These are different from MQTT 5.0 reason codes.
+///
+/// A 3.x CONNACK is encoded with the code converted from the packet's
+/// `ReasonCode`. Codes with no 3.x equivalent become `ServerUnavailable`.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ConnAckReturnCode {
     #[default]
     Accepted = 0x00,
+    /// The server doesn't support the protocol level the client asked for.
     UnacceptableProtocolVersion = 0x01,
+    /// The client ID is valid UTF-8, but the server doesn't allow it.
     IdentifierRejected = 0x02,
+    /// The network connection is up, but the MQTT service is unavailable.
     ServerUnavailable = 0x03,
+    /// The user name or password is malformed or wrong.
     BadUsernameOrPassword = 0x04,
+    /// The client may not connect.
     NotAuthorized = 0x05,
 }
 
@@ -207,6 +239,10 @@ impl From<ReasonCode> for ConnAckReturnCode {
 
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
+    /// Selects the wire format on encode: in MQTT 3.x a return code and no
+    /// properties. `decode` sets `V5`, and `decode_v3` sets `V3_1_1` for both
+    /// 3.1 and 3.1.1. [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
+    /// sets the version it is given.
     pub protocol_version: ProtocolVersion,
     pub flags: ConnAckFlags,
     pub reason_code: ReasonCode,
