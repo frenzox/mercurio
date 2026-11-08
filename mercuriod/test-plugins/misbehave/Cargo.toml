@@ -14,4 +14,5 @@ wasip2 = "2.0.1"
 [profile.release]
 opt-level = "s"
 
+# The root `exclude` doesn't stop cargo treating this as a member when built by path
 [workspace]

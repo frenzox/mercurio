@@ -131,13 +131,16 @@ async fn test_a_plugin_that_sleeps_in_init_fails_to_load() {
     let mut settings = settings("misbehave", &[("init_sleep_ms", "120000")]);
     settings.timeout = Duration::from_millis(200);
     let runtime = Runtime::new().unwrap();
+    let started = std::time::Instant::now();
     let loading = WasmPlugin::load(&runtime, settings);
     // Compiling the plugin counts too, and takes seconds when many tests
     // compile at once; a hang would last the two minutes of the sleep
     let result = tokio::time::timeout(Duration::from_secs(30), loading)
         .await
         .expect("loading hung");
-    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let error = result.err().expect("the load succeeded").to_string();
+    assert!(error.contains("took longer"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
