@@ -40,8 +40,24 @@ pub enum StorageError {
     DatabaseError(#[from] rusqlite::Error),
 
     #[cfg(feature = "postgres")]
-    #[error("PostgreSQL error: {0}")]
+    #[error("PostgreSQL: {}", error_chain(.0))]
     Postgres(#[from] tokio_postgres::Error),
+}
+
+/// An error with its causes, which tokio-postgres and deadpool leave out
+/// of their messages, such as the server's reason for refusing a query.
+#[cfg(feature = "postgres")]
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message = format!("{message}: {cause_text}");
+        }
+        source = cause.source();
+    }
+    message
 }
 
 /// Result type for storage operations.
@@ -219,16 +235,93 @@ pub trait QueueStore: Send + Sync {
     async fn clear_queue(&self, client_id: &str) -> Result<()>;
 }
 
+/// A change to what is stored for one client.
+#[derive(Debug, Clone)]
+pub enum Write {
+    SaveSession(SessionState),
+    /// Replace the session's subscriptions, creating the session if needed
+    SaveSubscriptions(Vec<StoredSubscription>),
+    /// Record when the session expires, if it is stored
+    SetExpiry {
+        interval: u32,
+        expires_at: u64,
+    },
+    StoreWill(StoredWillMessage),
+    DeleteWill,
+    StoreInflight(InflightMessage),
+    ReleaseInflight(u16),
+    RemoveInflight(u16),
+    Enqueue(u64, Message),
+    ClearQueue,
+    /// Remove the session and everything stored with it
+    DeleteSession,
+}
+
+/// Applies a client's changes in batches, in order.
+#[async_trait]
+pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
+    /// Apply `writes` for `client_id` in order. Each write may be applied
+    /// again after a failure, so applying one twice must be harmless.
+    /// Stores that can should apply the batch atomically.
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+        for write in writes {
+            match write {
+                Write::SaveSession(state) => self.save_session(client_id, state).await?,
+                Write::SaveSubscriptions(subscriptions) => {
+                    let mut state = self.load_session(client_id).await?.unwrap_or(SessionState {
+                        client_id: client_id.to_string(),
+                        subscriptions: Vec::new(),
+                        clean_start: false,
+                        expiry_interval: None,
+                        expires_at: None,
+                    });
+                    state.subscriptions = subscriptions.clone();
+                    self.save_session(client_id, &state).await?;
+                }
+                Write::SetExpiry {
+                    interval,
+                    expires_at,
+                } => {
+                    if let Some(mut state) = self.load_session(client_id).await? {
+                        state.expiry_interval = Some(*interval);
+                        state.expires_at = Some(*expires_at);
+                        self.save_session(client_id, &state).await?;
+                    }
+                }
+                Write::StoreWill(will) => self.store_will(client_id, will).await?,
+                Write::DeleteWill => self.delete_will(client_id).await?,
+                Write::StoreInflight(message) => {
+                    self.store_inflight(client_id, message.packet_id, message)
+                        .await?
+                }
+                Write::ReleaseInflight(packet_id) => {
+                    self.release_inflight(client_id, *packet_id).await?
+                }
+                Write::RemoveInflight(packet_id) => {
+                    self.remove_inflight(client_id, *packet_id).await?
+                }
+                Write::Enqueue(sequence, message) => {
+                    self.enqueue(client_id, *sequence, message).await?
+                }
+                Write::ClearQueue => self.clear_queue(client_id).await?,
+                Write::DeleteSession => {
+                    self.delete_session(client_id).await?;
+                    self.delete_will(client_id).await?;
+                    self.clear_queue(client_id).await?;
+                    for message in self.get_all_inflight(client_id).await? {
+                        self.remove_inflight(client_id, message.packet_id).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Combined trait for full MQTT storage functionality.
 ///
 /// Implementations provide all storage capabilities needed by an MQTT broker.
-pub trait MqttStore:
-    SessionStore + RetainedMessageStore + WillStore + InflightStore + QueueStore
-{
-}
+pub trait MqttStore: BatchStore + RetainedMessageStore {}
 
 /// Blanket implementation for any type implementing all storage traits.
-impl<T> MqttStore for T where
-    T: SessionStore + RetainedMessageStore + WillStore + InflightStore + QueueStore
-{
-}
+impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}

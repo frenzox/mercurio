@@ -22,8 +22,8 @@ use crate::{
     encoding::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
-    InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore, SessionState,
-    SessionStore, StorageError, StoredWillMessage, WillStore,
+    BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
+    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -196,31 +196,166 @@ impl FromSql for Identifiers {
     }
 }
 
-#[async_trait]
-impl SessionStore for SqliteStore {
-    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
-        let client_id = client_id.to_string();
-        let subscriptions = encode_subscriptions(&session.subscriptions);
-        let clean_start = session.clean_start;
-        let expiry_interval = session.expiry_interval;
-        let expires_at = session.expires_at.map(|t| t as i64);
-
-        self.blocking(move |conn| {
+/// Applies one change; the caller holds the transaction.
+fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> Result<()> {
+    match write {
+        Write::SaveSession(session) => {
             conn.execute(
                 "INSERT OR REPLACE INTO sessions
                  (client_id, subscriptions, clean_start, expiry_interval, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     client_id,
-                    subscriptions,
-                    clean_start,
-                    expiry_interval,
-                    expires_at
+                    encode_subscriptions(&session.subscriptions),
+                    session.clean_start,
+                    session.expiry_interval,
+                    session.expires_at.map(|t| t as i64)
                 ],
             )?;
-            Ok(())
+        }
+        Write::SaveSubscriptions(subscriptions) => {
+            conn.execute(
+                "INSERT INTO sessions (client_id, subscriptions, clean_start)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT (client_id) DO UPDATE SET subscriptions = excluded.subscriptions",
+                params![client_id, encode_subscriptions(subscriptions)],
+            )?;
+        }
+        Write::SetExpiry {
+            interval,
+            expires_at,
+        } => {
+            conn.execute(
+                "UPDATE sessions SET expiry_interval = ?2, expires_at = ?3 WHERE client_id = ?1",
+                params![client_id, interval, *expires_at as i64],
+            )?;
+        }
+        Write::StoreWill(will) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO will_messages
+                 (client_id, topic, payload, qos, retain, delay_secs, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    client_id,
+                    will.topic,
+                    &will.payload[..],
+                    qos_to_int(will.qos),
+                    will.retain,
+                    will.delay_secs,
+                    encode_properties(&will.properties)
+                ],
+            )?;
+        }
+        Write::DeleteWill => {
+            conn.execute(
+                "DELETE FROM will_messages WHERE client_id = ?1",
+                params![client_id],
+            )?;
+        }
+        Write::StoreInflight(message) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO inflight_messages
+                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
+                  subscription_identifiers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    client_id,
+                    message.packet_id,
+                    message.topic,
+                    message.payload.as_deref(),
+                    qos_to_int(message.qos),
+                    message.dup,
+                    // SQLite integers are signed; the bit pattern round-trips
+                    message.sequence as i64,
+                    message.released,
+                    encode_properties(&message.properties),
+                    Identifiers(message.subscription_identifiers.clone())
+                ],
+            )?;
+        }
+        Write::ReleaseInflight(packet_id) => {
+            conn.execute(
+                "UPDATE inflight_messages SET released = 1, payload = NULL
+                 WHERE client_id = ?1 AND packet_id = ?2",
+                params![client_id, packet_id],
+            )?;
+        }
+        Write::RemoveInflight(packet_id) => {
+            conn.execute(
+                "DELETE FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
+                params![client_id, packet_id],
+            )?;
+        }
+        Write::Enqueue(sequence, message) => {
+            conn.execute(
+                "INSERT OR REPLACE INTO queued_messages
+                 (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
+                  subscription_identifiers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    client_id,
+                    *sequence as i64,
+                    &*message.topic,
+                    message.payload.as_deref(),
+                    qos_to_int(message.qos),
+                    message.retain,
+                    encode_properties(&message.properties),
+                    message.expires_at.map(|t| t as i64),
+                    Identifiers(message.subscription_identifiers.clone())
+                ],
+            )?;
+        }
+        Write::ClearQueue => {
+            conn.execute(
+                "DELETE FROM queued_messages WHERE client_id = ?1",
+                params![client_id],
+            )?;
+        }
+        Write::DeleteSession => {
+            for table in [
+                "sessions",
+                "will_messages",
+                "queued_messages",
+                "inflight_messages",
+            ] {
+                conn.execute(
+                    &format!("DELETE FROM {table} WHERE client_id = ?1"),
+                    params![client_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Applies a batch in one transaction: one write to disk instead of one
+/// per change.
+#[async_trait]
+impl BatchStore for SqliteStore {
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+        let client_id = client_id.to_string();
+        let writes = writes.to_vec();
+        self.blocking(move |conn| {
+            conn.execute_batch("BEGIN")?;
+            let applied = writes
+                .iter()
+                .try_for_each(|write| apply_write(conn, &client_id, write));
+            conn.execute_batch(if applied.is_ok() {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            })?;
+            applied
         })
         .await
+    }
+}
+
+#[async_trait]
+impl SessionStore for SqliteStore {
+    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
+        self.apply(client_id, &[Write::SaveSession(session.clone())])
+            .await
     }
 
     async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
@@ -400,24 +535,8 @@ impl RetainedMessageStore for SqliteStore {
 #[async_trait]
 impl WillStore for SqliteStore {
     async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()> {
-        let client_id = client_id.to_string();
-        let topic = will.topic.clone();
-        let payload = will.payload.to_vec();
-        let qos = qos_to_int(will.qos);
-        let retain = will.retain;
-        let delay_secs = will.delay_secs;
-        let properties = encode_properties(&will.properties);
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO will_messages
-                 (client_id, topic, payload, qos, retain, delay_secs, properties)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![client_id, topic, payload, qos, retain, delay_secs, properties],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::StoreWill(will.clone())])
+            .await
     }
 
     async fn get_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
@@ -450,16 +569,7 @@ impl WillStore for SqliteStore {
     }
 
     async fn delete_will(&self, client_id: &str) -> Result<()> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "DELETE FROM will_messages WHERE client_id = ?1",
-                params![client_id],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::DeleteWill]).await
     }
 }
 
@@ -471,39 +581,12 @@ impl InflightStore for SqliteStore {
         packet_id: u16,
         message: &InflightMessage,
     ) -> Result<()> {
-        let client_id = client_id.to_string();
-        let topic = message.topic.clone();
-        let payload = message.payload.as_ref().map(|b| b.to_vec());
-        let qos = qos_to_int(message.qos);
-        let dup = message.dup;
-        // SQLite integers are signed; the bit pattern round-trips
-        let sequence = message.sequence as i64;
-        let released = message.released;
-        let properties = encode_properties(&message.properties);
-        let subscription_identifiers = Identifiers(message.subscription_identifiers.clone());
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO inflight_messages
-                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-                  subscription_identifiers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    client_id,
-                    packet_id,
-                    topic,
-                    payload,
-                    qos,
-                    dup,
-                    sequence,
-                    released,
-                    properties,
-                    subscription_identifiers
-                ],
-            )?;
-            Ok(())
-        })
-        .await
+        let message = InflightMessage {
+            packet_id,
+            ..message.clone()
+        };
+        self.apply(client_id, &[Write::StoreInflight(message)])
+            .await
     }
 
     async fn get_inflight(
@@ -550,30 +633,13 @@ impl InflightStore for SqliteStore {
     }
 
     async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "DELETE FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
-                params![client_id, packet_id],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::RemoveInflight(packet_id)])
+            .await
     }
 
     async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "UPDATE inflight_messages SET released = 1, payload = NULL
-                 WHERE client_id = ?1 AND packet_id = ?2",
-                params![client_id, packet_id],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::ReleaseInflight(packet_id)])
+            .await
     }
 
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
@@ -622,30 +688,8 @@ impl InflightStore for SqliteStore {
 #[async_trait]
 impl QueueStore for SqliteStore {
     async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()> {
-        let client_id = client_id.to_string();
-        let message = message.clone();
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO queued_messages
-                 (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
-                  subscription_identifiers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    client_id,
-                    sequence as i64,
-                    &*message.topic,
-                    message.payload.as_ref().map(|p| p.to_vec()),
-                    qos_to_int(message.qos),
-                    message.retain,
-                    encode_properties(&message.properties),
-                    message.expires_at.map(|t| t as i64),
-                    Identifiers(message.subscription_identifiers.clone())
-                ],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::Enqueue(sequence, message.clone())])
+            .await
     }
 
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
@@ -685,16 +729,7 @@ impl QueueStore for SqliteStore {
     }
 
     async fn clear_queue(&self, client_id: &str) -> Result<()> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            conn.execute(
-                "DELETE FROM queued_messages WHERE client_id = ?1",
-                params![client_id],
-            )?;
-            Ok(())
-        })
-        .await
+        self.apply(client_id, &[Write::ClearQueue]).await
     }
 }
 

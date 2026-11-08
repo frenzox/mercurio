@@ -205,14 +205,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             standby,
         } => {
             info!("Using PostgreSQL storage");
-            let store = PostgresStore::connect(url, ca_path.as_deref()).await?;
-            let lock = match store.try_lock().await? {
-                Some(lock) => lock,
+            let ca_path = ca_path.as_deref();
+            let held = match PostgresStore::connect_exclusive(url, ca_path, false).await? {
+                Some(held) => held,
                 None if *standby => {
                     info!("Another broker is using the database; standing by to take over");
-                    let lock = store.lock().await?;
+                    let held = PostgresStore::connect_exclusive(url, ca_path, true)
+                        .await?
+                        .expect("waiting returns once the database is taken");
                     info!("Took over the database");
-                    lock
+                    held
                 }
                 None => {
                     return Err("Another broker is using the database; set \
@@ -220,6 +222,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .into())
                 }
             };
+            let (store, lock) = held;
             (Some(store), Some(lock))
         }
         _ => (None, None),
@@ -228,7 +231,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         match &database_lock {
             Some(lock) => tokio::select! {
                 _ = shutdown_signal() => {}
-                _ = lock.lost() => error!("Lost the connection holding the database; stopping, since a standby may take over"),
+                _ = lock.lost() => error!("Lost hold of the database; stopping, since a standby may take over"),
             },
             None => shutdown_signal().await,
         }
