@@ -192,6 +192,11 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     /// Hears about connections, subscriptions and expired sessions.
+    ///
+    /// Events of one connection arrive in the order they happened. Session
+    /// expiry is reported separately: it may interleave with the events of
+    /// other connections, run concurrently with them, and isn't ordered
+    /// relative to the `Disconnected` of the same client.
     fn on_event<'a>(&'a self, _event: &'a Event) -> BoxFuture<'a, ()> {
         ready(())
     }

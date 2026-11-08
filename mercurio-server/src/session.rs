@@ -1079,15 +1079,17 @@ impl Session {
                 self.shared.subscriber_id,
                 subscriber.clone(),
             );
-            chain.emit(Event::Subscribed {
-                client: ClientInfo {
-                    client_id: session.client_id.clone(),
-                    username: session.verified_user.clone(),
-                    peer: session.peer,
-                },
-                filter: sub.topic_filter.clone(),
-                qos: granted_qos,
-            });
+            if !chain.is_empty() {
+                chain.emit(Event::Subscribed {
+                    client: ClientInfo {
+                        client_id: session.client_id.clone(),
+                        username: session.verified_user.clone(),
+                        peer: session.peer,
+                    },
+                    filter: sub.topic_filter.clone(),
+                    qos: granted_qos,
+                });
+            }
 
             // Shared subscriptions are never sent retained messages
             let shared = parse_shared_subscription(&sub.topic_filter).is_some();
@@ -1150,7 +1152,7 @@ impl Session {
             } else {
                 ReasonCode::NoSubscriptionExisted
             };
-            if reason_code == ReasonCode::Success {
+            if reason_code == ReasonCode::Success && !chain.is_empty() {
                 chain.emit(Event::Unsubscribed {
                     client: ClientInfo {
                         client_id: session.client_id.clone(),

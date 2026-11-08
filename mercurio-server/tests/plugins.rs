@@ -227,7 +227,12 @@ async fn lifecycle_events_reach_plugins() {
         Some(ControlPacket::UnsubAck(_))
     ));
     drop(client);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..200 {
+        if recorder.0.lock().unwrap().len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     assert_eq!(
         *recorder.0.lock().unwrap(),

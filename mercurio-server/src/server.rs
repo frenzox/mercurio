@@ -1235,6 +1235,7 @@ where
         session.set_verified_user(verified_user).await;
         session.set_peer(self.peer).await;
 
+        let mut announced = false;
         let result = async {
             Box::pin(session.begin(
                 &mut self.connection,
@@ -1263,9 +1264,12 @@ where
             }
 
             let _connected = ConnectedGuard::new(Arc::clone(&self.stats));
-            self.chain.emit(Event::Connected {
-                client: session.identity().await,
-            });
+            if !self.chain.is_empty() {
+                self.chain.emit(Event::Connected {
+                    client: session.identity().await,
+                });
+                announced = true;
+            }
             self.handle_connection(
                 &session,
                 keepalive,
@@ -1281,10 +1285,13 @@ where
             Err(Error::MQTTReasonCode(reason)) => Some(*reason),
             _ => None,
         };
-        self.chain.emit(Event::Disconnected {
-            client: session.identity().await,
-            reason,
-        });
+        // Plugins never saw a connection that failed before it was accepted
+        if announced {
+            self.chain.emit(Event::Disconnected {
+                client: session.identity().await,
+                reason,
+            });
+        }
 
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::MQTTReasonCode(reason)) = &result {

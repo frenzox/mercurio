@@ -793,7 +793,12 @@ mod tests {
         manager
             .end_connection(started.lease, Some(Duration::from_millis(10)))
             .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..200 {
+            if !recorder.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         assert_eq!(*recorder.0.lock().unwrap(), ["c"]);
     }
