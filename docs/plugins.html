@@ -58,7 +58,6 @@
 <li>Time limits fail closed. A call that runs out of time or traps denies, for authentication and access control, and drops, for messages.</li>
 <li>A plugin runs as several copies, set by <code>instances</code>, so calls run in parallel. A hook is a plain function: it keeps no state in statics, because the next call may run in another copy.</li>
 <li>A copy that traps or runs out of time is discarded. A fresh copy takes its place and runs <code>init</code> again.</li>
-<li>The WIT <code>auth-step</code> hook currently receives an empty <code>client-info</code>. A plugin can't tell yet which client it is answering.</li>
 </ul>
 
 <h3 id="kv">The key-value store</h3>

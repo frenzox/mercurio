@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use mercurio_plugin::{export_plugin, host, ClientInfo, Hooks, Plugin, Registration};
+use mercurio_plugin::{export_plugin, host, AuthResult, ClientInfo, Hooks, Plugin, Registration};
 use wasip2::{
     http::{
         outgoing_handler,
@@ -24,8 +24,18 @@ impl Plugin for Misbehave {
         }
         Ok(Registration {
             hooks: Hooks::ON_CONTROL,
-            auth_methods: Vec::new(),
+            auth_methods: vec!["WHO".into()],
         })
+    }
+
+    /// Succeeds as the client it was asked about.
+    fn auth_step(
+        client: ClientInfo,
+        _method: String,
+        _state: Option<Vec<u8>>,
+        _data: Option<Vec<u8>>,
+    ) -> AuthResult {
+        AuthResult::Success(Some(format!("{} {:?}", client.client_id, client.username)))
     }
 
     fn on_control(_client: ClientInfo, path: String, payload: Vec<u8>) -> Option<Vec<u8>> {

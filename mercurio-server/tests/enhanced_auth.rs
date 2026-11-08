@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -20,7 +20,7 @@ use mercurio_packets::{
     ControlPacket,
 };
 use mercurio_server::{
-    plugin::{ready, AuthExchange, AuthResult, BoxFuture, Plugin},
+    plugin::{ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Plugin},
     server::ServerConfig,
 };
 use tokio::{
@@ -34,6 +34,8 @@ use tokio::{
 #[derive(Default)]
 struct Challenge {
     issued: AtomicU32,
+    /// The clients exchanges were started for
+    clients: Mutex<Vec<ClientInfo>>,
 }
 
 enum ChallengeExchange {
@@ -47,10 +49,11 @@ impl Plugin for Challenge {
         "challenge"
     }
 
-    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+    fn begin_auth(&self, client: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
         if method != "CHALLENGE" {
             return None;
         }
+        self.clients.lock().unwrap().push(client.clone());
         let nonce = format!("nonce-{}", self.issued.fetch_add(1, Ordering::Relaxed));
         Some(Box::new(ChallengeExchange::Start(nonce)))
     }
@@ -77,10 +80,14 @@ impl AuthExchange for ChallengeExchange {
 }
 
 async fn start_broker() -> SocketAddr {
+    start_broker_with(Arc::default()).await
+}
+
+async fn start_broker_with(challenge: Arc<Challenge>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
-    config.plugins = vec![Arc::new(Challenge::default())];
+    config.plugins = vec![challenge];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
@@ -159,7 +166,8 @@ async fn answer_challenge(stream: &mut TcpStream, buffer: &mut BytesMut, sign: b
 
 #[tokio::test]
 async fn challenge_response_during_connect() {
-    let addr = start_broker().await;
+    let challenge = Arc::new(Challenge::default());
+    let addr = start_broker_with(Arc::clone(&challenge)).await;
     let (mut stream, mut buffer) = connect_with(addr, "CHALLENGE").await;
 
     let first_nonce = answer_challenge(&mut stream, &mut buffer, true).await;
@@ -179,6 +187,21 @@ async fn challenge_response_during_connect() {
         panic!("Expected AUTH");
     };
     assert_eq!(done.reason, ReasonCode::Success);
+
+    // The plugin knows who is authenticating: at CONNECT nobody is
+    // verified yet, and re-authentication names the verified user
+    let clients = challenge.clients.lock().unwrap();
+    let seen: Vec<_> = clients
+        .iter()
+        .map(|c| {
+            (
+                c.client_id.as_str(),
+                c.username.as_deref(),
+                c.peer.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(seen, [("c", None, true), ("c", Some("challenger"), true)]);
 }
 
 #[tokio::test]

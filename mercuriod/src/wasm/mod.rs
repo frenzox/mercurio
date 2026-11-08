@@ -257,13 +257,14 @@ impl Plugin for WasmPlugin {
         })
     }
 
-    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+    fn begin_auth(&self, client: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
         let loaded = self.loaded();
         if !loaded.auth_methods.iter().any(|m| m == method) {
             return None;
         }
         Some(Box::new(WasmAuth {
             loaded,
+            client: convert::client(client),
             method: method.to_string(),
             state: None,
         }))
@@ -393,6 +394,7 @@ impl Plugin for WasmPlugin {
 /// One client's enhanced authentication with a plugin.
 struct WasmAuth {
     loaded: Arc<Loaded>,
+    client: wit::ClientInfo,
     method: String,
     /// What the plugin asked to keep after the last step
     state: Option<Vec<u8>>,
@@ -400,13 +402,7 @@ struct WasmAuth {
 
 impl AuthExchange for WasmAuth {
     fn step<'a>(&'a mut self, data: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
-        // ponytail: `Plugin::begin_auth` doesn't say which client is
-        // authenticating, so the plugin sees an empty client
-        let client = wit::ClientInfo {
-            client_id: String::new(),
-            username: None,
-            peer: None,
-        };
+        let client = self.client.clone();
         let state = self.state.take();
         let data = data.map(|data| data.to_vec());
         let method = self.method.clone();

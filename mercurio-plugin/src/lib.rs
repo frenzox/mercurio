@@ -43,11 +43,16 @@ pub trait Plugin {
         Decision::Defer
     }
 
-    /// Carries out one step of MQTT 5 enhanced authentication with
-    /// `method`, one of the [`Registration::auth_methods`] the plugin
+    /// Carries out one step of MQTT 5 enhanced authentication of `client`
+    /// with `method`, one of the [`Registration::auth_methods`] the plugin
     /// registered. `data` is what the client sent in CONNECT or AUTH, if
     /// anything; `state` is None on the first step and otherwise the state
     /// of the last [`AuthResult::Continue`].
+    ///
+    /// During CONNECT, `client.username` is the user name the client
+    /// claims, if any, and `client.client_id` is empty when the server is
+    /// to assign one. On re-authentication they are the client identifier
+    /// and the verified user.
     ///
     /// The default fails with reason code 0x8C, Bad Authentication Method.
     fn auth_step(

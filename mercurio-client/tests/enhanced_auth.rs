@@ -13,7 +13,7 @@ use mercurio_client::{
 };
 use mercurio_core::reason::ReasonCode;
 use mercurio_server::{
-    plugin::{ready, AuthExchange, AuthResult, BoxFuture, Plugin},
+    plugin::{ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Plugin},
     server::ServerConfig,
 };
 use tokio::{net::TcpListener, time::timeout};
@@ -30,7 +30,7 @@ impl Plugin for ChallengeMethod {
         "challenge"
     }
 
-    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+    fn begin_auth(&self, _: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
         (method == "CHALLENGE")
             .then(|| Box::new(ChallengeExchange { challenged: false }) as Box<dyn AuthExchange>)
     }

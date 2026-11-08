@@ -57,7 +57,7 @@ impl Plugin for PlainAuth {
         "plain"
     }
 
-    fn begin_auth(&self, method: &str) -> Option<Box<dyn AuthExchange>> {
+    fn begin_auth(&self, _client: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
         (method == "PLAIN").then(|| {
             Box::new(PlainExchange {
                 credentials: Arc::clone(&self.credentials),
@@ -142,6 +142,10 @@ impl Plugin for SimpleCredentialValidator {
 mod tests {
     use super::*;
 
+    fn client() -> ClientInfo {
+        ClientInfo::new("c", None)
+    }
+
     fn create_plain_data(username: &str, password: &str) -> Bytes {
         let mut data = Vec::new();
         data.push(0); // Empty authorization identity
@@ -159,7 +163,10 @@ mod tests {
 
         let data = create_plain_data("user", "pass");
         assert_eq!(
-            auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await,
+            auth.begin_auth(&client(), "PLAIN")
+                .unwrap()
+                .step(Some(&data))
+                .await,
             AuthResult::Success {
                 username: Some("user".into())
             }
@@ -173,7 +180,12 @@ mod tests {
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("user", "wrongpass");
-        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
+        match auth
+            .begin_auth(&client(), "PLAIN")
+            .unwrap()
+            .step(Some(&data))
+            .await
+        {
             AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
@@ -186,7 +198,12 @@ mod tests {
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("unknown", "pass");
-        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
+        match auth
+            .begin_auth(&client(), "PLAIN")
+            .unwrap()
+            .step(Some(&data))
+            .await
+        {
             AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
@@ -197,7 +214,12 @@ mod tests {
         let credentials = HashMap::new();
         let auth = PlainAuth::new(credentials);
 
-        match auth.begin_auth("PLAIN").unwrap().step(None).await {
+        match auth
+            .begin_auth(&client(), "PLAIN")
+            .unwrap()
+            .step(None)
+            .await
+        {
             AuthResult::Failed(ReasonCode::BadAuthenticationMethod) => {}
             other => panic!("Expected BadAuthenticationMethod, got {:?}", other),
         }
@@ -210,7 +232,12 @@ mod tests {
 
         // Missing initial NUL
         let data = Bytes::from("user\0pass");
-        match auth.begin_auth("PLAIN").unwrap().step(Some(&data)).await {
+        match auth
+            .begin_auth(&client(), "PLAIN")
+            .unwrap()
+            .step(Some(&data))
+            .await
+        {
             AuthResult::Failed(ReasonCode::MalformedPacket) => {}
             other => panic!("Expected MalformedPacket, got {:?}", other),
         }
@@ -219,7 +246,7 @@ mod tests {
     #[test]
     fn test_plain_auth_unsupported_method() {
         assert!(PlainAuth::new(HashMap::new())
-            .begin_auth("UNKNOWN")
+            .begin_auth(&client(), "UNKNOWN")
             .is_none());
     }
 
@@ -230,7 +257,7 @@ mod tests {
         let auth = PlainAuth::new(credentials);
 
         let data = create_plain_data("admin", "secret");
-        let mut exchange = auth.begin_auth("PLAIN").unwrap();
+        let mut exchange = auth.begin_auth(&client(), "PLAIN").unwrap();
         assert!(matches!(
             exchange.step(Some(&data)).await,
             AuthResult::Success { .. }

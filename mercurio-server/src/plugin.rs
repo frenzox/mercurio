@@ -213,9 +213,14 @@ pub trait Plugin: Send + Sync + 'static {
         ready(Decision::Defer)
     }
 
-    /// Starts MQTT 5 enhanced authentication with `method`, if the plugin
-    /// implements it.
-    fn begin_auth(&self, _method: &str) -> Option<Box<dyn AuthExchange>> {
+    /// Starts MQTT 5 enhanced authentication of `client` with `method`, if
+    /// the plugin implements it.
+    ///
+    /// During CONNECT, `client.username` is the user name the client
+    /// claims, if any, and `client.client_id` is empty when the server is
+    /// to assign one. When a connected client re-authenticates, they are
+    /// its client identifier and verified user.
+    fn begin_auth(&self, _client: &ClientInfo, _method: &str) -> Option<Box<dyn AuthExchange>> {
         None
     }
 
@@ -395,13 +400,14 @@ impl Chain {
         Decision::Defer
     }
 
-    pub(crate) fn begin_auth(&self, method: &str) -> Option<Exchange> {
+    pub(crate) fn begin_auth(&self, client: &ClientInfo, method: &str) -> Option<Exchange> {
         self.plugins.iter().find_map(|plugin| {
-            let steps = std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(method)))
-                .unwrap_or_else(|_| {
-                    error!("Plugin `{}` panicked in begin_auth", plugin.name());
-                    None
-                })?;
+            let steps =
+                std::panic::catch_unwind(AssertUnwindSafe(|| plugin.begin_auth(client, method)))
+                    .unwrap_or_else(|_| {
+                        error!("Plugin `{}` panicked in begin_auth", plugin.name());
+                        None
+                    })?;
             Some(Exchange {
                 plugin: Arc::clone(plugin),
                 steps,
@@ -672,7 +678,7 @@ mod tests {
             "panics-at-once"
         }
 
-        fn begin_auth(&self, _: &str) -> Option<Box<dyn AuthExchange>> {
+        fn begin_auth(&self, _: &ClientInfo, _: &str) -> Option<Box<dyn AuthExchange>> {
             panic!("broken plugin")
         }
 
@@ -730,7 +736,7 @@ mod tests {
             panics.authorize(&client(), "t", Access::Read).await,
             Decision::Deny
         );
-        assert!(panics.begin_auth("PLAIN").is_none());
+        assert!(panics.begin_auth(&client(), "PLAIN").is_none());
     }
 
     #[tokio::test]

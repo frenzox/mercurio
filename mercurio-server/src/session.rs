@@ -1230,7 +1230,12 @@ impl Session {
 
         let result = match packet.reason {
             ReasonCode::ReAuthenticate => {
-                let Some(mut exchange) = chain.begin_auth(&method) else {
+                let client = ClientInfo {
+                    client_id: session.client_id.clone(),
+                    username: session.verified_user.clone(),
+                    peer: session.peer,
+                };
+                let Some(mut exchange) = chain.begin_auth(&client, &method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
                 };
                 let result = chain.step(&mut exchange, data.as_ref()).await;

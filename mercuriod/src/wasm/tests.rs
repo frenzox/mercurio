@@ -80,6 +80,22 @@ async fn test_deny_topic_decides_through_the_sandbox() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_auth_steps_see_the_client() {
+    use mercurio_server::plugin::AuthResult;
+
+    let plugin = misbehave(|_| ()).await;
+    let client = ClientInfo::new("who", Some("claimed".into()));
+    let mut exchange = plugin.begin_auth(&client, "WHO").unwrap();
+    assert_eq!(
+        exchange.step(None).await,
+        AuthResult::Success {
+            username: Some(r#"who Some("claimed")"#.into())
+        }
+    );
+    assert!(plugin.begin_auth(&client, "OTHER").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_init_errors_refuse_the_plugin() {
     let runtime = Runtime::new().unwrap();
     let error = WasmPlugin::load(&runtime, settings("deny-topic", &[]))

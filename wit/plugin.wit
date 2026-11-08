@@ -6,7 +6,9 @@ interface types {
   enum decision { allow, deny, defer }
   enum qos { at-most-once, at-least-once, exactly-once }
 
-  /// `username` is set only for a user the broker verified.
+  /// `username` is set only for a user the broker verified, except in
+  /// `authenticate` and in `auth-step` during CONNECT, where it is the user
+  /// name the client claims.
   record client-info {
     client-id: string,
     username: option<string>,
@@ -79,7 +81,9 @@ interface guest {
 
   init: func(config: list<tuple<string, string>>) -> result<registration, string>;
   authenticate: func(client: client-info, username: string, password: list<u8>) -> decision;
-  /// `state` is None on the first step of an exchange.
+  /// `state` is None on the first step of an exchange. During CONNECT,
+  /// `client` carries the user name the client claims; on
+  /// re-authentication, the verified user.
   auth-step: func(client: client-info, method: string, state: option<list<u8>>, data: option<list<u8>>) -> auth-result;
   authorize: func(client: client-info, topic: string, access: access) -> decision;
   on-message: func(client: client-info, message: message) -> message-action;

@@ -1378,7 +1378,12 @@ where
         connect_packet: &ConnectPacket,
         method: &str,
     ) -> Result<Option<Option<String>>> {
-        let exchange = self.chain.begin_auth(method);
+        let client = ClientInfo {
+            client_id: connect_packet.payload.client_id.clone(),
+            username: connect_packet.payload.user_name.clone(),
+            peer: self.peer,
+        };
+        let exchange = self.chain.begin_auth(&client, method);
         let Some(mut exchange) = exchange else {
             self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
                 .await?;
