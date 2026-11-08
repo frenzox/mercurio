@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
 ]
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-packets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "mercurio-core",
