@@ -25,6 +25,8 @@ top of tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
 - Authentication with a password file (Argon2 hashes) or MQTT 5 enhanced
   authentication, including re-authentication
 - Topic access control in mosquitto's `acl_file` format
+- WebAssembly plugins (`[[plugins]]`), sandboxed, written in any language that
+  builds WASI components
 - `$SYS/broker/` statistics
 - Server redirection, Server Keep Alive, Response Information
 - Graceful shutdown on Ctrl+C or SIGTERM: clients are told why they are being

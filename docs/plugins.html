@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebAssembly plugins · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="plugins.html" aria-current="page">WebAssembly plugins</a></li>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>WebAssembly plugins</h1>
+<p class="lead">A plugin is a WebAssembly component that <code>mercuriod</code> loads from a file and runs in a sandbox. It can authenticate clients, decide topic access, change or drop messages and react to events, without a rebuild of the broker.</p>
+
+<h2 id="overview">What a plugin can do</h2>
+<p>A plugin implements the hooks it needs. <code>init</code> returns the list of hooks the broker calls; the others are never called.</p>
+<table>
+<tr><th>Hook</th><th>Called</th></tr>
+<tr><td><code>authenticate</code></td><td>For a client that sends a username and password. Returns allow, deny or defer.</td></tr>
+<tr><td><code>auth-step</code></td><td>For each step of MQTT 5 enhanced authentication, for the methods the plugin lists in <code>init</code>.</td></tr>
+<tr><td><code>authorize</code></td><td>When a client publishes, subscribes or receives a topic (<code>write</code>, <code>subscribe</code>, <code>read</code>). Returns allow, deny or defer.</td></tr>
+<tr><td><code>on-message</code></td><td>For each published message. Returns keep, drop or a replacement message.</td></tr>
+<tr><td><code>on-event</code></td><td>When a client connects, disconnects, subscribes or unsubscribes, and when a session expires.</td></tr>
+<tr><td><code>on-tick</code></td><td>Once a second, for periodic work.</td></tr>
+<tr><td><code>on-control</code></td><td>For a publish to <code>$CONTROL/&lt;plugin name&gt;/...</code>. It may return a response payload.</td></tr>
+</table>
+<p>The interface is <a href="https://github.com/frenzox/mercurio/blob/master/wit/plugin.wit"><code>wit/plugin.wit</code></a>. A plugin also imports the <code>host</code> interface: <code>log</code> and a key-value store.</p>
+
+<h3>How it runs</h3>
+<p>Plugins join the same chain as plugins written against the server library, after the built-in password and ACL checks and in the order of the <code>[[plugins]]</code> tables. The rules of the chain (the first allow or deny decides, defer asks the next plugin, every plugin sees a message in turn) are described in <a href="embedding.html#auth">Embedding the broker</a>.</p>
+<ul>
+<li>Time limits fail closed. A call that runs out of time or traps denies, for authentication and access control, and drops, for messages.</li>
+<li>A plugin runs as several copies, set by <code>instances</code>, so calls run in parallel. A hook is a plain function: it keeps no state in statics, because the next call may run in another copy.</li>
+<li>A copy that traps or runs out of time is discarded. A fresh copy takes its place and runs <code>init</code> again.</li>
+<li>The WIT <code>auth-step</code> hook currently receives an empty <code>client-info</code>. A plugin can't tell yet which client it is answering.</li>
+</ul>
+
+<h3 id="kv">The key-value store</h3>
+<p><code>kv-get</code>, <code>kv-set</code>, <code>kv-delete</code> and <code>kv-list</code> give copies a place for shared state.</p>
+<ul>
+<li>One store is shared by all copies of a plugin. It is in memory and is lost when the broker restarts. It stays across SIGHUP reloads.</li>
+<li>It holds at most 16 MiB. Past that, <code>kv-set</code> returns an error.</li>
+<li>It is not transactional. A <code>kv-get</code> followed by a <code>kv-set</code> can race with another copy doing the same, so do not rely on a read-modify-write being atomic.</li>
+</ul>
+
+<h2 id="writing">Writing a plugin in Rust</h2>
+<p>Install the target and make a library crate:</p>
+<pre>rustup target add wasm32-wasip2
+cargo new --lib deny-topic</pre>
+<p>In <code>Cargo.toml</code>, build a <code>cdylib</code> and depend on <a href="https://github.com/frenzox/mercurio/tree/master/mercurio-plugin"><code>mercurio-plugin</code></a>, which holds the bindings and the <code>Plugin</code> trait:</p>
+<pre>[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mercurio-plugin = "0.1"</pre>
+<p>This plugin, <code>examples/plugins/deny-topic</code>, refuses publishing under a topic prefix from its configuration and defers every other decision:</p>
+<pre>use mercurio_plugin::{
+    export_plugin, host, Access, ClientInfo, Decision, Hooks, Plugin, Registration,
+};
+
+struct DenyTopic;
+
+impl Plugin for DenyTopic {
+    fn init(config: Vec&lt;(String, String)&gt;) -&gt; Result&lt;Registration, String&gt; {
+        let prefix = config
+            .into_iter()
+            .find(|(key, _)| key == "prefix")
+            .map(|(_, value)| value)
+            .ok_or("missing `prefix`")?;
+        if prefix.is_empty() {
+            return Err("`prefix` is empty, which would deny every publish".into());
+        }
+        host::kv_set("prefix", prefix.as_bytes())?;
+        Ok(Registration {
+            hooks: Hooks::AUTHORIZE,
+            auth_methods: Vec::new(),
+        })
+    }
+
+    fn authorize(_client: ClientInfo, topic: String, access: Access) -&gt; Decision {
+        let Some(prefix) = host::kv_get("prefix") else {
+            return Decision::Defer;
+        };
+        if access == Access::Write &amp;&amp; topic.as_bytes().starts_with(&amp;prefix) {
+            Decision::Deny
+        } else {
+            Decision::Defer
+        }
+    }
+}
+
+export_plugin!(DenyTopic);</pre>
+<p>If <code>init</code> returns an error, the plugin does not load and the broker does not start. Combine flags to register more hooks, such as <code>Hooks::AUTHORIZE | Hooks::ON_MESSAGE</code>. The <code>examples/plugins</code> directory also has <code>webhook-audit</code>, which sends an HTTP request, and <code>payload-rewrite</code>, which changes messages.</p>
+<p>Build it:</p>
+<pre>cargo build --release --target wasm32-wasip2</pre>
+<p>The component is <code>target/wasm32-wasip2/release/deny_topic.wasm</code>. Load it in the broker's configuration:</p>
+<pre>[[plugins]]
+path = "/etc/mercurio/plugins/deny_topic.wasm"
+name = "deny"
+config = { prefix = "$internal/" }</pre>
+<p>A plugin built for <code>mercurio:plugin/guest@0.1.x</code> loads. A component built for another version is refused, with an error that names the version. See the <a href="configuration.html#plugins">configuration reference</a> for every key.</p>
+
+<h2 id="sandbox">The sandbox</h2>
+<ul>
+<li>A plugin has no files, no environment variables and no standard input. Standard output and error are discarded; use <code>host::log</code>.</li>
+<li><code>allow_http</code> lists the hosts it may send HTTP requests to, as <code>host</code> or <code>host:port</code>. The default port is 443. The scheme is not checked, so <code>http://host:443</code> is allowed too. Other hosts are refused.</li>
+<li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may open sockets to. A socket may bind only to the wildcard address with port 0, which is what a connect needs. DNS lookups are off, so use addresses.</li>
+<li><code>memory_mb</code> caps the linear memory of each copy. The default is 64.</li>
+<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. The default is 5000. The broker's own limit per hook is 5 seconds, so a larger value is cut to 5 seconds by the chain.</li>
+</ul>
+<p>A plugin that traps, runs out of memory or runs out of time fails that call as described above, and its copy is replaced. The broker logs the cause.</p>
+
+<h2 id="languages">Other languages</h2>
+<p>Any toolchain that builds a WASI preview 2 component against <a href="https://github.com/frenzox/mercurio/blob/master/wit/plugin.wit"><code>wit/plugin.wit</code></a> works. Starting points are <code>wit-bindgen</code> for C and C++, and <code>componentize-py</code> and <code>jco componentize</code> for Python and JavaScript. The project has examples only in Rust.</p>
+
+<h2 id="reloading">Reloading</h2>
+<p>Send <code>SIGHUP</code> to swap a plugin's code. The broker rereads each plugin's file, and replaces the running code once the new file has loaded and run <code>init</code>. Calls already running finish on the old code. If the new file fails to load, the old code keeps running and the broker logs why. The store is kept.</p>
+<p>Changes to the <code>[[plugins]]</code> tables, such as <code>config</code>, <code>instances</code> or the allowlists, need a restart.</p>
+
+<h2 id="cost">Cost</h2>
+<p>A call into a component costs about 0.5 microseconds (0.55 in a microbenchmark of <code>authorize</code>). In the broker's benchmark, fan-in with QoS 1 had about 0.7% less throughput with an <code>authorize</code> plugin (<code>deny-topic</code>) on every message, and about 1.6% less with an <code>on-message</code> plugin. Fan-out was within noise. These numbers are approximate and depend on what the plugin does.</p>
+<p>With the default <code>wasm</code> feature, the stripped <code>mercuriod</code> binary is about 18 MB. Build with <code>--no-default-features</code> to leave out wasmtime.</p>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>
