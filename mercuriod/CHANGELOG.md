@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.1.0...mercuriod-v0.2.0) - 2026-11-08
+
+### Added
+
+- *(storage)* [**breaking**] apply changes in batches, fenced on PostgreSQL
+- *(mercuriod)* keep state in PostgreSQL, with standby brokers
+
+### Other
+
+- document storage durability, failover timings and PgBouncer
+- add a changelog to every crate
+
 ## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/mercuriod-v0.1.0) - 2026-11-08
 
 ### Added

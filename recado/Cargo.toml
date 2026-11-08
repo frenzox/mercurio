@@ -1,6 +1,6 @@
 [package]
 name = "recado"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "MQTT command-line client for publishing and subscribing, from the Mercurio project"
 license = "MIT OR Apache-2.0"
@@ -14,8 +14,8 @@ name = "recado"
 path = "src/main.rs"
 
 [dependencies]
-mercurio-client = { path = "../mercurio-client", version = "0.1.0" }
-mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
+mercurio-client = { path = "../mercurio-client", version = "0.2.0" }
+mercurio-core = { path = "../mercurio-core", version = "0.1.1" }
 
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

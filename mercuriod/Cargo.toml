@@ -1,6 +1,6 @@
 [package]
 name = "mercuriod"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Mercurio MQTT broker daemon"
 license = "MIT OR Apache-2.0"
@@ -14,10 +14,10 @@ name = "mercuriod"
 path = "src/main.rs"
 
 [dependencies]
-mercurio-core = { path = "../mercurio-core", version = "0.1.0" }
-mercurio-client = { path = "../mercurio-client", version = "0.1.0" }
-mercurio-server = { path = "../mercurio-server", version = "0.1.0" }
-mercurio-storage = { path = "../mercurio-storage", version = "0.1.0", features = ["sqlite", "postgres"] }
+mercurio-core = { path = "../mercurio-core", version = "0.1.1" }
+mercurio-client = { path = "../mercurio-client", version = "0.2.0" }
+mercurio-server = { path = "../mercurio-server", version = "0.2.0" }
+mercurio-storage = { path = "../mercurio-storage", version = "0.2.0", features = ["sqlite", "postgres"] }
 
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.1.0...mercurio-storage-v0.2.0) - 2026-11-08
+
+### Added
+
+- *(storage)* [**breaking**] apply changes in batches, fenced on PostgreSQL
+- *(storage)* add a PostgreSQL backend
+
+### Fixed
+
+- [**breaking**] drop the std feature from crates that always need std
+- *(storage)* build the postgres feature without tokio's macros
+
+### Other
+
+- document storage durability, failover timings and PgBouncer
+- *(storage)* share column encodings between SQL backends
+- add a changelog to every crate
+
 ## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/mercurio-storage-v0.1.0) - 2026-11-08
 
 ### Added
