@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.3.0...mercuriod-v0.4.0) - 2026-11-09
+
+### Added
+
+- *(server)* [**breaking**] pass the client to Plugin::begin_auth
+- *(plugin)* log a Rust plugin's panics through the broker
+- *(examples)* add audit and rewrite plugin examples
+- *(mercuriod)* configure WebAssembly plugins and reload them on SIGHUP
+- *(mercuriod)* run WebAssembly plugins in the plugin chain
+- *(server)* [**breaking**] check topic access through the plugin chain
+- *(server)* [**breaking**] authenticate clients through the plugin chain
+
+### Fixed
+
+- *(examples)* let payload-rewrite pass empty retained messages
+- *(mercuriod)* refuse plugin names that clash with topics or built-ins
+- *(mercuriod)* bound and escape the messages plugins log
+- *(mercuriod)* count a fixed cost per kv entry against the quota
+- *(mercuriod)* keep plugins from holding sockets without bound
+- *(examples)* keep every byte the webhook test receives
+- *(mercuriod)* bound what a WebAssembly plugin can hold and wait on
+- *(mercuriod)* keep a dynamic security reload out of a running batch
+- *(mercuriod)* serialize dynamic security command batches
+
+### Other
+
+- *(mercuriod)* count distinct kv keys to show the store is shared
+- *(mercuriod)* pin the init timeout test to the timeout error
+- *(mercuriod)* hold WASM plugins to their time, memory and network limits
+- *(mercuriod)* build the HTTP ACL request only when the cache misses
+- *(mercuriod)* wait for HTTP auth without blocking a runtime thread
+- *(mercuriod)* answer dynamic security commands as a plugin
+
 ## [0.3.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.2.0...mercuriod-v0.3.0) - 2026-11-08
 
 ### Added

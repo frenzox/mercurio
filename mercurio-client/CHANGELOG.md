@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.3.0...mercurio-client-v0.4.0) - 2026-11-09
+
+### Added
+
+- *(server)* [**breaking**] pass the client to Plugin::begin_auth
+- *(server)* [**breaking**] authenticate clients through the plugin chain
+
 ## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.2.0...mercurio-client-v0.3.0) - 2026-11-08
 
 ### Fixed
