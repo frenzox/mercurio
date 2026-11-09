@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/frenzox/mercurio/compare/recado-v0.2.2...recado-v0.2.3) - 2026-11-09
+
+### Fixed
+
+- *(recado)* stop quietly when the output pipe closes
+
+### Other
+
+- match package files by glob instead of naming a version
+
 ## [0.2.2](https://github.com/frenzox/mercurio/compare/recado-v0.2.1...recado-v0.2.2) - 2026-11-09
 
 ### Added

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.2...mercuriod-v0.4.3) - 2026-11-09
+
+### Other
+
+- Merge pull request #70 from frenzox/docs/readme-recado
+- use recado in examples that don't need mosquitto's tools
+- match package files by glob instead of naming a version
+
 ## [0.4.2](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.1...mercuriod-v0.4.2) - 2026-11-09
 
 ### Other
