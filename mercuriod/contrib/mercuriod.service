@@ -6,6 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# The packages create a static mercurio user, so files such as TLS keys can
+# be given to it; without one, systemd allocates a dynamic user of that name
+User=mercurio
+Group=mercurio
+DynamicUser=yes
 ExecStart=/usr/bin/mercuriod --config /etc/mercurio/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -18,6 +23,8 @@ ProtectHome=true
 PrivateTmp=true
 # Writable /var/lib/mercurio for SQLite storage, despite ProtectSystem
 StateDirectory=mercurio
+# /run/mercurio, for Unix socket listeners
+RuntimeDirectory=mercurio
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

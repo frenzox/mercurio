@@ -36,7 +36,21 @@
 </nav>
 <main>
 <h1>Installing &amp; running</h1>
-<p class="lead">Build the binaries, start the broker, and run it as a systemd service.</p>
+<p class="lead">Install a package or build the binaries, start the broker, and run it as a systemd service.</p>
+
+<h2>Packages</h2>
+<p>Each <a href="https://github.com/frenzox/mercurio/releases">mercuriod release</a> has <code>.deb</code> and <code>.rpm</code> packages and a plain <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. They need glibc 2.18 or later. Download the one for your system and install it:</p>
+<pre><span class="comment"># Debian, Ubuntu, Raspberry Pi OS</span>
+sudo apt install ./mercuriod_0.4.0-1_amd64.deb
+
+<span class="comment"># Fedora, RHEL, openSUSE</span>
+sudo dnf install ./mercuriod-0.4.0-1.x86_64.rpm</pre>
+<p>The packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, and create a <code>mercurio</code> system user for the service. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
+<pre>sudo systemctl enable --now mercuriod</pre>
+<p>The service runs as <code>mercurio</code>, so files it reads that aren't readable by everyone, such as TLS keys and password files, must belong to that user or its group:</p>
+<pre>sudo chown root:mercurio /etc/mercurio/server.key
+sudo chmod 640 /etc/mercurio/server.key</pre>
+<p>On armv7, WASM plugins run in wasmtime's interpreter, as its compiler doesn't support 32-bit ARM, so they're slower there.</p>
 
 <h2>Building</h2>
 <p>Mercurio needs a recent stable Rust toolchain. From the repository root:</p>
@@ -87,8 +101,8 @@ mercuriod -v</pre>
 </table>
 <p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
 
-<h2>Running as a systemd service</h2>
-<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>. It runs the broker sandboxed, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>.</p>
+<h2 id="systemd">Running as a systemd service</h2>
+<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
 <pre><span class="comment"># Binary, configuration and unit</span>
 sudo cp target/release/mercuriod /usr/bin/
 sudo mkdir -p /etc/mercurio

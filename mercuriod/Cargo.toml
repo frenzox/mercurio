@@ -47,3 +47,48 @@ wasmtime-wasi-http = { version = "50.0", optional = true, default-features = fal
 http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 anyhow = { version = "1", optional = true }
+
+[package.metadata.deb]
+maintainer = "Guilherme Felipe da Silva <gfsilva.eng@gmail.com>"
+section = "net"
+extended-description = """\
+Mercurio serves MQTT 3.1, 3.1.1 and 5.0 over TCP, TLS and WebSocket, with
+persistence in SQLite or PostgreSQL, bridges and WASM plugins. The service
+runs as the mercurio user, reads /etc/mercurio/config.toml and keeps its
+state in /var/lib/mercurio."""
+depends = "libc6 (>= 2.18), libgcc-s1 | libgcc1, systemd | systemd-standalone-sysusers"
+maintainer-scripts = "contrib/debian"
+systemd-units = { unit-scripts = "contrib", enable = true, start = true }
+assets = [
+    ["target/release/mercuriod", "usr/bin/", "755"],
+    ["contrib/config.toml", "etc/mercurio/config.toml", "644"],
+    ["contrib/mercurio.sysusers", "usr/lib/sysusers.d/mercurio.conf", "644"],
+    ["README.md", "usr/share/doc/mercuriod/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/mercuriod", dest = "/usr/bin/mercuriod", mode = "755" },
+    { source = "contrib/config.toml", dest = "/etc/mercurio/config.toml", mode = "644", config = "noreplace" },
+    { source = "contrib/mercuriod.service", dest = "/usr/lib/systemd/system/mercuriod.service", mode = "644" },
+    { source = "contrib/mercurio.sysusers", dest = "/usr/lib/sysusers.d/mercurio.conf", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/mercuriod/README.md", mode = "644", doc = true },
+]
+post_install_script = """
+systemd-sysusers mercurio.conf || :
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ $1 -eq 1 ]; then
+    systemctl preset mercuriod.service >/dev/null 2>&1 || :
+fi
+"""
+pre_uninstall_script = """
+if [ $1 -eq 0 ]; then
+    systemctl --no-reload disable --now mercuriod.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ $1 -ge 1 ]; then
+    systemctl try-restart mercuriod.service >/dev/null 2>&1 || :
+fi
+"""

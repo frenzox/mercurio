@@ -1,0 +1,59 @@
+name: packages
+
+on:
+  push:
+    tags: ['mercuriod-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build packages for, such as mercuriod-v0.4.0
+        required: true
+
+jobs:
+  packages:
+    # cross's images have an old glibc, so the binaries also run on older
+    # distributions than the runner's
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross,cargo-deb,cargo-generate-rpm
+      - name: Build
+        run: >
+          cross build --release --locked -p mercuriod --target "$TARGET"
+          --config profile.release.debug=false --config profile.release.strip=true
+      - name: Package
+        run: |
+          cargo deb -p mercuriod --target "$TARGET" --no-build --no-strip
+          cargo generate-rpm -p mercuriod --target "$TARGET"
+          name="mercuriod-${TAG#mercuriod-v}-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/mercuriod" mercuriod/README.md LICENSE-MIT LICENSE-APACHE \
+            mercuriod/contrib/config.toml mercuriod/contrib/mercuriod.service \
+            mercuriod/contrib/mercurio.sysusers "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "$TAG" --clobber "mercuriod-${TAG#mercuriod-v}-$TARGET.tar.gz"
+          target/"$TARGET"/debian/*.deb target/"$TARGET"/generate-rpm/*.rpm
