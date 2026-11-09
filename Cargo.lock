@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "mercuriod"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "recado"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "clap",
