@@ -11,7 +11,7 @@ use super::sandbox::State;
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
-        path: "../wit",
+        path: "wit",
         world: "plugin",
         imports: { default: async },
         exports: { default: async },
