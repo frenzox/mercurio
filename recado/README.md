@@ -13,8 +13,8 @@ Each [release](https://github.com/frenzox/mercurio/releases) has `.deb`
 and `.rpm` packages for x86_64, aarch64 and armv7 Linux:
 
 ```sh
-sudo apt install ./recado_0.2.2-1_amd64.deb
-sudo dnf install ./recado-0.2.2-1.x86_64.rpm
+sudo apt install ./recado_*.deb
+sudo dnf install ./recado-*.rpm
 ```
 
 Or with cargo:
