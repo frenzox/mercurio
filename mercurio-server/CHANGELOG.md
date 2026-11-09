@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.3.0...mercurio-server-v0.4.0) - 2026-11-09
+
+### Added
+
+- *(server)* [**breaking**] pass the client to Plugin::begin_auth
+- *(server)* [**breaking**] leave room to grow plugin events and message actions
+- *(server)* give plugins a tick and their own $CONTROL topics
+- *(server)* tell plugins about connections, subscriptions and expiry
+- *(server)* let plugins rewrite or drop published messages
+- *(server)* [**breaking**] check topic access through the plugin chain
+- *(server)* [**breaking**] authenticate clients through the plugin chain
+- *(server)* add the Plugin trait and the chain that runs it
+
+### Fixed
+
+- *(server)* drop messages a plugin moves to reserved topics
+- *(server)* name the plugin in enhanced authentication timeouts and panics
+- *(server)* bound the plugin event queue and drop events past it
+- *(server)* catch plugin panics raised while a hook builds its future
+- *(server)* pair Disconnected with Connected and skip no-plugin work
+
+### Other
+
+- spell out the plugin behaviours that are easy to get wrong
+- *(server)* cover fail-closed authentication and listener plugin chains
+- explain plugins in the embedding guide
+- *(server)* skip access checks for trusted connections
+
 ## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.2.0...mercurio-server-v0.3.0) - 2026-11-08
 
 ### Added
