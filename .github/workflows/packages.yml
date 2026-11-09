@@ -2,11 +2,11 @@ name: packages
 
 on:
   push:
-    tags: ['mercuriod-v*']
+    tags: ['mercuriod-v*', 'recado-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build packages for, such as mercuriod-v0.4.0
+        description: Release tag to build packages for, such as mercuriod-v0.4.1
         required: true
 
 jobs:
@@ -26,6 +26,7 @@ jobs:
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       TARGET: ${{ matrix.target }}
+      CRATE: ${{ startsWith(inputs.tag || github.ref_name, 'recado-') && 'recado' || 'mercuriod' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,21 +40,23 @@ jobs:
           tool: cross,cargo-deb,cargo-generate-rpm
       - name: Build
         run: >
-          cross build --release --locked -p mercuriod --target "$TARGET"
+          cross build --release --locked -p "$CRATE" --target "$TARGET"
           --config profile.release.debug=false --config profile.release.strip=true
       - name: Package
         run: |
-          cargo deb -p mercuriod --target "$TARGET" --no-build --no-strip
-          cargo generate-rpm -p mercuriod --target "$TARGET"
-          name="mercuriod-${TAG#mercuriod-v}-$TARGET"
+          cargo deb -p "$CRATE" --target "$TARGET" --no-build --no-strip
+          cargo generate-rpm -p "$CRATE" --target "$TARGET"
+          name="$CRATE-${TAG#"$CRATE"-v}-$TARGET"
           mkdir "$name"
-          cp "target/$TARGET/release/mercuriod" mercuriod/README.md LICENSE-MIT LICENSE-APACHE \
-            mercuriod/contrib/config.toml mercuriod/contrib/mercuriod.service \
-            mercuriod/contrib/mercurio.sysusers "$name/"
+          cp "target/$TARGET/release/$CRATE" "$CRATE/README.md" LICENSE-MIT LICENSE-APACHE "$name/"
+          if [ "$CRATE" = mercuriod ]; then
+            cp mercuriod/contrib/config.toml mercuriod/contrib/mercuriod.service \
+              mercuriod/contrib/mercurio.sysusers "$name/"
+          fi
           tar czf "$name.tar.gz" "$name"
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release upload "$TAG" --clobber "mercuriod-${TAG#mercuriod-v}-$TARGET.tar.gz"
+          gh release upload "$TAG" --clobber "$CRATE-${TAG#"$CRATE"-v}-$TARGET.tar.gz"
           target/"$TARGET"/debian/*.deb target/"$TARGET"/generate-rpm/*.rpm
