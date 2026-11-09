@@ -1,76 +1,69 @@
 # Mercurio
 
-![Build Status](https://github.com/frenzox/mercurio/actions/workflows/build.yml/badge.svg)
+[![Build](https://github.com/frenzox/mercurio/actions/workflows/build.yml/badge.svg)](https://github.com/frenzox/mercurio/actions/workflows/build.yml)
+[![crates.io](https://img.shields.io/crates/v/mercuriod.svg)](https://crates.io/crates/mercuriod)
+[![docs.rs](https://img.shields.io/docsrs/mercurio-client)](https://docs.rs/mercurio-client)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 An MQTT broker, client library and command-line client written in Rust on
-top of tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
+top of Tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
 
-## Features
+- **Ready for mosquitto users.** Mercurio reads mosquitto's password and
+  ACL files, takes the commands of its dynamic security plugin, publishes
+  `$SYS` statistics with the same names and bridges to other brokers. The
+  [migration guide](https://frenzox.github.io/mercurio/migrating.html)
+  maps every mosquitto option.
+- **Complete MQTT 5.** Shared subscriptions, subscription options, topic
+  aliases, message expiry, request/response, enhanced authentication and
+  server redirection, in the broker and the client alike.
+- **Durable.** Sessions, retained messages and queued messages are kept in
+  SQLite or PostgreSQL, and a standby broker takes over a PostgreSQL
+  database when the serving one stops.
+- **Extensible.** Plugins authenticate clients, check access, rewrite or
+  drop messages and react to events. Write them in any language that
+  builds WebAssembly components, sandboxed with their own limits, or in
+  Rust against the broker library.
+- **Embeddable.** The broker is also a library, `mercurio-server`, to run
+  inside your own program.
+- **Easy to run.** `.deb` and `.rpm` packages set up the broker as a
+  sandboxed systemd service, on x86_64, aarch64 and armv7 Linux.
 
-### Broker (`mercuriod`)
+## Install
 
-- QoS 0, 1 and 2 in both directions, with retransmission on reconnect
-- Persistent sessions with session expiry, kept in memory, SQLite or
-  PostgreSQL so they survive restarts
-- Retained messages, wills, and will delay
-- Shared subscriptions (`$share/group/filter`) and subscription identifiers
-- MQTT 5 subscription options: No Local, Retain As Published and Retain
-  Handling
-- MQTT 5 message properties: message expiry, content type, response topic,
-  correlation data and user properties
-- Flow control: Receive Maximum, Maximum Packet Size and topic aliases in
-  both directions
-- TLS, with optional client certificates
-- MQTT over WebSocket
-- Authentication with a password file (Argon2 hashes) or MQTT 5 enhanced
-  authentication, including re-authentication
-- Topic access control in mosquitto's `acl_file` format
-- WebAssembly plugins (`[[plugins]]`), sandboxed, written in any language that
-  builds WASI components
-- `$SYS/broker/` statistics
-- Server redirection, Server Keep Alive, Response Information
-- Graceful shutdown on Ctrl+C or SIGTERM: clients are told why they are being
-  disconnected
+Each [release](https://github.com/frenzox/mercurio/releases) of
+`mercuriod`, the broker, and `recado`, the command-line client, has `.deb`
+and `.rpm` packages and a `.tar.gz`. Download the ones for your system and
+install them:
 
-### Client library (`mercurio-client`)
+```bash
+# Debian, Ubuntu, Raspberry Pi OS
+sudo apt install ./mercuriod_*.deb ./recado_*.deb
 
-- Async API: `publish` and `subscribe` resolve when the broker acknowledges
-  them
-- Follows the limits the broker announces, and holds the broker to the
-  client's own limits
-- Optional automatic reconnection that resumes the session and resends
-  unacknowledged messages
-- MQTT 5 properties, subscription options and enhanced authentication
-- TLS through rustls
+# Fedora, RHEL, openSUSE
+sudo dnf install ./mercuriod-*.rpm ./recado-*.rpm
+```
 
-## Documentation
+The broker then runs as the `mercuriod` service, configured by
+`/etc/mercurio/config.toml`. Or install the binaries with cargo:
 
-The [documentation](https://frenzox.github.io/mercurio/) covers installation, every configuration
-option, authentication, listeners, bridges, operations, the command-line
-client, the client and server libraries, and a migration guide from
-mosquitto. Its source is the [`docs/`](docs) directory, published with
-GitHub Pages.
+```bash
+cargo install mercuriod recado
+```
 
 ## Quick start
 
-Build everything:
+Start the broker with its defaults, which listen on `127.0.0.1:1883` and
+keep state in memory, or use the service the packages started:
 
 ```bash
-cargo build --release
-```
-
-Start the broker with its default settings, which listen on
-`127.0.0.1:1883` and keep state in memory:
-
-```bash
-./target/release/mercuriod
+mercuriod
 ```
 
 Subscribe in one terminal, and publish from another:
 
 ```bash
-./target/release/recado sub -t 'sensors/#' -T
-./target/release/recado pub -t sensors/kitchen -m 21.5 -q 1
+recado sub -t 'sensors/#' -T
+recado pub -t sensors/kitchen -m 21.5 -q 1
 ```
 
 Any MQTT client works with the broker, mosquitto's included:
@@ -79,54 +72,50 @@ Any MQTT client works with the broker, mosquitto's included:
 mosquitto_sub -V mqttv5 -t 'sensors/#' -v
 ```
 
-## Configuring the broker
+## Features
 
-`mercuriod` reads a TOML file, `/etc/mercurio/config.toml` by default, or
-the path given with `-c`. A minimal configuration that persists state and
-requires a password:
+**Protocol**
 
-```toml
-[server]
-host = "0.0.0.0"
-port = 1883
+- MQTT 3.1, 3.1.1 and 5.0; QoS 0, 1 and 2 in both directions, with
+  retransmission on reconnect
+- Persistent sessions with session expiry, retained messages, wills and will
+  delay
+- Shared subscriptions, subscription identifiers, No Local, Retain As
+  Published and Retain Handling
+- Message expiry, content type, response topic, correlation data and user
+  properties
+- Flow control with Receive Maximum, Maximum Packet Size and topic aliases
+- Enhanced authentication and re-authentication, server redirection,
+  Server Keep Alive and Response Information
 
-[storage]
-backend = "sqlite"
-path = "/var/lib/mercurio/mercurio.db"
+**Broker**
 
-[auth]
-enabled = true
-allow_anonymous = false
-password_file = "/etc/mercurio/passwd"
-```
+- [Listeners](https://frenzox.github.io/mercurio/listeners.html) on TCP,
+  TLS, WebSocket and Unix sockets, with the PROXY protocol, mount points and
+  their own authentication
+- [Authentication](https://frenzox.github.io/mercurio/security.html) with
+  password files (Argon2 or mosquitto's hashes), client certificates, an
+  HTTP service or dynamic security managed at runtime
+- Topic access control in mosquitto's `acl_file` format
+- [Bridges](https://frenzox.github.io/mercurio/bridges.html) to other
+  brokers, over MQTT 5 or 3.1.1, with failover and mutual TLS
+- State in memory, SQLite or PostgreSQL, with standby failover on
+  PostgreSQL
+- [WebAssembly plugins](https://frenzox.github.io/mercurio/plugins.html)
+  with access to HTTP and sockets limited to allowlists
+- [`$SYS` statistics](https://frenzox.github.io/mercurio/operations.html),
+  logging to a file or syslog, limits on connections, queues and sessions
+- Configuration reloads on SIGHUP, graceful shutdown on SIGTERM
 
-Add users to the password file with:
+**Client library**
 
-```bash
-mercuriod passwd -f /etc/mercurio/passwd -u alice
-```
-
-See [`mercuriod/README.md`](mercuriod/README.md) for every option,
-including TLS, WebSocket, limits, access control and the systemd unit in
-[`mercuriod/contrib`](mercuriod/contrib).
-
-## Command-line client
-
-`recado pub` publishes one message, read from `-m` or from standard
-input. `recado sub` prints messages until interrupted. Both accept the
-connection options (`-H`, `-p`, `-u`, `-P`, `-V`, `--tls`, ...); run them
-with `--help` for the full list.
-
-```bash
-# MQTT 5 request with properties
-recado pub -t requests/lamp -m on --response-topic replies/me \
-    --correlation-data 42 --user-property source=cli
-
-# Persistent subscriber that survives broker restarts
-recado sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
-```
-
-## Client library
+- Async API: `publish` and `subscribe` resolve when the broker acknowledges
+  them
+- Automatic reconnection that resumes the session and resends
+  unacknowledged messages
+- Follows the limits the broker announces, and holds the broker to the
+  client's own
+- TLS through rustls
 
 ```rust
 use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
@@ -154,21 +143,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`publish_with_properties` and `subscribe_with` give access to MQTT 5
-properties and subscription options. `ConnectOptions::authenticator` plugs
-in an enhanced authentication method.
+## Documentation
 
-## Workspace layout
+The [documentation](https://frenzox.github.io/mercurio/) is built from
+[`docs/`](docs):
+
+| Page | Covers |
+|------|--------|
+| [Installing & running](https://frenzox.github.io/mercurio/install.html) | Packages, building, the systemd service, signals |
+| [Configuration reference](https://frenzox.github.io/mercurio/configuration.html) | Every option of the TOML file |
+| [Authentication & access](https://frenzox.github.io/mercurio/security.html) | Passwords, ACLs, TLS, HTTP auth, dynamic security |
+| [Listeners & transports](https://frenzox.github.io/mercurio/listeners.html) | TLS, WebSocket, Unix sockets, PROXY protocol, mount points |
+| [Bridges](https://frenzox.github.io/mercurio/bridges.html) | Forwarding topics to and from other brokers |
+| [Operations & monitoring](https://frenzox.github.io/mercurio/operations.html) | Persistence, limits, statistics, logs |
+| [Command-line client](https://frenzox.github.io/mercurio/cli.html) | `recado pub` and `recado sub` |
+| [Rust client library](https://frenzox.github.io/mercurio/client.html) | Connecting, publishing and subscribing from Rust |
+| [Embedding the broker](https://frenzox.github.io/mercurio/embedding.html) | Running `mercurio-server` in your program, Rust plugins |
+| [WebAssembly plugins](https://frenzox.github.io/mercurio/plugins.html) | Writing, configuring and limiting plugins |
+| [Migrating from mosquitto](https://frenzox.github.io/mercurio/migrating.html) | mosquitto's options and their equivalents |
+
+## Crates
 
 | Crate | Contents |
 |-------|----------|
-| [`mercurio-core`](mercurio-core) | Shared types: QoS, reason codes, properties, topic matching, codec primitives |
-| [`mercurio-packets`](mercurio-packets) | Encoding and decoding of every MQTT control packet, for all three protocol versions |
-| [`mercurio-storage`](mercurio-storage) | Storage traits for sessions, retained messages, wills, in-flight and queued messages, with memory, SQLite and PostgreSQL backends |
-| [`mercurio-server`](mercurio-server) | The broker as a library, to embed or extend with custom authentication and authorization |
-| [`mercuriod`](mercuriod) | The broker daemon: configuration, logging, password files |
-| [`mercurio-client`](mercurio-client) | The async client library |
+| [`mercuriod`](mercuriod) | The broker daemon: configuration, logging, password files, WASM plugins |
 | [`recado`](recado) | The `recado pub` and `recado sub` command-line client |
+| [`mercurio-client`](mercurio-client) | The async client library |
+| [`mercurio-server`](mercurio-server) | The broker as a library, with the `Plugin` trait |
+| [`mercurio-plugin`](mercurio-plugin) | The SDK for writing WASM plugins in Rust |
+| [`mercurio-storage`](mercurio-storage) | Storage for sessions, retained, in-flight and queued messages, in memory, SQLite or PostgreSQL |
+| [`mercurio-packets`](mercurio-packets) | Encoding and decoding of every MQTT packet, for all three protocol versions |
+| [`mercurio-core`](mercurio-core) | Shared types: QoS, reason codes, properties, topic matching |
 
 ## Development
 
