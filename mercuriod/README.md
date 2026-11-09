@@ -373,7 +373,7 @@ plugin, to `$CONTROL/dynamic-security/v1`, and reads the answers on
 `$CONTROL/dynamic-security/v1/response`:
 
 ```bash
-mosquitto_pub -u admin -P ... -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
+recado pub -u admin -P ... -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
   {"command": "createRole", "rolename": "sensor"},
   {"command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
    "topic": "sensors/#", "allow": true},

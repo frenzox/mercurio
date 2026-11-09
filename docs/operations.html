@@ -93,7 +93,7 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 
 <h2 id="sys">$SYS statistics</h2>
 <p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged.</p>
-<pre>mosquitto_sub -t '$SYS/broker/#' -v</pre>
+<pre>recado sub -t '$SYS/broker/#' -T</pre>
 <table>
 <tr><th>Topic</th><th>Value</th></tr>
 <tr><td><code>version</code></td><td>Broker version</td></tr>
