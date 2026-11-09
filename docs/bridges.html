@@ -104,8 +104,8 @@ key_path = "/etc/mercurio/site1.key"</pre>
 
 <h2>Monitoring</h2>
 <p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while connected, <code>0</code> after losing the connection.</p>
-<pre>mosquitto_sub -t '$SYS/broker/connection/+/state' -v
-<span class="comment"># $SYS/broker/connection/mercurio-bridge-cloud/state 1</span></pre>
+<pre>recado sub -t '$SYS/broker/connection/+/state' -T
+<span class="comment"># $SYS/broker/connection/mercurio-bridge-cloud/state: 1</span></pre>
 
 <h2>When the remote broker is down</h2>
 <ul>

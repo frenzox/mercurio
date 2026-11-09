@@ -136,9 +136,9 @@ enabled = true
 allow_anonymous = false
 dynamic_security = "/var/lib/mercurio/dynamic-security.json"</pre>
 <p>The administrator sends commands to <code>$CONTROL/dynamic-security/v1</code> and reads the answers on <code>$CONTROL/dynamic-security/v1/response</code>. Several commands can go in one message:</p>
-<pre>mosquitto_sub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1/response' &amp;
+<pre>recado sub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1/response' &amp;
 
-mosquitto_pub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
+recado pub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
   {"command": "createRole", "rolename": "sensor"},
   {"command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
    "topic": "sensors/#", "allow": true},
