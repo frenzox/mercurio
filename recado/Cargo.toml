@@ -23,3 +23,22 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.deb]
+maintainer = "Guilherme Felipe da Silva <gfsilva.eng@gmail.com>"
+section = "net"
+extended-description = """\
+recado publishes MQTT messages and subscribes to topics from the command
+line, over TCP or TLS, with MQTT 3.1.1 and 5.0. It works with any MQTT
+broker."""
+depends = "libc6 (>= 2.18), libgcc-s1 | libgcc1"
+assets = [
+    ["target/release/recado", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/recado/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/recado", dest = "/usr/bin/recado", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/recado/README.md", mode = "644", doc = true },
+]

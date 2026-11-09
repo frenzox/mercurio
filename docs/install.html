@@ -39,13 +39,13 @@
 <p class="lead">Install a package or build the binaries, start the broker, and run it as a systemd service.</p>
 
 <h2>Packages</h2>
-<p>Each <a href="https://github.com/frenzox/mercurio/releases">mercuriod release</a> has <code>.deb</code> and <code>.rpm</code> packages and a plain <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. They need glibc 2.18 or later. Download the one for your system and install it:</p>
+<p>Each <a href="https://github.com/frenzox/mercurio/releases">release</a> of <code>mercuriod</code>, the broker, and <code>recado</code>, the command-line client, has <code>.deb</code> and <code>.rpm</code> packages and a plain <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. They need glibc 2.18 or later. Download the one for your system and install it:</p>
 <pre><span class="comment"># Debian, Ubuntu, Raspberry Pi OS</span>
-sudo apt install ./mercuriod_0.4.0-1_amd64.deb
+sudo apt install ./mercuriod_0.4.1-1_amd64.deb ./recado_0.2.2-1_amd64.deb
 
 <span class="comment"># Fedora, RHEL, openSUSE</span>
-sudo dnf install ./mercuriod-0.4.0-1.x86_64.rpm</pre>
-<p>The packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, and create a <code>mercurio</code> system user for the service. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
+sudo dnf install ./mercuriod-0.4.1-1.x86_64.rpm ./recado-0.2.2-1.x86_64.rpm</pre>
+<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, and create a <code>mercurio</code> system user for the service. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
 <pre>sudo systemctl enable --now mercuriod</pre>
 <p>The service runs as <code>mercurio</code>, so files it reads that aren't readable by everyone, such as TLS keys and password files, must belong to that user or its group:</p>
 <pre>sudo chown root:mercurio /etc/mercurio/server.key
@@ -62,7 +62,7 @@ cargo build --release --package mercuriod
 
 <span class="comment"># Or install the binaries into ~/.cargo/bin</span>
 cargo install --path mercuriod
-cargo install --path mercurio</pre>
+cargo install --path recado</pre>
 <p>The binaries end up in <code>target/release/</code>: <code>mercuriod</code>, the broker, and <code>recado</code>, the command-line client.</p>
 
 <h2>Running the broker</h2>
