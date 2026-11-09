@@ -1,6 +1,6 @@
 [package]
 name = "mercuriod"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.97"
 description = "Mercurio MQTT broker daemon"
@@ -21,8 +21,8 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:http
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-client = { path = "../mercurio-client", version = "0.4.0" }
-mercurio-server = { path = "../mercurio-server", version = "0.4.0" }
-mercurio-storage = { path = "../mercurio-storage", version = "0.3.1", features = ["sqlite", "postgres"] }
+mercurio-server = { path = "../mercurio-server", version = "0.4.1" }
+mercurio-storage = { path = "../mercurio-storage", version = "0.3.2", features = ["sqlite", "postgres"] }
 
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
