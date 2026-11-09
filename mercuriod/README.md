@@ -12,8 +12,8 @@ and `.rpm` packages for x86_64, aarch64 and armv7 Linux, which install the
 binary, the configuration in `/etc/mercurio/` and the systemd unit:
 
 ```bash
-sudo apt install ./mercuriod_0.4.0-1_amd64.deb
-sudo dnf install ./mercuriod-0.4.0-1.x86_64.rpm
+sudo apt install ./mercuriod_0.4.1-1_amd64.deb
+sudo dnf install ./mercuriod-0.4.1-1.x86_64.rpm
 ```
 
 Or with cargo:
