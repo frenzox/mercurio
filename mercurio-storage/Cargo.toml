@@ -38,3 +38,6 @@ webpki-roots = { version = "0.26", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
