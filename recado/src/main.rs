@@ -1,6 +1,6 @@
 //! Mercurio - MQTT command-line client
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -305,10 +305,17 @@ async fn run_subscribe(
             loop {
                 match client.recv().await {
                     Some(Event::Message { topic, payload, .. }) => {
-                        if print_topic {
-                            println!("{}: {}", topic, String::from_utf8_lossy(&payload));
+                        let payload = String::from_utf8_lossy(&payload);
+                        let mut out = io::stdout();
+                        let written = if print_topic {
+                            writeln!(out, "{}: {}", topic, payload)
                         } else {
-                            println!("{}", String::from_utf8_lossy(&payload));
+                            writeln!(out, "{}", payload)
+                        };
+                        // The reader went away, as `head` does once it has
+                        // enough lines
+                        if written.is_err() {
+                            break;
                         }
                     }
                     Some(Event::Disconnected { reason }) => {
