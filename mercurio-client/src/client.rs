@@ -717,7 +717,10 @@ impl EventLoop {
         // arrive; a keep-alive of 0 means no pings at all
         let ping_interval =
             (keep_alive > 0).then(|| Duration::from_millis(u64::from(keep_alive) * 500));
-        let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
+        let period = ping_interval.unwrap_or(Duration::from_secs(3600));
+        let mut ping_timer = time::interval(period);
+        // Ticks missed while the loop was busy don't fire in a burst
+        ping_timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         ping_timer.tick().await; // Skip the first immediate tick
         let mut awaiting_pingresp = false;
         // Reading stopped at some point since the last PINGREQ, so its
@@ -806,10 +809,14 @@ impl EventLoop {
                 }
 
                 // Send PINGREQ for keep-alive
-                _ = ping_timer.tick(), if ping_interval.is_some() => {
+                scheduled = ping_timer.tick(), if ping_interval.is_some() => {
+                    // A late tick means the loop itself was stalled, by a
+                    // slow authenticator or a starved runtime, and couldn't
+                    // read the PINGRESP that may be waiting
+                    let stalled = scheduled.elapsed() > period / 2;
                     // The previous PINGREQ went unanswered: the broker or the
                     // network is gone
-                    if awaiting_pingresp && !paused_since_ping {
+                    if awaiting_pingresp && !paused_since_ping && !stalled {
                         warn!("No PINGRESP from the broker, closing the connection");
                         return DisconnectReason::KeepAliveTimeout;
                     }
