@@ -14,6 +14,9 @@ pub struct LogLevel {
     /// As last given, without the directive `connection_messages` adds
     directives: Mutex<String>,
     connection_messages: bool,
+    /// Why the configured level was replaced by `info`, to log once logging
+    /// is up
+    fallback: Option<String>,
 }
 
 impl LogLevel {
@@ -23,11 +26,12 @@ impl LogLevel {
         directives: &str,
         connection_messages: bool,
     ) -> (LogLevel, reload::Layer<EnvFilter, Registry>) {
-        let (directives, filter) = match filter(directives, connection_messages) {
-            Ok(filter) => (directives.to_string(), filter),
-            Err(_) => (
+        let (directives, filter, fallback) = match filter(directives, connection_messages) {
+            Ok(filter) => (directives.to_string(), filter, None),
+            Err(e) => (
                 "info".to_string(),
                 filter("info", connection_messages).expect("info is a valid level"),
+                Some(e),
             ),
         };
         let (layer, handle) = reload::Layer::new(filter);
@@ -35,6 +39,7 @@ impl LogLevel {
             handle,
             directives: Mutex::new(directives),
             connection_messages,
+            fallback,
         };
         (level, layer)
     }
@@ -78,7 +83,7 @@ fn filter(directives: &str, connection_messages: bool) -> Result<EnvFilter, Stri
 /// Sends logs where `config` says, at `debug` with `verbose`.
 pub fn init(config: &LoggingConfig, verbose: bool) -> Result<LogLevel, String> {
     let directives = if verbose { "debug" } else { &config.level };
-    let (level, filter) = LogLevel::new(directives, config.connection_messages);
+    let (mut level, filter) = LogLevel::new(directives, config.connection_messages);
     let registry = tracing_subscriber::registry().with(filter);
     #[cfg(unix)]
     let syslog = match config.syslog {
@@ -113,6 +118,9 @@ pub fn init(config: &LoggingConfig, verbose: bool) -> Result<LogLevel, String> {
                 .init();
         }
         (None, None) => registry.with(fmt::layer()).init(),
+    }
+    if let Some(reason) = level.fallback.take() {
+        tracing::warn!("[logging] level: {reason}; logging at info");
     }
     Ok(level)
 }
@@ -193,7 +201,12 @@ mod tests {
 
     #[test]
     fn test_an_invalid_configured_level_falls_back_to_info() {
-        let (level, _filter) = LogLevel::new("info,x=loud", true);
-        assert_eq!(level.get(), "info");
+        for bad in ["info,x=loud", ""] {
+            let (level, _filter) = LogLevel::new(bad, true);
+            assert_eq!(level.get(), "info");
+            assert!(level.fallback.is_some(), "{bad:?}");
+        }
+        let (level, _filter) = LogLevel::new("debug", true);
+        assert!(level.fallback.is_none());
     }
 }
