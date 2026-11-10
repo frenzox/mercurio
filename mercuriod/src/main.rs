@@ -1,8 +1,6 @@
 //! Mercuriod - MQTT broker daemon
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +34,7 @@ mod credentials;
 mod dynsec;
 mod http_auth;
 mod logging;
+mod password_file;
 mod reload;
 #[cfg(unix)]
 mod syslog;
@@ -339,7 +338,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(reload_on_sighup(reloadable));
 
     let result = match config.storage {
-        StorageConfig::Memory => {
+        StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
             serve(listener, server_config, storage, &commands, shutdown).await
         }
@@ -473,6 +472,26 @@ fn build_auth(
     reloadable: &mut Vec<Arc<dyn Reload>>,
     main: bool,
 ) -> Result<(ServerAuthConfig, Vec<Arc<dyn Plugin>>), String> {
+    let table = if main { "[auth]" } else { "[listeners.auth]" };
+    // Without authentication these would be ignored, letting everyone in
+    let authenticating = [
+        ("password_file", config.password_file.is_some()),
+        ("dynamic_security", config.dynamic_security.is_some()),
+        (
+            "user_url",
+            config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
+        ),
+    ];
+    if let Some((key, _)) = authenticating
+        .iter()
+        .find(|(_, set)| *set && !config.enabled)
+    {
+        return Err(format!(
+            "`{key}` is set in {table} but `enabled` is false, so no client would be \
+             authenticated; set `enabled = true` or remove `{key}`"
+        ));
+    }
+
     if let Some(path) = &config.dynamic_security {
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
@@ -491,8 +510,7 @@ fn build_auth(
 
     let http = config.http.as_ref().map(|http| {
         let auth = Arc::new(HttpAuth::new(
-            // The broker checks credentials whenever they're sent
-            http.user_url.clone().filter(|_| config.enabled),
+            http.user_url.clone(),
             http.acl_url.clone(),
             Duration::from_secs(http.timeout_seconds),
             Duration::from_secs(http.cache_seconds),
@@ -508,13 +526,11 @@ fn build_auth(
     }
 
     let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-    if config.enabled {
-        if let Some(path) = &config.password_file {
-            let validator = Arc::new(Reloadable::load(path, load_credentials)?);
-            info!("Loaded credentials from {}", path);
-            reloadable.push(validator.clone());
-            plugins.push(validator);
-        }
+    if let Some(path) = &config.password_file {
+        let validator = Arc::new(Reloadable::load(path, load_credentials)?);
+        info!("Loaded credentials from {}", path);
+        reloadable.push(validator.clone());
+        plugins.push(validator);
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
@@ -612,38 +628,13 @@ fn load_acl_file(path: &str) -> Result<AclFile, String> {
 }
 
 fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
-    let credentials = load_password_file(path).map_err(|e| e.to_string())?;
-    Ok(HashedCredentialValidator::new(credentials))
-}
-
-/// Load a password file with format: `username:hash` per line.
-/// Lines starting with `#` and empty lines are ignored.
-fn load_password_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read password file `{}`: {}", path, e))?;
-
-    let mut credentials = HashMap::new();
-    for (line_num, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((username, password_hash)) = line.split_once(':') else {
-            return Err(format!(
-                "Invalid format in password file `{}` at line {}: expected `username:hash`",
-                path,
-                line_num + 1
-            )
-            .into());
-        };
-        credentials.insert(username.to_string(), password_hash.to_string());
-    }
-
-    Ok(credentials)
+    Ok(HashedCredentialValidator::new(password_file::load(path)?))
 }
 
 /// Add or update a user in the password file.
 fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
+    password_file::check_username(username)?;
+    let mut users = password_file::read_users(path)?;
     let password = prompt_new_password(username)?;
 
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
@@ -652,9 +643,8 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
         .map_err(|e| format!("Failed to hash password: {}", e))?
         .to_string();
 
-    let mut entries = load_password_file_entries(path);
-    entries.insert(username.to_string(), hash);
-    write_password_file(path, &entries)?;
+    users.insert(username.to_string(), hash);
+    password_file::write_users(path, &users)?;
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
     Ok(())
@@ -675,34 +665,12 @@ fn prompt_new_password(username: &str) -> Result<String, Box<dyn std::error::Err
 
 /// Delete a user from the password file.
 fn delete_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut entries = load_password_file_entries(path);
-    if entries.remove(username).is_none() {
+    let mut users = password_file::read_users(path)?;
+    if users.remove(username).is_none() {
         return Err(format!("User `{}` not found in `{}`", username, path).into());
     }
-    write_password_file(path, &entries)?;
+    password_file::write_users(path, &users)?;
     eprintln!("User `{}` deleted from `{}`", username, path);
-    Ok(())
-}
-
-/// Load password file entries, returning empty map if file doesn't exist.
-fn load_password_file_entries(path: &str) -> HashMap<String, String> {
-    load_password_file(path).unwrap_or_default()
-}
-
-/// Write entries to a password file.
-fn write_password_file(
-    path: &str,
-    entries: &HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = std::fs::File::create(path)?;
-    writeln!(file, "# Mercurio password file")?;
-    writeln!(
-        file,
-        "# Managed by `mercuriod passwd`. Do not edit manually."
-    )?;
-    for (username, hash) in entries {
-        writeln!(file, "{}:{}", username, hash)?;
-    }
     Ok(())
 }
 
@@ -710,29 +678,62 @@ fn write_password_file(
 mod tests {
     use super::{address, build_auth, config};
 
+    fn auth(toml: &str) -> config::AuthConfig {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn test_authentication_settings_need_authentication_enabled() {
+        for (toml, key) in [
+            ("password_file = \"/nonexistent/passwd\"\n", "password_file"),
+            (
+                "dynamic_security = \"/nonexistent/dynsec.json\"\n",
+                "dynamic_security",
+            ),
+            ("[http]\nuser_url = \"http://h/user\"\n", "user_url"),
+        ] {
+            for main in [true, false] {
+                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
+                    panic!("{toml}: accepted");
+                };
+                assert!(
+                    error.contains(&format!("`{key}`")) && error.contains("`enabled`"),
+                    "{toml}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_access_control_works_without_authentication() {
+        let (value, plugins) = build_auth(
+            &auth("[http]\nacl_url = \"http://h/acl\"\n"),
+            &mut Vec::new(),
+            true,
+        )
+        .map_err(|e| panic!("{e}"))
+        .unwrap();
+        assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+
+        let acl = std::env::temp_dir().join(format!("mercuriod-acl-{}", std::process::id()));
+        std::fs::write(&acl, "topic read public/#\n").unwrap();
+        let result = build_auth(
+            &auth(&format!("acl_file = \"{}\"\n", acl.display())),
+            &mut Vec::new(),
+            true,
+        );
+        std::fs::remove_file(&acl).unwrap();
+        let (value, plugins) = result.map_err(|e| panic!("{e}")).unwrap();
+        assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+    }
+
     #[test]
     fn test_ipv6_hosts_are_bracketed() {
         assert_eq!(address("::", 1883), "[::]:1883");
         assert_eq!(address("[::1]", 1883), "[::1]:1883");
         assert_eq!(address("0.0.0.0", 1883), "0.0.0.0:1883");
         assert_eq!(address("localhost", 1883), "localhost:1883");
-    }
-
-    #[test]
-    fn test_http_auth_without_authentication_only_controls_access() {
-        // The broker checks any credentials sent, so the user URL must not
-        // be asked when authentication is off
-        let config: config::AuthConfig = toml::from_str(
-            r#"
-            [http]
-            user_url = "http://127.0.0.1:1/user"
-            acl_url = "http://127.0.0.1:1/acl"
-            "#,
-        )
-        .unwrap();
-        let (auth, plugins) = build_auth(&config, &mut Vec::new(), true).unwrap();
-        assert!(!auth.require_auth);
-        let hooks: Vec<String> = plugins.iter().flat_map(|p| p.status().hooks).collect();
-        assert_eq!(hooks, ["authorize"]);
     }
 }

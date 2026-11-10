@@ -49,8 +49,9 @@ the defaults below. A missing file at a path given with `-c` is an error.
 
 ## Configuration
 
-Mercuriod reads a TOML file. Every setting is optional; this is the full
-list with the defaults, also available as
+Mercuriod reads a TOML file. Every setting is optional, and a key it does
+not know stops it from starting, with an error naming the key. This is the
+full list with the defaults, also available as
 [`contrib/config.toml`](contrib/config.toml):
 
 ```toml
@@ -216,7 +217,9 @@ backend = "memory"
 # standby = false
 
 [auth]
-# Require clients to authenticate
+# Require clients to authenticate. password_file, dynamic_security and
+# user_url authenticate clients, so the broker refuses to start when one is
+# set while this is false; acl_file and acl_url work either way
 enabled = false
 
 # Allow clients that send no user name (when auth is enabled)
@@ -236,7 +239,8 @@ allow_anonymous = false
 # Create the file with `mercuriod dynsec-init -f <path>`.
 # dynamic_security = "/var/lib/mercurio/dynamic-security.json"
 
-# Or delegate checks to an HTTP service: a 2xx answer allows
+# Or delegate checks to an HTTP service: a 2xx answer allows. acl_url alone,
+# without authentication, only checks topic access
 # [auth.http]
 # user_url = "http://auth.internal/mqtt/user"
 # acl_url = "http://auth.internal/mqtt/acl"
@@ -353,6 +357,11 @@ mercuriod passwd -f /etc/mercurio/passwd -u alice
 # Remove a user
 mercuriod passwd -f /etc/mercurio/passwd -u alice -d
 ```
+
+`passwd` replaces the file in one step, keeping its owner, group and mode
+(at most 0640). A new file gets mode 0600: let the broker read it with
+`chgrp mercurio` and `chmod 640`. It refuses to change a file it
+cannot read in full, so fix a malformed line by hand first.
 
 ### Access control
 

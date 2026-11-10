@@ -61,6 +61,7 @@ mercuriod passwd -f /etc/mercurio/passwd -u alice
 
 <span class="comment"># Remove a user</span>
 mercuriod passwd -f /etc/mercurio/passwd -u alice -d</pre>
+<p><code>mercuriod passwd</code> replaces the file in one step, so a reload never sees half of it. The file keeps its owner, group and mode, at most <code>0640</code>; a new file gets <code>0600</code>, so let the broker read it with <code>chgrp mercurio</code> and <code>chmod 640</code>. A file it cannot read in full, such as one with a malformed line, is left unchanged with an error.</p>
 <p>Files written by <code>mosquitto_passwd</code> work unchanged: their <code>$7$</code> (PBKDF2-SHA512, mosquitto 2.0's default) and <code>$6$</code> (SHA-512, older versions) hashes are recognised.</p>
 
 <h2 id="acl">Access control lists</h2>

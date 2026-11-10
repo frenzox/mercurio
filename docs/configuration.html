@@ -38,7 +38,7 @@
 </nav>
 <main>
 <h1>Configuration reference</h1>
-<p class="lead">Every option of <code>mercuriod</code>'s TOML configuration file, with its default. Every option is optional.</p>
+<p class="lead">Every option of <code>mercuriod</code>'s TOML configuration file, with its default. Every option is optional. An option or table the broker does not know, such as a misspelled one, stops it from starting with an error that names it.</p>
 <p>The broker reads <code>/etc/mercurio/config.toml</code>, or the file given with <code>-c</code>. A commented file with every option is provided as <code>mercuriod/contrib/config.toml</code>.</p>
 
 <h2 id="include-dir">Top level</h2>
@@ -150,7 +150,7 @@ mount_point = "tenant1/"</pre>
 <p>See <a href="security.html">Authentication &amp; access</a>. <code>[listeners.auth]</code> takes the same options.</p>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate.</td></tr>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate. Needed by <code>password_file</code>, <code>dynamic_security</code> and <code>user_url</code>: the broker refuses to start when one of them is set and this is <code>false</code>. <code>acl_file</code> and <code>acl_url</code> work without it.</td></tr>
 <tr><td><code>allow_anonymous</code></td><td><code>false</code></td><td>With authentication enabled, still accept clients that send no user name.</td></tr>
 <tr><td><code>password_file</code></td><td></td><td>User names and password hashes.</td></tr>
 <tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>

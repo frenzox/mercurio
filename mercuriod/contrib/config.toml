@@ -162,7 +162,9 @@ backend = "memory"
 # standby = false
 
 [auth]
-# Require clients to authenticate
+# Require clients to authenticate. password_file, dynamic_security and
+# user_url authenticate clients, so the broker refuses to start when one is
+# set while this is false; acl_file and acl_url work either way
 enabled = false
 
 # Allow clients that send no user name (when auth is enabled)
@@ -182,7 +184,8 @@ allow_anonymous = false
 # Create the file with `mercuriod dynsec-init -f <path>`.
 # dynamic_security = "/var/lib/mercurio/dynamic-security.json"
 
-# Or delegate checks to an HTTP service: a 2xx answer allows
+# Or delegate checks to an HTTP service: a 2xx answer allows. acl_url alone,
+# without authentication, only checks topic access
 # [auth.http]
 # user_url = "http://auth.internal/mqtt/user"
 # acl_url = "http://auth.internal/mqtt/acl"
