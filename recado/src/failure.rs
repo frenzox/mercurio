@@ -17,6 +17,8 @@ pub enum Failure {
     Connection(String),
     /// The command line asks for something that can't be done
     Usage(String),
+    /// `sub -W` ran out of time
+    TimedOut(String),
 }
 
 impl Failure {
@@ -25,6 +27,7 @@ impl Failure {
             Failure::Rejected(_) => 1,
             Failure::Connection(_) => 2,
             Failure::Usage(_) => USAGE,
+            Failure::TimedOut(_) => 4,
         }
     }
 
@@ -73,9 +76,10 @@ impl From<std::io::Error> for Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failure::Rejected(message) | Failure::Connection(message) | Failure::Usage(message) => {
-                f.write_str(message)
-            }
+            Failure::Rejected(message)
+            | Failure::Connection(message)
+            | Failure::Usage(message)
+            | Failure::TimedOut(message) => f.write_str(message),
         }
     }
 }

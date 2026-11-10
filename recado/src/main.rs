@@ -16,7 +16,7 @@ use failure::Failure;
 const AFTER_HELP: &str = "\
 Exit status: 0 on success, 1 when the broker refused a subscription or a \
 message, 2 when the broker couldn't be reached, refused the login or \
-closed the connection, 3 on wrong usage.";
+closed the connection, 3 on wrong usage, 4 when sub -W ran out of time.";
 
 #[derive(Parser, Debug)]
 #[command(name = "recado")]

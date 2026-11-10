@@ -52,6 +52,9 @@ RECADO_PASSWORD="$(cat ~/.mqtt-password)" recado pub -u alice -t status -m up
 recado pub -t requests/lamp -m on --response-topic replies/me \
     --correlation-data 42 --user-property source=cli
 
+# In a script: wait up to 10 s for one message, then exit
+recado sub -t devices/7/status -C 1 -W 10
+
 # A persistent subscriber that reconnects on its own
 recado sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
 ```
@@ -70,7 +73,8 @@ Connection options, for both commands:
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a
 message, 2 when it couldn't be reached, refused the login or closed the
-connection, 3 on wrong usage. Messages go to standard error.
+connection, 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
+go to standard error.
 
 Run `recado pub --help` or `recado sub --help` for every option, or see
 the [CLI guide](https://frenzox.github.io/mercurio/cli.html).

@@ -80,6 +80,9 @@ recado sub -t 'sensors/#' -T
 <span class="comment"># Several filters</span>
 recado sub -t 'sensors/#' -t 'alerts/#' -T
 
+<span class="comment"># In a script: the device's retained status, or status 4 after 10 s</span>
+recado sub -t devices/7/status -C 1 -W 10
+
 <span class="comment"># A persistent subscriber that survives broker restarts and network loss</span>
 recado sub -t 'alerts/#' -i monitor -c -x 3600 --reconnect 5 -q 1
 
@@ -95,6 +98,8 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>--retain-as-published</code></td><td>Keep the retain flag messages were published with</td></tr>
 <tr><td><code>--retain-handling</code></td><td>Retained messages on subscribing: 0 always, 1 only for new subscriptions, 2 never</td></tr>
 <tr><td><code>--subscription-id</code></td><td>Identifier the broker attaches to messages matching these subscriptions</td></tr>
+<tr><td><code>-C, --count N</code></td><td>Exit after <code>N</code> messages, retained ones included</td></tr>
+<tr><td><code>-W, --timeout SECONDS</code></td><td>As mosquitto_sub's <code>-W</code>: exit with status 4 if still running this long after connecting. With <code>-C</code>, that means fewer than <code>N</code> messages came; without it, <code>sub</code> always ends this way</td></tr>
 <tr><td><code>--reconnect SECONDS</code></td><td>Reconnect after losing the connection, waiting this long between attempts</td></tr>
 <tr><td><code>--will-topic</code>, <code>--will-message</code></td><td>Will published by the broker if the client disconnects unexpectedly</td></tr>
 <tr><td><code>--will-qos</code>, <code>--will-retain</code>, <code>--will-delay</code></td><td>QoS, retain flag and delay (MQTT 5) of the will</td></tr>
@@ -148,13 +153,14 @@ recado pub -V 311 -t test -m hello
 recado sub --unix /run/mercurio/mqtt.sock -t 'sensors/#' -T</pre>
 
 <h2 id="exit-status">Exit status</h2>
-<p>recado uses the same exit statuses as <a href="mercurioctl.html#exit-status">mercurioctl</a>:</p>
+<p>recado uses the exit statuses of <a href="mercurioctl.html#exit-status">mercurioctl</a>, and 4 for <code>sub -W</code>:</p>
 <table>
 <tr><th>Status</th><th>Means</th></tr>
 <tr><td><code>0</code></td><td>Success, or <code>sub</code> stopped by Ctrl-C or by its reader going away</td></tr>
 <tr><td><code>1</code></td><td>The broker refused a subscription, or a QoS 1 or 2 message; the message names the filter and the reason</td></tr>
 <tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, or closed the connection; with <code>--reconnect</code>, when the client gives up</td></tr>
 <tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or a QoS above 2</td></tr>
+<tr><td><code>4</code></td><td><code>sub -W</code> ran out of time, such as before <code>-C</code>'s messages all arrived</td></tr>
 </table>
 <p>Messages and logs go to standard error, so standard output carries only the payloads.</p>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>

@@ -1,5 +1,6 @@
 //! `recado sub`.
 
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use mercurio_client::{
     Event, MessageProperties, MqttClient, QoS, RetainHandling, SubscriptionOptions, Will,
 };
 use serde_json::{json, Value};
-use tokio::signal;
+use tokio::{signal, time::Instant};
 
 use crate::common::{qos_level, ConnectionArgs};
 use crate::failure::Failure;
@@ -39,6 +40,15 @@ pub struct SubArgs {
 
     #[command(flatten)]
     subscription: SubscriptionArgs,
+
+    /// Exit after this many messages, retained ones included
+    #[arg(short = 'C', long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    count: Option<u64>,
+
+    /// Exit with status 4 if recado is still running this many seconds
+    /// after connecting, as when -C's messages haven't all arrived
+    #[arg(short = 'W', long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: Option<u64>,
 
     /// Reconnect after losing the connection, waiting this many seconds
     /// between attempts
@@ -122,6 +132,10 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     }
 
     let client = MqttClient::connect(options).await?;
+    // As mosquitto_sub's -W, from the connection on
+    let deadline = args
+        .timeout
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
 
     // Subscribe to topics
     let subscription = args.subscription;
@@ -153,11 +167,24 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
         return Err(failure);
     }
 
+    let received = Cell::new(0);
     // Handle Ctrl+C for graceful shutdown
     let outcome = tokio::select! {
         _ = signal::ctrl_c() => {
             eprintln!("\nDisconnecting...");
             Ok(())
+        }
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        } => {
+            let mut message = format!("timed out after {} s", args.timeout.unwrap_or_default());
+            if let Some(count) = args.count {
+                message.push_str(&format!(" with {} of {count} messages", received.get()));
+            }
+            Err(Failure::TimedOut(message))
         }
         outcome = async {
             loop {
@@ -194,6 +221,10 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                         // The reader went away, as `head` does once it has
                         // enough lines
                         if written.is_err() {
+                            return Ok(());
+                        }
+                        received.set(received.get() + 1);
+                        if Some(received.get()) == args.count {
                             return Ok(());
                         }
                     }

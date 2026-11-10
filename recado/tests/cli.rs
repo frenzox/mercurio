@@ -389,3 +389,48 @@ async fn json_lines_carry_the_message_and_its_properties() {
     );
     subscriber.kill().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sub_exits_after_count_messages() {
+    let broker = start().await;
+    // The retained message that says recado is ready counts as the first
+    let subscriber = broker
+        .subscriber(&["sub", "-t", "count/#", "-C", "3"], "count/ready")
+        .await;
+    let sender = broker.client("sender").await;
+    for payload in ["a", "b"] {
+        sender
+            .publish("count/x", payload, QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    let (status, rest, message) = subscriber.finish().await;
+    assert_eq!(status, Some(0), "{message}");
+    assert_eq!(rest, b"a\nb\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sub_fails_when_the_timeout_comes_first() {
+    let broker = start().await;
+    let started = std::time::Instant::now();
+    let output = broker.run(&["sub", "-t", "quiet", "-W", "1"]).await;
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(stderr(&output).contains("1 s"), "{}", stderr(&output));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    let output = broker
+        .run(&["sub", "-t", "quiet", "-C", "2", "-W", "1"])
+        .await;
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+
+    let sender = broker.client("sender").await;
+    sender
+        .publish_with_retain("kept", "here", QoS::AtLeastOnce, true)
+        .await
+        .unwrap();
+    let output = broker
+        .run(&["sub", "-t", "kept", "-C", "1", "-W", "5"])
+        .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(output.stdout, b"here\n");
+}
