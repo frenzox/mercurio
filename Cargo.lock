@@ -1917,6 +1917,7 @@ dependencies = [
  "clap",
  "mercurio-client",
  "mercurio-core",
+ "mercurio-server",
  "tokio",
  "tracing",
  "tracing-subscriber",

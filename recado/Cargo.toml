@@ -24,6 +24,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+mercurio-server = { path = "../mercurio-server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
 [package.metadata.deb]
 maintainer = "Guilherme Felipe da Silva <gfsilva.eng@gmail.com>"
 section = "net"

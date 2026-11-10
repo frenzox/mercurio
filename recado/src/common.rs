@@ -63,5 +63,9 @@ pub fn init_logging(verbose: bool) {
         EnvFilter::new("warn")
     };
 
-    fmt().with_env_filter(filter).init();
+    // Standard output carries the payloads
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
