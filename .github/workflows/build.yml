@@ -37,6 +37,12 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # The README's only rust block, built as a throwaway example of the
+      # client so that it keeps up with the API
+      - name: README client example
+        run: |
+          awk '/^```rust$/ {f=1; next} /^```$/ {f=0} f' README.md > mercurio-client/examples/readme.rs
+          cargo clippy -p mercurio-client --example readme -- -D warnings
       # Not workspace members: they build only for wasm32
       - name: Format the example plugins
         run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo fmt --manifest-path "$p/Cargo.toml" -- --check; done
