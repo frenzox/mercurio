@@ -366,6 +366,18 @@ where
     Ok(packet)
 }
 
+/// Size of a whole packet whose body is `remaining_len` bytes: the first
+/// byte, the Remaining Length and the body.
+pub(crate) fn packet_size(remaining_len: usize) -> usize {
+    1 + VariableByteInteger(remaining_len as u32).encoded_size() + remaining_len
+}
+
+/// Size of a property list with its length prefix.
+pub(crate) fn property_list_size<P: Encoder>(properties: &P) -> usize {
+    let len = properties.encoded_size();
+    VariableByteInteger(len as u32).encoded_size() + len
+}
+
 /// A property block that sets nothing reads as no block at all: the two
 /// mean the same, and senders use either.
 pub(crate) fn present<P: Default + PartialEq>(properties: P) -> Option<P> {
@@ -392,6 +404,28 @@ impl Encoder for ControlPacket {
             PingResp(p) => p.encode(buffer),
             Disconnect(p) => p.encode(buffer),
             Auth(p) => p.encode(buffer),
+        }
+    }
+
+    fn encoded_size(&self) -> usize {
+        use ControlPacket::*;
+
+        match self {
+            Connect(p) => p.encoded_size(),
+            ConnAck(p) => p.encoded_size(),
+            Publish(p) => p.encoded_size(),
+            PubAck(p) => p.encoded_size(),
+            PubRec(p) => p.encoded_size(),
+            PubRel(p) => p.encoded_size(),
+            PubComp(p) => p.encoded_size(),
+            Subscribe(p) => p.encoded_size(),
+            SubAck(p) => p.encoded_size(),
+            Unsubscribe(p) => p.encoded_size(),
+            UnsubAck(p) => p.encoded_size(),
+            PingReq(p) => p.encoded_size(),
+            PingResp(p) => p.encoded_size(),
+            Disconnect(p) => p.encoded_size(),
+            Auth(p) => p.encoded_size(),
         }
     }
 }
@@ -576,8 +610,9 @@ mod robustness_tests {
         }
     }
 
-    #[test]
-    fn test_valid_packets_parse_completely() {
+    /// The samples with the protocol version each is valid in, and a few
+    /// more packets that leave out what the spec lets them.
+    fn versioned_samples() -> Vec<(Vec<u8>, ProtocolVersion)> {
         let v3 = [1, 4, 10, 13];
         let mut packets: Vec<(Vec<u8>, ProtocolVersion)> = samples()
             .into_iter()
@@ -591,15 +626,33 @@ mod robustness_tests {
                 (p, version)
             })
             .collect();
-        // Optional fields left out, as the spec allows
         packets.extend([
             (vec![0x40, 0x03, 0x00, 0x01, 0x10], ProtocolVersion::V5),
             (vec![0x62, 0x03, 0x00, 0x01, 0x92], ProtocolVersion::V5),
             (vec![0xe0, 0x00], ProtocolVersion::V5),
             (vec![0xf0, 0x00], ProtocolVersion::V5),
+            (vec![0x20, 0x02, 0x01, 0x00], ProtocolVersion::V3_1_1),
+            (vec![0x90, 0x03, 0x00, 0x01, 0x01], ProtocolVersion::V3_1_1),
+            (vec![0xb0, 0x02, 0x00, 0x01], ProtocolVersion::V3_1_1),
         ]);
+        packets
+    }
 
-        for (bytes, version) in packets {
+    #[test]
+    fn test_encoded_size_is_what_encode_writes() {
+        for (bytes, version) in versioned_samples() {
+            let packet =
+                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
+                    .unwrap();
+            let mut encoded = BytesMut::new();
+            packet.encode(&mut encoded);
+            assert_eq!(packet.encoded_size(), encoded.len(), "{packet:?}");
+        }
+    }
+
+    #[test]
+    fn test_valid_packets_parse_completely() {
+        for (bytes, version) in versioned_samples() {
             let mut buffer = BytesMut::from(&bytes[..]);
             // Followed by another packet that must stay untouched
             buffer.extend_from_slice(&[0xc0, 0x00]);

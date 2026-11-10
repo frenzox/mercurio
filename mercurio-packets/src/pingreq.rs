@@ -18,6 +18,10 @@ impl Encoder for PingReqPacket {
         let remaining_len = 0;
         VariableByteInteger(remaining_len).encode(buffer);
     }
+
+    fn encoded_size(&self) -> usize {
+        2
+    }
 }
 
 impl Decoder for PingReqPacket {

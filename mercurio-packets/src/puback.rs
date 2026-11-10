@@ -67,30 +67,36 @@ const PACKET_TYPE: u8 = 0x04;
 
 impl Encoder for PubAckPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut remaining_len = 0;
-
         buffer.put_u8(PACKET_TYPE << 4);
-
-        remaining_len += self.packet_id.encoded_size();
-
-        if self.properties.is_some() || self.reason != ReasonCode::Success {
-            remaining_len += self.reason.encoded_size();
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
-        if remaining_len == 2 {
-            return;
+        if self.has_reason() {
+            self.reason.encode(buffer);
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
         }
+    }
 
-        self.reason.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl PubAckPacket {
+    /// Whether the reason and properties are written: they are left out
+    /// when the reason is `Success` and there are no properties.
+    fn has_reason(&self) -> bool {
+        self.properties.is_some() || self.reason != ReasonCode::Success
+    }
+
+    fn remaining_len(&self) -> usize {
+        let mut len = self.packet_id.encoded_size();
+        if self.has_reason() {
+            len += self.reason.encoded_size() + crate::property_list_size(&self.properties);
+        }
+        len
     }
 }
 

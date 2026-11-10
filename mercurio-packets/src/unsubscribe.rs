@@ -91,6 +91,10 @@ impl Encoder for UnsubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
         self.encode_inner(buffer, true);
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len(true))
+    }
 }
 
 impl Decoder for UnsubscribePacket {
@@ -110,23 +114,21 @@ impl UnsubscribePacket {
         Self::decode_inner(buffer, false)
     }
 
-    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
-        let mut remaining_len = 0;
+    fn remaining_len(&self, with_properties: bool) -> usize {
+        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
+        if with_properties {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
 
+    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
-        remaining_len += self.packet_id.encoded_size();
-        if with_properties {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-        remaining_len += self.payload.encoded_size();
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
         if with_properties {

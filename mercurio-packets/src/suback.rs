@@ -106,24 +106,11 @@ const PACKET_TYPE: u8 = 0x09;
 
 impl Encoder for SubAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut remaining_len = 0;
-
         // Fixed header
         let fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header.encode(buffer);
 
-        remaining_len += self.packet_id.encoded_size();
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        remaining_len += self.payload.encoded_size();
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
@@ -147,6 +134,21 @@ impl Encoder for SubAckPacket {
                 return_code.encode(buffer);
             }
         }
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl SubAckPacket {
+    fn remaining_len(&self) -> usize {
+        // Every return code is one byte, in MQTT 3.x as in MQTT 5
+        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
+        if self.protocol_version.supports_properties() {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
     }
 }
 

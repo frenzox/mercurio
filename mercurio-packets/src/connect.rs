@@ -394,26 +394,9 @@ impl Encoder for ConnectPacket {
         let protocol_name = self.protocol_version.protocol_name();
         let protocol_level = self.protocol_version.protocol_level();
 
-        let mut remaining_len = 0;
-
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += protocol_name.encoded_size();
-        remaining_len += protocol_level.encoded_size();
-        remaining_len += self.flags.encoded_size();
-        remaining_len += self.keepalive.encoded_size();
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        remaining_len += self
-            .payload
-            .encoded_size_for_version(self.protocol_version, &self.flags);
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         // Variable header
         protocol_name.encode(buffer);
@@ -430,6 +413,28 @@ impl Encoder for ConnectPacket {
         // Payload
         self.payload
             .encode_for_version(buffer, self.protocol_version, &self.flags);
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl ConnectPacket {
+    fn remaining_len(&self) -> usize {
+        let mut len = self.protocol_version.protocol_name().encoded_size()
+            + self.protocol_version.protocol_level().encoded_size()
+            + self.flags.encoded_size()
+            + self.keepalive.encoded_size();
+
+        // Properties only for MQTT 5.0
+        if self.protocol_version.supports_properties() {
+            len += crate::property_list_size(&self.properties);
+        }
+
+        len + self
+            .payload
+            .encoded_size_for_version(self.protocol_version, &self.flags)
     }
 }
 

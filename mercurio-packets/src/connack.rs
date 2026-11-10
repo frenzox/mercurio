@@ -240,24 +240,9 @@ const PACKET_TYPE: u8 = 0x02;
 
 impl Encoder for ConnAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut remaining_len = 0;
-
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += self.flags.encoded_size();
-
-        if self.protocol_version.supports_properties() {
-            // MQTT 5.0: reason code + properties
-            remaining_len += self.reason_code.encoded_size();
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        } else {
-            // MQTT 3.x: return code only, no properties
-            remaining_len += 1; // Return code byte
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         // Variable header
         self.flags.encode(buffer);
@@ -271,6 +256,23 @@ impl Encoder for ConnAckPacket {
             // MQTT 3.x: encode return code (mapped from reason code)
             let return_code: ConnAckReturnCode = self.reason_code.into();
             return_code.encode(buffer);
+        }
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl ConnAckPacket {
+    fn remaining_len(&self) -> usize {
+        if self.protocol_version.supports_properties() {
+            self.flags.encoded_size()
+                + self.reason_code.encoded_size()
+                + crate::property_list_size(&self.properties)
+        } else {
+            // MQTT 3.x: a return code, no properties
+            self.flags.encoded_size() + 1
         }
     }
 }

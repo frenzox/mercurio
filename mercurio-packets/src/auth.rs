@@ -75,17 +75,22 @@ const PACKET_TYPE: u8 = 0x0f;
 
 impl Encoder for AuthPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
-        let remaining_len = self.reason.encoded_size()
-            + properties_len.encoded_size()
-            + self.properties.encoded_size();
-
         buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.reason.encode(buffer);
-        properties_len.encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl AuthPacket {
+    fn remaining_len(&self) -> usize {
+        self.reason.encoded_size() + crate::property_list_size(&self.properties)
     }
 }
 

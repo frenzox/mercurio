@@ -29,12 +29,7 @@ pub trait Encoder {
     fn encode(&self, buffer: &mut BytesMut);
 
     /// Number of bytes [`encode`](Encoder::encode) writes.
-    ///
-    /// The default returns the in-memory size of the value. It is only
-    /// correct for fixed-size integers; every other type overrides it.
-    fn encoded_size(&self) -> usize {
-        mem::size_of_val(self)
-    }
+    fn encoded_size(&self) -> usize;
 }
 
 /// The longest packet MQTT can frame: the fixed header byte, a four-byte
@@ -187,6 +182,10 @@ impl Encoder for u8 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u8(*self);
     }
+
+    fn encoded_size(&self) -> usize {
+        1
+    }
 }
 
 impl Decoder for u8 {
@@ -202,6 +201,10 @@ impl Decoder for u8 {
 impl Encoder for u16 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u16(*self);
+    }
+
+    fn encoded_size(&self) -> usize {
+        2
     }
 }
 
@@ -219,6 +222,10 @@ impl Encoder for u32 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u32(*self);
     }
+
+    fn encoded_size(&self) -> usize {
+        4
+    }
 }
 
 impl Decoder for u32 {
@@ -234,6 +241,10 @@ impl Decoder for u32 {
 impl Encoder for bool {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u8(*self as u8);
+    }
+
+    fn encoded_size(&self) -> usize {
+        1
     }
 }
 

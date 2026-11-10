@@ -78,26 +78,30 @@ const PACKET_TYPE: u8 = 0x0e;
 
 impl Encoder for DisconnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut remaining_len = 0;
-
-        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
-
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += self.reason.encoded_size();
-        if self.properties.is_some() {
-            remaining_len += properties_len.encoded_size() + self.properties.encoded_size();
-        }
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.reason.encode(buffer);
         if self.properties.is_some() {
-            properties_len.encode(buffer);
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
         }
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
     }
 }
 
 impl DisconnectPacket {
+    fn remaining_len(&self) -> usize {
+        let mut len = self.reason.encoded_size();
+        if self.properties.is_some() {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
+
     /// Encodes a DISCONNECT packet in MQTT 3.x format, which has no
     /// variable header.
     pub fn encode_v3(&self, buffer: &mut BytesMut) {

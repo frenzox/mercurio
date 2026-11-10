@@ -113,6 +113,10 @@ impl Encoder for PublishPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         self.encode_inner(buffer, true);
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len(true))
+    }
 }
 
 impl Decoder for PublishPacket {
@@ -132,9 +136,15 @@ impl PublishPacket {
         Self::decode_inner(buffer, false)
     }
 
-    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
-        let mut remaining_len = 0;
+    fn remaining_len(&self, with_properties: bool) -> usize {
+        let mut len = self.topic_name.encoded_size() + self.packet_id.encoded_size();
+        if with_properties {
+            len += crate::property_list_size(&self.properties);
+        }
+        len + self.payload.as_ref().map_or(0, |payload| payload.len())
+    }
 
+    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= (self.dup as u8) << 3;
@@ -142,19 +152,7 @@ impl PublishPacket {
         fixed_header |= self.retain as u8;
         fixed_header.encode(buffer);
 
-        remaining_len += self.topic_name.encoded_size();
-        remaining_len += self.packet_id.encoded_size();
-        if with_properties {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        if let Some(payload) = &self.payload {
-            remaining_len += payload.len();
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
 
         // Variable header
         self.topic_name.encode(buffer);

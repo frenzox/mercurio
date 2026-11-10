@@ -101,24 +101,11 @@ const PACKET_TYPE: u8 = 0x0b;
 
 impl Encoder for UnsubAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut remaining_len = 0;
-
         // Fixed header
         let fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header.encode(buffer);
 
-        remaining_len += self.packet_id.encoded_size();
-
-        // Properties and payload reason codes only for MQTT 5.0
-        // MQTT 3.x UNSUBACK is just packet_id (2 bytes)
-        if self.protocol_version.supports_properties() {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-            remaining_len += self.payload.encoded_size();
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
@@ -128,6 +115,21 @@ impl Encoder for UnsubAckPacket {
             self.properties.encode(buffer);
             self.payload.encode(buffer);
         }
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl UnsubAckPacket {
+    fn remaining_len(&self) -> usize {
+        // MQTT 3.x UNSUBACK is just the packet id
+        let mut len = self.packet_id.encoded_size();
+        if self.protocol_version.supports_properties() {
+            len += crate::property_list_size(&self.properties) + self.payload.encoded_size();
+        }
+        len
     }
 }
 
