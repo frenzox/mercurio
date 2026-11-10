@@ -23,7 +23,7 @@ use mercurio_server::{
     },
     server::{ListenerConfig, LocalConnector, Server, ServerConfig, Transport},
 };
-use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore};
+use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore, BanStore};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -1446,4 +1446,42 @@ async fn re_authenticating_as_a_banned_user_closes_the_client() {
     };
     assert_eq!(disconnect.reason, ReasonCode::Banned);
     assert!(watcher.receive().await.is_none(), "the will is dropped");
+}
+
+#[tokio::test]
+async fn expired_bans_are_dropped_from_the_list_and_storage() {
+    let store = Arc::new(MemoryStore::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // config() publishes no $SYS statistics: bans are swept regardless
+    let server = Server::new(listener, config(Vec::new()), Arc::clone(&store))
+        .await
+        .unwrap();
+    let admin = server.admin();
+    tokio::spawn(server.run(std::future::pending::<()>()));
+
+    let mut ban = NewBan::new(BanKey::new(BanKind::ClientId, "brief"));
+    ban.duration = Some(1);
+    admin.add_ban(ban).await.unwrap();
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("brief")).await,
+        ReasonCode::Banned
+    );
+    assert_eq!(store.load_bans().await.unwrap().len(), 1);
+
+    // It holds one to two seconds, and is swept within a second after
+    let mut swept = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if store.load_bans().await.unwrap().is_empty() {
+            swept = true;
+            break;
+        }
+    }
+    assert!(swept, "the expired ban is still stored");
+    assert_eq!(admin.bans(Paging::default()).await.total_count, 0);
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("brief")).await,
+        ReasonCode::Success
+    );
 }

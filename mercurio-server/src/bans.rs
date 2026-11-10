@@ -10,7 +10,7 @@ use std::{
 use mercurio_core::message::unix_millis;
 use mercurio_storage::{BanStore, StoredBan};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     admin::{storage_failed, AdminError, Ban, BanKey, BanKind, NewBan},
@@ -279,6 +279,58 @@ impl Bans {
             .retain(|ban| !ban.has_key(key.kind, &value, key.prefix));
         Ok(())
     }
+
+    /// Drops the bans that expired, from storage too. Matching already
+    /// ignores them; this keeps them from piling up. One whose deletion
+    /// fails stays until a later sweep deletes it.
+    pub(crate) async fn sweep(&self) {
+        let expired = |now| -> Vec<Ban> {
+            self.active
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|ban| ban.expired(now))
+                .map(|ban| ban.ban.clone())
+                .collect()
+        };
+        if expired(unix_secs()).is_empty() {
+            return;
+        }
+        // The snapshot is taken under the lock: an `add` that replaced a ban
+        // in between would otherwise have its new row deleted
+        let _changes = self.changes.lock().await;
+        let now = unix_secs();
+        let expired = expired(now);
+        let mut gone = Vec::with_capacity(expired.len());
+        for ban in expired {
+            if let Some(store) = &self.store {
+                if let Err(e) = store
+                    .delete_ban(ban.kind.as_str(), &ban.value, ban.prefix)
+                    .await
+                {
+                    warn!(
+                        "Failed to delete the expired {} ban on `{}`{}: {}",
+                        ban.kind.as_str(),
+                        ban.value,
+                        if ban.prefix { " as a prefix" } else { "" },
+                        e
+                    );
+                    continue;
+                }
+            }
+            info!(
+                "The ban on the {} `{}` expired",
+                ban.kind.as_str(),
+                ban.value
+            );
+            gone.push(ban);
+        }
+        self.active.write().unwrap().retain(|active| {
+            !gone
+                .iter()
+                .any(|ban| active.has_key(ban.kind, &ban.value, ban.prefix) && active.expired(now))
+        });
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +481,98 @@ mod tests {
         let key = BanKey::new(BanKind::Address, "10.1.2.3/8");
         bans.remove(&key).await.unwrap();
         assert!(store.load_bans().await.unwrap().is_empty());
+    }
+
+    struct FlakyStore {
+        inner: MemoryStore,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BanStore for FlakyStore {
+        async fn load_bans(&self) -> mercurio_storage::Result<Vec<StoredBan>> {
+            self.inner.load_bans().await
+        }
+
+        async fn store_ban(&self, ban: &StoredBan) -> mercurio_storage::Result<()> {
+            self.inner.store_ban(ban).await
+        }
+
+        async fn delete_ban(
+            &self,
+            kind: &str,
+            value: &str,
+            prefix: bool,
+        ) -> mercurio_storage::Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.failures.load(SeqCst) > 0 {
+                self.failures.fetch_sub(1, SeqCst);
+                return Err(mercurio_storage::StorageError::OperationFailed(
+                    "connection lost".into(),
+                ));
+            }
+            self.inner.delete_ban(kind, value, prefix).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sweep_retries_a_failed_deletion() {
+        let store = Arc::new(FlakyStore {
+            inner: MemoryStore::new(),
+            failures: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let bans = Bans::load(Some(store.clone())).await.unwrap();
+        let mut new = NewBan::new(BanKey::new(BanKind::ClientId, "gone"));
+        new.duration = Some(1);
+        bans.add(new).await.unwrap();
+        // Expired, as far as the sweep can tell
+        bans.active.write().unwrap()[0].ban.expires_at = Some(1);
+
+        bans.sweep().await;
+        assert_eq!(store.load_bans().await.unwrap().len(), 1);
+        assert_eq!(bans.active.read().unwrap().len(), 1);
+
+        bans.sweep().await;
+        assert!(store.load_bans().await.unwrap().is_empty());
+        assert!(bans.active.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sweep_keeps_a_ban_added_again_while_it_waits() {
+        let store = Arc::new(MemoryStore::new());
+        let bans = Arc::new(Bans::load(Some(store.clone())).await.unwrap());
+        let key = BanKey::new(BanKind::ClientId, "again");
+        let mut new = NewBan::new(key.clone());
+        new.duration = Some(1);
+        bans.add(new).await.unwrap();
+        bans.active.write().unwrap()[0].ban.expires_at = Some(1);
+
+        // Hold the lock as an `add` of the same ban would, so the sweep
+        // sees the expired ban and then waits
+        let changes = bans.changes.lock().await;
+        let sweep = tokio::spawn({
+            let bans = Arc::clone(&bans);
+            async move { bans.sweep().await }
+        });
+        tokio::task::yield_now().await;
+        let (value, range) = checked(&key).unwrap();
+        let fresh = ActiveBan {
+            ban: Ban {
+                kind: key.kind,
+                value,
+                prefix: false,
+                reason: None,
+                created_at: unix_secs(),
+                expires_at: None,
+            },
+            range,
+        };
+        store.store_ban(&to_stored(&fresh.ban)).await.unwrap();
+        *bans.active.write().unwrap() = vec![fresh];
+        drop(changes);
+        sweep.await.unwrap();
+
+        assert_eq!(store.load_bans().await.unwrap().len(), 1);
+        assert_eq!(bans.list().len(), 1);
     }
 }

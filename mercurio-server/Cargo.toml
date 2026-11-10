@@ -33,4 +33,5 @@ mercurio-storage = { path = "../mercurio-storage", version = "0.3.2" }
 x509-parser = "0.18"
 
 [dev-dependencies]
+async-trait = "0.1"
 mercurio-storage = { path = "../mercurio-storage", features = ["sqlite"] }

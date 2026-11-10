@@ -992,6 +992,19 @@ impl<St: MqttStore + 'static> Server<St> {
                 interval,
             );
         }
+        // Its own timer: the $SYS publisher may be off, or slower
+        let bans = Arc::clone(&server.bans);
+        let mut stop = server.notify_shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.recv() => break,
+                }
+                bans.sweep().await;
+            }
+        });
         for (client_id, will, due) in restored_wills {
             let broker = server.broker.clone();
             let session_manager = session_manager.clone();
