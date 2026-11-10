@@ -1432,6 +1432,7 @@ dependencies = [
  "mercurio-storage",
  "rand 0.8.8",
  "rustls",
+ "serde",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",

@@ -354,6 +354,10 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
 /// per change.
 #[async_trait]
 impl BatchStore for SqliteStore {
+    fn backend_name(&self) -> &'static str {
+        "sqlite"
+    }
+
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
         let client_id = client_id.to_string();
         let writes = writes.to_vec();
@@ -765,6 +769,11 @@ mod tests {
 
     use super::*;
     use crate::StoredSubscription;
+
+    #[test]
+    fn test_backend_is_named() {
+        assert_eq!(SqliteStore::in_memory().unwrap().backend_name(), "sqlite");
+    }
 
     fn create_test_message(topic: &str, payload: &str) -> Message {
         Message {

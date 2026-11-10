@@ -286,6 +286,11 @@ pub enum Write {
 /// Applies a client's changes in batches, in order.
 #[async_trait]
 pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
+    /// Names the backend, as the broker's admin API reports it.
+    fn backend_name(&self) -> &'static str {
+        "custom"
+    }
+
     /// Apply `writes` for `client_id` in order. Each write may be applied
     /// again after a failure, so applying one twice must be harmless.
     /// Stores that can should apply the batch atomically.

@@ -102,14 +102,40 @@ impl Drop for ConnectedGuard {
     }
 }
 
+/// The counters published under `$SYS/broker/`, by their name there.
+pub(crate) fn counters(
+    stats: &Stats,
+    sessions: usize,
+    expired: u64,
+    retained: usize,
+    subscriptions: usize,
+) -> Vec<(&'static str, u64)> {
+    let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let connected = get(&stats.connected);
+    let sessions = sessions as u64;
+    vec![
+        ("clients/connected", connected),
+        ("clients/total", sessions),
+        ("clients/disconnected", sessions.saturating_sub(connected)),
+        ("clients/maximum", get(&stats.max_connected)),
+        ("clients/expired", expired),
+        ("messages/received", get(&stats.messages_received)),
+        ("messages/sent", get(&stats.messages_sent)),
+        ("bytes/received", get(&stats.bytes_received)),
+        ("bytes/sent", get(&stats.bytes_sent)),
+        ("retained messages/count", retained as u64),
+        ("subscriptions/count", subscriptions as u64),
+    ]
+}
+
 /// Publishes the statistics every `interval` until the process ends.
 pub(crate) fn spawn_publisher<St: MqttStore + 'static>(
     broker: Broker<St>,
     session_manager: SessionManager<St>,
     stats: Arc<Stats>,
+    started: Instant,
     interval: Duration,
 ) {
-    let started = Instant::now();
     tokio::spawn(async move {
         publish(
             &broker,
@@ -128,47 +154,31 @@ pub(crate) fn spawn_publisher<St: MqttStore + 'static>(
         let mut ticks = time::interval(interval);
         loop {
             ticks.tick().await;
+            let current = counters(
+                &stats,
+                session_manager.session_count().await,
+                session_manager.expired_count(),
+                broker.retained_count().await,
+                broker.topics().subscription_count(),
+            );
+            let mut values = vec![(
+                "uptime".to_string(),
+                format!("{} seconds", started.elapsed().as_secs()),
+            )];
+            values.extend(
+                current
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string())),
+            );
             let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-            let connected = get(&stats.connected);
-            let total = session_manager.session_count().await as u64;
-            let retained = broker.retained_count().await;
-            let counters = [
+            let rates = [
                 get(&stats.messages_received),
                 get(&stats.messages_sent),
                 get(&stats.bytes_received),
                 get(&stats.bytes_sent),
                 get(&stats.connections),
             ];
-            let mut values = vec![
-                (
-                    "uptime".to_string(),
-                    format!("{} seconds", started.elapsed().as_secs()),
-                ),
-                ("clients/connected".to_string(), connected.to_string()),
-                ("clients/total".to_string(), total.to_string()),
-                (
-                    "clients/disconnected".to_string(),
-                    total.saturating_sub(connected).to_string(),
-                ),
-                (
-                    "clients/maximum".to_string(),
-                    get(&stats.max_connected).to_string(),
-                ),
-                (
-                    "clients/expired".to_string(),
-                    session_manager.expired_count().to_string(),
-                ),
-                ("messages/received".to_string(), counters[0].to_string()),
-                ("messages/sent".to_string(), counters[1].to_string()),
-                ("bytes/received".to_string(), counters[2].to_string()),
-                ("bytes/sent".to_string(), counters[3].to_string()),
-                ("retained messages/count".to_string(), retained.to_string()),
-                (
-                    "subscriptions/count".to_string(),
-                    broker.topics().subscription_count().to_string(),
-                ),
-            ];
-            for (load, value) in loads.iter_mut().zip(counters) {
+            for (load, value) in loads.iter_mut().zip(rates) {
                 load.update(value, interval);
                 values.extend(load.values());
             }

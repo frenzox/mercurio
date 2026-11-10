@@ -35,7 +35,11 @@ impl MemoryStore {
     }
 }
 
-impl BatchStore for MemoryStore {}
+impl BatchStore for MemoryStore {
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+}
 
 #[async_trait]
 impl SessionStore for MemoryStore {

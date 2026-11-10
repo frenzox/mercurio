@@ -1,5 +1,5 @@
-//! Running the broker: the `run` functions, its configuration and limits,
-//! and in-process connections.
+//! Running the broker: [`Server`] and the `run` functions, its configuration
+//! and limits, and in-process connections.
 
 use std::{
     collections::HashMap,
@@ -7,7 +7,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::Poll,
 };
 
@@ -52,6 +55,7 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
     acl::Access,
+    admin::{Admin, AdminParts, ListenerInfo},
     broker::Broker,
     connection::Connection,
     http,
@@ -323,6 +327,32 @@ struct Endpoint {
     settings: EndpointSettings,
     /// One permit per allowed concurrent connection, when limited
     connection_slots: Option<Arc<Semaphore>>,
+    state: Arc<ListenerState>,
+}
+
+/// A listener as the admin API reports it, with its open connections.
+pub(crate) struct ListenerState {
+    /// How its clients' listener is reported: its address or path
+    #[allow(dead_code)]
+    pub name: Arc<str>,
+    pub info: ListenerInfo,
+    pub connections: AtomicUsize,
+}
+
+/// One connection in its listener's count, until dropped.
+struct ListenerSlot(Arc<ListenerState>);
+
+impl ListenerSlot {
+    fn new(state: &Arc<ListenerState>) -> Self {
+        state.connections.fetch_add(1, Ordering::Relaxed);
+        ListenerSlot(Arc::clone(state))
+    }
+}
+
+impl Drop for ListenerSlot {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// How the connections of a listener are served.
@@ -341,12 +371,44 @@ struct EndpointSettings {
 
 impl Endpoint {
     fn new(config: ListenerConfig, timeout: Duration) -> std::result::Result<Self, ServerError> {
+        let (address, path) = match &config.listener {
+            Socket::Tcp(listener) => (listener.local_addr().ok().map(|a| a.to_string()), None),
+            #[cfg(unix)]
+            Socket::Unix(listener) => (
+                None,
+                listener
+                    .local_addr()
+                    .ok()
+                    .and_then(|a| a.as_pathname().map(|p| p.display().to_string())),
+            ),
+        };
+        let state = Arc::new(ListenerState {
+            name: address
+                .clone()
+                .or_else(|| path.clone())
+                .unwrap_or_default()
+                .into(),
+            info: ListenerInfo {
+                address,
+                path,
+                protocol: match config.transport {
+                    Transport::Mqtt => "mqtt",
+                    Transport::WebSocket => "websocket",
+                }
+                .to_string(),
+                tls: config.tls.is_some(),
+                mount_point: config.mount_point.clone(),
+                connections: 0,
+            },
+            connections: AtomicUsize::new(0),
+        });
         let username_from_certificate = config
             .tls
             .as_ref()
             .and_then(|tls| tls.username_from_certificate);
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
+            state,
             listener: config.listener,
             connection_slots: config
                 .max_connections
@@ -393,8 +455,8 @@ struct HandlerParts<St: MqttStore + 'static> {
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
     /// Serves a connection accepted on a listener, after the PROXY header
-    /// and the TLS handshake if the listener has them. `_slots` are held for
-    /// as long as it runs.
+    /// and the TLS handshake if the listener has them. `_slots` and
+    /// `_listener` are held for as long as it runs.
     ///
     /// Everything here is boxed: the task holds this function's state for
     /// the whole connection, so it keeps only pointers, and the handshakes'
@@ -405,6 +467,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         settings: EndpointSettings,
         peer_addr: Option<SocketAddr>,
         _slots: [Option<OwnedSemaphorePermit>; 2],
+        _listener: ListenerSlot,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -743,130 +806,205 @@ pub async fn run_with_storage<St: MqttStore + 'static>(
     storage: Arc<St>,
     shutdown: impl Future,
 ) -> std::result::Result<(), ServerError> {
-    let ServerConfig {
-        tls: tls_config,
-        auth: auth_config,
-        limits,
-        policy,
-        listeners,
-        local_listener,
-        sys_interval,
-        plugins,
-        plugin_timeout,
-        plugin_tick_interval,
-    } = config;
-    let stats = Arc::new(Stats::default());
-    let policy = Arc::new(policy);
+    Server::new(listener, config, storage)
+        .await?
+        .run(shutdown)
+        .await
+}
 
-    let (notify_shutdown, _) = broadcast::channel(1);
-    let (shutdown_complete, mut shutdown_complete_rx) = mpsc::channel(1);
+/// A broker set up but not serving yet: its configuration is checked and
+/// the sessions an earlier run stored are restored. [`Server::admin`]
+/// administers it from then on; [`Server::run`] serves it.
+pub struct Server<St: MqttStore + 'static> {
+    listener: Listener<St>,
+    admin: Admin,
+    shutdown_complete_rx: mpsc::Receiver<()>,
+    restored_wills: Vec<(String, WillMessage, Duration)>,
+    plugins: Vec<Arc<dyn Plugin>>,
+    plugin_timeout: Duration,
+    plugin_tick_interval: Duration,
+    sys_interval: Option<Duration>,
+}
 
-    let listener_plugins: Vec<_> = listeners.iter().map(|l| l.plugins.clone()).collect();
-    let main = ListenerConfig {
-        tls: tls_config,
-        ..ListenerConfig::new(listener, Transport::Mqtt)
-    };
-    let endpoints = std::iter::once(main)
-        .chain(listeners)
-        .map(|l| Endpoint::new(l, plugin_timeout))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+impl<St: MqttStore + 'static> Server<St> {
+    /// Sets up a broker serving `listener` and `config`'s listeners, with
+    /// its state in `storage`. Fails if the configuration can't be used or
+    /// storage can't be read.
+    pub async fn new(
+        listener: TcpListener,
+        config: ServerConfig,
+        storage: Arc<St>,
+    ) -> std::result::Result<Self, ServerError> {
+        let ServerConfig {
+            tls: tls_config,
+            auth: auth_config,
+            limits,
+            policy,
+            listeners,
+            local_listener,
+            sys_interval,
+            plugins,
+            plugin_timeout,
+            plugin_tick_interval,
+        } = config;
+        let stats = Arc::new(Stats::default());
+        let policy = Arc::new(policy);
 
-    let auth_config = Arc::new(auth_config);
-    let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-    let chain = Chain::new(plugins, plugin_timeout);
+        let (notify_shutdown, _) = broadcast::channel(1);
+        let (shutdown_complete, shutdown_complete_rx) = mpsc::channel(1);
 
-    let mut server = Listener {
-        endpoints,
-        local_listener,
-        trusted_chain: chain.trusted(),
-        next_endpoint: 0,
-        broker: Broker::new(Arc::clone(&storage)),
-        session_manager_holder: SessionManagerDropGuard::new(storage, limits.queue),
-        address_slots: Arc::default(),
-        connection_slots: limits
-            .max_connections
-            .map(|max| Arc::new(Semaphore::new(max))),
-        notify_shutdown,
-        shutdown_complete,
-        auth_config,
-        chain,
-        policy,
-        limits,
-        stats,
-    };
+        let listener_plugins: Vec<_> = listeners.iter().map(|l| l.plugins.clone()).collect();
+        let main = ListenerConfig {
+            tls: tls_config,
+            ..ListenerConfig::new(listener, Transport::Mqtt)
+        };
+        let endpoints = std::iter::once(main)
+            .chain(listeners)
+            .map(|l| Endpoint::new(l, plugin_timeout))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let session_manager = server.session_manager_holder.session_manager();
-    if !all_plugins.is_empty() {
-        let mut ticks = time::interval(plugin_tick_interval);
-        ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut stop = server.notify_shutdown.subscribe();
-        let plugins = all_plugins.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = ticks.tick() => {}
-                    _ = stop.recv() => break,
-                }
-                for plugin in &plugins {
-                    guarded(plugin.name(), "on_tick", plugin_timeout, || {
-                        plugin.on_tick()
-                    })
-                    .await;
-                }
-            }
+        let auth_config = Arc::new(auth_config);
+        let all_plugins = distinct_plugins(&plugins, &listener_plugins);
+        let chain = Chain::new(plugins, plugin_timeout);
+        let broker = Broker::new(Arc::clone(&storage));
+        let session_manager_holder =
+            SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue);
+        let session_manager = session_manager_holder.session_manager();
+
+        let admin = Admin::new(AdminParts {
+            directory: Arc::new(session_manager.clone()),
+            retained: storage.clone(),
+            topics: broker.topics(),
+            stats: Arc::clone(&stats),
+            listeners: endpoints.iter().map(|e| Arc::clone(&e.state)).collect(),
+            storage: storage.backend_name(),
         });
-    }
-    session_manager.set_expiry_chain(Chain::new(all_plugins, plugin_timeout));
-    if let Some(interval) = sys_interval {
-        sys::spawn_publisher(
-            server.broker.clone(),
-            session_manager.clone(),
-            Arc::clone(&server.stats),
-            interval,
-        );
-    }
-    let restored_wills = session_manager.restore_from_storage(&server.broker).await?;
-    for (client_id, will, due) in restored_wills {
-        let broker = server.broker.clone();
-        let session_manager = session_manager.clone();
-        tokio::spawn(async move {
-            time::sleep(due).await;
-            if session_manager.take_restored_will(&client_id).await {
-                publish_will(&broker, will, &client_id).await;
-                session_manager.delete_will(&client_id);
-            }
-        });
+
+        let server = Listener {
+            endpoints,
+            local_listener,
+            trusted_chain: chain.trusted(),
+            next_endpoint: 0,
+            broker,
+            session_manager_holder,
+            address_slots: Arc::default(),
+            connection_slots: limits
+                .max_connections
+                .map(|max| Arc::new(Semaphore::new(max))),
+            notify_shutdown,
+            shutdown_complete,
+            auth_config,
+            chain,
+            policy,
+            limits,
+            stats,
+        };
+
+        session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
+        let restored_wills = session_manager.restore_from_storage(&server.broker).await?;
+
+        Ok(Server {
+            listener: server,
+            admin,
+            shutdown_complete_rx,
+            restored_wills,
+            plugins: all_plugins,
+            plugin_timeout,
+            plugin_tick_interval,
+            sys_interval,
+        })
     }
 
-    tokio::select! {
-        _ = server.run() => {}
-        _ = shutdown => {
-            info!("Shutting down!");
+    /// Administers this broker, before and while it runs.
+    pub fn admin(&self) -> Admin {
+        self.admin.clone()
+    }
+
+    /// Serves clients until `shutdown` completes, then lets connections
+    /// close and storage catch up, for a few seconds at most.
+    pub async fn run(self, shutdown: impl Future) -> std::result::Result<(), ServerError> {
+        let Server {
+            listener: mut server,
+            admin,
+            mut shutdown_complete_rx,
+            restored_wills,
+            plugins,
+            plugin_timeout,
+            plugin_tick_interval,
+            sys_interval,
+        } = self;
+
+        let session_manager = server.session_manager_holder.session_manager();
+        if !plugins.is_empty() {
+            let mut ticks = time::interval(plugin_tick_interval);
+            ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            let mut stop = server.notify_shutdown.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = ticks.tick() => {}
+                        _ = stop.recv() => break,
+                    }
+                    for plugin in &plugins {
+                        guarded(plugin.name(), "on_tick", plugin_timeout, || {
+                            plugin.on_tick()
+                        })
+                        .await;
+                    }
+                }
+            });
         }
-    }
+        if let Some(interval) = sys_interval {
+            sys::spawn_publisher(
+                server.broker.clone(),
+                session_manager.clone(),
+                Arc::clone(&server.stats),
+                admin.started(),
+                interval,
+            );
+        }
+        for (client_id, will, due) in restored_wills {
+            let broker = server.broker.clone();
+            let session_manager = session_manager.clone();
+            tokio::spawn(async move {
+                time::sleep(due).await;
+                if session_manager.take_restored_will(&client_id).await {
+                    publish_will(&broker, will, &client_id).await;
+                    session_manager.delete_will(&client_id);
+                }
+            });
+        }
 
-    // Let connections tell their clients and finish up, for a moment
-    let Listener {
-        notify_shutdown,
-        shutdown_complete,
-        ..
-    } = server;
-    let _ = notify_shutdown.send(());
-    drop(shutdown_complete);
-    if time::timeout(Duration::from_secs(5), shutdown_complete_rx.recv())
-        .await
-        .is_err()
-    {
-        warn!("Connections still open after waiting to shut down");
+        tokio::select! {
+            _ = server.run() => {}
+            _ = shutdown => {
+                info!("Shutting down!");
+            }
+        }
+
+        // Let connections tell their clients and finish up, for a moment
+        let Listener {
+            notify_shutdown,
+            shutdown_complete,
+            ..
+        } = server;
+        let _ = notify_shutdown.send(());
+        drop(shutdown_complete);
+        if time::timeout(Duration::from_secs(5), shutdown_complete_rx.recv())
+            .await
+            .is_err()
+        {
+            warn!("Connections still open after waiting to shut down");
+        }
+        // What connections changed as they closed is stored before returning
+        if time::timeout(Duration::from_secs(5), session_manager.flush())
+            .await
+            .is_err()
+        {
+            warn!("Storage still writing after waiting to shut down");
+        }
+        Ok(())
     }
-    // What connections changed as they closed is stored before returning
-    if time::timeout(Duration::from_secs(5), session_manager.flush())
-        .await
-        .is_err()
-    {
-        warn!("Storage still writing after waiting to shut down");
-    }
-    Ok(())
 }
 
 impl<St: MqttStore + 'static> Listener<St> {
@@ -933,15 +1071,17 @@ impl<St: MqttStore + 'static> Listener<St> {
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
+                    let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
                     tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots),
+                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
                     );
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
                     let settings = self.endpoints[endpoint].settings.clone();
+                    let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
                     tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots),
+                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
                     );
                 }
                 Accepted::Local(stream) => {
