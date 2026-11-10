@@ -30,3 +30,17 @@ path = "fuzz_targets/topic.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_direct"
+path = "fuzz_targets/decode_direct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_properties"
+path = "fuzz_targets/message_properties.rs"
+test = false
+doc = false
+bench = false
