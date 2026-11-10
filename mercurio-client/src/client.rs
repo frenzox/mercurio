@@ -57,6 +57,10 @@ enum Command {
 }
 
 /// An MQTT client for connecting to brokers.
+///
+/// Dropping the client closes the connection as [`MqttClient::disconnect`]
+/// does: with a normal DISCONNECT, so the broker discards the will. A
+/// client dropped while reconnecting stops trying.
 pub struct MqttClient {
     command_tx: mpsc::Sender<Command>,
     event_rx: Mutex<mpsc::Receiver<Event>>,
@@ -738,7 +742,13 @@ impl EventLoop {
                 }
 
                 // Handle commands from the client API
-                Some(cmd) = command_rx.recv() => {
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        // Every handle is gone: nobody can read events or
+                        // send requests any more
+                        let _ = MqttClient::handle_disconnect(&mut self.connection).await;
+                        return DisconnectReason::ClientInitiated;
+                    };
                     match cmd {
                         Command::Publish(request) => self.publish(request).await,
                         Command::Subscribe { topics, subscription_id, response } => {
