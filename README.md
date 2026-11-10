@@ -154,6 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::Disconnected { reason } => eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } => eprintln!("reconnected"),
+            // Event is non_exhaustive: later versions may add variants
+            _ => {}
         }
     }
     Ok(())

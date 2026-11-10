@@ -63,6 +63,8 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
             }
             Event::Disconnected { reason } =&gt; eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } =&gt; eprintln!("reconnected"),
+            // Event is non_exhaustive: later versions may add variants
+            _ =&gt; {}
         }
     }
     Ok(())
