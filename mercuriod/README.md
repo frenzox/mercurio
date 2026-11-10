@@ -425,8 +425,9 @@ client created with a `clientid` may connect only with that client id. A
 client has its own roles and those of its groups; clients without a user
 name get those of the anonymous group. ACLs of type `publishClientSend`
 decide publishing, `publishClientReceive` receiving, and
-`subscribePattern` and `subscribeLiteral` subscribing. The highest
-`priority` wins. Without a matching ACL, only receiving is allowed, unless
+`subscribePattern` and `subscribeLiteral` subscribing. The ACL with the
+highest `priority` wins, whichever role holds it; roles and groups have no
+priority of their own, and commands giving them one fail. Without a matching ACL, only receiving is allowed, unless
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
 
 `$CONTROL` topics are only open to clients when access control grants

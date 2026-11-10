@@ -224,11 +224,11 @@ impl Data {
                 if self.clients.iter().any(|c| c.username == username) {
                     return Err("Client already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename");
+                let roles = names(args.get("roles"), "rolename")?;
                 if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
                     return Err(format!("Role {missing} not found"));
                 }
-                let groups = names(args.get("groups"), "groupname");
+                let groups = names(args.get("groups"), "groupname")?;
                 if let Some(missing) = groups.iter().find(|g| self.group(g).is_err()) {
                     return Err(format!("Group {missing} not found"));
                 }
@@ -269,6 +269,7 @@ impl Data {
                 Ok((None, true))
             }
             "addClientRole" => {
+                no_priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let client = self.client(&text("username")?)?;
@@ -340,7 +341,7 @@ impl Data {
                 if self.groups.iter().any(|g| g.groupname == groupname) {
                     return Err("Group already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename");
+                let roles = names(args.get("roles"), "rolename")?;
                 if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
                     return Err(format!("Role {missing} not found"));
                 }
@@ -360,6 +361,7 @@ impl Data {
                 Ok((None, true))
             }
             "addGroupRole" => {
+                no_priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let group = self.group(&text("groupname")?)?;
@@ -376,6 +378,7 @@ impl Data {
                 Ok((None, true))
             }
             "addGroupClient" => {
+                no_priority(args)?;
                 let groupname = text("groupname")?;
                 self.group(&groupname)?;
                 let client = self.client(&text("username")?)?;
@@ -495,13 +498,30 @@ impl Data {
 
 /// Names given as `[{"rolename": ...}]` or `[{"groupname": ...}]`, as
 /// mosquitto does.
-fn names(list: Option<&Value>, key: &str) -> Vec<String> {
-    list.and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.get(key).and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
+fn names(list: Option<&Value>, key: &str) -> Result<Vec<String>, String> {
+    let entries = list.and_then(Value::as_array).into_iter().flatten();
+    let mut names = Vec::new();
+    for entry in entries {
+        no_priority(entry)?;
+        if let Some(name) = entry.get(key).and_then(Value::as_str) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Refuses the `priority` mosquitto gives a client's roles and groups:
+/// here the matching ACL with the highest priority decides, whichever role
+/// it is in, so ordering roles would change nothing. Mosquitto's default,
+/// -1, is accepted.
+fn no_priority(args: &Value) -> Result<(), String> {
+    match args.get("priority") {
+        None | Some(Value::Null) => Ok(()),
+        Some(priority) if priority.as_i64() == Some(-1) => Ok(()),
+        Some(_) => Err(
+            "Role and group priorities are not supported; give the ACLs priorities".to_string(),
+        ),
+    }
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -1213,6 +1233,54 @@ mod tests {
                 "{client_id:?}"
             );
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_role_priorities_are_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "mercuriod-dynsec-priority-{}",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "r" },
+                { "command": "createGroup", "groupname": "g" },
+                { "command": "createClient", "username": "s1" },
+                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": 5 },
+                { "command": "addGroupRole", "groupname": "g", "rolename": "r", "priority": 5 },
+                { "command": "addGroupClient", "groupname": "g", "username": "s1", "priority": 5 },
+                { "command": "createClient", "username": "s2",
+                  "roles": [{ "rolename": "r", "priority": 5 }] },
+                { "command": "createGroup", "groupname": "g2",
+                  "roles": [{ "rolename": "r", "priority": 5 }] },
+                // Mosquitto's default, as tools may send it
+                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": -1 },
+                { "command": "getClient", "username": "s1" },
+                { "command": "getGroup", "groupname": "g" },
+            ]),
+        );
+        assert!(
+            responses[..3].iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+        for response in &responses[3..8] {
+            assert!(response.get("error").is_some(), "{response}");
+        }
+        assert!(responses[8].get("error").is_none(), "{responses:?}");
+        assert_eq!(
+            responses[9]["data"]["client"]["groups"],
+            json!([]),
+            "{responses:?}"
+        );
+        assert_eq!(responses[10]["data"]["group"]["roles"], json!([]));
+        let listed = run(&security, json!([{ "command": "listClients" }]));
+        assert_eq!(listed[0]["data"]["clients"], json!(["admin", "s1"]));
         std::fs::remove_file(path).unwrap();
     }
 
