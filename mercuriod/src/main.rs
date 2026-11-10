@@ -171,18 +171,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Before binding, so a standby doesn't accept connections it can't serve
     let (postgres, database_lock) = match &config.storage {
-        StorageConfig::Postgres {
-            url,
-            ca_path,
-            standby,
-        } => {
+        StorageConfig::Postgres { url, standby, .. } => {
             info!("Using PostgreSQL storage");
-            let ca_path = ca_path.as_deref();
-            let held = match PostgresStore::connect_exclusive(url, ca_path, false).await? {
+            let options = config
+                .storage
+                .postgres_options()?
+                .expect("the backend is postgres");
+            let held = match PostgresStore::connect_exclusive(url, &options, false).await? {
                 Some(held) => held,
                 None if *standby => {
                     info!("Another broker is using the database; standing by to take over");
-                    let held = PostgresStore::connect_exclusive(url, ca_path, true)
+                    let held = PostgresStore::connect_exclusive(url, &options, true)
                         .await?
                         .expect("waiting returns once the database is taken");
                     info!("Took over the database");

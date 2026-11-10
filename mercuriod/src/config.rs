@@ -12,6 +12,7 @@ use mercurio_server::{
     server::{Limits, QueueLimits, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
+use mercurio_storage::postgres::ConnectOptions;
 
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -383,12 +384,54 @@ pub enum StorageConfig {
         /// it stops, instead of exiting
         #[serde(default)]
         standby: bool,
+        /// Connections the broker keeps to the database, besides the one
+        /// holding it
+        #[serde(default = "default_pool_size")]
+        pool_size: usize,
+        /// Seconds a write waits for a free connection before it is tried
+        /// again
+        #[serde(default = "default_pool_timeout")]
+        pool_timeout: u64,
     },
+}
+
+fn default_pool_size() -> usize {
+    ConnectOptions::default().pool_size
+}
+
+fn default_pool_timeout() -> u64 {
+    ConnectOptions::default().pool_timeout.as_secs()
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self::Memory {}
+    }
+}
+
+impl StorageConfig {
+    /// How to connect to PostgreSQL, with `backend = "postgres"`.
+    pub fn postgres_options(&self) -> Result<Option<ConnectOptions>, String> {
+        let StorageConfig::Postgres {
+            ca_path,
+            pool_size,
+            pool_timeout,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        if *pool_size == 0 {
+            return Err("pool_size must be at least 1".into());
+        }
+        if *pool_timeout == 0 {
+            return Err("pool_timeout must be at least 1 second".into());
+        }
+        let mut options = ConnectOptions::default();
+        options.ca_path = ca_path.clone();
+        options.pool_size = *pool_size;
+        options.pool_timeout = Duration::from_secs(*pool_timeout);
+        Ok(Some(options))
     }
 }
 
@@ -1246,6 +1289,31 @@ mod tests {
     }
 
     #[test]
+    fn test_postgres_pool_settings() {
+        let options = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.storage.postgres_options().unwrap().unwrap()
+        };
+        let defaults = options("[storage]\nbackend = \"postgres\"\nurl = \"postgres://h/db\"\n");
+        assert_eq!(defaults.pool_size, 16);
+        assert_eq!(defaults.pool_timeout, std::time::Duration::from_secs(5));
+
+        let set = options(
+            "[storage]\nbackend = \"postgres\"\nurl = \"postgres://h/db\"\n\
+             ca_path = \"ca.pem\"\npool_size = 64\npool_timeout = 30\n",
+        );
+        assert_eq!(set.pool_size, 64);
+        assert_eq!(set.pool_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(set.ca_path.as_deref(), Some(std::path::Path::new("ca.pem")));
+
+        let config: Config = toml::from_str(
+            "[storage]\nbackend = \"postgres\"\nurl = \"postgres://h/db\"\npool_size = 0\n",
+        )
+        .unwrap();
+        assert!(config.storage.postgres_options().is_err());
+    }
+
+    #[test]
     fn test_unknown_keys_are_refused_in_every_table() {
         for (toml, key) in [
             ("includedir = \"/x\"\n", "includedir"),
@@ -1363,7 +1431,10 @@ mod tests {
         for (backend, keys) in [
             ("memory", &[][..]),
             ("sqlite", &["path"][..]),
-            ("postgres", &["url", "ca_path", "standby"][..]),
+            (
+                "postgres",
+                &["url", "ca_path", "standby", "pool_size", "pool_timeout"][..],
+            ),
         ] {
             let mut table = toml::Table::new();
             table.insert("backend".into(), backend.into());
@@ -1372,7 +1443,15 @@ mod tests {
             }
             StorageConfig::deserialize(table).unwrap();
         }
-        let covered = ["backend", "path", "url", "ca_path", "standby"];
+        let covered = [
+            "backend",
+            "path",
+            "url",
+            "ca_path",
+            "standby",
+            "pool_size",
+            "pool_timeout",
+        ];
         assert!(storage.keys().all(|k| covered.contains(&k.as_str())));
     }
 

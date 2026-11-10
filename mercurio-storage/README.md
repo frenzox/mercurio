@@ -9,9 +9,10 @@ implementations:
 - `memory::MemoryStore`: everything in memory, lost on restart.
 - `sqlite::SqliteStore`: a SQLite database, behind the `sqlite` feature.
 - `postgres::PostgresStore`: a PostgreSQL database, behind the `postgres`
-  feature, over TLS when the server supports it. A broker serving from it
-  opens it with `PostgresStore::connect_exclusive(url, ca_path, wait)`,
-  which keeps any other broker from writing to the database meanwhile.
+  feature, over TLS, required unless the server is on the same host. A
+  broker serving from it opens it with
+  `PostgresStore::connect_exclusive(url, &options, wait)`, which keeps any
+  other broker from writing to the database meanwhile.
 
 ```rust,ignore
 use std::sync::Arc;
@@ -29,6 +30,11 @@ default applies them one at a time, and stores that can should apply a
 batch in one transaction. A store overriding it can pass the changes it
 has no batch form for, including kinds added in later versions, to
 `apply_each`.
+
+The broker retries a batch that fails with `StorageError::Transient`, such
+as on a lost connection, until storage recovers, and gives up others after
+a few attempts. `StorageError::Fenced` means another broker took the
+database over: the broker drops the batch, and should stop.
 
 ## Features
 

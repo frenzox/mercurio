@@ -5,14 +5,15 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    net::IpAddr,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use deadpool_postgres::{Manager, Object, Pool, Runtime};
+use deadpool_postgres::{Manager, Object, Pool, PoolError, Runtime};
 use futures_util::future::join_all;
 use mercurio_core::{
     codec::Decoder,
@@ -24,8 +25,14 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{sync::watch, task::JoinHandle};
-use tokio_postgres::{types::ToSql, Row};
+use tokio_postgres::{
+    config::{Host, SslMode},
+    error::SqlState,
+    types::ToSql,
+    Row,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
+use tracing::{info, warn};
 
 use crate::{
     encoding::{
@@ -170,7 +177,30 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON bans
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
 ",
+    // Fenced writes fail with a code of their own, FENCED
+    "
+    CREATE OR REPLACE FUNCTION mercurio_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        held TEXT := current_setting('mercurio.epoch', true);
+    BEGIN
+        IF held IS NULL OR held = ''
+            OR current_setting('mercurio.fenced', true) = 'yes' THEN
+            RETURN NULL;
+        END IF;
+        PERFORM 1 FROM mercurio_lease WHERE epoch = held::BIGINT FOR KEY SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'another broker took over the database'
+                USING ERRCODE = 'MQ001';
+        END IF;
+        PERFORM set_config('mercurio.fenced', 'yes', true);
+        RETURN NULL;
+    END
+    $$;
+",
 ];
+
+/// The SQLSTATE the fence triggers refuse a write with.
+const FENCED: &str = "MQ001";
 
 /// Brings the schema up to date, one broker at a time.
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -198,12 +228,9 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
                 0
             }
         };
-        let pending = MIGRATIONS.get(version as usize..).ok_or_else(|| {
-            StorageError::OperationFailed(format!(
-                "the database has schema version {version}, newer than this broker's {}",
-                MIGRATIONS.len()
-            ))
-        })?;
+        let pending = MIGRATIONS
+            .get(version as usize..)
+            .ok_or_else(|| newer_schema(version))?;
         for migration in pending {
             client.batch_execute(migration).await.db()?;
         }
@@ -224,6 +251,38 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
     result
 }
 
+fn newer_schema(version: i32) -> StorageError {
+    StorageError::OperationFailed(format!(
+        "the database has schema version {version}, newer than this broker's {}",
+        MIGRATIONS.len()
+    ))
+}
+
+/// Fails if the database's schema is newer than this broker knows, without
+/// changing it.
+async fn check_schema(client: &tokio_postgres::Client) -> Result<()> {
+    let exists: bool = client
+        .query_one("SELECT to_regclass('mercurio_schema') IS NOT NULL", &[])
+        .await
+        .db()?
+        .try_get(0)
+        .db()?;
+    if !exists {
+        return Ok(());
+    }
+    if let Some(row) = client
+        .query_opt("SELECT version FROM mercurio_schema", &[])
+        .await
+        .db()?
+    {
+        let version: i32 = row.try_get(0).db()?;
+        if version as usize > MIGRATIONS.len() {
+            return Err(newer_schema(version));
+        }
+    }
+    Ok(())
+}
+
 /// Turns tokio-postgres errors into the crate's, keeping its types out of
 /// the API.
 trait Db<T> {
@@ -232,7 +291,71 @@ trait Db<T> {
 
 impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
     fn db(self) -> Result<T> {
-        self.map_err(StorageError::database)
+        self.map_err(classify)
+    }
+}
+
+fn classify(error: tokio_postgres::Error) -> StorageError {
+    let Some(code) = error.code() else {
+        // No answer from the server: the connection failed or closed
+        let io = std::iter::successors(std::error::Error::source(&error), |e| e.source())
+            .any(|e| e.is::<std::io::Error>());
+        return if error.is_closed() || io {
+            StorageError::Transient(Box::new(error))
+        } else {
+            StorageError::database(error)
+        };
+    };
+    if code.code() == FENCED {
+        return StorageError::Fenced;
+    }
+    let class = &code.code()[..2];
+    let transient = [
+        &SqlState::T_R_SERIALIZATION_FAILURE,
+        &SqlState::T_R_DEADLOCK_DETECTED,
+        &SqlState::QUERY_CANCELED,
+        &SqlState::LOCK_NOT_AVAILABLE,
+        &SqlState::ADMIN_SHUTDOWN,
+        &SqlState::CRASH_SHUTDOWN,
+        &SqlState::CANNOT_CONNECT_NOW,
+        // A standby promoted late in a failover
+        &SqlState::READ_ONLY_SQL_TRANSACTION,
+    ]
+    .contains(&code)
+        // Connection exceptions and insufficient resources
+        || class == "08"
+        || class == "53";
+    if transient {
+        StorageError::Transient(Box::new(error))
+    } else {
+        StorageError::database(error)
+    }
+}
+
+/// How [`PostgresStore`] connects, besides the URL.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectOptions {
+    /// PEM file of the certificate authority that signed the server's
+    /// certificate; the Mozilla root certificates otherwise.
+    pub ca_path: Option<PathBuf>,
+    /// Most connections the store keeps open. A store from
+    /// [`PostgresStore::connect_exclusive`] opens one more, which holds the
+    /// database. 16 by default.
+    pub pool_size: usize,
+    /// Longest wait for a free connection once all are in use, after which
+    /// the operation fails with [`StorageError::Transient`]. 5 seconds by
+    /// default.
+    pub pool_timeout: Duration,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        ConnectOptions {
+            ca_path: None,
+            pool_size: 16,
+            pool_timeout: TIMEOUT,
+        }
     }
 }
 
@@ -241,6 +364,8 @@ impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: Pool,
+    /// Tells the [`DatabaseLock`], if any, that a write was fenced
+    lost: Option<watch::Sender<bool>>,
 }
 
 /// The database, held by one broker at a time; see
@@ -252,7 +377,8 @@ pub struct DatabaseLock {
 
 impl DatabaseLock {
     /// Completes once the database may have been taken over by another
-    /// broker, as the connection holding it closed or stopped answering.
+    /// broker, as the connection holding it closed or stopped answering,
+    /// or the store had a write refused with [`StorageError::Fenced`].
     /// The store refuses writes from then on; the broker should stop.
     pub async fn lost(&self) {
         let _ = self.lost.clone().wait_for(|lost| *lost).await;
@@ -276,18 +402,22 @@ impl PostgresStore {
     /// `postgres://user:password@localhost/mercurio`, and create or update
     /// the tables.
     ///
-    /// The connection is encrypted when the server supports it, or always
-    /// with `?sslmode=require` in the URL, and never with `sslmode=disable`.
-    /// The server's certificate is verified against `ca_path`, a PEM file,
-    /// or else the Mozilla root certificates.
+    /// The connection is encrypted, with the server's certificate and host
+    /// name verified against `options.ca_path`, a PEM file, or else the
+    /// Mozilla root certificates. Without `sslmode` in the URL, a server on
+    /// this host, over loopback or a Unix socket, may decline encryption
+    /// unless `ca_path` is given. `sslmode=require`, `verify-ca` and
+    /// `verify-full` all verify the certificate and host name;
+    /// `sslmode=prefer` and `disable` allow plaintext.
     ///
     /// Nothing stops another broker from using the database meanwhile; a
     /// broker serving clients should use [`Self::connect_exclusive`].
-    pub async fn connect(url: &str, ca_path: Option<&Path>) -> Result<Self> {
-        let config = base_config(url)?;
-        let tls = tls(ca_path)?;
-        let store = Self::with_pool(config, tls, None)?;
+    pub async fn connect(url: &str, options: &ConnectOptions) -> Result<Self> {
+        let config = base_config(url, options.ca_path.is_some())?;
+        let tls = tls(options.ca_path.as_deref())?;
+        let store = Self::with_pool(config, tls, options, None, None)?;
         let client = store.client().await?;
+        log_encryption(&client).await?;
         migrate(&client).await?;
         Ok(store)
     }
@@ -301,11 +431,11 @@ impl PostgresStore {
     /// fail, even those already on their way.
     pub async fn connect_exclusive(
         url: &str,
-        ca_path: Option<&Path>,
+        options: &ConnectOptions,
         wait: bool,
     ) -> Result<Option<(Self, DatabaseLock)>> {
-        let config = base_config(url)?;
-        let tls = tls(ca_path)?;
+        let config = base_config(url, options.ca_path.is_some())?;
+        let tls = tls(options.ca_path.as_deref())?;
 
         // The lock belongs to a connection of its own, outside the pool, so
         // it lasts as long as that connection
@@ -316,6 +446,7 @@ impl PostgresStore {
             let _ = connection.await;
             let _ = closed.send(true);
         });
+        log_encryption(&client).await?;
         // The database releases the lock within seconds of this host
         // vanishing, so a standby can take over
         client
@@ -327,7 +458,19 @@ impl PostgresStore {
             )
             .await
             .db()?;
-        migrate(&client).await?;
+        // A role's timeouts, common on managed PostgreSQL, would cancel a
+        // standby's wait for the lock or end its idle connection
+        client
+            .execute(
+                "SELECT set_config(name, '0', false) FROM pg_settings
+                 WHERE name IN ('statement_timeout', 'lock_timeout', 'idle_session_timeout')",
+                &[],
+            )
+            .await
+            .db()?;
+        // The schema changes only under the lock, as the broker holding it
+        // may not know a newer one
+        check_schema(&client).await?;
 
         let sql = if wait {
             "SELECT true FROM pg_advisory_lock($1)"
@@ -343,6 +486,7 @@ impl PostgresStore {
         {
             return Ok(None);
         }
+        migrate(&client).await?;
         // Waits for writes of the previous holder already past their check
         let epoch: i64 = client
             .query_one(
@@ -356,6 +500,7 @@ impl PostgresStore {
             .try_get(0)
             .db()?;
 
+        let fenced = lost_tx.clone();
         let heartbeat = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEARTBEAT).await;
@@ -366,52 +511,94 @@ impl PostgresStore {
                 }
             }
         });
-        let store = Self::with_pool(config, tls, Some(epoch))?;
+        let store = Self::with_pool(config, tls, options, Some(epoch), Some(fenced))?;
         Ok(Some((store, DatabaseLock { heartbeat, lost })))
     }
 
     fn with_pool(
         mut config: tokio_postgres::Config,
         tls: MakeRustlsConnect,
+        options: &ConnectOptions,
         epoch: Option<i64>,
+        lost: Option<watch::Sender<bool>>,
     ) -> Result<Self> {
-        let mut options = format!(
+        let mut settings = format!(
             "{} -c statement_timeout={}",
             config.get_options().unwrap_or_default(),
             TIMEOUT.as_millis()
         );
         if let Some(epoch) = epoch {
-            options.push_str(&format!(" -c mercurio.epoch={epoch}"));
+            settings.push_str(&format!(" -c mercurio.epoch={epoch}"));
         }
-        config.options(options.trim());
+        config.options(settings.trim());
         let pool = Pool::builder(Manager::new(config, tls))
             .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(TIMEOUT))
+            .max_size(options.pool_size)
+            .wait_timeout(Some(options.pool_timeout))
             .create_timeout(Some(TIMEOUT))
             .recycle_timeout(Some(TIMEOUT))
             .build()
             .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(PostgresStore { pool })
+        Ok(PostgresStore { pool, lost })
     }
 
     async fn client(&self) -> Result<Object> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| StorageError::OperationFailed(crate::error_chain(&e)))
+        self.pool.get().await.map_err(|e| match e {
+            PoolError::Backend(e) => classify(e),
+            PoolError::Timeout(_) => StorageError::Transient(Box::new(e)),
+            e => StorageError::OperationFailed(crate::error_chain(&e)),
+        })
+    }
+
+    /// Passes `result` on, giving the database up if another broker took
+    /// it over, so the broker stops without waiting for the lock's
+    /// heartbeat to notice.
+    fn fence<T>(&self, result: Result<T>) -> Result<T> {
+        if let (Err(StorageError::Fenced), Some(lost)) = (&result, &self.lost) {
+            lost.send_replace(true);
+        }
+        result
     }
 
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
         let client = self.client().await?;
         let statement = client.prepare_cached(sql).await.db()?;
-        client.query(&statement, params).await.db()
+        // Some, such as the retained lookup, delete what has expired
+        self.fence(client.query(&statement, params).await.db())
     }
 }
 
 /// The connection settings in `url`, with the timeouts and keepalives the
 /// broker needs where the URL sets none.
-fn base_config(url: &str) -> Result<tokio_postgres::Config> {
+///
+/// TLS is required where the URL sets no `sslmode` and the connection
+/// leaves the host or `ca` is given, as tokio-postgres would otherwise fall
+/// back to plaintext when the server has TLS off. libpq's `verify-ca` and
+/// `verify-full` become `require`, which verifies the certificate chain
+/// and host name with rustls.
+fn base_config(url: &str, ca: bool) -> Result<tokio_postgres::Config> {
+    let url = url
+        .replace("sslmode=verify-full", "sslmode=require")
+        .replace("sslmode=verify-ca", "sslmode=require");
     let mut config: tokio_postgres::Config = url.parse().db()?;
+    let local = config.get_hosts().iter().all(|host| match host {
+        Host::Tcp(name) => {
+            name == "localhost"
+                || name
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    });
+    if !url.contains("sslmode=") {
+        if ca || !local {
+            config.ssl_mode(SslMode::Require);
+        }
+    } else if config.get_ssl_mode() != SslMode::Require && !local {
+        warn!("The PostgreSQL URL allows an unencrypted connection to a remote host");
+    }
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(TIMEOUT);
     }
@@ -421,6 +608,25 @@ fn base_config(url: &str) -> Result<tokio_postgres::Config> {
         .keepalives_interval(Duration::from_secs(2))
         .keepalives_retries(3);
     Ok(config)
+}
+
+/// Logs whether the session is encrypted, which a URL allowing plaintext
+/// leaves to the server.
+async fn log_encryption(client: &tokio_postgres::Client) -> Result<()> {
+    let row = client
+        .query_one(
+            "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .db()?;
+    match row.try_get::<_, Option<String>>(1).db()? {
+        Some(version) if row.try_get(0).db()? => {
+            info!("Connected to PostgreSQL over {version}")
+        }
+        _ => info!("Connected to PostgreSQL without encryption"),
+    }
+    Ok(())
 }
 
 fn tls(ca_path: Option<&Path>) -> Result<MakeRustlsConnect> {
@@ -700,9 +906,15 @@ impl BatchStore for PostgresStore {
         Some(self)
     }
 
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+        self.fence(self.apply_batch(client_id, writes).await)
+    }
+}
+
+impl PostgresStore {
     /// Applies the batch in one transaction, its statements pipelined, so
     /// it costs about one round trip.
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+    async fn apply_batch(&self, client_id: &str, writes: &[Write]) -> Result<()> {
         let mut statements = Vec::new();
         let mut run = Vec::new();
         for write in writes {
@@ -856,7 +1068,7 @@ impl SessionStore for PostgresStore {
             .prepare_cached("DELETE FROM sessions WHERE client_id = $1")
             .await
             .db()?;
-        client.execute(&statement, &[&client_id]).await.db()?;
+        self.fence(client.execute(&statement, &[&client_id]).await.db())?;
         Ok(())
     }
 
@@ -878,7 +1090,7 @@ impl RetainedMessageStore for PostgresStore {
                 .prepare_cached("DELETE FROM retained_messages WHERE topic = $1")
                 .await
                 .db()?;
-            client.execute(&statement, &[&topic]).await.db()?;
+            self.fence(client.execute(&statement, &[&topic]).await.db())?;
             return Ok(());
         };
         let origin = msg.origin.as_deref();
@@ -896,7 +1108,7 @@ impl RetainedMessageStore for PostgresStore {
             )
             .await
             .db()?;
-        client
+        let stored = client
             .execute(
                 &statement,
                 &[
@@ -911,7 +1123,8 @@ impl RetainedMessageStore for PostgresStore {
                 ],
             )
             .await
-            .db()?;
+            .db();
+        self.fence(stored)?;
         Ok(())
     }
 
@@ -970,11 +1183,13 @@ impl RetainedMessageStore for PostgresStore {
     }
 
     async fn clear_all_retained(&self) -> Result<()> {
-        self.client()
-            .await?
-            .execute("DELETE FROM retained_messages", &[])
-            .await
-            .db()?;
+        let client = self.client().await?;
+        self.fence(
+            client
+                .execute("DELETE FROM retained_messages", &[])
+                .await
+                .db(),
+        )?;
         Ok(())
     }
 
@@ -1019,7 +1234,7 @@ impl BanStore for PostgresStore {
             )
             .await
             .db()?;
-        client
+        let stored = client
             .execute(
                 &statement,
                 &[
@@ -1032,7 +1247,8 @@ impl BanStore for PostgresStore {
                 ],
             )
             .await
-            .db()?;
+            .db();
+        self.fence(stored)?;
         Ok(())
     }
 
@@ -1042,10 +1258,12 @@ impl BanStore for PostgresStore {
             .prepare_cached("DELETE FROM bans WHERE kind = $1 AND value = $2 AND prefix = $3")
             .await
             .db()?;
-        client
-            .execute(&statement, &[&kind, &value, &prefix])
-            .await
-            .db()?;
+        self.fence(
+            client
+                .execute(&statement, &[&kind, &value, &prefix])
+                .await
+                .db(),
+        )?;
         Ok(())
     }
 }
@@ -1202,7 +1420,9 @@ mod tests {
     }
 
     async fn empty_store(url: &str) -> PostgresStore {
-        let store = PostgresStore::connect(url, None).await.unwrap();
+        let store = PostgresStore::connect(url, &ConnectOptions::default())
+            .await
+            .unwrap();
         store
             .client()
             .await
@@ -1260,7 +1480,9 @@ mod tests {
     async fn test_migrates_a_version_1_database() {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
-        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
         let client = store.client().await.unwrap();
         client
             .batch_execute(&format!(
@@ -1277,7 +1499,9 @@ mod tests {
             .unwrap();
         drop(client);
 
-        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
         let version: i32 = store
             .client()
             .await
@@ -1526,25 +1750,162 @@ mod tests {
         assert!(Arc::new(store).ban_store().is_some());
     }
 
+    /// `url` with `user` and `password` in place of its credentials.
+    fn url_as(url: &str, user: &str, password: &str) -> String {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let host = rest.split_once('@').map_or(rest, |(_, host)| host);
+        format!("{scheme}://{user}:{password}@{host}")
+    }
+
+    /// Managed PostgreSQL often gives roles a statement or lock timeout,
+    /// which would cancel a standby's wait for the lock.
+    #[tokio::test]
+    async fn test_a_standby_waits_despite_its_roles_timeouts() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        admin
+            .batch_execute(
+                "DROP ROLE IF EXISTS mercurio_hurried;
+                 CREATE ROLE mercurio_hurried LOGIN SUPERUSER PASSWORD 'hurried';
+                 ALTER ROLE mercurio_hurried SET statement_timeout = '200ms';
+                 ALTER ROLE mercurio_hurried SET lock_timeout = '200ms';",
+            )
+            .await
+            .unwrap();
+        let (_active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let hurried = url_as(&url, "mercurio_hurried", "hurried");
+        let waiting = tokio::spawn(async move {
+            PostgresStore::connect_exclusive(&hurried, &ConnectOptions::default(), true).await
+        });
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!waiting.is_finished(), "{:?}", waiting.await.unwrap().err());
+
+        drop(lock);
+        let (_, standby_lock) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the standby takes over")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(standby_lock);
+        let _ = admin.batch_execute("DROP ROLE mercurio_hurried").await;
+    }
+
+    /// A newer standby leaves the schema alone until it holds the
+    /// database, as the broker serving from it may not know the new one.
+    #[tokio::test]
+    async fn test_a_standby_migrates_once_it_holds_the_database() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        let version = || async {
+            let version: i32 = admin
+                .query_one("SELECT version FROM mercurio_schema", &[])
+                .await
+                .unwrap()
+                .get(0);
+            version as usize
+        };
+        let (_active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        // As if the serving broker were the version before the last change
+        admin
+            .execute(
+                "UPDATE mercurio_schema SET version = $1",
+                &[&(MIGRATIONS.len() as i32 - 1)],
+            )
+            .await
+            .unwrap();
+
+        let url_standby = url.clone();
+        let waiting = tokio::spawn(async move {
+            PostgresStore::connect_exclusive(&url_standby, &ConnectOptions::default(), true).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished());
+        assert_eq!(version().await, MIGRATIONS.len() - 1);
+
+        drop(lock);
+        let (_, standby_lock) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the standby takes over")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(version().await, MIGRATIONS.len());
+        drop(standby_lock);
+    }
+
+    /// A standby older than the database's schema fails at once, rather
+    /// than wait for a database it can't serve from.
+    #[tokio::test]
+    async fn test_an_older_standby_refuses_a_newer_schema() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        let (_active, _lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        let set_version = |version: usize| {
+            let admin = &admin;
+            async move {
+                admin
+                    .execute(
+                        "UPDATE mercurio_schema SET version = $1",
+                        &[&(version as i32)],
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_version(MIGRATIONS.len() + 1).await;
+        let standby = tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), true),
+        )
+        .await
+        .expect("an older standby doesn't wait");
+        set_version(MIGRATIONS.len()).await;
+        let error = standby.err().unwrap();
+        assert!(error.to_string().contains("newer"), "{error}");
+    }
+
     #[tokio::test]
     async fn test_one_broker_holds_the_database() {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
 
-        let (active, lock) = PostgresStore::connect_exclusive(&url, None, false)
-            .await
-            .unwrap()
-            .unwrap();
+        let (active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
         let ban = crate::testing::ban("address", "10.0.0.0/8", false);
         active.store_ban(&ban).await.unwrap();
-        assert!(PostgresStore::connect_exclusive(&url, None, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let url_standby = url.clone();
         let waiting = tokio::spawn(async move {
-            PostgresStore::connect_exclusive(&url_standby, None, true)
+            PostgresStore::connect_exclusive(&url_standby, &ConnectOptions::default(), true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1575,12 +1936,10 @@ mod tests {
         assert!(!standby_lock.is_lost());
 
         // The old holder's writes are refused, the new holder's accepted
-        assert!(active
-            .apply("c", &[Write::ClearQueue])
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("another broker took over"));
+        assert!(matches!(
+            active.apply("c", &[Write::ClearQueue]).await,
+            Err(StorageError::Fenced)
+        ));
         assert!(active.store_retained("t", None).await.is_err());
         standby.apply("c", &[Write::ClearQueue]).await.unwrap();
 
@@ -1597,10 +1956,198 @@ mod tests {
             .unwrap();
 
         drop(standby_lock);
-        let (_, lock) = PostgresStore::connect_exclusive(&url, None, false)
+        let (_, lock) = PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
             .await
             .unwrap()
             .expect("dropping the lock frees the database");
         drop(lock);
+    }
+
+    /// A takeover the holder's lock connection hasn't noticed yet, as when
+    /// that connection hangs: the first fenced write gives the lock up.
+    #[tokio::test]
+    async fn test_a_fenced_write_loses_the_lock() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let (active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        active.apply("c", &[Write::ClearQueue]).await.unwrap();
+        assert!(!lock.is_lost());
+
+        database
+            .client()
+            .await
+            .unwrap()
+            .batch_execute("UPDATE mercurio_lease SET epoch = epoch + 1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            active.apply("c", &[Write::ClearQueue]).await,
+            Err(StorageError::Fenced)
+        ));
+        assert!(lock.is_lost());
+    }
+
+    #[tokio::test]
+    async fn test_errors_worth_retrying_are_transient() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let client = store.client().await.unwrap();
+        let raise = |code: &str| {
+            format!("DO $$ BEGIN RAISE EXCEPTION 'test' USING ERRCODE = '{code}'; END $$")
+        };
+        for code in ["40001", "40P01", "57P01", "53300", "08006"] {
+            let error = client.batch_execute(&raise(code)).await.db().unwrap_err();
+            assert!(
+                matches!(error, StorageError::Transient(_)),
+                "{code}: {error}"
+            );
+        }
+        let error = client
+            .batch_execute(&raise("23505"))
+            .await
+            .db()
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Database(_)), "{error}");
+
+        // The server ends the connection, as on a failover
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .unwrap();
+        let error = client.batch_execute("SELECT 1").await.db().unwrap_err();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
+    }
+
+    /// A broker waiting for a free connection retries, rather than give
+    /// its changes up.
+    #[tokio::test]
+    async fn test_the_pool_is_sized_and_its_wait_is_transient() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let options = ConnectOptions {
+            pool_size: 1,
+            pool_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect(&url, &options).await.unwrap();
+        assert_eq!(store.pool.status().max_size, 1);
+        let _held = store.client().await.unwrap();
+        let error = store.client().await.err().unwrap();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
+    }
+
+    #[test]
+    fn test_remote_or_verified_connections_require_tls() {
+        use tokio_postgres::config::SslMode;
+        let mode = |url: &str, ca: bool| base_config(url, ca).unwrap().get_ssl_mode();
+        for local in [
+            "postgres://u@localhost/m",
+            "postgres://u@127.0.0.1/m",
+            "postgres://u@[::1]/m",
+            "host=/var/run/postgresql user=u",
+            "postgres://u@%2Fvar%2Frun%2Fpostgresql/m",
+        ] {
+            assert_eq!(mode(local, false), SslMode::Prefer, "{local}");
+            assert_eq!(mode(local, true), SslMode::Require, "{local}");
+        }
+        assert_eq!(
+            mode("postgres://u@db.example.com/m", false),
+            SslMode::Require
+        );
+        assert_eq!(
+            mode("host=localhost,db.example.com user=u", false),
+            SslMode::Require
+        );
+
+        // libpq's verifying modes, which rustls's require already does
+        for url in [
+            "postgres://u@db.example.com/m?sslmode=verify-full",
+            "postgres://u@localhost/m?connect_timeout=3&sslmode=verify-ca",
+            "host=db.example.com sslmode=verify-full user=u",
+        ] {
+            assert_eq!(mode(url, false), SslMode::Require, "{url}");
+        }
+
+        // The operator's explicit choice stands
+        assert_eq!(
+            mode("postgres://u@db.example.com/m?sslmode=disable", true),
+            SslMode::Disable
+        );
+        assert_eq!(
+            mode("postgres://u@db.example.com/m?sslmode=prefer", false),
+            SslMode::Prefer
+        );
+    }
+
+    /// The server in the tests has TLS off, as PostgreSQL's images do.
+    #[tokio::test]
+    async fn test_a_ca_path_refuses_plaintext() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        if url.contains("sslmode=") {
+            return;
+        }
+        let options = ConnectOptions {
+            ca_path: Some(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../mercurio-server/tests/fixtures/cert.pem"
+                )
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let ssl: bool = store
+            .client()
+            .await
+            .unwrap()
+            .query_one("SELECT current_setting('ssl')::bool", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if ssl {
+            return;
+        }
+        assert!(PostgresStore::connect(&url, &options).await.is_err());
+    }
+
+    #[test]
+    fn test_default_options() {
+        let options = ConnectOptions::default();
+        assert_eq!(options.pool_size, 16);
+        assert_eq!(options.pool_timeout, Duration::from_secs(5));
+        assert_eq!(options.ca_path, None);
+    }
+
+    #[tokio::test]
+    async fn test_an_unreachable_database_is_transient() {
+        let error = PostgresStore::connect(
+            "postgres://mercurio@127.0.0.1:1/mercurio",
+            &ConnectOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
     }
 }

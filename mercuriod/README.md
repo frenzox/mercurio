@@ -220,11 +220,19 @@ level = "info"
 backend = "memory"
 # path = "/var/lib/mercurio/mercurio.db"
 # url = "postgres://mercurio:password@localhost/mercurio?sslmode=require"
+# Connections to another host, or with ca_path, are encrypted unless the URL
+# sets sslmode=prefer or disable; the certificate and host name are verified
 # CA that signed the PostgreSQL server's certificate; Mozilla's roots otherwise
 # ca_path = "/etc/mercurio/postgres-ca.pem"
 # One broker serves from a PostgreSQL database at a time. When another is,
 # exit (false), or wait and take over once it stops (true)
 # standby = false
+# Connections each broker keeps to PostgreSQL, plus one that holds the
+# database: the server's max_connections must allow pool_size + 1 for each
+# broker, standbys included
+# pool_size = 16
+# Seconds a write waits for a free connection before it is tried again
+# pool_timeout = 5
 
 [auth]
 # Require clients to authenticate. password_file, dynamic_security and
