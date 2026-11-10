@@ -102,7 +102,7 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>-p, --port</code></td><td>Broker port</td><td><code>1883</code></td></tr>
 <tr><td><code>--unix PATH</code></td><td>Connect through this Unix socket instead of TCP; not with <code>-H</code>, <code>-p</code> or the TLS options</td><td></td></tr>
 <tr><td><code>-i, --client-id</code></td><td>Client id</td><td>generated</td></tr>
-<tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials</td><td></td></tr>
+<tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials. The password can also come from <code>RECADO_PASSWORD</code>, which other users can't see in <code>ps</code>; <code>-u</code> alone asks for it when standard error is a terminal</td><td></td></tr>
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
 <tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
@@ -112,8 +112,11 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
 </table>
-<pre><span class="comment"># Over TLS, with credentials</span>
-recado sub -H broker.example.com -p 8883 --cafile ca.crt -u alice -P secret -t '#'
+<pre><span class="comment"># Over TLS, as alice; asks for the password</span>
+recado sub -H broker.example.com -p 8883 --cafile ca.crt -u alice -t '#'
+
+<span class="comment"># In a script, with the password out of ps</span>
+RECADO_PASSWORD="$(cat ~/.mqtt-password)" recado pub -u alice -t status -m up
 
 <span class="comment"># MQTT 3.1.1</span>
 recado pub -V 311 -t test -m hello

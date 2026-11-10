@@ -59,7 +59,7 @@ mercurioctl -H broker.example.com -p 8883 --tls -u admin dynsec list-clients --j
 Connection options go before the command, and each can also be set with
 its `MERCURIOCTL_` variable, such as `MERCURIOCTL_HOST`. With none of
 them set, mercurioctl uses the admin socket. `-u` without `-P` asks for
-the password.
+the password on a terminal; `MERCURIOCTL_PASSWORD` keeps it out of `ps`.
 
 | Option | Meaning | Default |
 |---|---|---|

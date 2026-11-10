@@ -15,7 +15,7 @@ all-features = true
 
 [features]
 # Command-line arguments for connecting, shared by the Mercurio tools
-clap = ["dep:clap"]
+clap = ["dep:clap", "dep:rpassword"]
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
@@ -29,7 +29,8 @@ rustls = "0.23"
 webpki-roots = "0.26"
 tracing = "0.1"
 thiserror = "1"
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+rpassword = { version = "7", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -3,10 +3,14 @@
 use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, Command, Output, Stdio},
+    sync::Arc,
 };
 
 use mercurio_client::{ConnectOptions, MqttClient, QoS};
-use mercurio_server::server::{run_with_config, ServerConfig};
+use mercurio_server::{
+    auth::SimpleCredentialValidator,
+    server::{run_with_config, ServerConfig},
+};
 use tokio::net::TcpListener;
 
 struct Broker {
@@ -14,9 +18,23 @@ struct Broker {
 }
 
 async fn start() -> Broker {
+    start_with(ServerConfig::default()).await
+}
+
+/// A broker that only lets alice in, with the password `secret`.
+async fn start_with_login() -> Broker {
+    let credentials = [("alice".to_string(), "secret".to_string())];
+    let mut config = ServerConfig::default();
+    config.auth.require_auth = true;
+    config.plugins = vec![Arc::new(SimpleCredentialValidator::new(
+        credentials.into_iter().collect(),
+    ))];
+    start_with(config).await
+}
+
+async fn start_with(mut config: ServerConfig) -> Broker {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let mut config = ServerConfig::default();
     config.sys_interval = None;
     tokio::spawn(run_with_config(
         listener,
@@ -48,8 +66,15 @@ impl Broker {
 
     /// Runs recado to completion with `input` on its standard input.
     async fn run_with_input(&self, args: &[&str], input: &[u8]) -> Output {
+        self.run_with(args, input, &[]).await
+    }
+
+    /// Runs recado to completion with `input` on its standard input and
+    /// `env` as its environment.
+    async fn run_with(&self, args: &[&str], input: &[u8], env: &[(&str, &str)]) -> Output {
         let mut command = self.command(args);
         command
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -197,4 +222,32 @@ async fn failures_print_one_line_and_set_the_exit_status() {
     assert_eq!(usage.status.code(), Some(3), "{}", stderr(&usage));
     let help = broker.run(&["sub", "--help"]).await;
     assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_password_can_come_from_the_environment() {
+    let broker = start_with_login().await;
+    let publish = ["pub", "-u", "alice", "-t", "a", "-m", "x"];
+    let output = broker
+        .run_with(&publish, b"", &[("RECADO_PASSWORD", "secret")])
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // -P wins over the variable
+    let wrong = [&publish[..], &["-P", "wrong"]].concat();
+    let output = broker
+        .run_with(&wrong, b"", &[("RECADO_PASSWORD", "secret")])
+        .await;
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+
+    // Off a terminal nothing asks, and the broker refuses the login
+    let output = broker.run(&publish).await;
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+
+    let help = broker
+        .run_with(&["pub", "--help"], b"", &[("RECADO_PASSWORD", "hunter2")])
+        .await;
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("RECADO_PASSWORD"), "{help}");
+    assert!(!help.contains("hunter2"), "{help}");
 }

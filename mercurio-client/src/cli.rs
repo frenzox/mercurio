@@ -38,7 +38,8 @@ pub struct ConnectArgs {
     #[arg(short = 'u', long)]
     pub username: Option<String>,
 
-    /// Password for authentication
+    /// Password for authentication; other users can see it in `ps`, so
+    /// prefer the tool's variable, or leave it out with -u to be asked
     #[arg(short = 'P', long)]
     pub password: Option<String>,
 
@@ -75,6 +76,30 @@ impl std::fmt::Debug for ConnectArgs {
 }
 
 impl ConnectArgs {
+    /// `command`, which flattens these arguments, with the password also
+    /// read from the environment `variable` when `-P` isn't given. An empty
+    /// variable counts as unset, and `--help` never shows its value.
+    pub fn password_variable(command: clap::Command, variable: &'static str) -> clap::Command {
+        // Systemd units and CI often leave variables empty, which means
+        // unset, as for the shell's `${VAR:-}`
+        if std::env::var_os(variable).is_some_and(|value| value.is_empty()) {
+            return command;
+        }
+        command.mut_arg("password", |arg| arg.env(variable).hide_env_values(true))
+    }
+
+    /// With a user name and no password, asks for the password when
+    /// standard error is a terminal. Elsewhere, as in scripts, it connects
+    /// with the user name alone.
+    pub fn ask_password(&mut self) -> std::io::Result<()> {
+        use std::io::IsTerminal;
+
+        if self.username.is_some() && self.password.is_none() && std::io::stderr().is_terminal() {
+            self.password = Some(rpassword::prompt_password("Password: ")?);
+        }
+        Ok(())
+    }
+
     /// Connection options for these arguments; everything else keeps the
     /// defaults of [`ConnectOptions::new`].
     pub fn to_connect_options(&self) -> ConnectOptions {
@@ -134,6 +159,38 @@ mod tests {
         let shown = format!("{:?}", parse(&["-P", "hunter2"]).unwrap());
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains(r#"password: Some("<redacted>")"#), "{shown}");
+    }
+
+    #[test]
+    fn the_password_can_come_from_a_variable() {
+        let parse_with = |variable: &'static str, args: &[&str]| {
+            let command = ConnectArgs::password_variable(Cli::command(), variable);
+            let matches = command
+                .try_get_matches_from(std::iter::once("test").chain(args.iter().copied()))
+                .unwrap();
+            <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+                .unwrap()
+                .connect
+                .password
+        };
+        std::env::set_var("MERCURIO_CLIENT_TEST_PASSWORD", "from-env");
+        std::env::set_var("MERCURIO_CLIENT_TEST_EMPTY", "");
+        assert_eq!(
+            parse_with("MERCURIO_CLIENT_TEST_PASSWORD", &[]).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            parse_with("MERCURIO_CLIENT_TEST_PASSWORD", &["-P", "flag"]).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(parse_with("MERCURIO_CLIENT_TEST_EMPTY", &[]), None);
+        assert_eq!(parse_with("MERCURIO_CLIENT_TEST_UNSET", &[]), None);
+
+        let help = ConnectArgs::password_variable(Cli::command(), "MERCURIO_CLIENT_TEST_PASSWORD")
+            .render_help()
+            .to_string();
+        assert!(help.contains("MERCURIO_CLIENT_TEST_PASSWORD"), "{help}");
+        assert!(!help.contains("from-env"), "{help}");
     }
 
     #[test]

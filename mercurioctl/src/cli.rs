@@ -54,7 +54,6 @@ pub fn command() -> clap::Command {
         ("tls", "MERCURIOCTL_TLS"),
         ("cafile", "MERCURIOCTL_CAFILE"),
         ("insecure", "MERCURIOCTL_INSECURE"),
-        ("password", "MERCURIOCTL_PASSWORD"),
         ("timeout", "MERCURIOCTL_TIMEOUT"),
         #[cfg(unix)]
         ("unix", "MERCURIOCTL_UNIX"),
@@ -67,18 +66,13 @@ pub fn command() -> clap::Command {
         command = command.mut_arg(id, |arg| {
             let arg = arg.env(variable);
             match id {
-                // --help would show the value otherwise
-                "password" => arg.hide_env_values(true).help(
-                    "Password for authentication; other users can see it in `ps`, \
-                     so leave it out with -u to be asked",
-                ),
                 // 1, 0, yes, no, on and off, as well as true and false
                 "tls" | "insecure" => arg.value_parser(BoolishValueParser::new()),
                 _ => arg,
             }
         });
     }
-    command
+    ConnectArgs::password_variable(command, "MERCURIOCTL_PASSWORD")
 }
 
 #[derive(Subcommand, Debug)]

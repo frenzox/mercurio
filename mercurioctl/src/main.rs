@@ -43,9 +43,9 @@ fn parse() -> Result<Cli, clap::Error> {
 async fn run(cli: Cli) -> Result<(), Failure> {
     let request = commands::request(cli.command, new_password)?;
     let mut connect = client::resolve(cli.connect, Path::new(client::ADMIN_SOCKET));
-    if connect.username.is_some() && connect.password.is_none() {
-        connect.password = Some(prompt("Password: ")?);
-    }
+    connect
+        .ask_password()
+        .map_err(|e| Failure::Usage(format!("can't read a password: {e}")))?;
     let wait = Duration::from_secs(cli.timeout);
     let Some(data) = client::send(&connect, &request, wait).await? else {
         return Ok(());

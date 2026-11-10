@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use bytes::Bytes;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use mercurio_client::{
     Event, MessageProperties, MqttClient, RetainHandling, SubscriptionOptions, Will,
 };
@@ -16,6 +16,7 @@ mod common;
 mod failure;
 use common::{init_logging, ConnectionArgs};
 use failure::Failure;
+use mercurio_client::cli::ConnectArgs;
 
 const AFTER_HELP: &str = "\
 Exit status: 0 on success, 1 when the broker refused a subscription or a \
@@ -182,7 +183,7 @@ fn parse_user_property(value: &str) -> Result<(String, String), String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match parse() {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();
@@ -196,6 +197,18 @@ async fn main() -> ExitCode {
             ExitCode::from(failure.exit_code())
         }
     }
+}
+
+/// The command line, with the password also read from `RECADO_PASSWORD`.
+fn command() -> clap::Command {
+    let password = |command| ConnectArgs::password_variable(command, "RECADO_PASSWORD");
+    Cli::command()
+        .mut_subcommand("pub", password)
+        .mut_subcommand("sub", password)
+}
+
+fn parse() -> Result<Cli, clap::Error> {
+    Cli::from_arg_matches(&command().try_get_matches()?)
 }
 
 async fn run(cli: Cli) -> Result<(), Failure> {
@@ -236,7 +249,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
 }
 
 async fn run_publish(
-    connection: ConnectionArgs,
+    mut connection: ConnectionArgs,
     topic: String,
     message: Option<String>,
     qos: QoS,
@@ -254,6 +267,7 @@ async fn run_publish(
         }
     };
 
+    connection.connect.ask_password()?;
     // Connect to broker
     let options = connection.to_connect_options();
     let client = MqttClient::connect(options).await?;
@@ -270,7 +284,7 @@ async fn run_publish(
 }
 
 async fn run_subscribe(
-    connection: ConnectionArgs,
+    mut connection: ConnectionArgs,
     topics: Vec<String>,
     qos: QoS,
     print_topic: bool,
@@ -278,6 +292,7 @@ async fn run_subscribe(
     reconnect: Option<u64>,
     will: WillArgs,
 ) -> Result<(), Failure> {
+    connection.connect.ask_password()?;
     // Connect to broker
     let mut options = connection.to_connect_options();
 
