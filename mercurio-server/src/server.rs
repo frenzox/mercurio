@@ -1447,8 +1447,27 @@ where
             self.session_manager.hold_locally(client_id);
         }
 
-        session.set_verified_user(verified_user).await;
+        session.set_verified_user(verified_user.clone()).await;
         session.set_peer(self.peer).await;
+        // A ban added after the check above, while this client had yet to
+        // claim its id, also missed it in addBan's walk of the connected
+        // clients. Checked again now that the id is held and the session
+        // shows who the client is, either this check or that walk sees the
+        // other; the connection then closes with Banned once it is up.
+        {
+            let client_id = session.get_client_id().await;
+            if self.banned(&client_id, verified_user.as_deref()) {
+                warn!(
+                    "Client `{}` was banned while connecting, closing",
+                    client_id
+                );
+                let close = Close::Admin {
+                    reason: ReasonCode::Banned,
+                    send_will: false,
+                };
+                self.session_manager.close_own(&lease, close).await;
+            }
+        }
         let counters = session
             .attach(Arc::clone(&self.listener), keepalive, expiry)
             .await;
@@ -1527,6 +1546,20 @@ where
         }
 
         session.detach(lease.generation, expiry).await;
+
+        // A close that drops the will can lose the race against a read error,
+        // an EOF or a DISCONNECT with a will
+        if matches!(
+            *lease.close.borrow(),
+            Some(Close::Admin {
+                send_will: false,
+                ..
+            })
+        ) {
+            session.clear_will().await;
+            self.session_manager
+                .delete_will(&session.get_client_id().await);
+        }
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
@@ -2035,6 +2068,25 @@ where
                     }
                 }
 
+                // A re-authentication may land on a banned user name; the
+                // ban is in force before addBan walks the connected clients,
+                // so checking after the user is set covers both orders
+                if matches!(&maybe_res, Some(ControlPacket::Auth(a)) if a.reason == ReasonCode::Success)
+                {
+                    let identity = session.identity().await;
+                    if self.banned(&identity.client_id, identity.username.as_deref()) {
+                        warn!(
+                            "Client `{}` re-authenticated as a banned user, closing",
+                            identity.client_id
+                        );
+                        let close = Close::Admin {
+                            reason: ReasonCode::Banned,
+                            send_will: false,
+                        };
+                        return self.close_for(&session, protocol_version, close).await;
+                    }
+                }
+
                 if let Some(res) = maybe_res {
                     debug!(
                         "Sending {} to client {:?}",
@@ -2056,43 +2108,52 @@ where
                 // An abnormal disconnect: the will is published
                 Err(ReasonCode::KeepAliveTimeout.into())
             }
-            Wake::Closed(close) => {
-                let client_id = session.get_client_id().await;
-                let reason = match close {
-                    Close::TakenOver => {
-                        info!("Client `{}` was taken over by a new connection", client_id);
-                        ReasonCode::SessionTakenOver
-                    }
-                    Close::Admin { reason, send_will } => {
-                        info!(
-                            "Closing the connection of client `{}`: {}",
-                            client_id, reason
-                        );
-                        if !send_will {
-                            session.clear_will().await;
-                            self.session_manager.delete_will(&client_id);
-                        }
-                        reason
-                    }
-                };
-                if protocol_version.supports_reason_codes() {
-                    let _ = self
-                        .connection
-                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                            reason,
-                            properties: Some(DisconnectProperties {
-                                reason_string: reason_string(
-                                    reason,
-                                    session.client_maximum_packet_size().await,
-                                ),
-                                ..Default::default()
-                            }),
-                        }))
-                        .await;
-                }
-                Ok(Flow::Close)
-            }
+            Wake::Closed(close) => self.close_for(&session, protocol_version, close).await,
         }
+    }
+
+    /// Tells the client why its connection closes, dropping its will if
+    /// the close says so.
+    async fn close_for(
+        &mut self,
+        session: &Session,
+        protocol_version: ProtocolVersion,
+        close: Close,
+    ) -> Result<Flow> {
+        let client_id = session.get_client_id().await;
+        let reason = match close {
+            Close::TakenOver => {
+                info!("Client `{}` was taken over by a new connection", client_id);
+                ReasonCode::SessionTakenOver
+            }
+            Close::Admin { reason, send_will } => {
+                info!(
+                    "Closing the connection of client `{}`: {}",
+                    client_id, reason
+                );
+                if !send_will {
+                    session.clear_will().await;
+                    self.session_manager.delete_will(&client_id);
+                }
+                reason
+            }
+        };
+        if protocol_version.supports_reason_codes() {
+            let _ = self
+                .connection
+                .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                    reason,
+                    properties: Some(DisconnectProperties {
+                        reason_string: reason_string(
+                            reason,
+                            session.client_maximum_packet_size().await,
+                        ),
+                        ..Default::default()
+                    }),
+                }))
+                .await;
+        }
+        Ok(Flow::Close)
     }
 }
 

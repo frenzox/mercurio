@@ -2,12 +2,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    properties::{CorrelationData, ResponseTopic, SessionExpiryInterval},
+    properties::{AuthenticationMethod, CorrelationData, ResponseTopic, SessionExpiryInterval},
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
 };
 use mercurio_packets::{
+    auth::{AuthPacket, AuthProperties},
     connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
     publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
@@ -16,7 +17,10 @@ use mercurio_packets::{
 use mercurio_server::{
     acl::AclFile,
     admin::{Admin, AdminError, AdminExtension, BanKey, BanKind, ErrorCode, NewBan, Paging},
-    plugin::{ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin},
+    plugin::{
+        ready, Access, AuthExchange, AuthResult, BoxFuture, ClientInfo, Credentials, Decision,
+        Plugin,
+    },
     server::{ListenerConfig, LocalConnector, Server, ServerConfig, Transport},
 };
 use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore};
@@ -69,6 +73,61 @@ impl Plugin for AllowAll {
         _: &'a Credentials<'a>,
     ) -> BoxFuture<'a, Decision> {
         ready(Decision::Allow)
+    }
+}
+
+/// Bans `late` while the broker checks its will's topic, which comes after
+/// the CONNECT ban check and before the client id is claimed.
+struct BansDuringConnect(Arc<std::sync::OnceLock<Admin>>);
+
+impl Plugin for BansDuringConnect {
+    fn name(&self) -> &str {
+        "bans-during-connect"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        topic: &'a str,
+        _: Access,
+    ) -> BoxFuture<'a, Decision> {
+        Box::pin(async move {
+            if topic == "wills/late" {
+                let admin = self.0.get().expect("set before clients connect");
+                let ban = NewBan::new(BanKey::new(BanKind::ClientId, "late"));
+                admin.add_ban(ban).await.unwrap();
+            }
+            Decision::Allow
+        })
+    }
+}
+
+/// Authenticates a client as `alice` when it connects and as `mallory` when
+/// it authenticates again, in one step.
+struct SwitchUser;
+
+struct SwitchExchange(&'static str);
+
+impl Plugin for SwitchUser {
+    fn name(&self) -> &str {
+        "switch-user"
+    }
+
+    fn begin_auth(&self, client: &ClientInfo, _: &str) -> Option<Box<dyn AuthExchange>> {
+        let user = if client.username.is_some() {
+            "mallory"
+        } else {
+            "alice"
+        };
+        Some(Box::new(SwitchExchange(user)))
+    }
+}
+
+impl AuthExchange for SwitchExchange {
+    fn step<'a>(&'a mut self, _: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
+        ready(AuthResult::Success {
+            username: Some(self.0.into()),
+        })
     }
 }
 
@@ -1304,4 +1363,87 @@ async fn address_bans_on_mapped_blocks_apply_to_ipv4_clients() {
         .await,
         ReasonCode::Banned
     );
+}
+
+#[tokio::test]
+async fn a_ban_closes_matching_clients_without_their_will() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+    let mut device = Client::connect_with(addr, with_will("device-1")).await;
+    let mut other = Client::connect(addr, "other").await;
+
+    let response = admin
+        .run(json!({"command": "addBan", "type": "clientid", "value": "device-", "prefix": true}))
+        .await;
+    assert!(response.get("error").is_none(), "{response}");
+    let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert!(watcher.receive().await.is_none(), "the will is dropped");
+    // A client the ban doesn't match stays connected
+    other.subscribe("a").await;
+    let details = wait_for(&mut admin, "device-1", |d| d["connected"] == false).await;
+    assert_eq!(details["willPending"], false);
+}
+
+#[tokio::test]
+async fn a_client_banned_while_it_connects_is_closed_once_up() {
+    let slot = Arc::new(std::sync::OnceLock::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let plugin = Arc::new(BansDuringConnect(Arc::clone(&slot)));
+    let server = Server::new(listener, config(vec![plugin]), Arc::new(MemoryStore::new()))
+        .await
+        .unwrap();
+    assert!(slot.set(server.admin()).is_ok());
+    tokio::spawn(server.run(std::future::pending::<()>()));
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+
+    // Passed the ban check before the ban existed, so it is accepted,
+    // then closed at once
+    let mut late = Client::connect_with(addr, with_will("late")).await;
+    let Some(ControlPacket::Disconnect(disconnect)) = late.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert!(watcher.receive().await.is_none(), "the will is dropped");
+    let mut admin = admin_client(addr).await;
+    let details = wait_for(&mut admin, "late", |d| d["connected"] == false).await;
+    assert_eq!(details["willPending"], false);
+}
+
+#[tokio::test]
+async fn re_authenticating_as_a_banned_user_closes_the_client() {
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll), Arc::new(SwitchUser)])).await;
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+    let mut packet = with_will("device");
+    packet.properties = Some(ConnectProperties {
+        authentication_method: Some(AuthenticationMethod::new("SWITCH".into())),
+        ..Default::default()
+    });
+    let mut device = Client::connect_with(addr, packet).await;
+
+    // The ban matches nobody connected yet
+    let ban = NewBan::new(BanKey::new(BanKind::Username, "mallory"));
+    admin.add_ban(ban).await.unwrap();
+    device
+        .send(ControlPacket::Auth(AuthPacket {
+            reason: ReasonCode::ReAuthenticate,
+            properties: AuthProperties {
+                auth_method: Some(AuthenticationMethod::new("SWITCH".into())),
+                ..Default::default()
+            },
+        }))
+        .await;
+
+    let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert!(watcher.receive().await.is_none(), "the will is dropped");
 }

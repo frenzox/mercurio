@@ -32,7 +32,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::{
-    bans::Bans,
+    bans::{Bans, Candidate},
     plugin::{BoxFuture, Plugin, PluginStatus},
     queue::Subscriber,
     server::{AddressRange, ListenerState},
@@ -267,6 +267,12 @@ pub(crate) trait Directory: Send + Sync {
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
     fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
     fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool>;
+    fn close_generation<'a>(
+        &'a self,
+        client_id: &'a str,
+        generation: u64,
+        close: Close,
+    ) -> BoxFuture<'a, bool>;
     fn delete_session<'a>(
         &'a self,
         client_id: &'a str,
@@ -293,6 +299,17 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
 
     fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool> {
         Box::pin(SessionManager::close_connection(self, client_id, close))
+    }
+
+    fn close_generation<'a>(
+        &'a self,
+        client_id: &'a str,
+        generation: u64,
+        close: Close,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(SessionManager::close_generation(
+            self, client_id, generation, close,
+        ))
     }
 
     fn delete_session<'a>(
@@ -494,8 +511,10 @@ impl Admin {
         })
     }
 
-    /// Refuses clients matching `ban` from now on: `addBan`. A ban with the
-    /// same type, value and prefix is replaced, keeping when it was created.
+    /// Refuses clients matching `ban` from now on, and closes the
+    /// connections of those connected with Banned, without their will:
+    /// `addBan`. A ban with the same type, value and prefix is replaced,
+    /// keeping when it was created.
     pub async fn add_ban(&self, ban: NewBan) -> Result<(), AdminError> {
         let ban = self.inner.bans.add(ban).await?;
         info!(
@@ -503,6 +522,29 @@ impl Admin {
             ban.ban.kind.as_str(),
             ban.ban.value
         );
+        // Walked once the ban is in force: a client connecting meanwhile
+        // either checks again after this and sees the ban, or is listed here
+        let close = Close::Admin {
+            reason: ReasonCode::Banned,
+            send_will: false,
+        };
+        for entry in self.inner.directory.entries().await {
+            let Some(generation) = entry.generation else {
+                continue;
+            };
+            let identity = entry.session.identity().await;
+            let client = Candidate {
+                client_id: &entry.client_id,
+                username: identity.username.as_deref(),
+                ip: identity.peer.map(|peer| peer.ip()),
+            };
+            if ban.matches(&client) {
+                self.inner
+                    .directory
+                    .close_generation(&entry.client_id, generation, close)
+                    .await;
+            }
+        }
         Ok(())
     }
 
