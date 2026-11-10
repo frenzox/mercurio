@@ -116,7 +116,7 @@ impl Decoder for DisconnectPacket {
             // 0x00 is "Normal disconnection" in DISCONNECT, whether it is
             // sent or left out
             let reason = if buffer.has_remaining() {
-                match ReasonCode::decode(buffer)? {
+                match crate::decode_reason(buffer, PacketType::Disconnect)? {
                     ReasonCode::Success => ReasonCode::NormalDisconnection,
                     reason => reason,
                 }

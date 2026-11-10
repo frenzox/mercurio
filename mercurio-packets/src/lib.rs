@@ -25,7 +25,7 @@ pub mod subscribe;
 pub mod unsuback;
 pub mod unsubscribe;
 
-use core::convert::{TryFrom, TryInto};
+use core::convert::TryInto;
 
 use bytes::{buf::Take, Buf, BufMut, BytesMut};
 
@@ -43,6 +43,8 @@ use crate::{
     publish::PublishPacket, pubrec::PubRecPacket, pubrel::PubRelPacket, suback::SubAckPacket,
     subscribe::SubscribePacket, unsuback::UnsubAckPacket, unsubscribe::UnsubscribePacket,
 };
+
+pub use mercurio_core::protocol::PacketType;
 
 #[repr(u8)]
 #[derive(PartialEq, Eq, Debug)]
@@ -63,57 +65,6 @@ pub enum ControlPacket {
     PingResp(PingRespPacket),
     Disconnect(DisconnectPacket),
     Auth(AuthPacket),
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy)]
-/// The packet type, the high four bits of the first byte of the fixed
-/// header (section 2.1.2).
-pub enum PacketType {
-    Connect = 0x01,
-    ConnAck,
-    Publish,
-    PubAck,
-    PubRec,
-    PubRel,
-    PubComp,
-    Subscribe,
-    SubAck,
-    Unsubscribe,
-    UnsubAck,
-    PingReq,
-    PingResp,
-    Disconnect,
-    Auth,
-}
-
-impl TryFrom<u8> for PacketType {
-    type Error = ReasonCode;
-
-    fn try_from(value: u8) -> core::result::Result<Self, Self::Error> {
-        use PacketType::*;
-
-        let res = match value {
-            0x01 => Connect,
-            0x02 => ConnAck,
-            0x03 => Publish,
-            0x04 => PubAck,
-            0x05 => PubRec,
-            0x06 => PubRel,
-            0x07 => PubComp,
-            0x08 => Subscribe,
-            0x09 => SubAck,
-            0x0a => Unsubscribe,
-            0x0b => UnsubAck,
-            0x0c => PingReq,
-            0x0d => PingResp,
-            0x0e => Disconnect,
-            0x0f => Auth,
-            _ => return Err(ReasonCode::MalformedPacket),
-        };
-
-        Ok(res)
-    }
 }
 
 impl ControlPacket {
@@ -364,6 +315,16 @@ where
     }
 
     Ok(packet)
+}
+
+/// Reads an MQTT 5 reason code. A code that `packet_type` doesn't list is
+/// malformed, like a code no packet lists.
+pub(crate) fn decode_reason<T: Buf>(buffer: &mut T, packet_type: PacketType) -> Result<ReasonCode> {
+    let reason = ReasonCode::decode(buffer)?;
+    if !reason.is_valid_for(packet_type) {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+    Ok(reason)
 }
 
 /// Reads a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
@@ -730,8 +691,70 @@ mod robustness_tests {
         for &(bytes, version) in packets {
             let result = ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
             assert!(
-                matches!(result, Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))),
+                matches!(
+                    result,
+                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                ),
                 "{bytes:02x?} ({version}): {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reason_codes_must_belong_to_their_packet() {
+        // Per packet: one code its table lists, then one it doesn't
+        let cases: [(&str, &[u8], &[u8]); 9] = [
+            (
+                "CONNACK",
+                &[0x20, 0x03, 0x00, 0x87, 0x00],
+                &[0x20, 0x03, 0x00, 0x10, 0x00],
+            ),
+            (
+                "PUBACK",
+                &[0x40, 0x03, 0x00, 0x01, 0x10],
+                &[0x40, 0x03, 0x00, 0x01, 0x92],
+            ),
+            (
+                "PUBREC",
+                &[0x50, 0x03, 0x00, 0x01, 0x91],
+                &[0x50, 0x03, 0x00, 0x01, 0x92],
+            ),
+            (
+                "PUBREL",
+                &[0x62, 0x03, 0x00, 0x01, 0x92],
+                &[0x62, 0x03, 0x00, 0x01, 0x10],
+            ),
+            (
+                "PUBCOMP",
+                &[0x70, 0x03, 0x00, 0x01, 0x92],
+                &[0x70, 0x03, 0x00, 0x01, 0x80],
+            ),
+            (
+                "SUBACK",
+                &[0x90, 0x04, 0x00, 0x01, 0x00, 0x9e],
+                &[0x90, 0x04, 0x00, 0x01, 0x00, 0x11],
+            ),
+            (
+                "UNSUBACK",
+                &[0xb0, 0x04, 0x00, 0x01, 0x00, 0x11],
+                &[0xb0, 0x04, 0x00, 0x01, 0x00, 0x01],
+            ),
+            ("DISCONNECT", &[0xe0, 0x01, 0x8e], &[0xe0, 0x01, 0x92]),
+            ("AUTH", &[0xf0, 0x01, 0x18], &[0xf0, 0x01, 0x87]),
+        ];
+
+        for (name, valid, invalid) in cases {
+            let parse = |bytes: &[u8]| {
+                ControlPacket::parse_with_version(&mut BytesMut::from(bytes), ProtocolVersion::V5)
+            };
+            assert!(parse(valid).is_ok(), "{name}: {:?}", parse(valid));
+            assert!(
+                matches!(
+                    parse(invalid),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{name}: {:?}",
+                parse(invalid)
             );
         }
     }

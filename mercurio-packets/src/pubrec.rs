@@ -107,7 +107,7 @@ impl Decoder for PubRecPacket {
 
             // Reason and properties may be left out (section 3.4.2.1)
             let reason = if buffer.has_remaining() {
-                ReasonCode::decode(buffer)?
+                crate::decode_reason(buffer, PacketType::PubRec)?
             } else {
                 ReasonCode::Success
             };

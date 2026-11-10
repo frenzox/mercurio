@@ -77,7 +77,7 @@ impl Encoder for UnsubAckPayload {
 
 impl Decoder for UnsubAckPayload {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reason_code = ReasonCode::decode(buffer)?;
+        let reason_code = crate::decode_reason(buffer, PacketType::UnsubAck)?;
 
         Ok(UnsubAckPayload { reason_code })
     }
@@ -184,14 +184,14 @@ mod tests {
 
     #[test]
     fn test_unsuback_packet_encode_decode() {
-        let expected = vec![0xb0, 0x04, 0x00, 0x01, 0x00, 0x01];
+        let expected = vec![0xb0, 0x04, 0x00, 0x01, 0x00, 0x11];
 
         let packet = UnsubAckPacket {
             protocol_version: ProtocolVersion::V5,
             packet_id: 1,
             properties: None,
             payload: vec![UnsubAckPayload {
-                reason_code: ReasonCode::GrantedQoS1,
+                reason_code: ReasonCode::NoSubscriptionExisted,
             }],
         };
 

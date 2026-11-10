@@ -288,7 +288,7 @@ impl Decoder for ConnAckPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
             let flags = ConnAckFlags::decode(buffer)?;
-            let reason_code = ReasonCode::decode(buffer)?;
+            let reason_code = crate::decode_reason(buffer, PacketType::ConnAck)?;
             let properties = crate::present(ConnAckProperties::decode(buffer)?);
 
             Ok(ConnAckPacket {

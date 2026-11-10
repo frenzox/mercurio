@@ -101,7 +101,7 @@ impl Decoder for AuthPacket {
         crate::decode_packet(buffer, PacketType::Auth, |_, buffer| {
             // Both reason and properties may be omitted [MQTT-3.15.2-1]
             let reason = if buffer.has_remaining() {
-                ReasonCode::decode(buffer)?
+                crate::decode_reason(buffer, PacketType::Auth)?
             } else {
                 ReasonCode::Success
             };

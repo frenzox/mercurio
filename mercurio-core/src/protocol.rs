@@ -1,6 +1,8 @@
-//! MQTT protocol version handling.
+//! MQTT protocol versions and packet types.
 
 use core::fmt;
+
+use crate::reason::ReasonCode;
 
 /// MQTT protocol version.
 ///
@@ -73,6 +75,59 @@ impl TryFrom<u8> for ProtocolVersion {
             5 => Ok(ProtocolVersion::V5),
             _ => Err(level),
         }
+    }
+}
+
+/// The packet type, the high four bits of the first byte of the fixed
+/// header (section 2.1.2).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketType {
+    Connect = 0x01,
+    ConnAck,
+    Publish,
+    PubAck,
+    PubRec,
+    PubRel,
+    PubComp,
+    Subscribe,
+    SubAck,
+    Unsubscribe,
+    UnsubAck,
+    PingReq,
+    PingResp,
+    Disconnect,
+    Auth,
+}
+
+/// The packet type of the high four bits' value, or a malformed packet for
+/// the reserved value 0 and anything above 15.
+impl TryFrom<u8> for PacketType {
+    type Error = ReasonCode;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        use PacketType::*;
+
+        let res = match value {
+            0x01 => Connect,
+            0x02 => ConnAck,
+            0x03 => Publish,
+            0x04 => PubAck,
+            0x05 => PubRec,
+            0x06 => PubRel,
+            0x07 => PubComp,
+            0x08 => Subscribe,
+            0x09 => SubAck,
+            0x0a => Unsubscribe,
+            0x0b => UnsubAck,
+            0x0c => PingReq,
+            0x0d => PingResp,
+            0x0e => Disconnect,
+            0x0f => Auth,
+            _ => return Err(ReasonCode::MalformedPacket),
+        };
+
+        Ok(res)
     }
 }
 
