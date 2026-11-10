@@ -35,8 +35,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
-use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
-use crate::options::{check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will};
+use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
+use crate::options::{
+    check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
+};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
@@ -57,6 +59,7 @@ enum Command {
     Reauthenticate {
         response: oneshot::Sender<Result<()>>,
     },
+    Ack(AckToken),
 }
 
 /// An MQTT client for connecting to brokers.
@@ -335,6 +338,9 @@ impl MqttClient {
             authenticator: options.authenticator.clone(),
             reauthentication: None,
             pending_events: VecDeque::new(),
+            manual_acks: options.manual_acks,
+            unacknowledged: VecDeque::new(),
+            next_delivery: 0,
         };
         let mut keep_alive = session.keep_alive;
         let mut backoff = options.reconnect_backoff();
@@ -345,23 +351,26 @@ impl MqttClient {
             state.deliver(Event::Disconnected { reason });
             let Some(backoff) = reconnect else { break };
 
+            // Their acknowledgements can't go out any more; the broker
+            // sends the messages again if it kept the session
+            state.unacknowledged.clear();
             // Requests the broker never answered can't be answered now
             state.subscribes.clear();
             state.unsubscribes.clear();
             if let Some(response) = state.reauthentication.take() {
                 let _ = response.send(Err(ClientError::Disconnected));
             }
-            let (connection, session) = match state.reconnect(&mut command_rx, &options, backoff).await
-            {
-                Ok(opened) => opened,
-                Err(Some(error)) => {
-                    state.deliver(Event::Stopped {
-                        error: Arc::new(error),
-                    });
-                    break;
-                }
-                Err(None) => break,
-            };
+            let (connection, session) =
+                match state.reconnect(&mut command_rx, &options, backoff).await {
+                    Ok(opened) => opened,
+                    Err(Some(error)) => {
+                        state.deliver(Event::Stopped {
+                            error: Arc::new(error),
+                        });
+                        break;
+                    }
+                    Err(None) => break,
+                };
             state.connection = connection;
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
@@ -520,6 +529,19 @@ impl MqttClient {
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
+    /// Acknowledges a message received with
+    /// [`manual_acks`](ConnectOptions::manual_acks) on: QoS 1 gets its
+    /// PUBACK and QoS 2 its PUBREC, which also frees its place under the
+    /// Receive Maximum this client announced. Acknowledgements go out in
+    /// the order the messages came, so one waits for those of earlier
+    /// messages. A token from a connection that has ended does nothing.
+    pub async fn ack(&self, token: AckToken) -> Result<()> {
+        self.command_tx
+            .send(Command::Ack(token))
+            .await
+            .map_err(|_| ClientError::SendError)
+    }
+
     /// Disconnect from the broker gracefully.
     pub async fn disconnect(&self) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -551,7 +573,10 @@ impl MqttClient {
     /// subscription, an unsubscription, a re-authentication) waits for the
     /// broker's answer, it reads on and holds the messages that arrive
     /// before the answer, so awaiting a publish between two calls to `recv`
-    /// can't deadlock. No message is dropped while the client lives.
+    /// can't deadlock. No message is dropped while the client lives. With
+    /// [`manual_acks`](ConnectOptions::manual_acks), the QoS 1 and 2
+    /// messages held that way stay within the Receive Maximum the client
+    /// announced, as the broker sends no more before some are acknowledged.
     pub async fn recv(&self) -> Option<Event> {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
@@ -568,9 +593,8 @@ fn check_filters<'a>(filters: impl ExactSizeIterator<Item = &'a str>) -> Result<
     }
     for filter in filters {
         check_length("topic filter", filter)?;
-        validate_subscribe_filter(filter).map_err(|e| {
-            ClientError::InvalidArgument(format!("topic filter `{filter}`: {e}"))
-        })?;
+        validate_subscribe_filter(filter)
+            .map_err(|e| ClientError::InvalidArgument(format!("topic filter `{filter}`: {e}")))?;
     }
     Ok(())
 }
@@ -682,6 +706,23 @@ struct EventLoop {
     reauthentication: Option<oneshot::Sender<Result<()>>>,
     /// Events that didn't fit in the event channel, oldest first
     pending_events: VecDeque<Event>,
+    /// QoS 1 and 2 messages are acknowledged when the application says
+    manual_acks: bool,
+    /// With manual acknowledgement, the QoS 1 and 2 messages delivered on
+    /// this connection and not acknowledged to the broker yet, in the
+    /// order they came
+    unacknowledged: VecDeque<Unacknowledged>,
+    /// Numbers deliveries, so a token never matches a later message that
+    /// reuses its packet identifier
+    next_delivery: u64,
+}
+
+/// A message delivered to the application, awaiting its acknowledgement.
+struct Unacknowledged {
+    token: AckToken,
+    qos: QoS,
+    /// The application acknowledged it, but an earlier message still waits
+    acknowledged: bool,
 }
 
 /// A message the application asked to publish.
@@ -843,6 +884,7 @@ impl EventLoop {
                         Command::Reauthenticate { response } => {
                             self.reauthenticate(response).await;
                         }
+                        Command::Ack(token) => self.acknowledge(token).await,
                         Command::Disconnect { response } => {
                             let result = MqttClient::handle_disconnect(&mut self.connection).await;
                             let _ = response.send(result);
@@ -1033,6 +1075,8 @@ impl EventLoop {
                         Command::Reauthenticate { response } => {
                             let _ = response.send(Err(ClientError::Disconnected));
                         }
+                        // Delivered on a connection that is gone
+                        Command::Ack(_) => {}
                         Command::Disconnect { response } => {
                             let _ = response.send(Ok(()));
                             return Err(None);
@@ -1492,33 +1536,71 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Acknowledges a message the application is done with, and any later
+    /// ones it acknowledged before: acknowledgements go out in the order
+    /// the messages came [MQTT-4.6.0-2, MQTT-4.6.0-3]. A token from an
+    /// earlier connection, or used already, matches nothing.
+    async fn acknowledge(&mut self, token: AckToken) {
+        let Some(entry) = self.unacknowledged.iter_mut().find(|u| u.token == token) else {
+            return;
+        };
+        entry.acknowledged = true;
+        while self.unacknowledged.front().is_some_and(|u| u.acknowledged) {
+            let entry = self.unacknowledged.pop_front().expect("checked above");
+            // A failed write ends the connection, and the broker sends the
+            // messages again
+            if self
+                .send_acknowledgement(entry.token.packet_id, entry.qos)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// PUBACK for QoS 1; PUBREC for QoS 2, which then awaits PUBREL.
+    async fn send_acknowledgement(&mut self, packet_id: u16, qos: QoS) -> Result<()> {
+        let packet = if qos == QoS::ExactlyOnce {
+            self.incoming_qos2.insert(packet_id);
+            ControlPacket::PubRec(PubRecPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            })
+        } else {
+            ControlPacket::PubAck(PubAckPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            })
+        };
+        self.connection.write_packet(packet).await
+    }
+
+    /// QoS 1 and 2 messages the broker has sent and this client hasn't
+    /// fully acknowledged.
+    fn incoming_in_flight(&self) -> usize {
+        self.unacknowledged.len() + self.incoming_qos2.len()
+    }
+
     async fn handle_publish(&mut self, mut publish: PublishPacket) -> Result<()> {
         self.resolve_topic_alias(&mut publish)?;
         debug!("Received PUBLISH on topic: {}", publish.topic_name);
 
+        let mut ack = None;
         let deliver = match (publish.qos_level, publish.packet_id) {
-            (QoS::AtLeastOnce, Some(packet_id)) => {
-                self.connection
-                    .write_packet(ControlPacket::PubAck(PubAckPacket {
-                        packet_id,
-                        reason: ReasonCode::Success,
-                        properties: None,
-                    }))
-                    .await?;
-                true
+            (QoS::AtLeastOnce | QoS::ExactlyOnce, Some(packet_id))
+                if self
+                    .unacknowledged
+                    .iter()
+                    .any(|u| u.token.packet_id == packet_id) =>
+            {
+                // Sent again before the application acknowledged it
+                false
             }
-            (QoS::ExactlyOnce, Some(packet_id)) => {
-                // The broker must stay within this client's Receive Maximum
-                // [MQTT-3.3.4-9]
-                if !self.incoming_qos2.contains(&packet_id)
-                    && self.incoming_qos2.len() >= usize::from(self.receive_maximum)
-                {
-                    return Err(ClientError::BrokerViolation(
-                        ReasonCode::ReceiveMaximumExceeded,
-                    ));
-                }
-                // A retransmission before PUBREL was already delivered once
-                let first_delivery = self.incoming_qos2.insert(packet_id);
+            (QoS::ExactlyOnce, Some(packet_id)) if self.incoming_qos2.contains(&packet_id) => {
+                // Delivered once already; only the PUBREC went missing
                 self.connection
                     .write_packet(ControlPacket::PubRec(PubRecPacket {
                         packet_id,
@@ -1526,7 +1608,33 @@ impl EventLoop {
                         properties: None,
                     }))
                     .await?;
-                first_delivery
+                false
+            }
+            (qos @ (QoS::AtLeastOnce | QoS::ExactlyOnce), Some(packet_id)) => {
+                // The broker must stay within this client's Receive Maximum
+                // [MQTT-3.3.4-9]; QoS 1 messages count while unacknowledged
+                let counted = self.manual_acks || qos == QoS::ExactlyOnce;
+                if counted && self.incoming_in_flight() >= usize::from(self.receive_maximum) {
+                    return Err(ClientError::BrokerViolation(
+                        ReasonCode::ReceiveMaximumExceeded,
+                    ));
+                }
+                if self.manual_acks {
+                    self.next_delivery += 1;
+                    let token = AckToken {
+                        delivery: self.next_delivery,
+                        packet_id,
+                    };
+                    self.unacknowledged.push_back(Unacknowledged {
+                        token,
+                        qos,
+                        acknowledged: false,
+                    });
+                    ack = Some(token);
+                } else {
+                    self.send_acknowledgement(packet_id, qos).await?;
+                }
+                true
             }
             _ => true,
         };
@@ -1549,6 +1657,7 @@ impl EventLoop {
                 retain: publish.retain,
                 properties: MessageProperties::from_publish(publish.properties),
                 subscription_ids,
+                ack,
             });
         }
         Ok(())

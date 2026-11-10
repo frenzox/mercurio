@@ -416,6 +416,7 @@ impl Bridge {
                     retain,
                     properties,
                     subscription_ids,
+                    ..
                 } => {
                     // MQTT 3.1.1 brokers send no subscription identifiers
                     let route = match subscription_ids.first() {

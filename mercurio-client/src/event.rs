@@ -19,6 +19,10 @@ pub enum Event {
         properties: MessageProperties,
         /// Identifiers of the matching subscriptions that have one
         subscription_ids: Vec<u32>,
+        /// With [`manual_acks`](crate::ConnectOptions::manual_acks) on, what
+        /// to pass to [`MqttClient::ack`](crate::MqttClient::ack) once the
+        /// message is taken care of; `None` for QoS 0 and otherwise.
+        ack: Option<AckToken>,
     },
 
     /// The connection ended. With reconnection on, the client tries again
@@ -36,6 +40,15 @@ pub enum Event {
     ///
     /// [`MqttClient::recv`]: crate::MqttClient::recv
     Stopped { error: Arc<ClientError> },
+}
+
+/// Identifies a received message to acknowledge, with manual
+/// acknowledgement on. Only the connection it came on can acknowledge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckToken {
+    /// Counts deliveries for the whole life of the client
+    pub(crate) delivery: u64,
+    pub(crate) packet_id: u16,
 }
 
 /// Reason for disconnection.

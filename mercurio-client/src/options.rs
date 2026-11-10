@@ -305,6 +305,7 @@ pub struct ConnectOptions {
     pub(crate) reconnect_delay: Option<Duration>,
     pub(crate) reconnect_max: Option<Duration>,
     pub(crate) write_timeout: Option<Duration>,
+    pub(crate) manual_acks: bool,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
@@ -336,6 +337,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("reconnect_delay", &self.reconnect_delay)
             .field("reconnect_max", &self.reconnect_max)
             .field("write_timeout", &self.write_timeout)
+            .field("manual_acks", &self.manual_acks)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
@@ -398,6 +400,7 @@ impl ConnectOptions {
             reconnect_delay: None,
             reconnect_max: None,
             write_timeout: None,
+            manual_acks: false,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
@@ -533,10 +536,32 @@ impl ConnectOptions {
         ))
     }
 
-    /// Most QoS 2 messages the broker may have in flight to this client at
-    /// once. MQTT 5 only.
+    /// Most QoS 2 messages, and with manual acknowledgement QoS 1 ones too,
+    /// the broker may have in flight to this client at once. MQTT 5 only.
     pub fn receive_maximum(mut self, maximum: u16) -> Self {
         self.receive_maximum = Some(maximum);
+        self
+    }
+
+    /// Acknowledge QoS 1 and 2 messages only when the application calls
+    /// [`MqttClient::ack`] with the token each `Event::Message` carries,
+    /// rather than on receipt. A message counts against
+    /// [`receive_maximum`](Self::receive_maximum) until acknowledged, so
+    /// an MQTT 5 broker holds further messages back while the application
+    /// works on as many as it allows.
+    ///
+    /// A message that is never acknowledged, as when its event is dropped,
+    /// keeps its place under Receive Maximum and holds back the
+    /// acknowledgements of every later message, which go out in order,
+    /// until the connection ends. Messages unacknowledged when the
+    /// connection ends are forgotten; their tokens do nothing any more,
+    /// and a broker that kept the session sends them again after
+    /// reconnecting, as new events with new tokens. Processing then
+    /// acknowledging gives at-least-once delivery, for QoS 2 too.
+    ///
+    /// [`MqttClient::ack`]: crate::MqttClient::ack
+    pub fn manual_acks(mut self, manual: bool) -> Self {
+        self.manual_acks = manual;
         self
     }
 
