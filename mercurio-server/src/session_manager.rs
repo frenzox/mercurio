@@ -104,8 +104,28 @@ impl State {
             client_id: client_id.to_string(),
             session: guard.session(),
             connected: self.connections.contains_key(client_id),
-            generation: self.connections.get(client_id).map(|slot| slot.generation),
+            generation: self
+                .connections
+                .get(client_id)
+                .map(|slot| slot.holder.generation),
             restored_will: self.restored_wills.contains(client_id),
+        }
+    }
+
+    /// Lets go of the claim of `generation` on `client_id`, wherever it
+    /// stands. The latest claim hands the id back to the one it replaced,
+    /// and the id is free once no claim is left.
+    fn let_go(&mut self, client_id: &str, generation: u64) {
+        let Some(slot) = self.connections.get_mut(client_id) else {
+            return;
+        };
+        if slot.holder.generation != generation {
+            slot.replaced
+                .retain(|holder| holder.generation != generation);
+        } else if let Some(previous) = slot.replaced.pop() {
+            slot.holder = previous;
+        } else {
+            self.connections.remove(client_id);
         }
     }
 }
@@ -146,12 +166,21 @@ pub(crate) enum DeleteRefused {
 struct ConnectionSlot {
     /// Held by the active connection until it has fully shut down
     lease: Arc<Mutex<()>>,
-    /// Tells the active connection to close, and why
+    /// The latest connection to claim this client id
+    holder: Holder,
+    /// The claims `holder` replaced that are still around, oldest first:
+    /// the connection being taken over and claims waiting for it. The id
+    /// goes back to the latest of them when `holder` lets go of it.
+    replaced: Vec<Holder>,
+}
+
+/// A connection's claim on a client id.
+struct Holder {
+    /// Tells the connection to close, and why
     close: watch::Sender<Option<Close>>,
-    /// Identifies the latest connection to acquire this client id
+    /// Identifies the connection
     generation: u64,
-    /// Whom the latest connection to acquire this client id starts its
-    /// session for; None while the admin API holds the id
+    /// Whom the connection starts its session for; None for the admin API
     owner: Option<SessionOwner>,
 }
 
@@ -162,15 +191,11 @@ struct PendingLease {
     client_id: String,
     generation: u64,
     close: watch::Receiver<Option<Close>>,
-    /// What the slot held before the claim, handed back on giving up. Kept
-    /// only by claims that can give up: it holds the close sender of the
-    /// previous connection open
-    previous: Option<(watch::Sender<Option<Close>>, u64, Option<SessionOwner>)>,
 }
 
 /// How `acquire_client_id` ended.
-enum Acquired {
-    Lease(ConnectionLease),
+enum Acquired<S: BatchStore + 'static> {
+    Lease(Claim<S>),
     /// The id belongs to the session of this other owner
     OwnedBy(SessionOwner),
     /// The connection using the id didn't let go of it in time
@@ -220,40 +245,48 @@ pub(crate) struct ConnectionLease {
     pub close: watch::Receiver<Option<Close>>,
 }
 
-/// A client id claimed for a connection whose session is still starting.
-/// Gives the id back unless kept, also when the start is abandoned midway,
-/// so a failed start leaves no slot that refuses other owners.
-struct Claimed<S: BatchStore + 'static> {
+/// A connection's claim on a client id until its session has started.
+/// Let go of unless kept, also when the connection gives up or is
+/// abandoned midway, so it leaves no slot behind that refuses other owners.
+struct Claim<S: BatchStore + 'static> {
     manager: SessionManager<S>,
-    lease: Option<ConnectionLease>,
+    client_id: String,
+    generation: u64,
+    close: watch::Receiver<Option<Close>>,
+    /// Held once the connection that had the id before has finished
+    guard: Option<OwnedMutexGuard<()>>,
+    kept: bool,
 }
 
-impl<S: BatchStore + 'static> Claimed<S> {
+impl<S: BatchStore + 'static> Claim<S> {
     fn keep(mut self) -> ConnectionLease {
-        self.lease.take().expect("a claim is kept once")
-    }
-
-    async fn give_back(mut self) {
-        if let Some(lease) = self.lease.take() {
-            self.manager
-                .release(lease.guard, &lease.client_id, lease.generation)
-                .await;
+        self.kept = true;
+        ConnectionLease {
+            guard: self.guard.take().expect("a claim is kept once leased"),
+            client_id: std::mem::take(&mut self.client_id),
+            generation: self.generation,
+            close: self.close.clone(),
         }
     }
+
+    async fn let_go(mut self) {
+        self.kept = true;
+        drop(self.guard.take());
+        self.manager.let_go(&self.client_id, self.generation).await;
+    }
 }
 
-impl<S: BatchStore + 'static> Drop for Claimed<S> {
+impl<S: BatchStore + 'static> Drop for Claim<S> {
     fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else {
+        if self.kept {
             return;
-        };
+        }
+        drop(self.guard.take());
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let manager = self.manager.clone();
-            runtime.spawn(async move {
-                manager
-                    .release(lease.guard, &lease.client_id, lease.generation)
-                    .await;
-            });
+            let client_id = std::mem::take(&mut self.client_id);
+            let generation = self.generation;
+            runtime.spawn(async move { manager.let_go(&client_id, generation).await });
         }
     }
 }
@@ -355,12 +388,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
         let storage_error =
             |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e.to_string()));
-        let lease = match self
+        let claim = match self
             .acquire_client_id(&connect_packet.payload.client_id, &owner)
             .await
             .map_err(storage_error)?
         {
-            Acquired::Lease(lease) => lease,
+            Acquired::Lease(claim) => claim,
             Acquired::Busy => return Err(StartError::Busy),
             Acquired::OwnedBy(holder) => {
                 warn!(
@@ -373,11 +406,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
         };
 
-        let generation = lease.generation;
-        let claimed = Claimed {
-            manager: self.clone(),
-            lease: Some(lease),
-        };
+        let generation = claim.generation;
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
 
@@ -417,7 +446,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     Ok(None) => {}
                     Err(e) => {
                         drop(manager);
-                        claimed.give_back().await;
+                        claim.let_go().await;
                         return Err(storage_error(e));
                     }
                 }
@@ -488,7 +517,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             resume,
             assigned_client_id,
             subscriptions_to_restore,
-            lease: claimed.keep(),
+            lease: claim.keep(),
             inflight_to_retry,
         })
     }
@@ -534,7 +563,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         &self,
         client_id: &str,
         owner: &SessionOwner,
-    ) -> mercurio_storage::Result<Acquired> {
+    ) -> mercurio_storage::Result<Acquired<S>> {
         let pending = {
             let mut manager = self.shared.state.lock().await;
             if let Some(holder) = self.holder(&manager, client_id).await? {
@@ -552,7 +581,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         Ok(
             match self.wait_for_lease(pending, self.takeover_wait).await {
-                Some(lease) => Acquired::Lease(lease),
+                Some(claim) => Acquired::Lease(claim),
                 None => Acquired::Busy,
             },
         )
@@ -568,7 +597,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         if let Some(owner) = state
             .connections
             .get(client_id)
-            .and_then(|slot| slot.owner.clone())
+            .and_then(|slot| slot.holder.owner.clone())
         {
             return Ok(Some(owner));
         }
@@ -606,48 +635,45 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
             Self::claim(&mut manager, client_id, reason, None)
         };
-        Some((self.wait_for_lease(pending, wait).await?, held))
+        let claim = self.wait_for_lease(pending, wait).await?;
+        Some((claim.keep(), held))
     }
 
     /// Waits until the connection that held the id before `pending` claimed
     /// it has finished. With a `wait`, gives up once it hasn't in that time
-    /// and hands the slot back to it, so its release frees the id, unless a
-    /// later claim replaced this one meanwhile.
+    /// and lets go of the claim, handing the id back to the claim it
+    /// replaced if it is still the latest.
     async fn wait_for_lease(
         &self,
         pending: PendingLease,
         wait: Option<Duration>,
-    ) -> Option<ConnectionLease> {
+    ) -> Option<Claim<S>> {
         let PendingLease {
             lease,
             client_id,
             generation,
             close,
-            previous,
         } = pending;
-        let previous = previous.filter(|_| wait.is_some());
+        let mut claim = Claim {
+            manager: self.clone(),
+            client_id,
+            generation,
+            close,
+            guard: None,
+            kept: false,
+        };
         let guard = match wait {
             Some(wait) => match time::timeout(wait, lease.lock_owned()).await {
                 Ok(guard) => guard,
                 Err(_) => {
-                    let mut manager = self.shared.state.lock().await;
-                    let slot = manager.connections.get_mut(&client_id);
-                    if let (Some(slot), Some(previous)) = (slot, previous) {
-                        if slot.generation == generation {
-                            (slot.close, slot.generation, slot.owner) = previous;
-                        }
-                    }
+                    claim.let_go().await;
                     return None;
                 }
             },
             None => lease.lock_owned().await,
         };
-        Some(ConnectionLease {
-            guard,
-            client_id,
-            generation,
-            close,
-        })
+        claim.guard = Some(guard);
+        Some(claim)
     }
 
     /// Makes a new connection of `owner` the one holding `client_id` and
@@ -660,31 +686,38 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         owner: Option<SessionOwner>,
     ) -> (PendingLease, bool) {
         let (close_tx, close) = watch::channel(None);
-        let held = state.connections.contains_key(client_id);
         state.next_generation += 1;
         let generation = state.next_generation;
-        let slot = state
-            .connections
-            .entry(client_id.to_string())
-            .or_insert_with(|| ConnectionSlot {
-                lease: Arc::new(Mutex::new(())),
-                close: watch::channel(None).0,
-                generation,
-                owner: None,
-            });
-        slot.close
-            .send_modify(|pending| merge_close(pending, reason));
-        let previous = Some((
-            std::mem::replace(&mut slot.close, close_tx),
-            std::mem::replace(&mut slot.generation, generation),
-            std::mem::replace(&mut slot.owner, owner),
-        ));
+        let holder = Holder {
+            close: close_tx,
+            generation,
+            owner,
+        };
+        let (lease, held) = match state.connections.entry(client_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let slot = e.get_mut();
+                slot.holder
+                    .close
+                    .send_modify(|pending| merge_close(pending, reason));
+                let previous = std::mem::replace(&mut slot.holder, holder);
+                slot.replaced.push(previous);
+                (Arc::clone(&slot.lease), true)
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let lease = Arc::new(Mutex::new(()));
+                e.insert(ConnectionSlot {
+                    lease: Arc::clone(&lease),
+                    holder,
+                    replaced: Vec::new(),
+                });
+                (lease, false)
+            }
+        };
         let pending = PendingLease {
-            lease: Arc::clone(&slot.lease),
+            lease,
             client_id: client_id.to_string(),
             generation,
             close,
-            previous,
         };
         (pending, held)
     }
@@ -730,17 +763,15 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
     }
 
-    /// Gives the client id back, unless a newer connection took it since.
+    /// Gives the client id back once the connection of `generation` has
+    /// finished with it.
     async fn release(&self, guard: OwnedMutexGuard<()>, client_id: &str, generation: u64) {
         drop(guard);
-        let mut manager = self.shared.state.lock().await;
-        if manager
-            .connections
-            .get(client_id)
-            .is_some_and(|slot| slot.generation == generation)
-        {
-            manager.connections.remove(client_id);
-        }
+        self.let_go(client_id, generation).await;
+    }
+
+    async fn let_go(&self, client_id: &str, generation: u64) {
+        self.shared.state.lock().await.let_go(client_id, generation);
     }
 
     /// Asks the connection using `client_id` to close. False if none does.
@@ -749,7 +780,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let Some(slot) = manager.connections.get(client_id) else {
             return false;
         };
-        slot.close
+        slot.holder
+            .close
             .send_modify(|pending| merge_close(pending, close));
         true
     }
@@ -766,11 +798,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let Some(slot) = manager
             .connections
             .get(client_id)
-            .filter(|slot| slot.generation == generation)
+            .filter(|slot| slot.holder.generation == generation)
         else {
             return false;
         };
-        slot.close
+        slot.holder
+            .close
             .send_modify(|pending| merge_close(pending, close));
         true
     }
@@ -1051,7 +1084,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             && manager
                 .connections
                 .get(client_id)
-                .is_some_and(|slot| slot.generation != generation);
+                .is_some_and(|slot| slot.holder.generation != generation);
         let resumed_since = match manager.sessions.get(client_id) {
             Some(session) => session.session().generation().await != generation,
             None => false,
@@ -1978,20 +2011,18 @@ mod tests {
 
         let deleting = manager.clone();
         let deletion = tokio::spawn(async move { deleting.delete_session("c", true).await });
-        // The deletion's claim replaces the sender once it has set the close
+        let dropped_will = Some(Close::Admin {
+            reason: ReasonCode::AdministrativeAction,
+            send_will: false,
+        });
         let close = &mut started.lease.close;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while close.changed().await.is_ok() {}
-        })
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            close.wait_for(|c| *c == dropped_will),
+        )
         .await
+        .unwrap()
         .unwrap();
-        assert_eq!(
-            *close.borrow(),
-            Some(Close::Admin {
-                reason: ReasonCode::AdministrativeAction,
-                send_will: false,
-            })
-        );
 
         manager.end_connection(started.lease, None).await;
         assert_eq!(deletion.await.unwrap(), Ok(()));
@@ -2096,6 +2127,75 @@ mod tests {
         assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
         manager.end_connection(first.lease, None).await;
         assert!(second.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_takeovers_that_all_give_up_leave_the_client_id_free() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        manager.takeover_wait = Some(Duration::from_millis(100));
+        let first = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+
+        // The earlier takeover gives up first, while the later one still
+        // holds the claim
+        let mut takeovers = Vec::new();
+        for _ in 0..2 {
+            let claimed = manager.entry("c").await.unwrap().generation;
+            let mut taking_over = manager.clone();
+            takeovers.push(tokio::spawn(async move {
+                taking_over
+                    .start_session(connect_packet("c"), SessionOwner::default())
+                    .await
+                    .map(|_| ())
+            }));
+            while manager.entry("c").await.unwrap().generation == claimed {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        for takeover in takeovers {
+            assert!(matches!(takeover.await.unwrap(), Err(StartError::Busy)));
+        }
+        assert_eq!(
+            manager.entry("c").await.unwrap().generation,
+            Some(first.lease.generation)
+        );
+
+        manager.end_connection(first.lease, None).await;
+        assert!(!manager.entry("c").await.unwrap().connected);
+        manager.delete_session("c", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_abandoned_takeover_hands_the_client_id_back() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let first = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let mut taking_over = manager.clone();
+        let takeover = tokio::spawn(async move {
+            taking_over
+                .start_session(connect_packet("c"), SessionOwner::default())
+                .await
+                .map(|_| ())
+        });
+        let mut close = first.lease.close.clone();
+        close.changed().await.unwrap();
+        takeover.abort();
+        let _ = takeover.await;
+
+        let handed_back = Some(first.lease.generation);
+        for _ in 0..100 {
+            if manager.entry("c").await.unwrap().generation == handed_back {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.entry("c").await.unwrap().generation, handed_back);
+        manager.end_connection(first.lease, None).await;
+        assert!(!manager.entry("c").await.unwrap().connected);
     }
 
     #[tokio::test]
