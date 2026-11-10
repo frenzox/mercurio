@@ -107,8 +107,9 @@ pub trait Plugin {
 
     /// Handles a message published to `$CONTROL/<name>/<path>`, once the
     /// client may publish there, when the plugin registered
-    /// [`Hooks::ON_CONTROL`]. A returned payload is published to
-    /// `$CONTROL/<name>/<path>/response`; the default returns none.
+    /// [`Hooks::ON_CONTROL`]. A returned payload goes only to that client:
+    /// on the request's Response Topic with its Correlation Data, or else on
+    /// `$CONTROL/<name>/<path>/response`. The default returns none.
     ///
     /// A client publishing to `$CONTROL/<name>/x/response` reaches this
     /// hook with path `"x/response"`, so a plugin that only answers

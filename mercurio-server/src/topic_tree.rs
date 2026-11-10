@@ -182,11 +182,39 @@ impl<T: Clone> TopicTree<T> {
     /// Returns the subscribers of every filter matching `topic`, once per
     /// matching filter.
     pub fn matching(&self, topic: &str) -> Matches<T> {
-        let root = self.root.read().unwrap();
         let mut matches = Matches {
             regular: Vec::new(),
             shared: Vec::new(),
         };
+        self.walk(topic, |node| node.collect(&mut matches));
+        matches
+    }
+
+    /// Returns every subscriber accepted by `keep` among those of the
+    /// filters matching `topic`, including all members of share groups.
+    /// Unlike `matching`, it leaves the share groups' turns alone.
+    pub fn matching_where(&self, topic: &str, keep: impl Fn(&T) -> bool) -> Vec<T> {
+        let mut found = Vec::new();
+        self.walk(topic, |node| {
+            let members = node
+                .shared
+                .values()
+                .flat_map(|g| &g.members)
+                .map(|(_, m)| m);
+            found.extend(
+                node.subscribers
+                    .values()
+                    .chain(members)
+                    .filter(|s| keep(s))
+                    .cloned(),
+            );
+        });
+        found
+    }
+
+    /// Calls `visit` on the node of every filter matching `topic`.
+    fn walk(&self, topic: &str, mut visit: impl FnMut(&TopicNode<T>)) {
+        let root = self.root.read().unwrap();
 
         // Use SmallVec to avoid heap allocation for typical topic depths (< 8 levels)
         let mut stack: SmallVec<[(&TopicNode<T>, usize); 8]> = SmallVec::new();
@@ -197,11 +225,11 @@ impl<T: Clone> TopicTree<T> {
 
         while let Some((node, depth)) = stack.pop() {
             if depth == target_depth {
-                node.collect(&mut matches);
+                visit(node);
 
                 // "a/#" also matches "a" itself
                 if let Some(wildcard) = node.children.get("#") {
-                    wildcard.collect(&mut matches);
+                    visit(wildcard);
                 }
                 continue;
             }
@@ -222,11 +250,9 @@ impl<T: Clone> TopicTree<T> {
 
             // Multi-level wildcard (#) matches the remainder of the topic
             if let Some(child) = node.children.get("#") {
-                child.collect(&mut matches);
+                visit(child);
             }
         }
-
-        matches
     }
 }
 
@@ -301,6 +327,20 @@ mod tests {
 
         assert_eq!(matching(&tree, "$SYS/monitor/clients"), ["sys", "sys-plus"]);
         assert_eq!(matching(&tree, "a/monitor/clients"), ["all", "plus"]);
+    }
+
+    #[test]
+    fn test_matching_where_leaves_share_turns_alone() {
+        let tree = TopicTree::new();
+        tree.subscribe("$share/g/a/b", 1, "one");
+        tree.subscribe("$share/g/a/b", 2, "two");
+        tree.subscribe("a/+", 3, "plain");
+
+        for _ in 0..3 {
+            assert_eq!(tree.matching_where("a/b", |m| *m == "two"), ["two"]);
+        }
+        assert_eq!(tree.matching("a/b").shared, ["one"]);
+        assert_eq!(tree.matching("a/b").shared, ["two"]);
     }
 
     #[test]

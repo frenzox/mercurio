@@ -2,12 +2,15 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder, properties::UserProperty, protocol::ProtocolVersion, qos::QoS,
+    codec::Encoder,
+    properties::{CorrelationData, ResponseTopic, UserProperty},
+    protocol::ProtocolVersion,
+    qos::QoS,
     reason::ReasonCode,
 };
 use mercurio_packets::{
     connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
-    publish::PublishPacket,
+    publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
 };
@@ -126,6 +129,22 @@ impl Client {
             Some(ControlPacket::PubAck(ack)) => ack.reason,
             other => panic!("Expected PUBACK, got {other:?}"),
         }
+    }
+
+    /// Publishes a request at QoS 0, so no PUBACK races the answer.
+    async fn request(
+        &mut self,
+        topic: &str,
+        payload: &'static [u8],
+        properties: PublishProperties,
+    ) {
+        self.send(ControlPacket::Publish(PublishPacket {
+            topic_name: topic.into(),
+            payload: Some(Bytes::from_static(payload)),
+            properties: Some(properties),
+            ..Default::default()
+        }))
+        .await;
     }
 }
 
@@ -280,25 +299,92 @@ impl Plugin for Echo {
 }
 
 #[tokio::test]
-async fn control_requests_are_answered_and_not_routed() {
+async fn control_requests_are_answered_to_the_requester_only() {
     let addr = start_broker(vec![Arc::new(Echo::default())]).await;
-    // A separate listener, so the PUBACK and the response can't race on one
-    // connection
     let mut listener = Client::connect(addr, "listener").await;
     listener.subscribe("$CONTROL/echo/#").await;
     let mut admin = Client::connect(addr, "admin").await;
+    admin.subscribe("$CONTROL/echo/#").await;
 
-    assert_eq!(
-        admin.publish("$CONTROL/echo/v1", b"ping").await,
-        ReasonCode::Success
-    );
-    let Some(ControlPacket::Publish(answer)) = listener.receive().await else {
+    admin
+        .request("$CONTROL/echo/v1", b"ping", PublishProperties::default())
+        .await;
+    let Some(ControlPacket::Publish(answer)) = admin.receive().await else {
         panic!("Expected the response");
     };
     assert_eq!(answer.topic_name, "$CONTROL/echo/v1/response");
     assert_eq!(answer.payload.as_deref(), Some(&b"PING"[..]));
-    // The request itself wasn't sent to subscribers
+    // Neither the request nor the answer reaches anyone else
     assert!(listener.receive().await.is_none());
+}
+
+#[tokio::test]
+async fn control_responses_follow_the_response_topic() {
+    let addr = start_broker(vec![Arc::new(Echo::default())]).await;
+    let mut admin = Client::connect(addr, "admin").await;
+    admin.subscribe("replies/admin").await;
+
+    admin
+        .request(
+            "$CONTROL/echo/v1",
+            b"ping",
+            PublishProperties {
+                response_topic: Some(ResponseTopic::new("replies/admin".into())),
+                correlation_data: Some(CorrelationData::new(Bytes::from_static(b"42"))),
+                ..Default::default()
+            },
+        )
+        .await;
+    let Some(ControlPacket::Publish(answer)) = admin.receive().await else {
+        panic!("Expected the response");
+    };
+    assert_eq!(answer.topic_name, "replies/admin");
+    assert_eq!(answer.payload.as_deref(), Some(&b"PING"[..]));
+    let correlation = answer.properties.and_then(|p| p.correlation_data);
+    assert_eq!(
+        correlation.map(|c| c.value),
+        Some(Bytes::from_static(b"42"))
+    );
+}
+
+#[tokio::test]
+async fn control_responses_reach_requesters_in_share_groups() {
+    let addr = start_broker(vec![Arc::new(Echo::default())]).await;
+    let mut admin = Client::connect(addr, "admin").await;
+    admin.subscribe("$share/g/replies/#").await;
+    let mut other = Client::connect(addr, "other").await;
+    other.subscribe("$share/g/replies/#").await;
+
+    for _ in 0..3 {
+        admin
+            .request(
+                "$CONTROL/echo/v1",
+                b"ping",
+                PublishProperties {
+                    response_topic: Some(ResponseTopic::new("replies/admin".into())),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+    for _ in 0..3 {
+        let Some(ControlPacket::Publish(answer)) = admin.receive().await else {
+            panic!("Expected the response");
+        };
+        assert_eq!(answer.topic_name, "replies/admin");
+    }
+    assert!(other.receive().await.is_none());
+}
+
+#[tokio::test]
+async fn control_responses_need_a_matching_subscription() {
+    let addr = start_broker(vec![Arc::new(Echo::default())]).await;
+    let mut admin = Client::connect(addr, "admin").await;
+
+    admin
+        .request("$CONTROL/echo/v1", b"ping", PublishProperties::default())
+        .await;
+    assert!(admin.receive().await.is_none());
 }
 
 #[tokio::test]

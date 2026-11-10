@@ -132,6 +132,15 @@ impl<S: RetainedMessageStore> Broker<S> {
         }
         Ok(matches.len())
     }
+
+    /// Delivers a message only to the session `session_id`, through its
+    /// subscriptions matching `topic`. Nothing is retained.
+    pub(crate) fn publish_to(&self, topic: &str, message: Message, session_id: u64) {
+        let own = self
+            .subscriptions
+            .matching_where(topic, |s| s.session_id == session_id);
+        Subscriber::deliver(&own, message, None);
+    }
 }
 
 #[cfg(test)]
