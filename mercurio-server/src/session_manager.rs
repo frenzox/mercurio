@@ -977,6 +977,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     /// Discards the session of `client_id` unless a connection newer than
     /// `generation` has used it since. An expiry timer passes its `timer`
     /// token, and does nothing once deletion or a newer timer retired it.
+    /// Without a timer, the connection of `generation` ends its own session,
+    /// even when a new one waits to take it over [MQTT-3.1.2-6].
     async fn end_session(&self, client_id: &str, generation: u64, timer: Option<u64>) -> bool {
         let mut manager = self.shared.state.lock().await;
         if let Some(token) = timer {
@@ -985,10 +987,11 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
             manager.expiry_timers.remove(client_id);
         }
-        let connected_since = manager
-            .connections
-            .get(client_id)
-            .is_some_and(|slot| slot.generation != generation);
+        let connected_since = timer.is_some()
+            && manager
+                .connections
+                .get(client_id)
+                .is_some_and(|slot| slot.generation != generation);
         let resumed_since = match manager.sessions.get(client_id) {
             Some(session) => session.session().generation().await != generation,
             None => false,
@@ -1850,6 +1853,29 @@ mod tests {
         assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
         manager.end_connection(first.lease, None).await;
         assert!(second.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_a_session_without_expiry_ends_under_a_waiting_takeover() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let first = manager
+            .start_session(clean("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let mut taking_over = manager.clone();
+        let second = tokio::spawn(async move {
+            taking_over
+                .start_session(resuming("c"), SessionOwner::default())
+                .await
+                .map(|started| started.resume)
+        });
+        let mut close = first.lease.close.clone();
+        close.changed().await.unwrap();
+
+        manager
+            .end_connection(first.lease, Some(Duration::ZERO))
+            .await;
+        assert!(!second.await.unwrap().unwrap(), "the ended session resumed");
     }
 
     #[tokio::test]
