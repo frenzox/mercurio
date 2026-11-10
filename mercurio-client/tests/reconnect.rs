@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use mercurio_client::{ConnectOptions, DisconnectReason, Event, MqttClient, QoS};
+use mercurio_client::{
+    ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ProtocolVersion, QoS,
+};
+use mercurio_core::reason::ReasonCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -210,4 +213,68 @@ async fn resent_messages_respect_a_lowered_receive_maximum() {
     b.unwrap();
     client.disconnect().await.unwrap();
     broker.await.unwrap();
+}
+
+/// Drops the first connection, refuses the reconnections with each of
+/// `refusals` in turn, then takes the client back.
+async fn refusing_broker(
+    listener: TcpListener,
+    protocol: ProtocolVersion,
+    refusals: Vec<u8>,
+) -> TcpStream {
+    drop(accept(&listener, false).await);
+    let connack = |code| match protocol {
+        ProtocolVersion::V5 => vec![0x20, 0x03, 0x00, code, 0x00],
+        _ => vec![0x20, 0x02, 0x00, code],
+    };
+    for code in refusals {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket.write_all(&connack(code)).await.unwrap();
+    }
+    let (mut socket, _) = listener.accept().await.unwrap();
+    read_packet(&mut socket).await;
+    socket.write_all(&connack(0)).await.unwrap();
+    socket
+}
+
+async fn events_until_none(client: &MqttClient) -> Vec<Event> {
+    let mut events = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => return events,
+            Err(_) => panic!("the client neither stopped nor sent more: {events:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_permanent_refusal_stops_the_client_with_its_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Not authorized, then a connection the client must not come back for
+    let _broker = tokio::spawn(refusing_broker(listener, ProtocolVersion::V5, vec![0x87]));
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap();
+
+    let events = events_until_none(&client).await;
+    assert!(matches!(events[0], Event::Disconnected { .. }), "{events:?}");
+    let Event::Stopped { error } = &events[1] else {
+        panic!("no final event: {events:?}");
+    };
+    assert!(
+        matches!(
+            **error,
+            ClientError::ConnectionRefused(ReasonCode::NotAuthorized)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(events.len(), 2, "{events:?}");
 }

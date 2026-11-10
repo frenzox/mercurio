@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -340,10 +341,16 @@ impl MqttClient {
             if let Some(response) = state.reauthentication.take() {
                 let _ = response.send(Err(ClientError::Disconnected));
             }
-            let Some((connection, session)) =
-                state.reconnect(&mut command_rx, &options, delay).await
-            else {
-                break;
+            let (connection, session) = match state.reconnect(&mut command_rx, &options, delay).await
+            {
+                Ok(opened) => opened,
+                Err(Some(error)) => {
+                    state.deliver(Event::Stopped {
+                        error: Arc::new(error),
+                    });
+                    break;
+                }
+                Err(None) => break,
             };
             state.connection = connection;
             state.limits = session.limits;
@@ -583,6 +590,15 @@ fn should_reconnect(reason: &DisconnectReason) -> bool {
         ),
         _ => true,
     }
+}
+
+/// Whether a failed reconnection attempt means the broker won't take the
+/// client back.
+fn refused_for_good(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ConnectionRefused(_) | ClientError::Redirected { .. }
+    )
 }
 
 /// A QoS 1 or 2 message sent to the broker and not acknowledged yet.
@@ -943,13 +959,14 @@ impl EventLoop {
 
     /// Waits `delay` between attempts to reopen the connection. Meanwhile
     /// QoS 1 and 2 publishes queue up, and other requests fail. Gives up
-    /// when the broker refuses the client or the application disconnects.
+    /// with the error when the broker refuses the client for good, or
+    /// without one when the application disconnects.
     async fn reconnect(
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
         options: &ConnectOptions,
         delay: Duration,
-    ) -> Option<(Connection, Session)> {
+    ) -> std::result::Result<(Connection, Session), Option<ClientError>> {
         let event_tx = self.event_tx.clone();
         loop {
             let wait = time::sleep(delay);
@@ -960,7 +977,7 @@ impl EventLoop {
                     permit = event_tx.reserve(), if !self.pending_events.is_empty() => {
                         self.hand_over(permit);
                     }
-                    command = command_rx.recv() => match command? {
+                    command = command_rx.recv() => match command.ok_or(None)? {
                         Command::Publish(request) if request.qos != QoS::AtMostOnce => {
                             self.waiting.push_back(request);
                         }
@@ -978,17 +995,17 @@ impl EventLoop {
                         }
                         Command::Disconnect { response } => {
                             let _ = response.send(Ok(()));
-                            return None;
+                            return Err(None);
                         }
                     },
                 }
             }
 
             match MqttClient::open(options).await {
-                Ok(opened) => return Some(opened),
-                Err(e @ (ClientError::ConnectionRefused(_) | ClientError::Redirected { .. })) => {
+                Ok(opened) => return Ok(opened),
+                Err(e) if refused_for_good(&e) => {
                     error!("Broker refused to reconnect: {}", e);
-                    return None;
+                    return Err(Some(e));
                 }
                 Err(e) => warn!("Reconnecting failed: {}", e),
             }

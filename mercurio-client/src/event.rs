@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use mercurio_core::{qos::QoS, reason::ReasonCode};
 
+use crate::error::ClientError;
 use crate::options::MessageProperties;
 
 /// Events received from the MQTT broker.
@@ -19,12 +22,20 @@ pub enum Event {
     },
 
     /// The connection ended. With reconnection on, the client tries again
-    /// and reports `Reconnected`; otherwise no more events follow.
+    /// and reports `Reconnected`, or `Stopped` if the broker refuses it
+    /// for good; otherwise no more events follow.
     Disconnected { reason: DisconnectReason },
 
     /// The client reconnected after losing the connection. Without
     /// `session_present` the broker forgot the subscriptions.
     Reconnected { session_present: bool },
+
+    /// Reconnecting failed for good, as when the broker refused the
+    /// credentials; the last event before [`MqttClient::recv`] returns
+    /// `None`.
+    ///
+    /// [`MqttClient::recv`]: crate::MqttClient::recv
+    Stopped { error: Arc<ClientError> },
 }
 
 /// Reason for disconnection.
