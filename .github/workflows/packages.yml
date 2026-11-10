@@ -40,7 +40,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cross,cargo-deb,cargo-generate-rpm
+          tool: cross@0.2.5,cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
       - name: Build
         run: >
           cross build --release --locked -p "$CRATE" --target "$TARGET"
