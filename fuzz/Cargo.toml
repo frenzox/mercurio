@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
 mercurio-core = { path = "../mercurio-core" }
 mercurio-packets = { path = "../mercurio-packets" }
@@ -34,6 +35,13 @@ bench = false
 [[bin]]
 name = "decode_direct"
 path = "fuzz_targets/decode_direct.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
 bench = false
