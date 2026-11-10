@@ -32,6 +32,12 @@ const RELEASE_ABOVE: usize = 64 * 1024;
 /// header included. 1 MiB, the same default as EMQX.
 pub const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
 
+/// Largest CONNECT accepted unless configured otherwise. It is read before
+/// the client is authenticated, so it gets less room than other packets;
+/// 64 KiB still fits the will, credentials and properties of ordinary
+/// clients.
+pub const DEFAULT_MAX_CONNECT_PACKET_SIZE: usize = 64 * 1024;
+
 /// How long a closing connection waits for the client to close its side.
 const LINGER: Duration = Duration::from_secs(1);
 

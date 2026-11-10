@@ -518,6 +518,11 @@ pub struct ServerConfig {
     #[serde(default = "default_max_packet_size")]
     pub max_packet_size: usize,
 
+    /// Largest CONNECT, and AUTH during enhanced authentication, accepted
+    /// from a client, in bytes; they come before it is authenticated
+    #[serde(default = "default_max_connect_packet_size")]
+    pub max_connect_packet_size: usize,
+
     /// Messages that may wait for one client before any are dropped
     #[serde(default = "default_max_queued_messages")]
     pub max_queued_messages: usize,
@@ -617,7 +622,8 @@ pub struct ServerConfig {
     pub max_retained_messages: Option<usize>,
 
     /// Connections one client address may hold at once, the address a PROXY
-    /// header gives counted; unbounded when unset
+    /// header gives counted and IPv6 clients counted by /64; unbounded when
+    /// unset
     pub max_connections_per_ip: Option<usize>,
 
     /// TLS configuration
@@ -636,6 +642,7 @@ impl Default for ServerConfig {
             sys_interval: default_sys_interval(),
             max_connections: default_max_connections(),
             max_packet_size: default_max_packet_size(),
+            max_connect_packet_size: default_max_connect_packet_size(),
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: default_max_queued_bytes(),
@@ -787,6 +794,10 @@ fn default_max_packet_size() -> usize {
     Limits::default().max_packet_size
 }
 
+fn default_max_connect_packet_size() -> usize {
+    Limits::default().max_connect_packet_size
+}
+
 fn default_max_queued_messages() -> usize {
     Limits::default().queue.max_messages
 }
@@ -832,6 +843,9 @@ impl ServerConfig {
         if self.max_inflight == 0 {
             return Err("max_inflight must be at least 1".to_string());
         }
+        if self.max_connect_packet_size == 0 {
+            return Err("max_connect_packet_size must be at least 1".into());
+        }
         if self.write_timeout == 0 {
             return Err("write_timeout must be at least 1 second".into());
         }
@@ -839,6 +853,7 @@ impl ServerConfig {
         limits.connect_timeout = Duration::from_secs(self.connect_timeout);
         limits.write_timeout = Duration::from_secs(self.write_timeout);
         limits.max_packet_size = self.max_packet_size;
+        limits.max_connect_packet_size = self.max_connect_packet_size;
         limits.queue.max_qos0 = self.max_queued_qos0_messages;
         limits.queue.max_messages = self.max_queued_messages;
         limits.queue.max_bytes = Some(self.max_queued_bytes);
@@ -1205,6 +1220,19 @@ mod tests {
         let config: Config = toml::from_str("[server]\nmax_inflight = 5\n").unwrap();
         assert_eq!(config.server.limits().unwrap().max_inflight, 5);
         let config: Config = toml::from_str("[server]\nmax_inflight = 0\n").unwrap();
+        assert!(config.server.limits().is_err());
+    }
+
+    #[test]
+    fn test_max_connect_packet_size_reaches_the_limits_and_rejects_zero() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.server.limits().unwrap().max_connect_packet_size,
+            mercurio_server::server::DEFAULT_MAX_CONNECT_PACKET_SIZE
+        );
+        let config: Config = toml::from_str("[server]\nmax_connect_packet_size = 512\n").unwrap();
+        assert_eq!(config.server.limits().unwrap().max_connect_packet_size, 512);
+        let config: Config = toml::from_str("[server]\nmax_connect_packet_size = 0\n").unwrap();
         assert!(config.server.limits().is_err());
     }
 

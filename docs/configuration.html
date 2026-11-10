@@ -70,6 +70,7 @@ mount_point = "tenant1/"</pre>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>max_connections</code></td><td><code>10000</code></td><td>Concurrent connections, across every listener. Further ones are closed right after being accepted.</td></tr>
 <tr><td><code>max_packet_size</code></td><td><code>1048576</code></td><td>Largest packet accepted from a client, in bytes. Announced to MQTT 5 clients.</td></tr>
+<tr><td><code>max_connect_packet_size</code></td><td><code>65536</code></td><td>Largest CONNECT accepted from a client, in bytes, and largest AUTH during enhanced authentication. These come before the client is authenticated, so they get less room than other packets; <code>max_packet_size</code> still caps it. A larger one is refused as Packet Too Large. At least <code>1</code>.</td></tr>
 <tr><td><code>connect_timeout</code></td><td><code>10</code></td><td>Seconds a new connection has, in all, to send its PROXY header, complete the TLS and WebSocket handshakes and send CONNECT, enhanced authentication included.</td></tr>
 <tr><td><code>max_queued_messages</code></td><td><code>10000</code></td><td>Messages that may wait for one client, any QoS, before further ones are dropped.</td></tr>
 <tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
@@ -91,7 +92,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>persistent_client_expiration</code></td><td>never</td><td>Seconds the session of an MQTT 3.x client connected without clean session outlives its connection. MQTT 5 clients choose their own expiry.</td></tr>
 <tr><td><code>max_session_expiry</code></td><td>unbounded</td><td>Most seconds any session may outlive its connection. MQTT 5 clients asking for longer, or for no expiry, are told to use this; it also bounds <code>persistent_client_expiration</code>. Worth setting where clients aren't trusted, as each stored session takes memory and storage.</td></tr>
 <tr><td><code>max_retained_messages</code></td><td>unbounded</td><td>Topics that may hold a retained message at once, about 20 of the broker's own <code>$SYS</code> topics included. Retaining a message on another topic is refused with Quota Exceeded; updating or clearing a retained topic is always allowed.</td></tr>
-<tr><td><code>max_connections_per_ip</code></td><td>unbounded</td><td>Connections one client address may hold at once; further ones are closed. Behind a proxy sending PROXY headers, the address the header gives is counted, so set <code>proxy_from</code> too. Unbounded by default, as carrier NAT puts many devices behind one address.</td></tr>
+<tr><td><code>max_connections_per_ip</code></td><td>unbounded</td><td>Connections one client address may hold at once, counted from the moment they are accepted, before any TLS or WebSocket handshake; further ones are closed. An IPv6 client counts as its /64 block, and an IPv4 client reaching an IPv6 socket as its IPv4 address. Behind a proxy sending PROXY headers, the address the header gives is counted, so set <code>proxy_from</code> too. Unbounded by default, as carrier NAT puts many devices behind one address.</td></tr>
 </table>
 
 <h3>Delivery</h3>

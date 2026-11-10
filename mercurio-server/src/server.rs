@@ -89,7 +89,10 @@ pub struct AuthConfig {
     pub allow_anonymous: bool,
 }
 
-pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
+pub use crate::{
+    connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
+    queue::QueueLimits,
+};
 
 /// Subscriptions a session may hold unless configured otherwise: far more
 /// than clients need, far fewer than it takes to exhaust the broker.
@@ -114,6 +117,11 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Largest packet accepted from a client, fixed header included.
     pub max_packet_size: usize,
+    /// Largest CONNECT accepted, and AUTH during enhanced authentication,
+    /// fixed header included. These come before the client is
+    /// authenticated, so they get less room than `max_packet_size`, which
+    /// still caps it. A larger one is refused as Packet Too Large.
+    pub max_connect_packet_size: usize,
     /// Messages waiting to be sent to one session.
     pub queue: QueueLimits,
     /// Connections beyond this many are closed right after being accepted.
@@ -155,7 +163,9 @@ pub struct Limits {
     /// then refused with Quota Exceeded. Unbounded when unset.
     pub max_retained_messages: Option<usize>,
     /// Connections one client address may hold at once, counting the
-    /// address a PROXY header gives; further ones are closed. Unbounded
+    /// address a PROXY header gives; further ones are closed before any
+    /// TLS or WebSocket handshake. IPv6 clients count by /64 block, and
+    /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
 }
@@ -166,6 +176,7 @@ impl Default for Limits {
             connect_timeout: Duration::from_secs(10),
             write_timeout: crate::connection::DEFAULT_WRITE_TIMEOUT,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            max_connect_packet_size: DEFAULT_MAX_CONNECT_PACKET_SIZE,
             queue: QueueLimits::default(),
             max_connections: None,
             topic_alias_maximum: 10,
@@ -580,7 +591,9 @@ struct HandlerParts<St: MqttStore + 'static> {
 impl<St: MqttStore + 'static> HandlerParts<St> {
     /// Serves a connection accepted on a listener, after the PROXY header
     /// and the TLS handshake if the listener has them. `_slots` and
-    /// `_listener` are held for as long as it runs.
+    /// `_listener` are held for as long as it runs, and `address_slot` too;
+    /// on a PROXY listener that slot is taken here instead, once the header
+    /// gave the client's own address.
     ///
     /// Everything here is boxed: the task holds this function's state for
     /// the whole connection, so it keeps only pointers, and the handshakes'
@@ -592,24 +605,25 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         peer_addr: Option<SocketAddr>,
         _slots: [Option<OwnedSemaphorePermit>; 2],
         _listener: ListenerSlot,
+        address_slot: Option<AddressSlot>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let transport = settings.transport;
+        let proxied = settings.proxy_protocol;
         let Some((parts, stream, peer_addr)) =
             Box::pin(self.handshake(socket, settings, peer_addr)).await
         else {
             return;
         };
-        // Counted once the PROXY header gave the client's own address
-        let _address_slot = match (parts.limits.max_connections_per_ip, peer_addr) {
-            (Some(max), Some(peer)) => match parts.address_slots.acquire(peer.ip(), max) {
+        let _address_slot = match (proxied, parts.limits.max_connections_per_ip, peer_addr) {
+            (true, Some(max), Some(peer)) => match parts.address_slots.acquire(peer.ip(), max) {
                 Some(slot) => Some(slot),
                 None => {
                     return warn!("{} holds the most connections allowed, closing", peer.ip());
                 }
             },
-            _ => None,
+            _ => address_slot,
         };
         match stream {
             Secured::Plain(stream) => Box::pin(parts.serve(stream, transport, peer_addr)).await,
@@ -641,7 +655,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 return None;
             }
             let header = proxy::read_header(&mut socket);
-            match time::timeout_at(self.connect_deadline, header).await {
+            match connect_step(&mut self.shutdown, self.connect_deadline, header).await? {
                 Ok(Ok(source)) => {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
@@ -671,7 +685,8 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let Some(acceptor) = settings.tls_acceptor else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
-        match time::timeout_at(self.connect_deadline, acceptor.accept(socket)).await {
+        let accept = acceptor.accept(socket);
+        match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
                 debug!("TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
@@ -699,7 +714,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
 
     /// Serves one client on `stream`, after the WebSocket handshake if it
     /// came in on the WebSocket listener.
-    async fn serve<S>(self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
+    async fn serve<S>(mut self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -709,7 +724,12 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
                         let request = Box::pin(http::serve_or_upgrade(stream, &dir));
-                        match time::timeout_at(self.connect_deadline, request).await {
+                        let request =
+                            connect_step(&mut self.shutdown, self.connect_deadline, request);
+                        let Some(request) = request.await else {
+                            return;
+                        };
+                        match request {
                             Ok(Ok(Some(upgrade))) => upgrade,
                             Ok(Ok(None)) => return,
                             Ok(Err(e)) => {
@@ -723,7 +743,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
                 let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
-                match time::timeout_at(self.connect_deadline, handshake).await {
+                let handshake = connect_step(&mut self.shutdown, self.connect_deadline, handshake);
+                let Some(handshake) = handshake.await else {
+                    return;
+                };
+                match handshake {
                     Ok(Ok(websocket)) => {
                         Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
                     }
@@ -884,6 +908,8 @@ fn describe(packet: &ControlPacket) -> String {
 
 /// Checks credentials, at most one login per core at a time, so a flood of
 /// logins queues instead of starving the broker of CPU for password hashes.
+/// Run as a `connect_step`, so a login still queued when the client's time
+/// to connect is up gives up its place without a check.
 async fn validate_credentials(
     chain: &Chain,
     client: &ClientInfo,
@@ -898,6 +924,21 @@ async fn validate_credentials(
         return Decision::Deny;
     };
     chain.authenticate(client, credentials).await
+}
+
+/// Runs one step of connecting, such as a handshake or reading CONNECT,
+/// within the connect deadline. None if the server starts shutting down
+/// first: a client that isn't connected has nothing to be told, so it is
+/// just closed.
+async fn connect_step<F: Future>(
+    shutdown: &mut Shutdown,
+    deadline: Instant,
+    step: F,
+) -> Option<std::result::Result<F::Output, time::error::Elapsed>> {
+    tokio::select! {
+        result = time::timeout_at(deadline, step) => Some(result),
+        _ = shutdown.recv() => None,
+    }
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -1235,6 +1276,22 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             let slots = [slot, listener_slot];
 
+            // Taken before any handshake, so an address can't hold more
+            // half-open TLS or WebSocket connections than served ones.
+            // Behind a proxy it waits for the PROXY header's address.
+            let address_slot = match (self.limits.max_connections_per_ip, peer_addr) {
+                (Some(max), Some(peer)) if !proxied => {
+                    match self.address_slots.acquire(peer.ip(), max) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            warn!("{} holds the most connections allowed, closing", peer.ip());
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             info!(target: CONNECTIONS, "Got a connection: {:?}", peer_addr);
 
             let parts = HandlerParts {
@@ -1264,9 +1321,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
-                    );
+                    tokio::spawn(Box::new(parts).serve_accepted(
+                        socket,
+                        settings,
+                        peer_addr,
+                        slots,
+                        counted,
+                        address_slot,
+                    ));
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
@@ -1285,9 +1347,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
-                    );
+                    tokio::spawn(Box::new(parts).serve_accepted(
+                        socket,
+                        settings,
+                        peer_addr,
+                        slots,
+                        counted,
+                        address_slot,
+                    ));
                 }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
@@ -1309,12 +1376,20 @@ impl<St: MqttStore + 'static> Listener<St> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Until the client is authenticated; see `Handler::run`
+        let limits = &handler.limits;
         handler
             .connection
-            .set_max_packet_size(handler.limits.max_packet_size);
+            .set_max_packet_size(limits.max_connect_packet_size.min(limits.max_packet_size));
 
-        let first_packet =
-            time::timeout_at(handler.connect_deadline, handler.connection.read_packet()).await;
+        let first_packet = connect_step(
+            &mut handler.shutdown,
+            handler.connect_deadline,
+            handler.connection.read_packet(),
+        );
+        let Some(first_packet) = first_packet.await else {
+            return debug!("Connection closed for shutdown before CONNECT");
+        };
 
         // Boxed, as it is kept until the connection ends
         let first_packet = Box::new(first_packet);
@@ -1481,7 +1556,14 @@ where
                         peer: self.peer,
                     };
                     let credentials = Credentials::new(username, password);
-                    match validate_credentials(&self.chain, &client, &credentials).await {
+                    let checked = validate_credentials(&self.chain, &client, &credentials);
+                    let checked = connect_step(&mut self.shutdown, self.connect_deadline, checked);
+                    let decision = checked.await.ok_or(ReasonCode::ServerShuttingDown)?;
+                    let Ok(decision) = decision else {
+                        warn!("Login of user `{}` not checked in time, closing", username);
+                        return Ok(());
+                    };
+                    match decision {
                         Decision::Allow => {
                             verified_user = Some(username.clone());
                             true
@@ -1507,6 +1589,8 @@ where
                     .await;
             }
         }
+        self.connection
+            .set_max_packet_size(self.limits.max_packet_size);
 
         if let Some(reason) = self.refused_will(&connect_packet) {
             return self.reject_connect(&connect_packet, reason).await;
@@ -1850,9 +1934,14 @@ where
                 .await?;
 
             // The exchange counts towards the time allowed to connect
-            let response = time::timeout_at(self.connect_deadline, self.connection.read_packet())
-                .await
-                .map_err(|_| ReasonCode::MaximumConnectTime)??;
+            let response = connect_step(
+                &mut self.shutdown,
+                self.connect_deadline,
+                self.connection.read_packet(),
+            )
+            .await
+            .ok_or(ReasonCode::ServerShuttingDown)?
+            .map_err(|_| ReasonCode::MaximumConnectTime)??;
 
             // Only AUTH continuing the same method may answer a challenge
             let Some(ControlPacket::Auth(auth)) = response else {
@@ -2365,13 +2454,28 @@ where
     }
 }
 
-/// Connections each client address holds.
+/// Connections each client address holds, keyed by `address_key`.
 #[derive(Default)]
 struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
 
+/// Whom `ip` counts as for the per-address limit. An IPv4 client of an
+/// IPv6 socket counts as its IPv4 address. An IPv6 client counts as its
+/// /64, the block one subscriber is usually given, so it can't take a new
+/// address from it for every connection.
+fn address_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        },
+        v4 => v4,
+    }
+}
+
 impl AddressSlots {
-    /// A slot for `ip`, unless it holds `max` already.
+    /// A slot for `ip`, unless its address or block holds `max` already.
     fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<AddressSlot> {
+        let ip = address_key(ip);
         let mut counts = self.0.lock().unwrap();
         let count = counts.entry(ip).or_default();
         if *count >= max {
@@ -2607,6 +2711,20 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_address_slots_count_mapped_addresses_as_ipv4_and_ipv6_by_64() {
+        let slots = Arc::new(AddressSlots::default());
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        let _v4 = slots.acquire(ip("192.0.2.7"), 1).unwrap();
+        assert!(slots.acquire(ip("::ffff:192.0.2.7"), 1).is_none());
+        assert!(slots.acquire(ip("192.0.2.8"), 1).is_some());
+
+        let _v6 = slots.acquire(ip("2001:db8:0:1::1"), 1).unwrap();
+        assert!(slots.acquire(ip("2001:db8:0:1:ffff::2"), 1).is_none());
+        assert!(slots.acquire(ip("2001:db8:0:2::1"), 1).is_some());
+    }
 
     #[test]
     fn test_address_ranges_print_their_first_address() {
