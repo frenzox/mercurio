@@ -963,3 +963,30 @@ async fn subscriptions_are_listed_with_their_subscribers() {
         .await;
     assert_eq!(invalid["code"], "invalidArgument");
 }
+
+/// Reports the default status.
+struct Custom;
+
+impl Plugin for Custom {
+    fn name(&self) -> &str {
+        "custom"
+    }
+}
+
+#[tokio::test]
+async fn plugins_are_listed_in_chain_order() {
+    let acl = "topic readwrite replies/#\ntopic write $CONTROL/broker/v1/#\n";
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(AclFile::parse(acl).unwrap()), Arc::new(Custom)];
+    let (addr, _) = start(config(plugins)).await;
+    let mut admin = admin_client(addr).await;
+    let listed = admin.run(json!({"command": "listPlugins"})).await;
+    assert_eq!(listed["data"]["totalCount"], 2);
+    assert_eq!(
+        listed["data"]["plugins"],
+        json!([
+            {"name": "acl-file", "kind": "builtin", "hooks": ["authorize"]},
+            {"name": "custom", "kind": "rust", "hooks": []},
+        ])
+    );
+}

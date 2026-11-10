@@ -888,6 +888,7 @@ impl<St: MqttStore + 'static> Server<St> {
             listeners: endpoints.iter().map(|e| Arc::clone(&e.state)).collect(),
             storage: storage.backend_name(),
             extension: admin_extension,
+            plugins: all_plugins.clone(),
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {

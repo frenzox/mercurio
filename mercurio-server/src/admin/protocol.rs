@@ -272,6 +272,10 @@ async fn run(
                 .await?;
             serde_json::json!({ "deleted": deleted })
         }
+        "listPlugins" => {
+            let paging = arguments::<PageArgs>(args)?.paging()?;
+            listing("plugins", Page::of(admin.plugins().await, paging))
+        }
         "listSubscriptions" => {
             let a: ListSubscriptionsArgs = arguments(args)?;
             let prefix = a.filter_prefix.as_deref().unwrap_or("");

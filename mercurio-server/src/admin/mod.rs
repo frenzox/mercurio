@@ -32,7 +32,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::{
-    plugin::BoxFuture,
+    plugin::{BoxFuture, Plugin, PluginStatus},
     queue::Subscriber,
     server::{AddressRange, ListenerState},
     session::SessionSnapshot,
@@ -59,6 +59,7 @@ struct Inner {
     started_at: u64,
     started: Instant,
     extension: Option<Arc<dyn AdminExtension>>,
+    plugins: Vec<Arc<dyn Plugin>>,
 }
 
 /// Why a command failed: a stable [`ErrorCode`] for scripts, and a message
@@ -207,6 +208,7 @@ pub(crate) struct AdminParts {
     pub listeners: Vec<Arc<ListenerState>>,
     pub storage: &'static str,
     pub extension: Option<Arc<dyn AdminExtension>>,
+    pub plugins: Vec<Arc<dyn Plugin>>,
 }
 
 /// The sessions as the admin API reaches them, whatever the storage the
@@ -294,8 +296,20 @@ impl Admin {
                 started_at: unix_millis() / 1000,
                 started: Instant::now(),
                 extension: parts.extension,
+                plugins: parts.plugins,
             }),
         }
+    }
+
+    /// Every plugin, each once: the main chain's in the order they run, then
+    /// those only a listener runs: `listPlugins`. A listener's own plugins
+    /// replace the main chain for its clients.
+    pub async fn plugins(&self) -> Vec<PluginStatus> {
+        self.inner
+            .plugins
+            .iter()
+            .map(|plugin| plugin.status())
+            .collect()
     }
 
     pub(crate) fn extension(&self) -> Option<&Arc<dyn AdminExtension>> {
