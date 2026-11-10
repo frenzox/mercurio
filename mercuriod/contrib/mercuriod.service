@@ -16,22 +16,46 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
+# One descriptor per client, and max_connections defaults to 10000
+LimitNOFILE=65536
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# Files the broker creates, such as the SQLite database and the log file,
+# are readable by its user only
+UMask=0077
 # Writable /var/lib/mercurio for SQLite storage, despite ProtectSystem
 StateDirectory=mercurio
-# /run/mercurio, for Unix socket listeners
+StateDirectoryMode=0700
+# /var/log/mercurio, for [logging] file
+LogsDirectory=mercurio
+# /run/mercurio, for Unix socket listeners and the admin socket, which the
+# broker opens to the admin group itself
 RuntimeDirectory=mercurio
 PrivateDevices=true
+ProtectProc=invisible
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# No MemoryDenyWriteExecute=: WebAssembly plugins are compiled to machine
+# code at runtime
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
-# Allow binding to privileged ports if needed
+# Binding ports below 1024 is the only privilege the broker needs
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 # Logging

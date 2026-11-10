@@ -47,7 +47,7 @@ sudo apt install ./mercuriod_*.deb ./mercurioctl_*.deb ./recado_*.deb
 
 <span class="comment"># Fedora, RHEL, openSUSE</span>
 sudo dnf install ./mercuriod-*.rpm ./mercurioctl-*.rpm ./recado-*.rpm</pre>
-<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, create a <code>mercurio</code> system user and group for the service, and recommend <code>mercurioctl</code>. Members of the group may run <a href="mercurioctl.html">mercurioctl</a> on the broker's host. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
+<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, create a <code>mercurio</code> system user and group for the service, and recommend <code>mercurioctl</code>. Members of the group may run <a href="mercurioctl.html">mercurioctl</a> on the broker's host. The configuration can hold passwords, so only root and the group may read it (<code>0640 root:mercurio</code>). Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
 <pre>sudo systemctl enable --now mercuriod</pre>
 <p>The service runs as <code>mercurio</code>, so files it reads that aren't readable by everyone, such as TLS keys and password files, must belong to that user or its group:</p>
 <pre>sudo chown root:mercurio /etc/mercurio/server.key
@@ -100,12 +100,12 @@ mercuriod -v</pre>
 <table>
 <tr><th>Signal</th><th>Effect</th></tr>
 <tr><td><code>SIGTERM</code>, Ctrl+C</td><td>Graceful shutdown: every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close.</td></tr>
-<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>. <code>mercurioctl broker reload</code> does the same and reports each file.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>. <code>mercurioctl broker reload</code> does the same and reports each file. Received while the broker starts, for example while a standby waits for the database, it reloads once the broker serves.</td></tr>
 </table>
 <p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
 
 <h2 id="systemd">Running as a systemd service</h2>
-<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
+<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code>, which suits the SQLite database, and <code>/var/log/mercurio</code>, for a log <code>file</code>, as its only writable directories, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. Files the broker creates are readable by its user only, and it may keep 65536 files open, as each client connection takes one. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
 <pre><span class="comment"># Binary, configuration and unit</span>
 sudo cp target/release/mercuriod /usr/bin/
 sudo mkdir -p /etc/mercurio

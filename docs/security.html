@@ -183,8 +183,8 @@ enabled = true
 allow_anonymous = false
 
 [auth.http]
-user_url = "http://auth.internal/mqtt/user"
-acl_url = "http://auth.internal/mqtt/acl"
+user_url = "https://auth.internal/mqtt/user"
+acl_url = "https://auth.internal/mqtt/acl"
 timeout_seconds = 5
 cache_seconds = 30</pre>
 <table>
@@ -192,7 +192,7 @@ cache_seconds = 30</pre>
 <tr><td><code>user_url</code>, at each login</td><td><code>{"username": "alice", "password": "...", "clientid": ""}</code></td></tr>
 <tr><td><code>acl_url</code>, at each topic check</td><td><code>{"username": "alice", "clientid": "c1", "topic": "a/b", "acc": 2}</code></td></tr>
 </table>
-<p><code>acc</code> is 1 to receive, 2 to publish and 4 to subscribe. A 2xx status allows; any other status, an error or a timeout denies. Topic answers are reused for <code>cache_seconds</code>, since every message is checked. <code>user_url</code> replaces <code>password_file</code>, and <code>acl_url</code> replaces <code>acl_file</code>; either can be used alone.</p>
+<p><code>acc</code> is 1 to receive, 2 to publish and 4 to subscribe. A 2xx status allows and a 4xx status denies. Topic answers are reused for <code>cache_seconds</code>, since every message is checked. Any other status, an error or a timeout also denies, but is not cached, so the check is asked again once the service is back; the broker logs these failures at <code>warn</code>, at most once every 10 seconds. At most 32 requests run at once, and identical checks made while one is out wait for its answer. A <code>user_url</code> that is plain <code>http://</code> to another host is logged at startup, as passwords then cross the network unencrypted. <code>user_url</code> replaces <code>password_file</code>, and <code>acl_url</code> replaces <code>acl_file</code>; either can be used alone.</p>
 <p>A minimal service, in Python:</p>
 <pre>from http.server import BaseHTTPRequestHandler, HTTPServer
 import json

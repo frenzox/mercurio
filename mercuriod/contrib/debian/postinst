@@ -1,4 +1,15 @@
 #!/bin/sh
 set -e
 
+# The configuration can hold passwords, so only root and the broker's group
+# may read it. The group is created here, as the generated part below does
+# so too late: it also starts the service, which must be able to read it.
+# An override the administrator set is kept.
+if [ "$1" = "configure" ]; then
+    systemd-sysusers ${DPKG_ROOT:+--root="$DPKG_ROOT"} mercurio.conf
+    if ! dpkg-statoverride --list /etc/mercurio/config.toml >/dev/null; then
+        dpkg-statoverride --update --add root mercurio 0640 /etc/mercurio/config.toml
+    fi
+fi
+
 #DEBHELPER#
