@@ -39,7 +39,7 @@
 <main>
 <h1>Administration</h1>
 <p class="lead">Look at and change a running broker: its clients and sessions, bans, retained messages and subscriptions, its log level and files, without restarting it.</p>
-<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <a href="mercurioctl.html">mercurioctl</a> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.</p>
+<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <a href="mercurioctl.html">mercurioctl</a> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.3 or earlier.</p>
 
 <h2 id="socket">The admin socket</h2>
 <pre>[admin]
@@ -176,7 +176,7 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <li>With SQLite or PostgreSQL storage, bans survive restarts, and a standby broker loads them when it takes over. In memory, they last until the broker stops.</li>
 </ul>
 
-<h2 id="upgrading">Upgrading from mercuriod 0.4</h2>
+<h2 id="upgrading">Upgrading from mercuriod 0.4.3 or earlier</h2>
 <ul>
 <li><strong>Answers to <code>$CONTROL</code> requests go only to the client that sent the request</strong>, for dynamic security and plugins as well. A client subscribed to <code>$CONTROL/dynamic-security/v1/response</code> no longer sees the answers to other clients' commands, so a script that subscribes with one client and publishes with another, such as <code>recado sub</code> beside <code>recado pub</code>, gets nothing back. Install <a href="mercurioctl.html"><code>mercurioctl</code></a> and use it, or one client that subscribes and then publishes, as <a href="#protocol"><code>mosquitto_rr</code></a> does.</li>
 <li><strong>Dynamic security files created by earlier versions</strong> give the administrator role <code>$CONTROL/dynamic-security/#</code> and <code>$SYS/#</code> only. Dynamic security commands keep working from anywhere, and every command works through the admin socket. To run the broker's commands over the network too, add the ACLs <code>mercuriod dynsec-init</code> now grants, for example through the admin socket as root (a user newly added to the socket's group needs a new login and a broker restart first):
