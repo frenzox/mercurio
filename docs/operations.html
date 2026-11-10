@@ -90,6 +90,7 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>max_packet_size</code></td><td>Oversized packets; MQTT 5 clients are told the limit</td></tr>
 <tr><td><code>max_keepalive</code></td><td>Clients asking for very long or no keep-alive, which keeps dead connections around</td></tr>
 <tr><td><code>receive_maximum</code></td><td>Too many QoS 2 messages awaiting release</td></tr>
+<tr><td><code>max_inflight</code></td><td>Clients that read messages and never acknowledge them, each held in memory until they do</td></tr>
 <tr><td><code>max_qos</code>, <code>retain_available</code></td><td>Costly QoS 2 traffic, or retained messages you must not keep</td></tr>
 <tr><td><code>clientid_prefixes</code></td><td>Clients outside your naming scheme</td></tr>
 </table>

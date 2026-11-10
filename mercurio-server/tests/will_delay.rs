@@ -117,3 +117,39 @@ async fn will_is_published_when_session_ends_before_delay() {
         Some(WILL_PUBLISH.to_vec())
     );
 }
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+/// Tasks still alive once they drop to `count`, or after two seconds.
+async fn settle_tasks(count: usize) -> usize {
+    for _ in 0..100 {
+        if alive_tasks() <= count {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    alive_tasks()
+}
+
+#[tokio::test]
+async fn reconnecting_frees_the_pending_will_and_expiry_timer() {
+    let addr = start_broker().await;
+    sleep(Duration::from_millis(100)).await;
+    let idle = alive_tasks();
+
+    // Waits an hour to publish its will and an hour to end its session
+    drop(connect(addr, b'c', true, 3600, Some(3600)).await);
+    sleep(Duration::from_millis(200)).await;
+    assert!(alive_tasks() > idle);
+
+    // Resumes, then ends the session at once with a clean disconnect
+    let mut reconnected = connect(addr, b'c', false, 0, None).await;
+    reconnected.write_all(&[0xe0, 0x00]).await.unwrap();
+    drop(reconnected);
+
+    assert_eq!(settle_tasks(idle).await, idle);
+}

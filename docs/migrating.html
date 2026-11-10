@@ -130,7 +130,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td><code>max_packet_size</code>, <code>message_size_limit</code></td><td><code>max_packet_size</code></td></tr>
 <tr><td><code>max_keepalive</code></td><td><code>max_keepalive</code>, for MQTT 5 clients only; see <a href="#differences">below</a></td></tr>
 <tr><td><code>max_qos</code>, <code>retain_available</code></td><td>the same</td></tr>
-<tr><td><code>max_inflight_messages</code></td><td><code>receive_maximum</code>, for QoS 2 from clients; clients announce their own Receive Maximum</td></tr>
+<tr><td><code>max_inflight_messages</code></td><td><code>max_inflight</code>, for messages to clients, lowered further by the client's own Receive Maximum; <code>receive_maximum</code> for QoS 2 from clients</td></tr>
 <tr><td><code>upgrade_outgoing_qos</code></td><td><code>upgrade_outgoing_qos</code></td></tr>
 <tr><td><code>persistent_client_expiration 1w</code></td><td><code>persistent_client_expiration = 604800</code>, in seconds</td></tr>
 <tr><td><code>sys_interval</code></td><td><code>sys_interval</code></td></tr>

@@ -179,3 +179,79 @@ async fn zero_receive_maximum_is_refused() {
     // Protocol error
     assert_eq!(connack[3], 0x82);
 }
+
+#[tokio::test]
+async fn sends_no_more_than_the_broker_max_inflight() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_inflight = 2;
+        value
+    })
+    .await;
+
+    // No Receive Maximum: the client accepts 65535
+    let mut subscriber = connect(addr, b's', None).await;
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x01])
+        .await
+        .unwrap();
+    let mut buffer = BytesMut::new();
+    next_packet(&mut subscriber, &mut buffer).await.unwrap();
+
+    let mut publisher = connect(addr, b'p', None).await;
+    for i in 1..=5u8 {
+        publisher
+            .write_all(&[0x32, 0x07, 0x00, 0x01, b't', 0x00, i, 0x00, i])
+            .await
+            .unwrap();
+    }
+
+    let mut first_id = None;
+    for _ in 0..2 {
+        let Some(ControlPacket::Publish(publish)) = next_packet(&mut subscriber, &mut buffer).await
+        else {
+            panic!("Expected Publish");
+        };
+        first_id.get_or_insert(publish.packet_id.unwrap());
+    }
+    assert!(next_packet(&mut subscriber, &mut buffer).await.is_none());
+
+    let id = first_id.unwrap().to_be_bytes();
+    subscriber
+        .write_all(&[0x40, 0x02, id[0], id[1]])
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut subscriber, &mut buffer).await,
+        Some(ControlPacket::Publish(_))
+    ));
+    assert!(next_packet(&mut subscriber, &mut buffer).await.is_none());
+}
+
+#[tokio::test]
+async fn zero_max_inflight_still_delivers() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_inflight = 0;
+        value
+    })
+    .await;
+
+    let mut subscriber = connect(addr, b's', None).await;
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x01])
+        .await
+        .unwrap();
+    let mut buffer = BytesMut::new();
+    next_packet(&mut subscriber, &mut buffer).await.unwrap();
+
+    let mut publisher = connect(addr, b'p', None).await;
+    publisher
+        .write_all(&[0x32, 0x07, 0x00, 0x01, b't', 0x00, 0x01, 0x00, b'x'])
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut subscriber, &mut buffer).await,
+        Some(ControlPacket::Publish(_))
+    ));
+}

@@ -62,7 +62,10 @@ use crate::{
     http,
     plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
     proxy,
-    session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
+    session::{
+        cap_expiry_interval, cap_session_expiry, effective_keepalive, Outgoing, Session,
+        WillMessage,
+    },
     session_manager::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
@@ -92,6 +95,10 @@ pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
 /// than clients need, far fewer than it takes to exhaust the broker.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
+/// Unacknowledged QoS 1 and 2 messages one client may have unless
+/// configured otherwise.
+pub const DEFAULT_MAX_INFLIGHT: u16 = 64;
+
 /// Tunable limits of the broker.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -110,6 +117,10 @@ pub struct Limits {
     pub topic_alias_maximum: u16,
     /// QoS 2 messages a client may have awaiting PUBREL at once.
     pub receive_maximum: u16,
+    /// QoS 1 and 2 messages sent to a client and not yet acknowledged, at
+    /// most, whatever Receive Maximum the client announces. Each holds its
+    /// whole message in memory. 0 counts as 1.
+    pub max_inflight: u16,
     /// Longest keep-alive MQTT 5 clients may use; those asking for more, or
     /// for none, are told to use this one instead.
     pub max_keepalive: Option<u16>,
@@ -153,6 +164,7 @@ impl Default for Limits {
             max_connections: None,
             topic_alias_maximum: 10,
             receive_maximum: u16::MAX,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
             max_keepalive: None,
             send_topic_aliases: false,
             maximum_qos: QoS::ExactlyOnce,
@@ -1717,31 +1729,30 @@ where
             // Published after the will delay or when the session ends, whichever
             // comes first, unless the client reconnects before then [MQTT-3.1.3-9]
             let delay = expiry.map_or(will.delay, |expiry| expiry.min(will.delay));
-            if !delay.is_zero() {
-                session.set_delayed_will(true).await;
-            }
             let generation = lease.generation;
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
-            let session = session.clone();
+            let will_session = session.clone();
 
             let publish = async move {
                 if !delay.is_zero() {
                     time::sleep(delay).await;
-                    if session.generation().await != generation {
+                    if !will_session.claim_pending_will(generation).await {
                         return;
                     }
                 }
-                let client_id = session.get_client_id().await;
+                let client_id = will_session.get_client_id().await;
                 publish_will(&broker, will, &client_id).await;
                 session_manager.delete_will(&client_id);
-                session.set_delayed_will(false).await;
             };
 
             if delay.is_zero() {
                 Box::pin(publish).await;
             } else {
-                tokio::spawn(publish);
+                // Aborted, freeing the will, as soon as a new connection
+                // takes the session over or the session is deleted
+                let task = tokio::spawn(publish).abort_handle();
+                session.set_pending_will(generation, task).await;
             }
         }
 
@@ -2153,6 +2164,7 @@ where
                             if *expiry == Some(Duration::ZERO) && interval != 0 {
                                 return Err(ReasonCode::ProtocolError.into());
                             }
+                            let interval = cap_expiry_interval(interval, &self.limits);
                             *expiry = (interval != u32::MAX)
                                 .then(|| Duration::from_secs(interval.into()));
                         }

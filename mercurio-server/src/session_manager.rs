@@ -6,6 +6,7 @@ use std::{
 use crate::CONNECTIONS;
 use tokio::{
     sync::{watch, Mutex, OwnedMutexGuard},
+    task::AbortHandle,
     time::Duration,
 };
 use tracing::info;
@@ -74,12 +75,23 @@ struct State {
     next_generation: u64,
     /// Clients whose will, left over from a previous run, is still due
     restored_wills: HashSet<String>,
-    /// The expiry timer that may end each session, by the token it holds.
-    /// Deleting a session drops its entry, which retires the timer.
-    expiry_timers: HashMap<String, u64>,
+    /// The expiry timer that may end each session. Deleting or resuming a
+    /// session, or scheduling a new timer for it, stops the timer.
+    expiry_timers: HashMap<String, ExpiryTimer>,
+}
+
+struct ExpiryTimer {
+    token: u64,
+    task: AbortHandle,
 }
 
 impl State {
+    fn stop_expiry_timer(&mut self, client_id: &str) {
+        if let Some(timer) = self.expiry_timers.remove(client_id) {
+            timer.task.abort();
+        }
+    }
+
     fn entry(&self, client_id: &str, guard: &SessionDropGuard) -> ClientEntry {
         ClientEntry {
             client_id: client_id.to_string(),
@@ -379,6 +391,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 e.insert(new_session).session()
             }
         };
+        manager.stop_expiry_timer(&client_id);
 
         drop(manager);
         {
@@ -666,7 +679,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         let removed = {
             let mut manager = self.shared.state.lock().await;
-            manager.expiry_timers.remove(client_id);
+            manager.stop_expiry_timer(client_id);
             let was_restored = manager.restored_wills.remove(client_id);
             let removed = manager.sessions.remove(client_id);
             if let Some(removed) = &removed {
@@ -702,44 +715,41 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     /// Ends the session of `client_id` after `delay`, unless a connection
     /// newer than `generation` uses it in the meantime.
     async fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
-        let token = {
-            let mut manager = self.shared.state.lock().await;
-            // The session may be gone already, deleted while this connection
-            // was closing, and a deleted session never expires. Generation 0
-            // is a session restored from storage, which may have no
-            // in-memory session left to find.
-            if generation != 0 {
-                let current = match manager.sessions.get(&client_id) {
-                    Some(guard) => guard.session().generation().await == generation,
-                    None => false,
-                };
-                if !current {
-                    return;
-                }
+        let mut manager = self.shared.state.lock().await;
+        // The session may be gone already, deleted while this connection
+        // was closing, and a deleted session never expires. Generation 0
+        // is a session restored from storage, which may have no
+        // in-memory session left to find.
+        if generation != 0 {
+            let current = match manager.sessions.get(&client_id) {
+                Some(guard) => guard.session().generation().await == generation,
+                None => false,
+            };
+            if !current {
+                return;
             }
-            manager.next_generation += 1;
-            let token = manager.next_generation;
-            manager.expiry_timers.insert(client_id.clone(), token);
-            token
-        };
-        let manager = self.clone();
-        tokio::spawn(async move {
+        }
+        manager.next_generation += 1;
+        let token = manager.next_generation;
+        let ender = self.clone();
+        let ended = client_id.clone();
+        let task = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if manager
-                .end_session(&client_id, generation, Some(token))
-                .await
-            {
-                manager
+            if ender.end_session(&ended, generation, Some(token)).await {
+                ender
                     .shared
                     .expired
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(chain) = manager.shared.expiry_chain.get() {
-                    chain.emit(Event::SessionExpired {
-                        client_id: client_id.clone(),
-                    });
+                if let Some(chain) = ender.shared.expiry_chain.get() {
+                    chain.emit(Event::SessionExpired { client_id: ended });
                 }
             }
-        });
+        })
+        .abort_handle();
+        let timer = ExpiryTimer { token, task };
+        if let Some(replaced) = manager.expiry_timers.insert(client_id, timer) {
+            replaced.task.abort();
+        }
     }
 
     /// Schedules the expiry of sessions persisted by a previous run, and
@@ -898,7 +908,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     async fn end_session(&self, client_id: &str, generation: u64, timer: Option<u64>) -> bool {
         let mut manager = self.shared.state.lock().await;
         if let Some(token) = timer {
-            if manager.expiry_timers.get(client_id) != Some(&token) {
+            if manager.expiry_timers.get(client_id).map(|t| t.token) != Some(token) {
                 return false;
             }
             manager.expiry_timers.remove(client_id);
@@ -1138,6 +1148,48 @@ mod tests {
         }
 
         assert_eq!(*recorder.0.lock().unwrap(), ["c"]);
+    }
+
+    /// Waits for the expiry timers sleeping with a clone of `manager` to
+    /// drop to `count`, giving up after a second.
+    async fn sleeping_timers(manager: &SessionManager<MemoryStore>, count: usize) -> usize {
+        for _ in 0..100 {
+            if Arc::strong_count(&manager.shared) - 1 <= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Arc::strong_count(&manager.shared) - 1
+    }
+
+    #[tokio::test]
+    async fn test_superseded_expiry_timers_stop_at_once() {
+        let storage = create_test_storage();
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
+        let hour = Duration::from_secs(3600);
+
+        let started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        manager.end_connection(started.lease, Some(hour)).await;
+        assert_eq!(sleeping_timers(&manager, 1).await, 1);
+
+        // Resumed
+        let started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        assert_eq!(sleeping_timers(&manager, 0).await, 0);
+
+        // Replaced
+        manager.end_connection(started.lease, Some(hour)).await;
+        manager.schedule_end("c".to_string(), 0, hour).await;
+        assert_eq!(sleeping_timers(&manager, 1).await, 1);
+
+        // Deleted
+        manager.delete_session("c", false).await.unwrap();
+        assert_eq!(sleeping_timers(&manager, 0).await, 0);
     }
 
     #[tokio::test]

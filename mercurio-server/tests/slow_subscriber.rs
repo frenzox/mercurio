@@ -80,5 +80,11 @@ async fn slow_subscriber_receives_every_qos1_message() {
         };
         assert_eq!(publish.qos_level, QoS::AtLeastOnce);
         assert_eq!(publish.payload.unwrap()[..], [i]);
+        // Acknowledged, so the broker's in-flight window keeps moving
+        let id = publish.packet_id.unwrap().to_be_bytes();
+        subscriber
+            .write_all(&[0x40, 0x02, id[0], id[1]])
+            .await
+            .unwrap();
     }
 }

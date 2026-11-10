@@ -133,3 +133,54 @@ async fn session_expiry_is_capped_and_announced() {
     // A shorter one stands, and isn't announced
     assert_eq!(announced_expiry(addr, 30).await, None);
 }
+
+/// Connects as "d" asking for `connect_expiry` and disconnects asking for
+/// `disconnect_expiry`. Returns whether the session was resumed.
+async fn reset_expiry_on_disconnect(
+    addr: SocketAddr,
+    clean: bool,
+    connect_expiry: u32,
+    disconnect_expiry: u32,
+) -> bool {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let flags = if clean { 0x02 } else { 0x00 };
+    let mut packet = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, flags, 0x00, 0x3c];
+    packet.extend_from_slice(&[0x05, 0x11]);
+    packet.extend_from_slice(&connect_expiry.to_be_bytes());
+    packet.extend_from_slice(&[0x00, 0x01, b'd']);
+    let mut connect = vec![0x10, packet.len() as u8];
+    connect.extend_from_slice(&packet);
+    stream.write_all(&connect).await.unwrap();
+    let connack = common::read_connack(&mut stream).await;
+    assert_eq!(connack[3], 0x00, "connection refused");
+
+    // Normal disconnection, Session Expiry Interval
+    let mut disconnect = vec![0xe0, 0x07, 0x00, 0x05, 0x11];
+    disconnect.extend_from_slice(&disconnect_expiry.to_be_bytes());
+    stream.write_all(&disconnect).await.unwrap();
+    let _ = timeout(Duration::from_secs(2), stream.read(&mut [0u8; 1])).await;
+
+    connack[2] == 0x01
+}
+
+#[tokio::test]
+async fn session_expiry_set_on_disconnect_is_capped() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = mercurio_server::server::ServerConfig::default();
+    config.limits.max_session_expiry = Some(Duration::from_secs(1));
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    for asked in [u32::MAX, 3600] {
+        assert!(!reset_expiry_on_disconnect(addr, true, 1, asked).await);
+        sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !reset_expiry_on_disconnect(addr, false, 0, 0).await,
+            "session outlived the maximum when asked for {asked}"
+        );
+    }
+}
