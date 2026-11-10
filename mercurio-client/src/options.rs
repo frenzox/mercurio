@@ -1,4 +1,6 @@
 use std::fmt;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -257,10 +259,19 @@ pub struct ConnectOptions {
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
     pub(crate) connector: Option<Connector>,
+    /// Connect through this Unix socket instead of TCP
+    #[cfg(unix)]
+    pub(crate) unix_path: Option<PathBuf>,
 }
 
 impl ConnectOptions {
     pub(crate) fn check(&self) -> crate::error::Result<()> {
+        #[cfg(unix)]
+        if self.unix_path.is_some() && self.tls.enabled {
+            return Err(ClientError::Tls(
+                "TLS isn't supported over a Unix socket".to_string(),
+            ));
+        }
         if let Some(client_id) = &self.client_id {
             check_length("client id", client_id)?;
         }
@@ -299,6 +310,19 @@ impl ConnectOptions {
             request_problem_information: true,
             authenticator: None,
             connector: None,
+            #[cfg(unix)]
+            unix_path: None,
+        }
+    }
+
+    /// Create connection options for a broker listening on the Unix socket
+    /// at `path`, such as its admin socket. Reconnecting uses the same path;
+    /// TLS can't be enabled on it.
+    #[cfg(unix)]
+    pub fn unix(path: impl Into<PathBuf>) -> Self {
+        Self {
+            unix_path: Some(path.into()),
+            ..Self::new("localhost", 1883)
         }
     }
 
@@ -468,5 +492,15 @@ mod tests {
             Err(ClientError::TooLong("user property"))
         ));
         assert!(ConnectOptions::new("localhost", 1883).check().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tls_is_refused_over_unix_sockets() {
+        let options = ConnectOptions::unix("/run/mercurio/admin.sock").tls(true);
+        assert!(matches!(options.check(), Err(ClientError::Tls(_))));
+        assert!(ConnectOptions::unix("/run/mercurio/admin.sock")
+            .check()
+            .is_ok());
     }
 }
