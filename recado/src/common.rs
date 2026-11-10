@@ -1,7 +1,7 @@
 //! Shared utilities for recado.
 
 use clap::{Args, ValueEnum};
-use mercurio_client::{cli::ConnectArgs, ConnectOptions, QoS};
+use mercurio_client::{cli::ConnectArgs, ConnectOptions, QoS, Will};
 use mercurio_core::protocol::ProtocolVersion;
 
 /// Common connection arguments shared between pub and sub tools.
@@ -31,6 +31,46 @@ pub struct ConnectionArgs {
     /// Enable verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
+}
+
+/// The will, which the broker publishes when the client goes away without
+/// disconnecting.
+#[derive(Args, Debug)]
+pub struct WillArgs {
+    /// Will message topic (sent by broker if client disconnects unexpectedly)
+    #[arg(long)]
+    will_topic: Option<String>,
+
+    /// Will message payload
+    #[arg(long, requires = "will_topic")]
+    will_message: Option<String>,
+
+    /// Will message QoS level (0, 1, or 2)
+    #[arg(long, default_value = "0", value_parser = qos_level)]
+    will_qos: QoS,
+
+    /// Retain the will message on the broker
+    #[arg(long)]
+    will_retain: bool,
+
+    /// Seconds the broker waits before publishing the will (MQTT 5)
+    #[arg(long, default_value = "0")]
+    will_delay: u32,
+}
+
+impl WillArgs {
+    /// `options` with the will, when there is one.
+    pub fn apply(self, options: ConnectOptions) -> ConnectOptions {
+        match self.will_topic {
+            Some(topic) => options.will(
+                Will::new(topic, self.will_message.unwrap_or_default())
+                    .qos(self.will_qos)
+                    .retain(self.will_retain)
+                    .delay(self.will_delay),
+            ),
+            None => options,
+        }
+    }
 }
 
 impl ConnectionArgs {

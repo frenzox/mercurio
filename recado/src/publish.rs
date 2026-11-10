@@ -8,7 +8,7 @@ use clap::Args;
 use mercurio_client::{MessageProperties, MqttClient, QoS};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::common::{qos_level, ConnectionArgs};
+use crate::common::{qos_level, ConnectionArgs, WillArgs};
 use crate::failure::Failure;
 
 #[derive(Args, Debug)]
@@ -44,6 +44,9 @@ pub struct PubArgs {
 
     #[command(flatten)]
     properties: PropertyArgs,
+
+    #[command(flatten)]
+    will: WillArgs,
 }
 
 /// MQTT 5 properties of a published message.
@@ -131,7 +134,7 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
 
     args.connection.connect.ask_password()?;
     // Connect to broker
-    let options = args.connection.to_connect_options();
+    let options = args.will.apply(args.connection.to_connect_options());
     let client = MqttClient::connect(options).await?;
 
     let properties = MessageProperties::from(args.properties);

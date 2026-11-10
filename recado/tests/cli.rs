@@ -269,13 +269,18 @@ async fn the_password_can_come_from_the_environment() {
 /// Not UTF-8, with a NUL and a line feed in the middle.
 const BINARY: &[u8] = &[0xff, 0x00, b'\n', 0xfe, 0x80];
 
-/// The payload of the next message `client` receives.
+/// The payload of the next message `client` receives within 10 s.
 async fn next_payload(client: &MqttClient) -> Vec<u8> {
-    loop {
-        if let Some(mercurio_client::Event::Message { payload, .. }) = client.recv().await {
-            return payload.to_vec();
+    let next = async {
+        loop {
+            if let Some(mercurio_client::Event::Message { payload, .. }) = client.recv().await {
+                return payload.to_vec();
+            }
         }
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), next)
+        .await
+        .expect("no message within 10 s")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -304,6 +309,41 @@ async fn binary_payloads_are_published_from_stdin_and_files() {
         .run(&["pub", "-t", "bin", "-m", "x", "-f", "/dev/null"])
         .await;
     assert_eq!(both.status.code(), Some(3), "{}", stderr(&both));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pub_sends_a_will() {
+    let broker = start().await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("will/#", QoS::AtLeastOnce)])
+        .await
+        .unwrap();
+    let mut publisher = broker
+        .command(&[
+            "pub",
+            "-t",
+            "will/line",
+            "-l",
+            "--will-topic",
+            "will/status",
+            "--will-message",
+            "gone",
+            "--will-qos",
+            "1",
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    watchdog(&publisher);
+    // Connected once its first line arrives
+    let mut stdin = publisher.stdin.take().unwrap();
+    stdin.write_all(b"up\n").unwrap();
+    assert_eq!(next_payload(&receiver).await, b"up");
+    publisher.kill().unwrap();
+    publisher.wait().unwrap();
+    assert_eq!(next_payload(&receiver).await, b"gone");
 }
 
 #[tokio::test(flavor = "multi_thread")]

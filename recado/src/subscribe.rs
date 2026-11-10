@@ -5,15 +5,14 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use mercurio_client::{
-    Event, MessageProperties, MqttClient, QoS, RetainHandling, SubscriptionOptions, Will,
+    Event, MessageProperties, MqttClient, QoS, RetainHandling, SubscriptionOptions,
 };
 use serde_json::{json, Value};
 use tokio::{signal, time::Instant};
 
-use crate::common::{qos_level, ConnectionArgs};
+use crate::common::{qos_level, ConnectionArgs, WillArgs};
 use crate::failure::Failure;
 
 #[derive(Args, Debug)]
@@ -65,29 +64,6 @@ enum Format {
     Json,
 }
 
-#[derive(Args, Debug)]
-struct WillArgs {
-    /// Will message topic (sent by broker if client disconnects unexpectedly)
-    #[arg(long)]
-    will_topic: Option<String>,
-
-    /// Will message payload
-    #[arg(long)]
-    will_message: Option<String>,
-
-    /// Will message QoS level (0, 1, or 2)
-    #[arg(long, default_value = "0", value_parser = qos_level)]
-    will_qos: QoS,
-
-    /// Retain the will message on the broker
-    #[arg(long)]
-    will_retain: bool,
-
-    /// Seconds the broker waits before publishing the will (MQTT 5)
-    #[arg(long, default_value = "0")]
-    will_delay: u32,
-}
-
 /// MQTT 5 subscription options.
 #[derive(Args, Debug)]
 struct SubscriptionArgs {
@@ -113,19 +89,7 @@ struct SubscriptionArgs {
 pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     args.connection.connect.ask_password()?;
     // Connect to broker
-    let mut options = args.connection.to_connect_options();
-
-    // Configure will message if topic is provided
-    let will = args.will;
-    if let Some(topic) = will.will_topic {
-        let payload = will.will_message.unwrap_or_default();
-        options = options.will(
-            Will::new(topic, Bytes::from(payload))
-                .qos(will.will_qos)
-                .retain(will.will_retain)
-                .delay(will.will_delay),
-        );
-    }
+    let mut options = args.will.apply(args.connection.to_connect_options());
     let reconnect = args.reconnect;
     if let Some(seconds) = reconnect {
         options = options.reconnect(Duration::from_secs(seconds));
