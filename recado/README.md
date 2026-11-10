@@ -53,7 +53,7 @@ Connection options, for both commands:
 | `-H, --host` | Broker host | `localhost` |
 | `-p, --port` | Broker port | `1883` |
 | `--unix` | Unix socket, instead of host and port | |
-| `-i, --client-id` | Client id | generated |
+| `-i, --client-id` | Client id | assigned by the broker |
 | `-u, --username`, `-P, --password` | Credentials | |
 | `-V, --protocol-version` | `5`, `311` or `31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |

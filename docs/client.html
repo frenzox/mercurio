@@ -42,7 +42,7 @@
 
 <h2>Adding it</h2>
 <pre>[dependencies]
-mercurio-client = { git = "https://github.com/frenzox/mercurio" }
+mercurio-client = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }</pre>
 
 <h2>Connecting, publishing, subscribing</h2>
@@ -63,6 +63,8 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
             }
             Event::Disconnected { reason } =&gt; eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } =&gt; eprintln!("reconnected"),
+            // Event is non_exhaustive: later versions may add variants
+            _ =&gt; {}
         }
     }
     Ok(())

@@ -1,0 +1,39 @@
+# cargo-deny configuration, run in CI by the deny job of build.yml
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+# Every licence here is permissive and can ship inside a crate licensed
+# MIT OR Apache-2.0
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # wasmtime and cranelift
+    "Apache-2.0 WITH LLVM-exception",
+    # icu_* and unicode-ident, through url and idna
+    "Unicode-3.0",
+    # ring, untrusted, rustls-webpki and aws-lc-sys
+    "ISC",
+    # subtle, encoding_rs and aws-lc-sys
+    "BSD-3-Clause",
+    # foldhash
+    "Zlib",
+    # the Mozilla root certificates bundled by webpki-roots
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicates come from wasmtime and the TLS stacks moving at their own pace;
+# report them without failing the build
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace crates refer to each other by path in dev-dependencies, which
+# never reach crates.io
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

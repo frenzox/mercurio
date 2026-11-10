@@ -8,6 +8,9 @@ on:
   schedule:
     - cron: "0 6 * * 1"
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,12 +22,13 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
+          toolchain: stable
           components: rustfmt, clippy
           targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
@@ -33,6 +37,12 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      # The README's only rust block, built as a throwaway example of the
+      # client so that it keeps up with the API
+      - name: README client example
+        run: |
+          awk '/^```rust$/ {f=1; next} /^```$/ {f=0} f' README.md > mercurio-client/examples/readme.rs
+          cargo clippy -p mercurio-client --example readme -- -D warnings
       # Not workspace members: they build only for wasm32
       - name: Format the example plugins
         run: for p in examples/plugins/*/ mercuriod/test-plugins/*/; do cargo fmt --manifest-path "$p/Cargo.toml" -- --check; done
@@ -43,9 +53,11 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.89
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check with the minimum supported Rust
         run: cargo check --workspace --all-features --exclude mercuriod
 
@@ -53,9 +65,11 @@ jobs:
   msrv-mercuriod:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: "1.97"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check mercuriod with its minimum supported Rust
         run: cargo check -p mercuriod --all-features
 
@@ -64,12 +78,66 @@ jobs:
   features:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-hack
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-hack
       - name: Check each crate with each feature
         run: cargo hack check --workspace --each-feature --no-dev-deps
+
+  # The host has std, which can hide a stray std use in the no_std crates;
+  # a target without it cannot
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: stable
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check the no_std crates on bare metal
+        run: cargo check -p mercurio-core -p mercurio-packets --no-default-features --target thumbv7em-none-eabihf
+
+  # Not a workspace member: cargo fuzz builds with sanitizers, on nightly
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      - name: Build the fuzz targets
+        run: cargo fuzz build
+
+  # Experimental: this job has not passed yet, so a failure does not fail the
+  # build. Remove continue-on-error once it is green. macOS limits Unix
+  # socket paths to 104 bytes and its temporary directory is long, which the
+  # Unix socket tests may run into. mercuriod is left out: it is packaged for
+  # Linux only, and wasmtime makes it the slowest crate to build.
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check
+        run: cargo check --workspace --all-features --exclude mercuriod
+      - name: Test the client and the command-line tools
+        run: cargo test -p mercurio-client -p recado -p mercurioctl --all-features
 
   test:
     runs-on: ubuntu-latest
@@ -83,11 +151,12 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
+          toolchain: stable
           targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the example plugins
         run: for p in examples/plugins/*/; do cargo build --release --target wasm32-wasip2 --manifest-path "$p/Cargo.toml" --target-dir target/plugins; done
       - name: Test
@@ -95,10 +164,13 @@ jobs:
         env:
           MERCURIO_TEST_POSTGRES_URL: postgres://postgres:mercurio@localhost:5432/postgres
 
-  audit:
+  # Advisories, licences, duplicate crates and sources, set in deny.toml
+  deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@cargo-audit
-      - name: Audit dependencies
-        run: cargo audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny
+      - name: Check dependencies
+        run: cargo deny check

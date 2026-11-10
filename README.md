@@ -15,7 +15,9 @@ top of Tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
   maps every mosquitto option.
 - **Complete MQTT 5.** Shared subscriptions, subscription options, topic
   aliases, message expiry, request/response, enhanced authentication and
-  server redirection, in the broker and the client alike.
+  server redirection in the broker. The client supports the same, except
+  that it only accepts topic aliases from the broker and reports a
+  redirection to the application without following it.
 - **Durable.** Sessions, retained messages and queued messages are kept in
   SQLite or PostgreSQL, and a standby broker takes over a PostgreSQL
   database when the serving one stops.
@@ -154,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::Disconnected { reason } => eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } => eprintln!("reconnected"),
+            // Event is non_exhaustive: later versions may add variants
+            _ => {}
         }
     }
     Ok(())
