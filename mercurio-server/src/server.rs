@@ -884,20 +884,26 @@ fn describe(packet: &ControlPacket) -> String {
 
 /// Checks credentials, at most one login per core at a time, so a flood of
 /// logins queues instead of starving the broker of CPU for password hashes.
+/// None if the wait and the check outlast `deadline`: the client's time to
+/// connect is up, so a queued login gives up its place without a check.
 async fn validate_credentials(
     chain: &Chain,
     client: &ClientInfo,
     credentials: &Credentials<'_>,
-) -> Decision {
+    deadline: Instant,
+) -> Option<Decision> {
     static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let checks = CHECKS.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         Arc::new(tokio::sync::Semaphore::new(cores))
     });
-    let Ok(_permit) = checks.acquire().await else {
-        return Decision::Deny;
+    let check = async {
+        let Ok(_permit) = checks.acquire().await else {
+            return Decision::Deny;
+        };
+        chain.authenticate(client, credentials).await
     };
-    chain.authenticate(client, credentials).await
+    time::timeout_at(deadline, check).await.ok()
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -1481,7 +1487,17 @@ where
                         peer: self.peer,
                     };
                     let credentials = Credentials::new(username, password);
-                    match validate_credentials(&self.chain, &client, &credentials).await {
+                    let checked = validate_credentials(
+                        &self.chain,
+                        &client,
+                        &credentials,
+                        self.connect_deadline,
+                    );
+                    let Some(decision) = checked.await else {
+                        warn!("Login of user `{}` not checked in time, closing", username);
+                        return Ok(());
+                    };
+                    match decision {
                         Decision::Allow => {
                             verified_user = Some(username.clone());
                             true
