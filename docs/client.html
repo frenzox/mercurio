@@ -70,6 +70,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <ul>
 <li><code>publish</code> and <code>subscribe</code> resolve once the broker acknowledged them: PUBACK, PUBCOMP or SUBACK.</li>
 <li><code>recv</code> returns the next event, and <code>None</code> once the client is closed for good.</li>
+<li>Up to 256 events wait for <code>recv</code>. Once that many wait, the client stops reading new messages from the broker until the application takes some, but keeps sending pings and requests. A publish awaited inside the <code>recv</code> loop still completes, and no message is dropped.</li>
 <li>Dropping the last handle disconnects normally, as <code>disconnect</code> does: the broker discards the will.</li>
 <li><code>MqttClient</code> methods take <code>&amp;self</code>, so one client can be shared between tasks behind an <code>Arc</code>.</li>
 </ul>

@@ -26,6 +26,7 @@ use mercurio_packets::subscribe::{
 use mercurio_packets::unsubscribe::{UnsubscribePacket, UnsubscribePayload};
 use mercurio_packets::ControlPacket;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
@@ -336,6 +337,7 @@ impl MqttClient {
             receive_maximum: options.receive_maximum.unwrap_or(u16::MAX),
             authenticator: options.authenticator.clone(),
             reauthentication: None,
+            pending_events: VecDeque::new(),
         };
         let mut keep_alive = session.keep_alive;
 
@@ -344,7 +346,7 @@ impl MqttClient {
             let reconnect = options
                 .reconnect_delay
                 .filter(|_| should_reconnect(&reason));
-            let _ = state.event_tx.send(Event::Disconnected { reason }).await;
+            state.deliver(Event::Disconnected { reason });
             let Some(delay) = reconnect else { break };
 
             // Requests the broker never answered can't be answered now
@@ -360,15 +362,23 @@ impl MqttClient {
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
             state.topic_aliases.clear();
             keep_alive = session.keep_alive;
-            let _ = state
-                .event_tx
-                .send(Event::Reconnected {
-                    session_present: session.session_present,
-                })
-                .await;
+            state.deliver(Event::Reconnected {
+                session_present: session.session_present,
+            });
             state.resume(session.session_present).await;
         }
-        // Dropping the state fails every request still waiting for the broker
+
+        // Fail every request still waiting for the broker, and refuse new
+        // ones, before waiting for the application to take the last events
+        let pending_events = std::mem::take(&mut state.pending_events);
+        let event_tx = state.event_tx.clone();
+        drop(state);
+        drop(command_rx);
+        for event in pending_events {
+            if event_tx.send(event).await.is_err() {
+                break;
+            }
+        }
     }
 
     /// Handle a disconnect command.
@@ -522,6 +532,17 @@ impl MqttClient {
 
     /// Receive the next event from the broker.
     /// Returns None if the client is disconnected.
+    ///
+    /// Up to 256 events wait for the application. Once that many are
+    /// waiting, the client stops reading from the broker, which holds
+    /// further messages back (and with them, over TCP, its publishers),
+    /// until the application takes events again. Meanwhile the client keeps
+    /// sending keep-alive pings and requests, so a slow reader stays
+    /// connected. While one of its requests (a QoS 1 or 2 publish, a
+    /// subscription, an unsubscription, a re-authentication) waits for the
+    /// broker's answer, it reads on and holds the messages that arrive
+    /// before the answer, so awaiting a publish between two calls to `recv`
+    /// can't deadlock. No message is dropped while the client lives.
     pub async fn recv(&self) -> Option<Event> {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
@@ -616,6 +637,8 @@ struct EventLoop {
     authenticator: Option<SharedAuthenticator>,
     /// The application waiting for a re-authentication to finish
     reauthentication: Option<oneshot::Sender<Result<()>>>,
+    /// Events that didn't fit in the event channel, oldest first
+    pending_events: VecDeque<Event>,
 }
 
 /// A message the application asked to publish.
@@ -694,11 +717,18 @@ impl EventLoop {
         let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
         ping_timer.tick().await; // Skip the first immediate tick
         let mut awaiting_pingresp = false;
+        // Reading stopped at some point since the last PINGREQ, so its
+        // PINGRESP may still be unread
+        let mut paused_since_ping = false;
+        // A permit borrowing `self` would outlive the select
+        let event_tx = self.event_tx.clone();
 
         loop {
+            let reading = self.pending_events.is_empty() || self.waits_for_broker();
+            paused_since_ping |= !reading;
             tokio::select! {
                 // Handle incoming packets
-                maybe_packet = self.connection.read_packet() => {
+                maybe_packet = self.connection.read_packet(), if reading => {
                     match maybe_packet {
                         Ok(Some(ControlPacket::Disconnect(disconnect))) => {
                             // The broker is closing the connection [MQTT-3.14.4-1]
@@ -741,6 +771,10 @@ impl EventLoop {
                     }
                 }
 
+                permit = event_tx.reserve(), if !self.pending_events.is_empty() => {
+                    self.hand_over(permit);
+                }
+
                 // Handle commands from the client API
                 cmd = command_rx.recv() => {
                     let Some(cmd) = cmd else {
@@ -772,11 +806,12 @@ impl EventLoop {
                 _ = ping_timer.tick(), if ping_interval.is_some() => {
                     // The previous PINGREQ went unanswered: the broker or the
                     // network is gone
-                    if awaiting_pingresp {
+                    if awaiting_pingresp && !paused_since_ping {
                         warn!("No PINGRESP from the broker, closing the connection");
                         return DisconnectReason::KeepAliveTimeout;
                     }
                     awaiting_pingresp = true;
+                    paused_since_ping = false;
                     debug!("Sending PINGREQ");
                     if let Err(e) = self.connection.write_packet(
                         ControlPacket::PingReq(PingReqPacket {})
@@ -787,6 +822,43 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// Hands an event to the application, or holds it while the event
+    /// channel is full.
+    fn deliver(&mut self, event: Event) {
+        if self.pending_events.is_empty() {
+            match self.event_tx.try_send(event) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(event)) => self.pending_events.push_back(event),
+            }
+        } else {
+            self.pending_events.push_back(event);
+        }
+    }
+
+    /// Moves the oldest held event into the room `permit` made in the
+    /// event channel.
+    fn hand_over(&mut self, permit: std::result::Result<mpsc::Permit<'_, Event>, SendError<()>>) {
+        match permit {
+            Ok(permit) => {
+                if let Some(event) = self.pending_events.pop_front() {
+                    permit.send(event);
+                }
+            }
+            // The application is gone
+            Err(_) => self.pending_events.clear(),
+        }
+    }
+
+    /// Whether a request of the application waits for the broker's answer.
+    /// The answer may be queued behind messages, so they must be read even
+    /// though the application isn't taking events.
+    fn waits_for_broker(&self) -> bool {
+        self.outgoing.values().any(|o| o.sent)
+            || !self.subscribes.is_empty()
+            || !self.unsubscribes.is_empty()
+            || self.reauthentication.is_some()
     }
 
     /// Starts re-authenticating [MQTT-4.12.1-1].
@@ -880,12 +952,16 @@ impl EventLoop {
         options: &ConnectOptions,
         delay: Duration,
     ) -> Option<(Connection, Session)> {
+        let event_tx = self.event_tx.clone();
         loop {
             let wait = time::sleep(delay);
             tokio::pin!(wait);
             loop {
                 tokio::select! {
                     _ = &mut wait => break,
+                    permit = event_tx.reserve(), if !self.pending_events.is_empty() => {
+                        self.hand_over(permit);
+                    }
                     command = command_rx.recv() => match command? {
                         Command::Publish(request) if request.qos != QoS::AtMostOnce => {
                             self.waiting.push_back(request);
@@ -1404,17 +1480,14 @@ impl EventLoop {
                         .collect()
                 })
                 .unwrap_or_default();
-            let _ = self
-                .event_tx
-                .send(Event::Message {
-                    topic: publish.topic_name,
-                    payload: publish.payload.unwrap_or_default(),
-                    qos: publish.qos_level,
-                    retain: publish.retain,
-                    properties: MessageProperties::from_publish(publish.properties),
-                    subscription_ids,
-                })
-                .await;
+            self.deliver(Event::Message {
+                topic: publish.topic_name,
+                payload: publish.payload.unwrap_or_default(),
+                qos: publish.qos_level,
+                retain: publish.retain,
+                properties: MessageProperties::from_publish(publish.properties),
+                subscription_ids,
+            });
         }
         Ok(())
     }
