@@ -1,6 +1,7 @@
 //! `recado pub`.
 
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use clap::Args;
@@ -18,9 +19,14 @@ pub struct PubArgs {
     #[arg(short = 't', long)]
     topic: String,
 
-    /// Message payload (reads from stdin if not provided)
+    /// Message payload, as text; without it or -f, standard input is
+    /// published as it is, binary or not
     #[arg(short = 'm', long)]
     message: Option<String>,
+
+    /// Publish the contents of this file, binary or not
+    #[arg(short = 'f', long, value_name = "PATH", conflicts_with = "message")]
+    file: Option<PathBuf>,
 
     /// QoS level (0, 1, or 2)
     #[arg(short = 'q', long, default_value = "0", value_parser = qos_level)]
@@ -83,14 +89,15 @@ fn parse_user_property(value: &str) -> Result<(String, String), String> {
 }
 
 pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
-    // Get the message payload
-    let payload = match args.message {
-        Some(msg) => msg,
-        None => {
-            // Read from stdin
-            let mut buffer = String::new();
-            io::stdin().read_to_string(&mut buffer)?;
-            buffer
+    let payload = match (args.message, &args.file) {
+        (Some(message), _) => Bytes::from(message),
+        (None, Some(path)) => std::fs::read(path)
+            .map(Bytes::from)
+            .map_err(|e| Failure::Usage(format!("can't read {}: {e}", path.display())))?,
+        (None, None) => {
+            let mut buffer = Vec::new();
+            io::stdin().read_to_end(&mut buffer)?;
+            Bytes::from(buffer)
         }
     };
 
@@ -103,7 +110,7 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
     client
         .publish_with_properties(
             &args.topic,
-            Bytes::from(payload),
+            payload,
             args.qos,
             args.retain,
             args.properties.into(),

@@ -35,6 +35,9 @@ recado pub -t sensors/kitchen -m 21.5 -q 1
 # From standard input, retained
 date | recado pub -t system/time -r
 
+# A binary file; sub prints payloads byte for byte
+recado pub -t cameras/door/snapshot -f snapshot.jpg
+
 # Over TLS, with credentials
 recado sub -H broker.example.com -p 8883 --tls -u alice -t '#'
 

@@ -148,13 +148,14 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
             loop {
                 match client.recv().await {
                     Some(Event::Message { topic, payload, .. }) => {
-                        let payload = String::from_utf8_lossy(&payload);
-                        let mut out = io::stdout();
-                        let written = if args.print_topic {
-                            writeln!(out, "{}: {}", topic, payload)
-                        } else {
-                            writeln!(out, "{}", payload)
-                        };
+                        let mut out = io::stdout().lock();
+                        let written = (|| {
+                            if args.print_topic {
+                                write!(out, "{topic}: ")?;
+                            }
+                            out.write_all(&payload)?;
+                            out.write_all(b"\n")
+                        })();
                         // The reader went away, as `head` does once it has
                         // enough lines
                         if written.is_err() {

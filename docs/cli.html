@@ -48,6 +48,9 @@ recado pub -t sensors/kitchen -m 21.5 -q 1
 <span class="comment"># From standard input</span>
 echo '{"temp": 21.5}' | recado pub -t sensors/kitchen --content-type application/json
 
+<span class="comment"># A binary file, such as an image or a firmware image</span>
+recado pub -t cameras/door/snapshot -f snapshot.jpg
+
 <span class="comment"># Retained, so new subscribers get it at once</span>
 recado pub -t status/door -m open -r
 
@@ -57,7 +60,8 @@ recado pub -t requests/lamp -m on --response-topic replies/me \
 <table>
 <tr><th>Option</th><th>Meaning</th></tr>
 <tr><td><code>-t, --topic</code></td><td>Topic to publish to (required)</td></tr>
-<tr><td><code>-m, --message</code></td><td>Payload; read from standard input when absent</td></tr>
+<tr><td><code>-m, --message</code></td><td>Payload, as text. Without it or <code>-f</code>, standard input is published byte for byte</td></tr>
+<tr><td><code>-f, --file PATH</code></td><td>Publish the contents of a file, binary or not</td></tr>
 <tr><td><code>-q, --qos</code></td><td>0, 1 or 2 (default 0)</td></tr>
 <tr><td><code>-r, --retain</code></td><td>Retain the message on the broker</td></tr>
 <tr><td><code>--content-type</code></td><td>Content type of the payload, such as a MIME type</td></tr>
@@ -84,7 +88,7 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><th>Option</th><th>Meaning</th></tr>
 <tr><td><code>-t, --topic</code></td><td>Topic filter; may be repeated (required)</td></tr>
 <tr><td><code>-q, --qos</code></td><td>QoS of the subscriptions (default 0)</td></tr>
-<tr><td><code>-T, --print-topic</code></td><td>Print the topic before each message</td></tr>
+<tr><td><code>-T, --print-topic</code></td><td>Print the topic and <code>: </code> before each message</td></tr>
 <tr><td><code>--no-local</code></td><td>Don't receive messages this client publishes itself</td></tr>
 <tr><td><code>--retain-as-published</code></td><td>Keep the retain flag messages were published with</td></tr>
 <tr><td><code>--retain-handling</code></td><td>Retained messages on subscribing: 0 always, 1 only for new subscriptions, 2 never</td></tr>

@@ -116,10 +116,6 @@ impl Broker {
         })
         .await
         .unwrap();
-        client
-            .publish_with_retain(ready, "", QoS::AtLeastOnce, true)
-            .await
-            .unwrap();
         Subscriber { child, stdout }
     }
 
@@ -137,13 +133,29 @@ struct Subscriber {
 }
 
 impl Subscriber {
+    /// The next line recado prints, with its line feed.
+    fn next_line(&mut self) -> Vec<u8> {
+        let mut line = Vec::new();
+        tokio::task::block_in_place(|| self.stdout.read_until(b'\n', &mut line)).unwrap();
+        line
+    }
+
+    /// Stops recado and returns what [`Subscriber::finish`] does.
+    async fn kill(mut self) -> (Option<i32>, Vec<u8>, String) {
+        self.child.kill().unwrap();
+        self.finish().await
+    }
+
     /// Waits for recado to exit, and returns its status, the rest of its
     /// output and its standard error.
     async fn finish(self) -> (Option<i32>, Vec<u8>, String) {
-        let Subscriber { mut child, stdout } = self;
+        let Subscriber {
+            mut child,
+            mut stdout,
+        } = self;
         tokio::task::spawn_blocking(move || {
             let mut rest = Vec::new();
-            std::io::Read::read_to_end(&mut stdout.into_inner(), &mut rest).unwrap();
+            std::io::Read::read_to_end(&mut stdout, &mut rest).unwrap();
             let mut stderr = String::new();
             std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
             (child.wait().unwrap().code(), rest, stderr)
@@ -250,4 +262,59 @@ async fn the_password_can_come_from_the_environment() {
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("RECADO_PASSWORD"), "{help}");
     assert!(!help.contains("hunter2"), "{help}");
+}
+
+/// Not UTF-8, with a NUL and a line feed in the middle.
+const BINARY: &[u8] = &[0xff, 0x00, b'\n', 0xfe, 0x80];
+
+/// The payload of the next message `client` receives.
+async fn next_payload(client: &MqttClient) -> Vec<u8> {
+    loop {
+        if let Some(mercurio_client::Event::Message { payload, .. }) = client.recv().await {
+            return payload.to_vec();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_payloads_are_published_from_stdin_and_files() {
+    let broker = start().await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("bin", QoS::AtMostOnce)])
+        .await
+        .unwrap();
+
+    let output = broker.run_with_input(&["pub", "-t", "bin"], BINARY).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(next_payload(&receiver).await, BINARY);
+
+    let file = std::env::temp_dir().join(format!("recado-binary-{}", std::process::id()));
+    std::fs::write(&file, BINARY).unwrap();
+    let output = broker
+        .run(&["pub", "-t", "bin", "-f", file.to_str().unwrap()])
+        .await;
+    std::fs::remove_file(&file).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(next_payload(&receiver).await, BINARY);
+
+    let both = broker
+        .run(&["pub", "-t", "bin", "-m", "x", "-f", "/dev/null"])
+        .await;
+    assert_eq!(both.status.code(), Some(3), "{}", stderr(&both));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_payloads_are_printed_as_they_are() {
+    let broker = start().await;
+    let mut subscriber = broker
+        .subscriber(&["sub", "-t", "bin/#", "-T"], "bin/ready")
+        .await;
+    let sender = broker.client("sender").await;
+    sender
+        .publish("bin/x", &[0xff, 0x00, 0xfe][..], QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(subscriber.next_line(), b"bin/x: \xff\x00\xfe\n");
+    subscriber.kill().await;
 }
