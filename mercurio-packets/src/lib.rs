@@ -737,6 +737,15 @@ mod robustness_tests {
     }
 
     #[test]
+    fn test_suback_without_return_codes_is_a_protocol_error() {
+        assert_protocol_error(&[
+            (&[0x90, 0x02, 0x00, 0x01], ProtocolVersion::V3_1),
+            (&[0x90, 0x02, 0x00, 0x01], ProtocolVersion::V3_1_1),
+            (&[0x90, 0x03, 0x00, 0x01, 0x00], ProtocolVersion::V5),
+        ]);
+    }
+
+    #[test]
     fn test_packet_identifier_zero_is_a_protocol_error() {
         use ProtocolVersion::{V3_1_1, V5};
 

@@ -190,6 +190,12 @@ impl SubAckPacket {
     fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let packet_id = crate::decode_packet_id(buffer)?;
 
+        // One return code per filter of the SUBSCRIBE, which has at least
+        // one, as in MQTT 5
+        if !buffer.has_remaining() {
+            return Err(ReasonCode::ProtocolError.into());
+        }
+
         // No properties in MQTT 3.x
         // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure
         let mut payload = Vec::new();
