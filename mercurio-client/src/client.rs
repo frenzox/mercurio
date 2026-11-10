@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -436,6 +439,23 @@ impl MqttClient {
         retain: bool,
         properties: MessageProperties,
     ) -> Result<()> {
+        self.start_publish(topic, payload, qos, retain, properties)
+            .await?
+            .await
+    }
+
+    /// Hands a message to the client and returns once it is queued, with
+    /// a [`PendingPublish`] that completes as `publish_with_properties`
+    /// would. Messages started one after another go out in that order, so
+    /// many can be in flight at once without reordering them.
+    pub async fn start_publish(
+        &self,
+        topic: &str,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+        properties: MessageProperties,
+    ) -> Result<PendingPublish> {
         check_length("topic", topic)?;
         validate_publish_topic(topic)
             .map_err(|e| ClientError::InvalidArgument(format!("topic `{topic}`: {e}")))?;
@@ -452,8 +472,7 @@ impl MqttClient {
             }))
             .await
             .map_err(|_| ClientError::SendError)?;
-
-        response_rx.await.map_err(|_| ClientError::Disconnected)?
+        Ok(PendingPublish(response_rx))
     }
 
     /// Subscribe to one or more topics.
@@ -622,6 +641,22 @@ fn auth_answer(
             ..Default::default()
         },
     }))
+}
+
+/// A publish handed to the client, completing once the broker has
+/// acknowledged it (QoS 1 and 2) or it was written (QoS 0). Dropping it
+/// doesn't cancel the publish.
+#[must_use = "a publish's outcome is only known by awaiting it"]
+pub struct PendingPublish(oneshot::Receiver<Result<()>>);
+
+impl Future for PendingPublish {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|answer| answer.unwrap_or(Err(ClientError::Disconnected)))
+    }
 }
 
 /// What CONNACK settled for a connection.

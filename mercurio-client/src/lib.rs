@@ -13,7 +13,7 @@ mod event;
 mod options;
 mod tls;
 
-pub use client::MqttClient;
+pub use client::{MqttClient, PendingPublish};
 pub use error::{ClientError, Result};
 pub use event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
 pub use mercurio_packets::subscribe::{RetainHandling, SubscriptionOptions};

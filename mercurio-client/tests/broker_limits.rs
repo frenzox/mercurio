@@ -228,3 +228,47 @@ async fn packets_over_the_set_limit_are_refused_from_their_header() {
         announce_oversized_packet(|o| o.maximum_packet_size(500), [0xe8, 0x07, 0x00, 0x00]).await;
     refused_as_too_large(&answer, event);
 }
+
+#[tokio::test]
+async fn started_publishes_go_out_in_order_without_waiting_for_each_other() {
+    let (port, listener) = limited_broker().await;
+    let broker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for payload in *b"123" {
+            let publish = read_packet(&mut socket).await;
+            assert_eq!(publish[0], 0x32);
+            assert_eq!(*publish.last().unwrap(), payload, "{publish:02x?}");
+            ids.push([publish[5], publish[6]]);
+        }
+        for id in ids.iter().rev() {
+            socket.write_all(&[0x40, 0x02, id[0], id[1]]).await.unwrap();
+        }
+        socket
+    });
+
+    let client = MqttClient::connect(ConnectOptions::new("127.0.0.1", port).keep_alive(0))
+        .await
+        .unwrap();
+    let mut pending = Vec::new();
+    for payload in ["1", "2", "3"] {
+        pending.push(
+            client
+                .start_publish("a", payload, QoS::AtLeastOnce, false, Default::default())
+                .await
+                .unwrap(),
+        );
+    }
+    for publish in pending {
+        timeout(Duration::from_secs(3), publish)
+            .await
+            .expect("a started publish never completed")
+            .unwrap();
+    }
+    let _socket = broker.await.unwrap();
+}
