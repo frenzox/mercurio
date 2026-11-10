@@ -1425,6 +1425,7 @@ dependencies = [
 name = "mercurio-server"
 version = "0.4.1"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "futures-util",
  "mercurio-core",
@@ -1432,6 +1433,8 @@ dependencies = [
  "mercurio-storage",
  "rand 0.8.8",
  "rustls",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use mercurio_core::topic::{topic_matches_filter, validate_subscribe_filter};
 
-use crate::plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin};
+use crate::plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin, PluginKind, PluginStatus};
 
 /// What a client wants to do with a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +195,10 @@ impl AclFile {
 impl Plugin for AclFile {
     fn name(&self) -> &str {
         "acl-file"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&["authorize"])
     }
 
     /// Never defers: anything the file doesn't grant is denied.

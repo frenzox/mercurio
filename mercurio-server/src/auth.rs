@@ -9,6 +9,7 @@ use mercurio_core::reason::ReasonCode;
 
 use crate::plugin::{
     ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+    PluginKind, PluginStatus,
 };
 
 /// PLAIN authentication method (RFC 4616).
@@ -55,6 +56,10 @@ fn parse_plain_data(data: &Bytes) -> Option<(String, String)> {
 impl Plugin for PlainAuth {
     fn name(&self) -> &str {
         "plain"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&["begin_auth"])
     }
 
     fn begin_auth(&self, _client: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
@@ -118,6 +123,10 @@ impl SimpleCredentialValidator {
 impl Plugin for SimpleCredentialValidator {
     fn name(&self) -> &str {
         "credentials"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&["authenticate"])
     }
 
     fn authenticate<'a>(

@@ -25,7 +25,10 @@ use std::{
 use bytes::Bytes;
 use futures_util::FutureExt;
 use mercurio_core::{message::MessageProperties, qos::QoS, reason::ReasonCode};
+use serde::Serialize;
 use tracing::{error, warn};
+
+use crate::admin::Admin;
 
 pub use crate::acl::Access;
 
@@ -52,6 +55,59 @@ pub enum MessageAction {
     Continue,
     /// Drop the message. A QoS 1 or 2 publisher is still acknowledged.
     Drop,
+}
+
+/// What the admin API's `listPlugins` reports about a plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PluginStatus {
+    pub name: String,
+    pub kind: PluginKind,
+    /// The hooks it implements, by their method name, such as `authorize`
+    pub hooks: Vec<String>,
+    /// WASM plugins: instances running
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instances: Option<usize>,
+    /// WASM plugins: calls that failed since the broker started
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failures: Option<u64>,
+    /// WASM plugins: the last failure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl PluginStatus {
+    /// The status of a plugin called `name`, with no hooks listed.
+    pub fn new(name: impl Into<String>, kind: PluginKind) -> Self {
+        PluginStatus {
+            name: name.into(),
+            kind,
+            hooks: Vec::new(),
+            instances: None,
+            failures: None,
+            last_error: None,
+        }
+    }
+
+    /// Lists `hooks` as the ones it implements, by their method name.
+    pub fn with_hooks(mut self, hooks: &[&str]) -> Self {
+        self.hooks = hooks.iter().map(|hook| hook.to_string()).collect();
+        self
+    }
+}
+
+/// How a plugin is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum PluginKind {
+    /// Part of the broker or `mercuriod`
+    Builtin,
+    /// Rust code built into the program
+    Rust,
+    /// A WebAssembly component
+    Wasm,
 }
 
 /// The client a hook is about.
@@ -194,7 +250,16 @@ pub trait Plugin: Send + Sync + 'static {
     ///
     /// Publishes to `$CONTROL/<name>/...` go to the plugin with that name,
     /// see [`Plugin::on_control`], so pick a name no client topic needs.
+    ///
+    /// The name `broker` is taken: `$CONTROL/broker/...` is the broker's own
+    /// admin API, so a plugin with that name never sees those requests.
     fn name(&self) -> &str;
+
+    /// What the admin API reports about the plugin. The default gives its
+    /// name, kind [`PluginKind::Rust`] and no hooks.
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Rust)
+    }
 
     /// Checks the user name and password of a CONNECT, when the broker
     /// requires authentication.
@@ -331,6 +396,8 @@ pub(crate) struct Chain {
     trusted: bool,
     /// Shared by the clones of a chain.
     events: Arc<Events>,
+    /// Serves `$CONTROL/broker/v1`; set on every chain the server builds
+    admin: Option<Admin>,
 }
 
 /// An enhanced authentication in progress, with the plugin carrying it out.
@@ -358,6 +425,14 @@ impl Chain {
             timeout,
             trusted: false,
             events: Arc::default(),
+            admin: None,
+        }
+    }
+
+    pub(crate) fn with_admin(self, admin: Admin) -> Chain {
+        Chain {
+            admin: Some(admin),
+            ..self
         }
     }
 
@@ -518,6 +593,15 @@ impl Chain {
     ) -> Option<Option<Bytes>> {
         let rest = topic.strip_prefix("$CONTROL/")?;
         let (name, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if let (Some(admin), "broker") = (&self.admin, name) {
+            // Anything else under `$CONTROL/broker/`, responses included,
+            // is consumed unanswered
+            let answer = match path {
+                "v1" => Some(crate::admin::handle_request(admin, self, client, &payload).await),
+                _ => None,
+            };
+            return Some(answer);
+        }
         let plugin = self.plugins.iter().find(|p| p.name() == name)?;
         Some(
             guarded(plugin.name(), "on_control", self.timeout, || {
@@ -595,6 +679,14 @@ mod tests {
 
     fn fixed(name: &'static str, decision: Decision) -> Arc<dyn Plugin> {
         Arc::new(Fixed { name, decision })
+    }
+
+    #[test]
+    fn test_plugins_report_rust_without_hooks_by_default() {
+        let status = fixed("a", Decision::Allow).status();
+        assert_eq!(status, PluginStatus::new("a", PluginKind::Rust));
+        assert!(status.hooks.is_empty());
+        assert_eq!(status.instances, None);
     }
 
     fn client() -> ClientInfo {

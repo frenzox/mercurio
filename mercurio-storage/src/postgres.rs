@@ -677,6 +677,10 @@ fn in_bulk(write: &Write) -> bool {
 
 #[async_trait]
 impl BatchStore for PostgresStore {
+    fn backend_name(&self) -> &'static str {
+        "postgres"
+    }
+
     /// Applies the batch in one transaction, its statements pipelined, so
     /// it costs about one round trip.
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {

@@ -212,6 +212,54 @@ impl<T: Clone> TopicTree<T> {
         found
     }
 
+    /// Every filter that has subscribers, with how many. A shared
+    /// subscription's group is listed as `$share/<group>/<filter>`. Only
+    /// counts are taken, so the tree stays read-locked for as short as
+    /// possible.
+    pub fn filters(&self) -> Vec<(String, usize)> {
+        let root = self.root.read().unwrap();
+        let mut found = Vec::new();
+        let mut stack: Vec<(String, &TopicNode<T>)> = root
+            .children
+            .iter()
+            .map(|(level, node)| (level.clone(), node))
+            .collect();
+        while let Some((filter, node)) = stack.pop() {
+            if !node.subscribers.is_empty() {
+                found.push((filter.clone(), node.subscribers.len()));
+            }
+            for (group, share) in &node.shared {
+                found.push((format!("$share/{group}/{filter}"), share.members.len()));
+            }
+            for (level, child) in &node.children {
+                stack.push((format!("{filter}/{level}"), child));
+            }
+        }
+        found
+    }
+
+    /// The subscribers of exactly `filter`, which may be a shared
+    /// subscription.
+    pub fn subscribers_of(&self, filter: &str) -> Vec<T> {
+        let (share_name, filter) = split_shared(filter);
+        let root = self.root.read().unwrap();
+        let mut node = &*root;
+        for level in filter.split('/') {
+            match node.children.get(level) {
+                Some(child) => node = child,
+                None => return Vec::new(),
+            }
+        }
+        match share_name {
+            None => node.subscribers.values().cloned().collect(),
+            Some(name) => node
+                .shared
+                .get(name)
+                .map(|group| group.members.iter().map(|(_, m)| m.clone()).collect())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Calls `visit` on the node of every filter matching `topic`.
     fn walk(&self, topic: &str, mut visit: impl FnMut(&TopicNode<T>)) {
         let root = self.root.read().unwrap();
@@ -274,6 +322,40 @@ mod tests {
         let mut matches = [found.regular, found.shared].concat();
         matches.sort();
         matches
+    }
+
+    #[test]
+    fn test_filters_lists_every_filter_with_its_subscribers() {
+        let tree = TopicTree::new();
+        tree.subscribe("a/#", 1, "one");
+        tree.subscribe("a/#", 2, "two");
+        tree.subscribe("/b", 1, "one");
+        tree.subscribe("$share/g/a/#", 3, "three");
+
+        tree.subscribe("a//b", 1, "one");
+        tree.subscribe("#", 1, "one");
+        tree.subscribe("+/x", 1, "one");
+
+        let mut filters = tree.filters();
+        filters.sort();
+        assert_eq!(
+            filters,
+            [
+                ("#".to_string(), 1),
+                ("$share/g/a/#".to_string(), 1),
+                ("+/x".to_string(), 1),
+                ("/b".to_string(), 1),
+                ("a/#".to_string(), 2),
+                ("a//b".to_string(), 1),
+            ]
+        );
+
+        let mut subscribers = tree.subscribers_of("a/#");
+        subscribers.sort();
+        assert_eq!(subscribers, ["one", "two"]);
+        assert_eq!(tree.subscribers_of("$share/g/a/#"), ["three"]);
+        assert!(tree.subscribers_of("a").is_empty());
+        assert!(tree.subscribers_of("$share/h/a/#").is_empty());
     }
 
     #[test]

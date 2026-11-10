@@ -26,6 +26,7 @@ use mercurio_core::{
         SubscriptionIdentifier, SubscriptionIdentifierAvailable, TopicAlias, TopicAliasMaximum,
         WildcardSubscriptionAvailable,
     },
+    protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
     topic::{parse_shared_subscription, validate_publish_topic, validate_subscribe_filter},
@@ -57,6 +58,7 @@ use crate::{
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
+    sys::ClientCounters,
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
@@ -308,6 +310,47 @@ struct State {
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
     max_retained_messages: Option<usize>,
+    /// What the admin API reports about the connection
+    presence: Presence,
+}
+
+/// The session's current or last connection, for the admin API.
+#[derive(Default)]
+struct Presence {
+    listener: Option<Arc<str>>,
+    /// Unix seconds; None until a client connects in this run of the broker
+    connected_at: Option<u64>,
+    /// Unix seconds
+    disconnected_at: Option<u64>,
+    keepalive: u16,
+    /// How long the session outlives the connection; forever if None
+    session_expiry: Option<Duration>,
+    /// Unix milliseconds, once disconnected
+    expires_at: Option<u64>,
+    counters: Arc<ClientCounters>,
+    /// A will waits for its delay before being published
+    delayed_will: bool,
+}
+
+/// A session's state at one moment, for the admin API.
+pub(crate) struct SessionSnapshot {
+    pub username: Option<String>,
+    pub peer: Option<SocketAddr>,
+    pub listener: Option<Arc<str>>,
+    /// None for a session restored from storage whose client hasn't
+    /// connected since, like the other connection details
+    pub protocol_version: Option<ProtocolVersion>,
+    pub keepalive: Option<u16>,
+    pub clean_start: Option<bool>,
+    pub connected_at: Option<u64>,
+    pub disconnected_at: Option<u64>,
+    pub session_expiry: Option<Duration>,
+    pub expires_at: Option<u64>,
+    pub subscriptions: Vec<StoredSubscription>,
+    pub queued: usize,
+    pub inflight: usize,
+    pub will_pending: bool,
+    pub counters: Arc<ClientCounters>,
 }
 
 impl From<Session> for SessionDropGuard {
@@ -365,6 +408,7 @@ impl Session {
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
                     max_retained_messages: None,
+                    presence: Presence::default(),
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
@@ -920,6 +964,83 @@ impl Session {
             client_id: session.client_id.clone(),
             username: session.verified_user.clone(),
             peer: session.peer,
+        }
+    }
+
+    /// Identifies this session's subscriptions in the topic tree.
+    pub(crate) fn subscriber_id(&self) -> u64 {
+        self.shared.subscriber_id
+    }
+
+    /// Records a new connection to the session and returns the counters
+    /// of its traffic.
+    pub(crate) async fn attach(
+        &self,
+        listener: Arc<str>,
+        keepalive: u16,
+        expiry: Option<Duration>,
+    ) -> Arc<ClientCounters> {
+        let counters = Arc::new(ClientCounters::default());
+        self.shared.state.lock().await.presence = Presence {
+            listener: Some(listener),
+            connected_at: Some(unix_millis() / 1000),
+            disconnected_at: None,
+            keepalive,
+            session_expiry: expiry,
+            expires_at: None,
+            counters: Arc::clone(&counters),
+            delayed_will: false,
+        };
+        counters
+    }
+
+    /// Records that the connection of `generation` ended, the session
+    /// outliving it by `expiry`, unless a newer connection took over.
+    pub(crate) async fn detach(&self, generation: u64, expiry: Option<Duration>) {
+        let mut state = self.shared.state.lock().await;
+        if state.generation != generation {
+            return;
+        }
+        let now = unix_millis();
+        state.presence.disconnected_at = Some(now / 1000);
+        state.presence.session_expiry = expiry;
+        state.presence.expires_at = expiry.map(|e| now + e.as_millis() as u64);
+    }
+
+    /// Records a session restored from storage as disconnected from now on.
+    pub(crate) async fn mark_restored(&self, expiry: Option<Duration>, expires_at: Option<u64>) {
+        let presence = &mut self.shared.state.lock().await.presence;
+        presence.disconnected_at = Some(unix_millis() / 1000);
+        presence.session_expiry = expiry;
+        presence.expires_at = expires_at;
+    }
+
+    pub(crate) async fn set_delayed_will(&self, delayed: bool) {
+        self.shared.state.lock().await.presence.delayed_will = delayed;
+    }
+
+    pub(crate) async fn snapshot(&self) -> SessionSnapshot {
+        let state = self.shared.state.lock().await;
+        let presence = &state.presence;
+        let seen = presence.connected_at.is_some();
+        SessionSnapshot {
+            username: state.owner.username.clone(),
+            peer: state.peer,
+            listener: presence.listener.clone(),
+            protocol_version: seen.then_some(state.connect_packet.protocol_version),
+            keepalive: seen.then_some(presence.keepalive),
+            clean_start: seen.then_some(state.connect_packet.flags.clean_start),
+            connected_at: presence
+                .connected_at
+                .filter(|_| presence.disconnected_at.is_none()),
+            disconnected_at: presence.disconnected_at,
+            session_expiry: presence.session_expiry,
+            expires_at: presence.expires_at,
+            subscriptions: state.subscriptions.values().cloned().collect(),
+            queued: self.shared.queue.len(),
+            inflight: state.unacknowledged_messages.len() + state.pubrecs.len(),
+            will_pending: state.will_message.is_some() || presence.delayed_will,
+            counters: Arc::clone(&presence.counters),
         }
     }
 

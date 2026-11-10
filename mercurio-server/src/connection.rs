@@ -14,7 +14,7 @@ use mercurio_core::{
 use mercurio_packets::ControlPacket;
 use tracing::warn;
 
-use crate::sys::Stats;
+use crate::sys::{ClientCounters, Stats};
 
 /// Initial capacity of the read buffer, which grows for larger packets.
 /// Kept small, as most connections are idle or exchange small packets, and
@@ -54,6 +54,8 @@ where
     mount_point: Option<String>,
     /// Where the bytes read and written are counted
     stats: Option<Arc<Stats>>,
+    /// Where this client's traffic is counted, once it has a session
+    counters: Option<Arc<ClientCounters>>,
 }
 
 /// Moves the topics a client sent under `mount_point`. Empty names are left
@@ -112,11 +114,16 @@ where
             connect_version: None,
             mount_point: None,
             stats: None,
+            counters: None,
         }
     }
 
     pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
         self.stats = Some(stats);
+    }
+
+    pub(crate) fn set_counters(&mut self, counters: Arc<ClientCounters>) {
+        self.counters = Some(counters);
     }
 
     pub fn set_mount_point(&mut self, mount_point: Option<String>) {
@@ -138,6 +145,9 @@ where
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
             if let Some(mut packet) = self.parse_packet()? {
+                if let (Some(counters), ControlPacket::Publish(_)) = (&self.counters, &packet) {
+                    Stats::add(&counters.messages_in);
+                }
                 if let Some(mount_point) = &self.mount_point {
                     mount(&mut packet, mount_point);
                 }
@@ -150,6 +160,9 @@ where
             let read = self.stream.read_buf(&mut self.read_buffer).await?;
             if let Some(stats) = &self.stats {
                 Stats::add_n(&stats.bytes_received, read as u64);
+            }
+            if let Some(counters) = &self.counters {
+                Stats::add_n(&counters.bytes_in, read as u64);
             }
             if read == 0 {
                 if self.read_buffer.is_empty() {
@@ -187,6 +200,11 @@ where
             warn!("Dropping a packet too large for MQTT to frame");
             self.write_buffer.clear();
         }
+        if let (Some(counters), ControlPacket::Publish(_)) = (&self.counters, &packet) {
+            if !self.write_buffer.is_empty() {
+                Stats::add(&counters.messages_out);
+            }
+        }
         self.send_encoded()
     }
 
@@ -196,6 +214,9 @@ where
         self.stream.flush().await?;
         if let Some(stats) = &self.stats {
             Stats::add_n(&stats.bytes_sent, self.write_buffer.len() as u64);
+        }
+        if let Some(counters) = &self.counters {
+            Stats::add_n(&counters.bytes_out, self.write_buffer.len() as u64);
         }
         if self.write_buffer.capacity() > RELEASE_ABOVE {
             self.write_buffer = BytesMut::with_capacity(WRITE_BUFFER_CAPACITY);
