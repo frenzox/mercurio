@@ -171,6 +171,11 @@ impl Decoder for ConnAckProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
+        check_authentication(
+            &properties.authentication_method,
+            &properties.authentication_data,
+        )?;
+
         Ok(properties)
     }
 }

@@ -983,6 +983,33 @@ mod property_list_tests {
     }
 
     #[test]
+    fn test_authentication_data_needs_a_method() {
+        fn run<P: Decoder>(bytes: &'static [u8]) -> Result<()> {
+            P::decode(&mut Bytes::from_static(bytes)).map(|_| ())
+        }
+        type Decode = fn(&'static [u8]) -> Result<()>;
+        let decoders: [Decode; 3] = [
+            run::<connect::ConnectProperties>,
+            run::<connack::ConnAckProperties>,
+            run::<auth::AuthProperties>,
+        ];
+
+        // Authentication Data alone, then with Authentication Method "m"
+        let data_only = &[0x03, 0x16, 0x00, 0x00][..];
+        let with_method = &[0x07, 0x16, 0x00, 0x00, 0x15, 0x00, 0x01, b'm'][..];
+        for (i, decode) in decoders.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    decode(data_only),
+                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                ),
+                "decoder {i}"
+            );
+            assert!(decode(with_method).is_ok(), "decoder {i}");
+        }
+    }
+
+    #[test]
     fn test_every_property_list_takes_user_properties() {
         // Two User Properties "k" = "" and "" = ""
         let list = &[

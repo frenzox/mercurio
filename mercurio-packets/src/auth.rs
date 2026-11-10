@@ -59,6 +59,8 @@ impl Decoder for AuthProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
+        check_authentication(&properties.auth_method, &properties.auth_data)?;
+
         Ok(properties)
     }
 }
