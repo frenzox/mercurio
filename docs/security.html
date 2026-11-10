@@ -174,7 +174,7 @@ mercurioctl -H broker.example.com -u admin dynsec list-clients</pre>
 <tr><td>Groups</td><td><code>createGroup</code>, <code>deleteGroup</code>, <code>addGroupRole</code>, <code>removeGroupRole</code>, <code>addGroupClient</code>, <code>removeGroupClient</code>, <code>getGroup</code>, <code>listGroups</code>, <code>setAnonymousGroup</code>, <code>getAnonymousGroup</code></td></tr>
 <tr><td>Defaults</td><td><code>setDefaultACLAccess</code>, <code>getDefaultACLAccess</code></td></tr>
 </table>
-<p>Changes take effect at once and are saved to the file after each message. The file is replaced in one step, so a crash never leaves it half written.</p>
+<p>Changes take effect at once and are saved to the file after each message. As in mosquitto, a change that can take access away disconnects the connected clients it concerns, with reason code Administrative Action (0x98) and without their wills, so they log in again under their new access: deleting or disabling a client or setting its password, adding or removing a client's roles or groups, adding or removing a group's roles, deleting a group or a role, and adding or removing a role's ACLs. Changes to the anonymous group disconnect anonymous clients that came over the network; in-process clients and those of Unix sockets stay connected. The file is replaced in one step, so a crash never leaves it half written.</p>
 
 <h2 id="http">HTTP authentication</h2>
 <p>Delegates checks to an HTTP service, with the requests of mosquitto-go-auth's HTTP backend, so services written for it answer Mercurio too.</p>

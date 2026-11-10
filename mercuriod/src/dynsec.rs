@@ -8,14 +8,16 @@
 //! name with no client gets no access.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, OnceLock, RwLock},
 };
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
+use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
@@ -208,6 +210,53 @@ impl Data {
                 _ => false,
             },
         }
+    }
+
+    /// The clients whose access `command` may change, to disconnect once it
+    /// is applied, as mosquitto does: they log in again under the access
+    /// they now have, and their subscriptions are checked again.
+    fn affected_by(&self, command: &str, args: &Value) -> Affected {
+        let text = |name: &str| args.get(name).and_then(Value::as_str);
+        let mut affected = Affected::default();
+        match command {
+            "deleteClient" | "disableClient" | "setClientPassword" | "addClientRole"
+            | "removeClientRole" | "addGroupClient" | "removeGroupClient" => {
+                affected.users.extend(text("username").map(str::to_string));
+            }
+            "addGroupRole" | "removeGroupRole" | "deleteGroup" => {
+                if let Some(group) = text("groupname") {
+                    self.add_members(group, &mut affected);
+                }
+            }
+            "deleteRole" | "addRoleACL" | "removeRoleACL" => {
+                if let Some(role) = text("rolename") {
+                    let holders = self
+                        .clients
+                        .iter()
+                        .filter(|c| c.roles.iter().any(|r| r == role));
+                    affected.users.extend(holders.map(|c| c.username.clone()));
+                    for group in self
+                        .groups
+                        .iter()
+                        .filter(|g| g.roles.iter().any(|r| r == role))
+                    {
+                        self.add_members(&group.groupname, &mut affected);
+                    }
+                }
+            }
+            "setAnonymousGroup" => affected.anonymous = true,
+            _ => {}
+        }
+        affected
+    }
+
+    fn add_members(&self, group: &str, affected: &mut Affected) {
+        let members = self
+            .clients
+            .iter()
+            .filter(|c| c.groups.iter().any(|g| g == group));
+        affected.users.extend(members.map(|c| c.username.clone()));
+        affected.anonymous |= self.anonymous_group.as_deref() == Some(group);
     }
 
     /// Applies one command. Returns its response data, if any, and whether
@@ -519,9 +568,9 @@ fn no_priority(args: &Value) -> Result<(), String> {
     match args.get("priority") {
         None | Some(Value::Null) => Ok(()),
         Some(priority) if priority.as_i64() == Some(-1) => Ok(()),
-        Some(_) => Err(
-            "Role and group priorities are not supported; give the ACLs priorities".to_string(),
-        ),
+        Some(_) => {
+            Err("Role and group priorities are not supported; give the ACLs priorities".to_string())
+        }
     }
 }
 
@@ -533,6 +582,20 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to hash password: {e}"))
 }
 
+/// Connected clients a change of the state concerns.
+#[derive(Debug, Default)]
+struct Affected {
+    users: BTreeSet<String>,
+    /// Clients without a user name
+    anonymous: bool,
+}
+
+impl Affected {
+    fn is_empty(&self) -> bool {
+        self.users.is_empty() && !self.anonymous
+    }
+}
+
 /// The dynamic security state, checking passwords and topic access.
 pub struct DynamicSecurity {
     path: String,
@@ -541,6 +604,8 @@ pub struct DynamicSecurity {
     /// overwrite each other's changes or the temporary file, and a reload
     /// doesn't land between a batch's copy of the state and its save
     commands: Mutex<()>,
+    /// Disconnects the clients a change affects, once the broker runs
+    admin: OnceLock<Admin>,
 }
 
 impl DynamicSecurity {
@@ -549,7 +614,14 @@ impl DynamicSecurity {
             path: path.to_string(),
             data: RwLock::new(read(path)?),
             commands: Mutex::new(()),
+            admin: OnceLock::new(),
         })
+    }
+
+    /// Hands over the broker's `Admin`, which exists only once the broker
+    /// does.
+    pub fn set_admin(&self, admin: Admin) {
+        let _ = self.admin.set(admin);
     }
 
     /// Writes a new state file with an administrator client, `admin`, whose
@@ -593,12 +665,19 @@ impl DynamicSecurity {
     }
 
     /// Runs a batch of commands, `{"commands": [...]}`, and returns the
-    /// response batch. The file is saved once if any command changed the
-    /// state; if saving fails, the changes are undone.
-    fn handle(&self, request: &[u8]) -> Value {
+    /// response batch with the clients the changes concern. The file is
+    /// saved once if any command changed the state; if saving fails, the
+    /// changes are undone.
+    fn handle(&self, request: &[u8]) -> (Value, Affected) {
         let request: Value = match serde_json::from_slice(request) {
             Ok(request) => request,
-            Err(e) => return json!({ "responses": [{ "error": format!("Invalid JSON: {e}") }] }),
+            Err(e) => {
+                let error = format!("Invalid JSON: {e}");
+                return (
+                    json!({ "responses": [{ "error": error }] }),
+                    Affected::default(),
+                );
+            }
         };
         let commands = request
             .get("commands")
@@ -612,13 +691,19 @@ impl DynamicSecurity {
         let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         let mut data = self.data.read().unwrap().clone();
         let mut changed = false;
+        let mut affected = Affected::default();
         let mut responses = Vec::new();
         for args in &commands {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             let mut response = json!({ "command": command });
+            // Before applying it: a deleted role or group no longer names
+            // its holders
+            let concerned = data.affected_by(command, args);
             match data.apply(command, args) {
                 Ok((reply, change)) => {
                     changed |= change;
+                    affected.users.extend(concerned.users);
+                    affected.anonymous |= concerned.anonymous;
                     if let Some(reply) = reply {
                         response["data"] = reply;
                     }
@@ -636,10 +721,43 @@ impl DynamicSecurity {
                 Err(e) => {
                     error!("Dynamic security: {e}");
                     responses = vec![json!({ "error": "Failed to save the changes" })];
+                    affected = Affected::default();
                 }
             }
         }
-        json!({ "responses": responses })
+        (json!({ "responses": responses }), affected)
+    }
+}
+
+/// Disconnects the connected clients `affected` names, with Administrative
+/// Action and without their wills, as mosquitto does. Anonymous clients are
+/// those with a network address: in-process clients and those of Unix
+/// sockets, the trusted admin socket among them, are left alone.
+async fn disconnect(admin: Admin, affected: Affected) {
+    let mut query = ClientQuery::default();
+    query.connected = Some(true);
+    let mut targets = Vec::new();
+    loop {
+        query.paging = Paging::new(query.paging.offset, MAX_PAGE).expect("a page allowed");
+        let page = admin.clients(&query).await;
+        if page.items.is_empty() {
+            break;
+        }
+        query.paging.offset += page.items.len();
+        let concerned = page
+            .items
+            .into_iter()
+            .filter(|client| match &client.username {
+                Some(username) => affected.users.contains(username),
+                None => affected.anonymous && client.address.is_some(),
+            });
+        targets.extend(concerned.map(|client| client.client_id));
+    }
+    let mut options = DisconnectOptions::default();
+    options.send_will = false;
+    for client_id in targets {
+        // It may have left meanwhile
+        let _ = admin.disconnect(&client_id, options).await;
     }
 }
 
@@ -720,7 +838,10 @@ impl DynamicSecurity {
                 _ => (None, None),
             }
         };
-        match hash.as_deref().and_then(|hash| PasswordHash::new(hash).ok()) {
+        match hash
+            .as_deref()
+            .and_then(|hash| PasswordHash::new(hash).ok())
+        {
             Some(hash) => {
                 let valid = Argon2::default().verify_password(password, &hash).is_ok();
                 valid && bound.is_none_or(|bound| bound == client_id)
@@ -759,7 +880,12 @@ impl Plugin for DynamicSecurity {
         }
         Box::pin(async move {
             // Hashing passwords takes a while; keep it off the runtime
-            let response = tokio::task::block_in_place(|| self.handle(&payload));
+            let (response, affected) = tokio::task::block_in_place(|| self.handle(&payload));
+            // Apart, so a long list of sessions doesn't hold the answer up
+            let admin = self.admin.get().cloned();
+            if let Some(admin) = admin.filter(|_| !affected.is_empty()) {
+                tokio::spawn(disconnect(admin, affected));
+            }
             Some(Bytes::from(response.to_string()))
         })
     }
@@ -906,7 +1032,7 @@ mod tests {
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
         let request = json!({ "commands": commands }).to_string();
-        let response = security.handle(request.as_bytes());
+        let (response, _) = security.handle(request.as_bytes());
         response["responses"].as_array().unwrap().clone()
     }
 
@@ -1246,6 +1372,190 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Connects `username`, password `pw`, as client `username`.
+    async fn connect(port: u16, username: &str) -> mercurio_client::MqttClient {
+        let options = mercurio_client::ConnectOptions::new("127.0.0.1", port)
+            .client_id(username)
+            .username(username)
+            .password("pw");
+        mercurio_client::MqttClient::connect(options)
+            .await
+            .unwrap_or_else(|e| panic!("{username} failed to connect: {e}"))
+    }
+
+    /// Whether the broker disconnected `client` for an administrative
+    /// action within a while.
+    async fn kicked(client: &mercurio_client::MqttClient) -> bool {
+        use mercurio_client::{DisconnectReason, Event};
+        use mercurio_core::reason::ReasonCode;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(500), client.recv()).await;
+            match event {
+                Err(_) => return false,
+                Ok(Some(Event::Disconnected {
+                    reason: DisconnectReason::ServerInitiated { reason, .. },
+                })) => return reason == ReasonCode::AdministrativeAction,
+                Ok(Some(Event::Disconnected { reason })) => panic!("{reason:?}"),
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("ended without a disconnect event"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_changes_disconnect_the_clients_they_affect() {
+        use mercurio_server::server::{Server, ServerConfig};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-kick-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = std::sync::Arc::new(DynamicSecurity::load(path).unwrap());
+        let mut config = ServerConfig::default();
+        config.plugins = vec![security.clone()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = Server::new(
+            listener,
+            config,
+            std::sync::Arc::new(mercurio_storage::memory::MemoryStore::new()),
+        )
+        .await
+        .unwrap();
+        security.set_admin(server.admin());
+        tokio::spawn(server.run(std::future::pending::<()>()));
+
+        let admin = ClientInfo::new("admin", Some("admin".to_string()));
+        let command = |commands: Value| {
+            let security = security.clone();
+            let admin = admin.clone();
+            async move {
+                let request = json!({ "commands": commands }).to_string();
+                let answer = security
+                    .on_control(&admin, "v1", Bytes::from(request))
+                    .await
+                    .unwrap();
+                let answer: Value = serde_json::from_slice(&answer).unwrap();
+                for response in answer["responses"].as_array().unwrap() {
+                    assert!(response.get("error").is_none(), "{answer}");
+                }
+            }
+        };
+
+        // Each case: setup, then the command that must disconnect `user`
+        // and no one else
+        let cases = [
+            (
+                json!([]),
+                json!({ "command": "deleteClient", "username": "user" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "disableClient", "username": "user" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "setClientPassword", "username": "user", "password": "x" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "removeClientRole", "username": "user", "rolename": "r" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "addClientRole", "username": "user", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "removeGroupClient", "username": "user", "groupname": "g" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "addGroupClient", "username": "user", "groupname": "g" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "removeGroupRole", "groupname": "g", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" },
+                       { "command": "removeGroupRole", "groupname": "g", "rolename": "r" }]),
+                json!({ "command": "addGroupRole", "groupname": "g", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "deleteGroup", "groupname": "g" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "deleteRole", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "removeRoleACL", "rolename": "r",
+                        "acltype": "subscribePattern", "topic": "a/#" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "addRoleACL", "rolename": "r",
+                        "acltype": "subscribePattern", "topic": "b/#", "allow": true }),
+            ),
+        ];
+        for (n, (setup, change)) in cases.into_iter().enumerate() {
+            let user = format!("user{n}");
+            let bystander = format!("bystander{n}");
+            let rename = |value: Value| {
+                serde_json::from_str::<Value>(
+                    &value.to_string().replace("\"user\"", &format!("{user:?}")),
+                )
+                .unwrap()
+            };
+            command(json!([
+                { "command": "createRole", "rolename": "r", "acls": [
+                    { "acltype": "subscribePattern", "topic": "a/#", "allow": true },
+                ]},
+                { "command": "createGroup", "groupname": "g", "roles": [{ "rolename": "r" }] },
+                { "command": "createClient", "username": user, "password": "pw" },
+                { "command": "createClient", "username": bystander, "password": "pw" },
+            ]))
+            .await;
+            command(rename(setup)).await;
+            let affected = connect(port, &user).await;
+            let other = connect(port, &bystander).await;
+
+            command(json!([rename(change.clone())])).await;
+            assert!(kicked(&affected).await, "{change}");
+            assert!(!kicked(&other).await, "{change}");
+
+            let _ = other.disconnect().await;
+            let cleanup = [
+                json!({ "command": "deleteClient", "username": user }),
+                json!({ "command": "deleteClient", "username": bystander }),
+                json!({ "command": "deleteGroup", "groupname": "g" }),
+                json!({ "command": "deleteRole", "rolename": "r" }),
+            ];
+            let request = json!({ "commands": cleanup }).to_string();
+            security.handle(request.as_bytes());
+        }
+
+        // Anonymous clients have the anonymous group's roles
+        command(json!([
+            { "command": "createGroup", "groupname": "guests" },
+            { "command": "createClient", "username": "named", "password": "pw" },
+        ]))
+        .await;
+        let options = mercurio_client::ConnectOptions::new("127.0.0.1", port).client_id("anon");
+        let anonymous = mercurio_client::MqttClient::connect(options).await.unwrap();
+        let named = connect(port, "named").await;
+        command(json!([{ "command": "setAnonymousGroup", "groupname": "guests" }])).await;
+        assert!(kicked(&anonymous).await);
+        assert!(!kicked(&named).await);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn test_users_it_does_not_know_get_no_access() {
         let path =
@@ -1342,10 +1652,8 @@ mod tests {
 
     #[test]
     fn test_role_priorities_are_refused() {
-        let path = std::env::temp_dir().join(format!(
-            "mercuriod-dynsec-priority-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-priority-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
@@ -1390,10 +1698,8 @@ mod tests {
 
     #[test]
     fn test_invalid_default_access_changes_nothing() {
-        let path = std::env::temp_dir().join(format!(
-            "mercuriod-dynsec-default-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-default-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();

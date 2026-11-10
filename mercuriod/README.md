@@ -431,6 +431,9 @@ decide publishing, `publishClientReceive` receiving, and
 highest `priority` wins, whichever role holds it; roles and groups have no
 priority of their own, and commands giving them one fail. Without a matching ACL, only receiving is allowed, unless
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
+As in mosquitto, a change that can take access away disconnects the
+connected clients it concerns, with Administrative Action (0x98), so they
+log in again under their new access.
 
 `$CONTROL` topics are only open to clients when access control grants
 them, so a broker without `acl_file` or `dynamic_security` refuses them

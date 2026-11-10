@@ -244,7 +244,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .collect();
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
-    let (auth_config, builtins) = build_auth(&config.auth, &mut reloadable, true)?;
+    let (auth_config, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
     let wasm = load_plugins(&config.plugins, &mut reloadable).await?;
     // Listeners naming plugins share these copies of `[auth]`'s built-ins
     // and of the plugins with the broker's chain
@@ -277,7 +277,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             value.http_dir = extra.http_dir.clone().map(Into::into);
             let names = extra.plugins.as_deref();
             if let Some(auth) = &extra.auth {
-                let (auth, plugins) = build_auth(auth, &mut reloadable, false)?;
+                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;
                 value.auth = Some(auth);
                 value.plugins = Some(chain(&plugins, names));
             } else if names.is_some() {
@@ -340,16 +340,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = match config.storage {
         StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
-            serve(listener, server_config, storage, &commands, shutdown).await
+            serve(
+                listener,
+                server_config,
+                storage,
+                &commands,
+                dynsec,
+                shutdown,
+            )
+            .await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            serve(listener, server_config, storage, &commands, shutdown).await
+            serve(
+                listener,
+                server_config,
+                storage,
+                &commands,
+                dynsec,
+                shutdown,
+            )
+            .await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            serve(listener, server_config, storage, &commands, shutdown).await
+            serve(
+                listener,
+                server_config,
+                storage,
+                &commands,
+                dynsec,
+                shutdown,
+            )
+            .await
         }
     };
     // Removed now, as exiting skips destructors
@@ -371,17 +395,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Sets the broker up, hands its `Admin` to the daemon's commands, and
-/// serves until `shutdown`.
+/// Sets the broker up, hands its `Admin` to the daemon's commands and to
+/// dynamic security, and serves until `shutdown`.
 async fn serve<St: MqttStore + 'static>(
     listener: TcpListener,
     config: ServerConfig,
     storage: Arc<St>,
     commands: &commands::DaemonCommands,
+    dynsec: Option<Arc<DynamicSecurity>>,
     shutdown: impl Future,
 ) -> Result<(), ServerError> {
     let server = Server::new(listener, config, storage).await?;
     commands.set_admin(server.admin());
+    if let Some(dynsec) = dynsec {
+        dynsec.set_admin(server.admin());
+    }
     server.run(shutdown).await
 }
 
@@ -465,13 +493,21 @@ async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
 }
 
-/// The authentication and access control of `config`, and the plugins that
-/// check credentials, adding the files it loads to `reloadable`.
+/// What `build_auth` sets up: the settings, the plugins that check
+/// credentials, and dynamic security when it is one of them.
+type Auth = (
+    ServerAuthConfig,
+    Vec<Arc<dyn Plugin>>,
+    Option<Arc<DynamicSecurity>>,
+);
+
+/// The authentication and access control of `config`, adding the files it
+/// loads to `reloadable`.
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
     main: bool,
-) -> Result<(ServerAuthConfig, Vec<Arc<dyn Plugin>>), String> {
+) -> Result<Auth, String> {
     let table = if main { "[auth]" } else { "[listeners.auth]" };
     // Without authentication these would be ignored, letting everyone in
     let authenticating = [
@@ -505,7 +541,7 @@ fn build_auth(
         let mut value = ServerAuthConfig::default();
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
-        return Ok((value, vec![security]));
+        return Ok((value, vec![security.clone()], Some(security)));
     }
 
     let http = config.http.as_ref().map(|http| {
@@ -546,7 +582,7 @@ fn build_auth(
     let mut value = ServerAuthConfig::default();
     value.require_auth = config.enabled;
     value.allow_anonymous = config.allow_anonymous;
-    Ok((value, plugins))
+    Ok((value, plugins, None))
 }
 
 /// Loads the `[[plugins]]` in order, with their names, adding each to
@@ -706,7 +742,7 @@ mod tests {
 
     #[test]
     fn test_access_control_works_without_authentication() {
-        let (value, plugins) = build_auth(
+        let (value, plugins, _) = build_auth(
             &auth("[http]\nacl_url = \"http://h/acl\"\n"),
             &mut Vec::new(),
             true,
@@ -724,7 +760,7 @@ mod tests {
             true,
         );
         std::fs::remove_file(&acl).unwrap();
-        let (value, plugins) = result.map_err(|e| panic!("{e}")).unwrap();
+        let (value, plugins, _) = result.map_err(|e| panic!("{e}")).unwrap();
         assert!(!value.require_auth);
         assert_eq!(plugins.len(), 1);
     }
