@@ -1091,21 +1091,6 @@ impl EventLoop {
     /// the broker has acknowledged them, and wait their turn if the broker's
     /// Receive Maximum is reached [MQTT-3.3.4-7].
     async fn publish(&mut self, request: PublishRequest) {
-        // Features the broker doesn't support are refused here rather than
-        // sent [MQTT-3.2.2-11, MQTT-3.2.2-14]
-        if (request.qos as u8) > (self.limits.maximum_qos as u8) {
-            let _ = request
-                .response
-                .send(Err(ClientError::NotSupported("this QoS")));
-            return;
-        }
-        if request.retain && !self.limits.retain_available {
-            let _ = request
-                .response
-                .send(Err(ClientError::NotSupported("retained messages")));
-            return;
-        }
-
         if request.qos != QoS::AtMostOnce && self.in_flight() >= self.window() {
             self.waiting.push_back(request);
             return;
@@ -1163,6 +1148,17 @@ impl EventLoop {
             properties,
             response,
         } = request;
+        // Features the broker doesn't support are refused here rather than
+        // sent [MQTT-3.2.2-11, MQTT-3.2.2-14]. A publish that waited may
+        // meet the limits of a later connection.
+        if (qos as u8) > (self.limits.maximum_qos as u8) {
+            let _ = response.send(Err(ClientError::NotSupported("this QoS")));
+            return;
+        }
+        if retain && !self.limits.retain_available {
+            let _ = response.send(Err(ClientError::NotSupported("retained messages")));
+            return;
+        }
         let packet_id = match qos {
             QoS::AtMostOnce => None,
             _ => match self.next_packet_id() {

@@ -368,6 +368,53 @@ async fn a_resent_message_now_too_large_fails_and_frees_its_slot() {
 }
 
 #[tokio::test]
+async fn publishes_queued_while_disconnected_follow_the_new_limits() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        drop(accept(&listener, false).await);
+        // Now Maximum QoS 1 and no retained messages
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket
+            .write_all(&[0x20, 0x07, 0x00, 0x00, 0x04, 0x24, 0x01, 0x25, 0x00])
+            .await
+            .unwrap();
+        let mut sent = [0u8; 1];
+        timeout(Duration::from_millis(500), socket.read(&mut sent))
+            .await
+            .is_err()
+    });
+
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        client.recv().await,
+        Some(Event::Disconnected { .. })
+    ));
+    let (qos2, retained) = timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            client.publish("a", "1", QoS::ExactlyOnce),
+            client.publish_with_retain("a", "2", QoS::AtLeastOnce, true)
+        )
+    })
+    .await
+    .expect("the queued publishes never completed");
+    assert!(matches!(qos2, Err(ClientError::NotSupported(_))), "{qos2:?}");
+    assert!(
+        matches!(retained, Err(ClientError::NotSupported(_))),
+        "{retained:?}"
+    );
+    assert!(broker.await.unwrap(), "an unsupported publish was sent");
+}
+
+#[tokio::test]
 async fn reconnection_backs_off() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
