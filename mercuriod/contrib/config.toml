@@ -98,7 +98,8 @@ max_inflight = 64
 
 # Accept clients that send an empty client id, assigning them one
 # allow_zero_length_clientid = true
-# Prefix of the client ids the broker assigns
+# Prefix of the client ids the broker assigns, which are bare UUIDs without
+# one
 # auto_id_prefix = "auto-"
 # Only accept client ids starting with one of these
 # clientid_prefixes = ["sensor-", "auto-"]

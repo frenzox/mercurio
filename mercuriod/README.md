@@ -153,7 +153,8 @@ max_inflight = 64
 
 # Accept clients that send an empty client id, assigning them one
 # allow_zero_length_clientid = true
-# Prefix of the client ids the broker assigns
+# Prefix of the client ids the broker assigns, which are bare UUIDs without
+# one
 # auto_id_prefix = "auto-"
 # Only accept client ids starting with one of these
 # clientid_prefixes = ["sensor-", "auto-"]
@@ -459,8 +460,9 @@ over the network. The admin socket, below, needs no grant.
 
 `[auth.http]` delegates checks to an HTTP service, as mosquitto-go-auth's
 HTTP backend does. For each login, the broker POSTs
-`{"username", "password", "clientid"}` to `user_url`; `clientid` is
-always empty. For each topic check, it POSTs
+`{"username", "password", "clientid"}` to `user_url`; `clientid` is the
+one the client sent, empty when the broker is to assign one. For each
+topic check, it POSTs
 `{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
 receive, 2 to publish and 4 to subscribe. A 2xx status allows; anything else, a timeout
 included, denies. Topic answers are reused for `cache_seconds`, since
