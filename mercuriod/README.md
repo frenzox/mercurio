@@ -114,6 +114,11 @@ max_queued_qos0_messages = 1000
 # the TLS and WebSocket handshakes and send CONNECT
 connect_timeout = 10
 
+# Seconds writing one packet to a client may take before its connection is
+# dropped as stalled. A client reconnecting with the same client id waits as
+# long for the old connection to close, then gets Server Busy
+write_timeout = 10
+
 # Highest topic alias MQTT 5 clients may use (0 disables topic aliases)
 max_topic_alias = 10
 

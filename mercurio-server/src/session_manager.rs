@@ -6,7 +6,7 @@ use std::{
 use crate::CONNECTIONS;
 use tokio::{
     sync::{watch, Mutex, OwnedMutexGuard},
-    time::Duration,
+    time::{self, Duration},
 };
 use tracing::info;
 use uuid::Uuid;
@@ -38,6 +38,9 @@ pub(crate) struct SessionManager<S: BatchStore> {
     /// Every change to what is stored for a client goes through its writer
     writers: Writers<S>,
     queue_limits: QueueLimits,
+    /// How long a new connection waits for the one it takes over to let go
+    /// of the client id; forever when unset
+    takeover_wait: Option<Duration>,
 }
 
 impl<S: BatchStore> Clone for SessionManager<S> {
@@ -47,6 +50,7 @@ impl<S: BatchStore> Clone for SessionManager<S> {
             storage: Arc::clone(&self.storage),
             writers: self.writers.clone(),
             queue_limits: self.queue_limits,
+            takeover_wait: self.takeover_wait,
         }
     }
 }
@@ -153,10 +157,14 @@ pub(crate) struct ConnectionLease {
 }
 
 impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
-    pub(crate) fn new(storage: Arc<S>, queue_limits: QueueLimits) -> SessionManagerDropGuard<S> {
-        SessionManagerDropGuard {
-            session_manager: SessionManager::with_queue_limits(storage, queue_limits),
-        }
+    pub(crate) fn new(
+        storage: Arc<S>,
+        queue_limits: QueueLimits,
+        takeover_wait: Duration,
+    ) -> SessionManagerDropGuard<S> {
+        let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits);
+        session_manager.takeover_wait = Some(takeover_wait);
+        SessionManagerDropGuard { session_manager }
     }
 
     pub(crate) fn session_manager(&self) -> SessionManager<S> {
@@ -208,12 +216,16 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             writers: Writers::new(Arc::clone(&storage)),
             storage,
             queue_limits,
+            takeover_wait: None,
         }
     }
 
     /// Starts or resumes the session of the client in `connect_packet`,
     /// authenticated as `owner`. A session another owner left is never
     /// resumed: it is discarded as if the client asked for a clean start.
+    /// Fails with Server Busy when the connection using the client id
+    /// doesn't let go of it within `takeover_wait`; that connection is still
+    /// asked to close, and nothing else changes.
     pub(crate) async fn start_session(
         &mut self,
         mut connect_packet: ConnectPacket,
@@ -231,7 +243,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
         let lease = self
             .acquire_client_id(&connect_packet.payload.client_id, Close::TakenOver)
-            .await;
+            .await
+            .ok_or(ReasonCode::ServerBusy)?;
 
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
@@ -390,27 +403,29 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
     /// Asks any connection already using `client_id` to close for `reason`
     /// [MQTT-3.1.4-3] and waits until it has, so the two never share
-    /// session state.
-    async fn acquire_client_id(&self, client_id: &str, reason: Close) -> ConnectionLease {
-        self.claim_client_id(client_id, reason, false)
+    /// session state. None if it didn't within `takeover_wait`.
+    async fn acquire_client_id(&self, client_id: &str, reason: Close) -> Option<ConnectionLease> {
+        self.claim_client_id(client_id, reason, false, self.takeover_wait)
             .await
-            .expect("a claim without conditions succeeds")
-            .0
+            .map(|(lease, _)| lease)
     }
 
     /// Like `acquire_client_id`, but with `only_if_free` gives up, touching
     /// nothing, when a connection holds the client id. The check and the
     /// claim happen under one lock, so no connection is closed by a claim it
     /// wasn't meant to close. Also tells whether a connection held the id.
+    /// With a `wait`, gives up too once the connection holding the id hasn't
+    /// let go of it in that time; it is still asked to close.
     async fn claim_client_id(
         &self,
         client_id: &str,
         reason: Close,
         only_if_free: bool,
+        wait: Option<Duration>,
     ) -> Option<(ConnectionLease, bool)> {
         let (close_tx, close) = watch::channel(None);
 
-        let (lease, generation, held) = {
+        let (lease, generation, held, previous) = {
             let mut manager = self.shared.state.lock().await;
             let held = manager.connections.contains_key(client_id);
             if only_if_free && held {
@@ -428,13 +443,36 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 });
             slot.close
                 .send_modify(|pending| merge_close(pending, reason));
-            slot.close = close_tx;
-            slot.generation = generation;
-            (Arc::clone(&slot.lease), generation, held)
+            let previous_close = std::mem::replace(&mut slot.close, close_tx);
+            let previous_generation = std::mem::replace(&mut slot.generation, generation);
+            // Kept only to hand the slot back on giving up
+            let previous = wait
+                .is_some()
+                .then_some((previous_close, previous_generation));
+            (Arc::clone(&slot.lease), generation, held, previous)
         };
 
+        let guard = match wait {
+            Some(wait) => match time::timeout(wait, lease.lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    // The slot goes back to the connection still holding the
+                    // id, so its release frees it, unless a later claim
+                    // replaced this one meanwhile
+                    let mut manager = self.shared.state.lock().await;
+                    let slot = manager.connections.get_mut(client_id);
+                    if let (Some(slot), Some(previous)) = (slot, previous) {
+                        if slot.generation == generation {
+                            (slot.close, slot.generation) = previous;
+                        }
+                    }
+                    return None;
+                }
+            },
+            None => lease.lock_owned().await,
+        };
         let lease = ConnectionLease {
-            guard: lease.lock_owned().await,
+            guard,
             client_id: client_id.to_string(),
             generation,
             close,
@@ -556,7 +594,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 guard, generation, ..
             },
             was_connected,
-        )) = self.claim_client_id(client_id, close, !disconnect).await
+        )) = self
+            .claim_client_id(client_id, close, !disconnect, None)
+            .await
         else {
             return Err(DeleteRefused::Connected);
         };

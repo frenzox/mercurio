@@ -35,6 +35,9 @@ pub const DEFAULT_MAX_PACKET_SIZE: usize = 1024 * 1024;
 /// How long a closing connection waits for the client to close its side.
 const LINGER: Duration = Duration::from_secs(1);
 
+/// How long writing one packet may take unless configured otherwise.
+pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A connection that can be either plain TCP or TLS-encrypted.
 pub struct Connection<S = TcpStream>
 where
@@ -56,6 +59,10 @@ where
     stats: Option<Arc<Stats>>,
     /// Where this client's traffic is counted, once it has a session
     counters: Option<Arc<ClientCounters>>,
+    write_timeout: Duration,
+    /// A write timed out partway through a packet, so nothing more can be
+    /// framed on the stream
+    stalled: bool,
 }
 
 /// Moves the topics a client sent under `mount_point`. Empty names are left
@@ -99,6 +106,13 @@ fn mount(packet: &mut ControlPacket, mount_point: &str) {
     }
 }
 
+fn stalled() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the client stopped taking what is sent to it",
+    )
+}
+
 impl<S> Connection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -115,7 +129,15 @@ where
             mount_point: None,
             stats: None,
             counters: None,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            stalled: false,
         }
+    }
+
+    /// How long writing one packet may take before the connection is given
+    /// up as stalled.
+    pub fn set_write_timeout(&mut self, write_timeout: Duration) {
+        self.write_timeout = write_timeout;
     }
 
     pub(crate) fn set_stats(&mut self, stats: Arc<Stats>) {
@@ -209,9 +231,22 @@ where
     }
 
     async fn send_encoded(&mut self) -> Result<()> {
+        if self.stalled {
+            return Err(stalled().into());
+        }
         // Each packet is encoded whole first, so it goes out in one write
-        self.stream.write_all(&self.write_buffer).await?;
-        self.stream.flush().await?;
+        let (stream, buffer) = (&mut self.stream, &self.write_buffer);
+        let write = async {
+            stream.write_all(buffer).await?;
+            stream.flush().await
+        };
+        match time::timeout(self.write_timeout, write).await {
+            Ok(written) => written?,
+            Err(_) => {
+                self.stalled = true;
+                return Err(stalled().into());
+            }
+        }
         if let Some(stats) = &self.stats {
             Stats::add_n(&stats.bytes_sent, self.write_buffer.len() as u64);
         }
@@ -231,7 +266,11 @@ where
     /// it hasn't read yet. So writing stops first, then whatever the client
     /// still sends is discarded until it closes too, for at most a second.
     pub async fn close(&mut self) {
-        let _ = self.stream.shutdown().await;
+        // Shutting TLS or WebSocket down writes to the client, which a
+        // stalled one wouldn't take
+        if !self.stalled {
+            let _ = time::timeout(self.write_timeout, self.stream.shutdown()).await;
+        }
         let mut discard = [0u8; 4096];
         let _ = time::timeout(LINGER, async {
             while matches!(self.stream.read(&mut discard).await, Ok(n) if n > 0) {}

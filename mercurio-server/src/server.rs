@@ -97,6 +97,11 @@ pub struct Limits {
     /// complete the TLS and WebSocket handshakes and send CONNECT, enhanced
     /// authentication included, before it is closed.
     pub connect_timeout: Duration,
+    /// How long writing one packet to a client may take before the
+    /// connection is dropped as stalled. A connection taking over a client
+    /// id waits as long for the previous one to let go, then is refused
+    /// with Server Busy.
+    pub write_timeout: Duration,
     /// Largest packet accepted from a client, fixed header included.
     pub max_packet_size: usize,
     /// Messages waiting to be sent to one session.
@@ -145,6 +150,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
+            write_timeout: crate::connection::DEFAULT_WRITE_TIMEOUT,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             queue: QueueLimits::default(),
             max_connections: None,
@@ -715,6 +721,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
     {
         connection.set_mount_point(self.mount_point);
         connection.set_stats(Arc::clone(&self.stats));
+        connection.set_write_timeout(self.limits.write_timeout);
         let mut handler = Handler {
             broker: self.broker,
             session_manager: self.session_manager,
@@ -977,7 +984,7 @@ impl<St: MqttStore + 'static> Server<St> {
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
         let broker = Broker::new(Arc::clone(&storage));
         let session_manager_holder =
-            SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue);
+            SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue, limits.write_timeout);
         let session_manager = session_manager_holder.session_manager();
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
@@ -1563,8 +1570,24 @@ where
             username: verified_user.clone(),
             mount_point: self.connection.mount_point().map(str::to_string),
         };
-        let mut start_result =
-            Box::pin(self.session_manager.start_session(*connect_packet, owner)).await?;
+        let client_id = connect_packet.payload.client_id.clone();
+        let started = Box::pin(self.session_manager.start_session(*connect_packet, owner)).await;
+        let mut start_result = match started {
+            Err(Error::MQTTReasonCode(ReasonCode::ServerBusy)) => {
+                warn!(
+                    "The connection using client id `{}` didn't let go of it in time",
+                    client_id
+                );
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerBusy,
+                    )
+                    .await;
+            }
+            started => started?,
+        };
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
@@ -1896,20 +1919,30 @@ where
         connect_packet: &'a ConnectPacket,
         reason_code: ReasonCode,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        let client_maximum = connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.maximum_packet_size.as_ref())
+            .map(|m| m.value);
+        self.refuse(connect_packet.protocol_version, client_maximum, reason_code)
+    }
+
+    /// Answers a CONNECT of `protocol_version` with `reason_code`, its
+    /// reason string fitting in `client_maximum`.
+    fn refuse(
+        &mut self,
+        protocol_version: ProtocolVersion,
+        client_maximum: Option<u32>,
+        reason_code: ReasonCode,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let client_maximum = connect_packet
-                .properties
-                .as_ref()
-                .and_then(|p| p.maximum_packet_size.as_ref())
-                .map(|m| m.value);
             let connack = ConnAckPacket {
-                protocol_version: connect_packet.protocol_version,
+                protocol_version,
                 flags: ConnAckFlags {
                     session_present: false,
                 },
                 reason_code,
-                properties: connect_packet
-                    .protocol_version
+                properties: protocol_version
                     .supports_properties()
                     .then(|| ConnAckProperties {
                         reason_string: reason_string(reason_code, client_maximum),
