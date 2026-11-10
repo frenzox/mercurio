@@ -196,10 +196,7 @@ pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Li
     if !connect_packet.protocol_version.supports_properties() {
         return;
     }
-    // u32::MAX means no expiry, so the most a maximum can be is one less
-    let max = u32::try_from(max.as_secs())
-        .unwrap_or(u32::MAX - 1)
-        .min(u32::MAX - 1);
+    let max = max_expiry_interval(max);
     let requested = connect_packet
         .properties
         .as_ref()
@@ -213,12 +210,26 @@ pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Li
     }
 }
 
+/// Lowers the Session Expiry Interval a DISCONNECT asks for to the server's
+/// maximum, no expiry included, as CONNECT's is.
+pub(crate) fn cap_expiry_interval(interval: u32, limits: &Limits) -> u32 {
+    limits
+        .max_session_expiry
+        .map_or(interval, |max| interval.min(max_expiry_interval(max)))
+}
+
+/// `max` as a Session Expiry Interval. u32::MAX means no expiry, so the
+/// most a maximum can be is one less.
+fn max_expiry_interval(max: Duration) -> u32 {
+    u32::try_from(max.as_secs())
+        .unwrap_or(u32::MAX - 1)
+        .min(u32::MAX - 1)
+}
+
 /// The session expiry to announce in CONNACK: the server's maximum, when
 /// the client's request was lowered to it.
 fn announced_session_expiry(connect_packet: &ConnectPacket, limits: &Limits) -> Option<u32> {
-    let max = u32::try_from(limits.max_session_expiry?.as_secs())
-        .unwrap_or(u32::MAX - 1)
-        .min(u32::MAX - 1);
+    let max = max_expiry_interval(limits.max_session_expiry?);
     let requested = connect_packet
         .properties
         .as_ref()?

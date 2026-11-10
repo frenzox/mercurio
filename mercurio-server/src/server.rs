@@ -62,7 +62,10 @@ use crate::{
     http,
     plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
     proxy,
-    session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
+    session::{
+        cap_expiry_interval, cap_session_expiry, effective_keepalive, Outgoing, Session,
+        WillMessage,
+    },
     session_manager::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard,
     },
@@ -2140,6 +2143,7 @@ where
                             if *expiry == Some(Duration::ZERO) && interval != 0 {
                                 return Err(ReasonCode::ProtocolError.into());
                             }
+                            let interval = cap_expiry_interval(interval, &self.limits);
                             *expiry = (interval != u32::MAX)
                                 .then(|| Duration::from_secs(interval.into()));
                         }
