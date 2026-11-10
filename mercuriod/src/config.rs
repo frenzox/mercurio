@@ -399,7 +399,10 @@ impl Config {
     /// other values replace the file's.
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let mut table = read_table(path)?;
+        let mut source = path.display().to_string();
         if let Some(dir) = table.get("include_dir").and_then(|d| d.as_str()) {
+            // Merged values no longer tell which file they came from
+            source = format!("{source} or a file of {dir}");
             let mut files: Vec<_> = std::fs::read_dir(dir)
                 .map_err(|e| format!("Failed to read include_dir {dir}: {e}"))?
                 .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -410,7 +413,8 @@ impl Config {
                 merge(&mut table, read_table(&file)?);
             }
         }
-        let config = Config::deserialize(table)?;
+        let config = Config::deserialize(table)
+            .map_err(|e| format!("{source}: {}", e.to_string().trim_end().replace('\n', " ")))?;
         config.check()?;
         Ok(config)
     }
@@ -1234,9 +1238,14 @@ mod tests {
         let main = dir.join("main.toml");
         std::fs::write(&main, format!("include_dir = \"{}\"\n", conf_d.display())).unwrap();
         std::fs::write(conf_d.join("auth.toml"), "[auth]\nenable = true\n").unwrap();
-        let error = Config::from_file(&main).unwrap_err().to_string();
+        let error = Config::from_file(&main).unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(error.contains("`enable`"), "{error}");
+        // main prints the error with Debug
+        let shown = format!("{error:?}");
+        assert!(shown.contains("`enable`"), "{shown}");
+        assert!(shown.contains("main.toml"), "{shown}");
+        assert!(shown.contains("auth"), "{shown}");
+        assert!(!shown.contains("TomlError"), "{shown}");
     }
 
     /// `sample` with every commented-out `key = value` line and table header
