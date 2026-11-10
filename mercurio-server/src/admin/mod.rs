@@ -11,10 +11,11 @@ mod types;
 pub(crate) use protocol::handle as handle_request;
 pub use types::{
     BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo, RetainedMessage,
-    RetainedProperties, RetainedSummary,
+    RetainedProperties, RetainedSummary, SubscriberInfo, SubscriptionSummary,
 };
 
 use std::{
+    collections::HashMap,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -590,6 +591,57 @@ impl Admin {
             filter
         );
         Ok(messages.len())
+    }
+
+    /// Every subscribed filter starting with `prefix`, sorted, with how
+    /// many sessions subscribe to it: `listSubscriptions`.
+    pub async fn subscriptions(&self, prefix: &str, paging: Paging) -> Page<SubscriptionSummary> {
+        let mut found: Vec<SubscriptionSummary> = self
+            .inner
+            .topics
+            .filters()
+            .into_iter()
+            .filter(|(filter, _)| filter.starts_with(prefix))
+            .map(|(filter, subscribers)| SubscriptionSummary {
+                filter,
+                subscribers,
+            })
+            .collect();
+        found.sort_by(|a, b| a.filter.cmp(&b.filter));
+        Page::of(found, paging)
+    }
+
+    /// The clients subscribed to exactly `filter`, with their options:
+    /// `getSubscribers`.
+    pub async fn subscribers(&self, filter: &str) -> Result<Vec<SubscriberInfo>, AdminError> {
+        validate_subscribe_filter(filter).map_err(|e| {
+            AdminError::invalid_argument(format!("`{filter}` is not a topic filter: {e}"))
+        })?;
+        let clients: HashMap<u64, String> = self
+            .inner
+            .directory
+            .entries()
+            .await
+            .into_iter()
+            .map(|entry| (entry.session.subscriber_id(), entry.client_id))
+            .collect();
+        let mut found: Vec<SubscriberInfo> = self
+            .inner
+            .topics
+            .subscribers_of(filter)
+            .into_iter()
+            .filter_map(|s| {
+                Some(SubscriberInfo {
+                    client_id: clients.get(&s.session_id)?.clone(),
+                    qos: s.granted_qos as u8,
+                    no_local: s.no_local,
+                    retain_as_published: s.retain_as_published,
+                    subscription_identifier: s.subscription_identifier,
+                })
+            })
+            .collect();
+        found.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        Ok(found)
     }
 }
 

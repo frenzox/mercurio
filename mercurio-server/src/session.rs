@@ -968,7 +968,6 @@ impl Session {
     }
 
     /// Identifies this session's subscriptions in the topic tree.
-    #[allow(dead_code)]
     pub(crate) fn subscriber_id(&self) -> u64 {
         self.shared.subscriber_id
     }

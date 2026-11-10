@@ -163,3 +163,26 @@ pub struct RetainedProperties {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub user_properties: Vec<(String, String)>,
 }
+
+/// One entry of `listSubscriptions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SubscriptionSummary {
+    pub filter: String,
+    pub subscribers: usize,
+}
+
+/// One entry of `getSubscribers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SubscriberInfo {
+    #[serde(rename = "clientid")]
+    pub client_id: String,
+    pub qos: u8,
+    pub no_local: bool,
+    pub retain_as_published: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_identifier: Option<u32>,
+}

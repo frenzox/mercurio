@@ -907,3 +907,59 @@ async fn retained_messages_are_listed_read_and_deleted() {
         .await;
     assert_eq!(shared["code"], "invalidArgument");
 }
+
+#[tokio::test]
+async fn subscriptions_are_listed_with_their_subscribers() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut one = Client::connect(addr, "one").await;
+    one.subscribe("a/#").await;
+    one.subscribe("$share/g/b").await;
+    let mut two = Client::connect(addr, "two").await;
+    two.subscribe("a/#").await;
+
+    let all = admin.run(json!({"command": "listSubscriptions"})).await;
+    assert_eq!(all["data"]["totalCount"], 3);
+    assert_eq!(
+        all["data"]["subscriptions"],
+        json!([
+            {"filter": "$share/g/b", "subscribers": 1},
+            {"filter": "a/#", "subscribers": 2},
+            {"filter": "replies/admin", "subscribers": 1},
+        ])
+    );
+    let prefixed = admin
+        .run(json!({"command": "listSubscriptions", "filterPrefix": "a/"}))
+        .await;
+    assert_eq!(prefixed["data"]["totalCount"], 1);
+    assert_eq!(prefixed["data"]["subscriptions"][0]["filter"], "a/#");
+    let paged = admin
+        .run(json!({"command": "listSubscriptions", "offset": 1, "count": 1}))
+        .await;
+    assert_eq!(paged["data"]["totalCount"], 3);
+    assert_eq!(
+        paged["data"]["subscriptions"],
+        json!([{"filter": "a/#", "subscribers": 2}])
+    );
+
+    let subscribers = admin
+        .run(json!({"command": "getSubscribers", "filter": "a/#"}))
+        .await;
+    let list = &subscribers["data"]["subscribers"];
+    assert_eq!(list[0]["clientid"], "one");
+    assert_eq!(list[0]["qos"], 1);
+    assert_eq!(list[0]["noLocal"], false);
+    assert_eq!(list[1]["clientid"], "two");
+    let shared = admin
+        .run(json!({"command": "getSubscribers", "filter": "$share/g/b"}))
+        .await;
+    assert_eq!(shared["data"]["subscribers"][0]["clientid"], "one");
+    let none = admin
+        .run(json!({"command": "getSubscribers", "filter": "zzz"}))
+        .await;
+    assert_eq!(none["data"]["subscribers"], json!([]));
+    let invalid = admin
+        .run(json!({"command": "getSubscribers", "filter": "a/#/b"}))
+        .await;
+    assert_eq!(invalid["code"], "invalidArgument");
+}

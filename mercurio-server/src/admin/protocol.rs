@@ -178,6 +178,14 @@ struct ListRetainedArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSubscriptionsArgs {
+    filter_prefix: Option<String>,
+    #[serde(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Deserialize)]
 struct TopicArgs {
     topic: String,
 }
@@ -263,6 +271,20 @@ async fn run(
                 .delete_retained(&arguments::<FilterArgs>(args)?.filter)
                 .await?;
             serde_json::json!({ "deleted": deleted })
+        }
+        "listSubscriptions" => {
+            let a: ListSubscriptionsArgs = arguments(args)?;
+            let prefix = a.filter_prefix.as_deref().unwrap_or("");
+            listing(
+                "subscriptions",
+                admin.subscriptions(prefix, a.page.paging()?).await,
+            )
+        }
+        "getSubscribers" => {
+            let subscribers = admin
+                .subscribers(&arguments::<FilterArgs>(args)?.filter)
+                .await?;
+            serde_json::json!({ "subscribers": subscribers })
         }
         _ => extension(admin, command, args).await?,
     })
