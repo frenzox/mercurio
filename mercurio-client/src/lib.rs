@@ -1,4 +1,11 @@
 #![doc = include_str!("../README.md")]
+//!
+//! # Features
+//!
+//! - `clap`: the `cli` module, with command-line arguments for connecting
+//!   that tools can flatten into their own `clap` command. Off by default.
+#[cfg(feature = "clap")]
+pub mod cli;
 mod client;
 mod connection;
 mod error;

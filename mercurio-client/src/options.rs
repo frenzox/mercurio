@@ -237,7 +237,7 @@ pub struct TlsOptions {
 }
 
 /// Options for connecting to an MQTT broker.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -262,6 +262,42 @@ pub struct ConnectOptions {
     /// Connect through this Unix socket instead of TCP
     #[cfg(unix)]
     pub(crate) unix_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ConnectOptions");
+        debug
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("keep_alive", &self.keep_alive)
+            .field("clean_start", &self.clean_start)
+            .field("session_expiry", &self.session_expiry)
+            .field("will", &self.will)
+            .field("protocol_version", &self.protocol_version)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("tls", &self.tls)
+            .field("reconnect_delay", &self.reconnect_delay)
+            .field("receive_maximum", &self.receive_maximum)
+            .field("maximum_packet_size", &self.maximum_packet_size)
+            .field("topic_alias_maximum", &self.topic_alias_maximum)
+            .field(
+                "request_response_information",
+                &self.request_response_information,
+            )
+            .field(
+                "request_problem_information",
+                &self.request_problem_information,
+            )
+            .field("authenticator", &self.authenticator)
+            .field("connector", &self.connector);
+        #[cfg(unix)]
+        debug.field("unix_path", &self.unix_path);
+        debug.finish()
+    }
 }
 
 impl ConnectOptions {
@@ -479,6 +515,15 @@ impl ConnectOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_debug_output_hides_the_password() {
+        let options = ConnectOptions::new("localhost", 1883).password("hunter2");
+        let shown = format!("{options:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains(r#"password: Some("<redacted>")"#), "{shown}");
+        assert!(format!("{:?}", ConnectOptions::new("h", 1)).contains("password: None"));
+    }
 
     #[test]
     fn test_overlong_values_are_refused() {
