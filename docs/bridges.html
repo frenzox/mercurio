@@ -92,7 +92,7 @@ protocol_version = "mqttv311"</pre>
 <pre>[[bridges]]
 name = "cloud"
 addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]</pre>
-<p>When a broker can't be reached or the connection is lost, the bridge waits five seconds and tries the next address, round and round.</p>
+<p>When a broker can't be reached or the connection is lost, the bridge waits and tries the next address, round and round. The first wait is about a second; each failed attempt doubles it, up to a minute, and a randomised share keeps bridges that lost the same broker from all coming back at once. A successful connection starts the waits over.</p>
 
 <h2>TLS and client certificates</h2>
 <pre>[[bridges]]

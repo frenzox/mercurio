@@ -29,8 +29,9 @@ use tracing::{error, info, warn};
 
 use crate::config::{BridgeConfig, BridgeProtocol, Direction};
 
-/// Waits between attempts to connect
-const RETRY: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(5));
+/// Waits between attempts to connect, doubling from the first to the
+/// second while attempts fail
+const RETRY: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
 
 /// Messages a bridge takes from one side before the other accepted them:
 /// the Receive Maximum it announces to each broker, and the most publishes

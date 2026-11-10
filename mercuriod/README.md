@@ -539,8 +539,9 @@ apply to it. A QoS 1 or 2 message is acknowledged to the broker it came
 from only once the other broker accepted it, so a connection lost on either
 side never loses it; it may arrive twice instead. Up to 100 messages are in
 flight in each direction, within the receiving broker's Receive Maximum, and
-keep their order. If the remote broker is unreachable, the bridge retries every
-five seconds, and messages to forward wait in the bridge's queue on this
+keep their order. If the remote broker is unreachable, the bridge retries after
+one second, doubling the wait after each failed attempt up to a minute, with
+some randomness, and messages to forward wait in the bridge's queue on this
 broker, up to `max_queued_messages`. Its session there lasts a day, so messages for `in` topics
 wait for the bridge across short outages.
 
