@@ -30,14 +30,15 @@ jobs:
       # The tag names the crate: mercuriod-v0.4.1 is mercuriod's
       - name: Crate
         run: echo "CRATE=${TAG%-v*}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cross,cargo-deb,cargo-generate-rpm
       - name: Build
