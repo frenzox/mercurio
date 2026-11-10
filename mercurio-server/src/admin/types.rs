@@ -112,3 +112,54 @@ pub struct ClientSubscription {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_identifier: Option<u32>,
 }
+
+/// One entry of `listRetained`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RetainedSummary {
+    pub topic: String,
+    pub qos: u8,
+    /// Payload bytes
+    pub size: usize,
+    /// Seconds left; null for never
+    pub expires_in: Option<u64>,
+    /// The payload's first 64 bytes as text; null when they aren't UTF-8
+    pub preview: Option<String>,
+}
+
+/// `getRetained`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RetainedMessage {
+    pub topic: String,
+    pub qos: u8,
+    /// The payload, when it is UTF-8
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    /// The payload, when it isn't UTF-8
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_base64: Option<String>,
+    pub properties: RetainedProperties,
+    /// Seconds left; null for never
+    pub expires_in: Option<u64>,
+}
+
+/// The MQTT 5 properties stored with a retained message.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct RetainedProperties {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_format_indicator: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_data_base64: Option<String>,
+    /// Name and value pairs, in order
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub user_properties: Vec<(String, String)>,
+}

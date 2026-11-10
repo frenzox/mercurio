@@ -808,3 +808,102 @@ async fn disconnect_client_closes_mqtt311_connections() {
     assert_eq!(read.unwrap(), 0, "no packet before the close");
     assert!(!admin.client("old").await.unwrap().connected);
 }
+
+#[tokio::test]
+async fn sys_messages_are_left_to_sys_filters() {
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    config.sys_interval = Some(Duration::from_secs(60));
+    let (addr, _) = start(config).await;
+    let mut admin = admin_client(addr).await;
+    let mut publisher = Client::connect(addr, "publisher").await;
+    publisher.publish("r/1", b"hello", true).await;
+    let version = json!({"command": "listRetained", "filter": "$SYS/broker/version"});
+    let mut published = false;
+    for _ in 0..100 {
+        if admin.run(version.clone()).await["data"]["totalCount"] == 1 {
+            published = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(published, "the broker never published its version");
+
+    let all = admin.run(json!({"command": "listRetained"})).await;
+    assert_eq!(all["data"]["totalCount"], 1, "{all}");
+    assert_eq!(all["data"]["messages"][0]["topic"], "r/1");
+    let deleted = admin
+        .run(json!({"command": "deleteRetained", "filter": "#"}))
+        .await;
+    assert_eq!(deleted["data"]["deleted"], 1);
+    let sys = admin
+        .run(json!({"command": "listRetained", "filter": "$SYS/#"}))
+        .await;
+    let topics: Vec<&str> = sys["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["topic"].as_str().unwrap())
+        .collect();
+    assert!(topics.contains(&"$SYS/broker/version"), "{topics:?}");
+}
+
+#[tokio::test]
+async fn retained_messages_are_listed_read_and_deleted() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut publisher = Client::connect(addr, "publisher").await;
+    publisher.publish("r/1", b"hello", true).await;
+    publisher.publish("r/2", &[0xff, 0xfe], true).await;
+    publisher.publish("s/1", b"other", true).await;
+
+    let listed = admin
+        .run(json!({"command": "listRetained", "filter": "r/#"}))
+        .await;
+    assert_eq!(listed["data"]["totalCount"], 2);
+    let messages = &listed["data"]["messages"];
+    assert_eq!(messages[0]["topic"], "r/1");
+    assert_eq!(messages[0]["qos"], 1);
+    assert_eq!(messages[0]["size"], 5);
+    assert_eq!(messages[0]["preview"], "hello");
+    assert_eq!(messages[0]["expiresIn"], Value::Null);
+    assert_eq!(messages[1]["topic"], "r/2");
+    assert_eq!(messages[1]["preview"], Value::Null);
+
+    let text = admin
+        .run(json!({"command": "getRetained", "topic": "r/1"}))
+        .await;
+    assert_eq!(text["data"]["payload"], "hello");
+    assert!(text["data"].get("payloadBase64").is_none());
+    assert!(text["data"].get("expiresIn").is_some_and(Value::is_null));
+    let binary = admin
+        .run(json!({"command": "getRetained", "topic": "r/2"}))
+        .await;
+    assert_eq!(binary["data"]["payloadBase64"], "//4=");
+    assert!(binary["data"].get("payload").is_none());
+    let missing = admin
+        .run(json!({"command": "getRetained", "topic": "r/3"}))
+        .await;
+    assert_eq!(missing["code"], "notFound");
+    let wildcard = admin
+        .run(json!({"command": "getRetained", "topic": "r/#"}))
+        .await;
+    assert_eq!(wildcard["code"], "invalidArgument");
+
+    let deleted = admin
+        .run(json!({"command": "deleteRetained", "filter": "r/#"}))
+        .await;
+    assert_eq!(deleted["data"]["deleted"], 2);
+    let rest = admin.run(json!({"command": "listRetained"})).await;
+    assert_eq!(rest["data"]["totalCount"], 1);
+    assert_eq!(rest["data"]["messages"][0]["topic"], "s/1");
+
+    // New subscribers get none of the deleted ones
+    let mut late = Client::connect(addr, "late").await;
+    late.subscribe("r/#").await;
+    assert!(late.receive().await.is_none());
+
+    let shared = admin
+        .run(json!({"command": "deleteRetained", "filter": "$share/g/r/#"}))
+        .await;
+    assert_eq!(shared["code"], "invalidArgument");
+}

@@ -170,6 +170,23 @@ pub(crate) async fn handle(
         .into()
 }
 
+#[derive(Deserialize)]
+struct ListRetainedArgs {
+    filter: Option<String>,
+    #[serde(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Deserialize)]
+struct TopicArgs {
+    topic: String,
+}
+
+#[derive(Deserialize)]
+struct FilterArgs {
+    filter: String,
+}
+
 async fn run(
     admin: &Admin,
     chain: &Chain,
@@ -230,6 +247,22 @@ async fn run(
                 .delete_session(&a.clientid, a.disconnect.unwrap_or(false))
                 .await?;
             Value::Null
+        }
+        "listRetained" => {
+            let a: ListRetainedArgs = arguments(args)?;
+            let filter = a.filter.as_deref().unwrap_or("#");
+            listing("messages", admin.retained(filter, a.page.paging()?).await?)
+        }
+        "getRetained" => json(
+            admin
+                .retained_message(&arguments::<TopicArgs>(args)?.topic)
+                .await?,
+        ),
+        "deleteRetained" => {
+            let deleted = admin
+                .delete_retained(&arguments::<FilterArgs>(args)?.filter)
+                .await?;
+            serde_json::json!({ "deleted": deleted })
         }
         _ => extension(admin, command, args).await?,
     })

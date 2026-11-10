@@ -9,15 +9,23 @@ mod protocol;
 mod types;
 
 pub(crate) use protocol::handle as handle_request;
-pub use types::{BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo};
+pub use types::{
+    BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo, RetainedMessage,
+    RetainedProperties, RetainedSummary,
+};
 
 use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
-use mercurio_core::{message::unix_millis, reason::ReasonCode};
-use mercurio_storage::{BatchStore, RetainedMessageStore};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use mercurio_core::{
+    message::unix_millis,
+    reason::ReasonCode,
+    topic::{parse_shared_subscription, validate_publish_topic, validate_subscribe_filter},
+};
+use mercurio_storage::{BatchStore, RetainedMessageStore, StorageError};
 use serde::Serialize;
 use serde_json::Value;
 use tracing::info;
@@ -482,6 +490,107 @@ impl Admin {
             })
             .collect()
     }
+
+    /// The retained messages matching `filter`, sorted by topic:
+    /// `listRetained`.
+    pub async fn retained(
+        &self,
+        filter: &str,
+        paging: Paging,
+    ) -> Result<Page<RetainedSummary>, AdminError> {
+        retained_filter(filter)?;
+        let mut messages = self
+            .inner
+            .retained
+            .get_retained(filter)
+            .await
+            .map_err(storage_failed)?;
+        messages.sort_by(|a, b| a.topic.cmp(&b.topic));
+        let now = unix_millis();
+        let all = messages
+            .into_iter()
+            .map(|message| {
+                let payload = message.payload.unwrap_or_default();
+                RetainedSummary {
+                    topic: message.topic.to_string(),
+                    qos: message.qos as u8,
+                    size: payload.len(),
+                    expires_in: expires_in(message.expires_at, now),
+                    preview: preview(&payload),
+                }
+            })
+            .collect();
+        Ok(Page::of(all, paging))
+    }
+
+    /// The retained message on `topic`, whole: `getRetained`.
+    pub async fn retained_message(&self, topic: &str) -> Result<RetainedMessage, AdminError> {
+        validate_publish_topic(topic).map_err(|e| {
+            AdminError::invalid_argument(format!("`{topic}` is not a topic name: {e}"))
+        })?;
+        let message = self
+            .inner
+            .retained
+            .get_retained(topic)
+            .await
+            .map_err(storage_failed)?
+            .into_iter()
+            .find(|message| &*message.topic == topic)
+            .ok_or_else(|| AdminError::not_found(format!("no retained message on `{topic}`")))?;
+        let payload = message.payload.clone().unwrap_or_default();
+        let text = std::str::from_utf8(&payload).ok().map(str::to_string);
+        let properties = &message.properties;
+        Ok(RetainedMessage {
+            topic: topic.to_string(),
+            qos: message.qos as u8,
+            payload_base64: text.is_none().then(|| STANDARD.encode(&payload)),
+            payload: text,
+            properties: RetainedProperties {
+                payload_format_indicator: properties
+                    .payload_format_indicator
+                    .as_ref()
+                    .map(|p| p.value),
+                content_type: properties.content_type.as_ref().map(|p| p.value.clone()),
+                response_topic: properties.response_topic.as_ref().map(|p| p.value.clone()),
+                correlation_data_base64: properties
+                    .correlation_data
+                    .as_ref()
+                    .map(|p| STANDARD.encode(&p.value)),
+                user_properties: properties
+                    .user_property
+                    .iter()
+                    .flatten()
+                    .map(|p| (p.key.clone(), p.value.clone()))
+                    .collect(),
+            },
+            expires_in: expires_in(message.expires_at, unix_millis()),
+        })
+    }
+
+    /// Deletes the retained message of every topic `filter` matches, and
+    /// returns how many: `deleteRetained`.
+    pub async fn delete_retained(&self, filter: &str) -> Result<usize, AdminError> {
+        retained_filter(filter)?;
+        let messages = self
+            .inner
+            .retained
+            .get_retained(filter)
+            .await
+            .map_err(storage_failed)?;
+        for message in &messages {
+            self.inner
+                .retained
+                .store_retained(&message.topic, None)
+                .await
+                .map_err(storage_failed)?;
+        }
+        info!(
+            "Deleted {} retained messages matching `{}` for the admin API",
+            messages.len(),
+            filter
+        );
+        Ok(messages.len())
+    }
 }
 
 fn summary(entry: &ClientEntry, s: &SessionSnapshot) -> ClientSummary {
@@ -500,9 +609,57 @@ fn summary(entry: &ClientEntry, s: &SessionSnapshot) -> ClientSummary {
     }
 }
 
+/// A topic filter retained messages can be looked up by; shared
+/// subscriptions name no topics.
+fn retained_filter(filter: &str) -> Result<(), AdminError> {
+    if parse_shared_subscription(filter).is_some() || validate_subscribe_filter(filter).is_err() {
+        return Err(AdminError::invalid_argument(format!(
+            "`{filter}` is not a topic filter"
+        )));
+    }
+    Ok(())
+}
+
+fn storage_failed(e: StorageError) -> AdminError {
+    AdminError::new(ErrorCode::Unavailable, format!("storage failed: {e}"))
+}
+
+/// Seconds until `expires_at`, in Unix milliseconds.
+fn expires_in(expires_at: Option<u64>, now: u64) -> Option<u64> {
+    expires_at.map(|at| at.saturating_sub(now) / 1000)
+}
+
+/// The first 64 bytes of `payload` as text; a character cut by the 64th
+/// byte is left out, other invalid UTF-8 gives None.
+fn preview(payload: &[u8]) -> Option<String> {
+    let cut = payload.len() > 64;
+    let head = &payload[..payload.len().min(64)];
+    match std::str::from_utf8(head) {
+        Ok(text) => Some(text.to_string()),
+        Err(e) if cut && e.error_len().is_none() => {
+            Some(String::from_utf8_lossy(&head[..e.valid_up_to()]).into_owned())
+        }
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_previews_stop_at_64_bytes_without_cutting_characters() {
+        assert_eq!(preview(b"hello").as_deref(), Some("hello"));
+        // 1 + 2 * 40 bytes: the 64th byte starts a character
+        let text = format!("a{}", "é".repeat(40));
+        assert_eq!(
+            preview(text.as_bytes()),
+            Some(format!("a{}", "é".repeat(31)))
+        );
+        assert_eq!(preview(&[0xff, 0xfe]), None);
+        // Only a character the 64 bytes cut may be left unfinished
+        assert_eq!(preview(b"abc\xc3"), None);
+    }
 
     #[test]
     fn test_pages_cut_the_list_and_count_all_of_it() {
