@@ -1,13 +1,25 @@
 name: release-plz
 
 on:
+  # The release PR only proposes changes, so it follows every push
   push:
     branches: [master]
+  # Publishing waits for the build workflow to pass on the pushed commit
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+    branches: [master]
+
+permissions: {}
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'frenzox'
+    if: >-
+      github.repository_owner == 'frenzox'
+      && github.event_name == 'workflow_run'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: write
       pull-requests: read
@@ -21,10 +33,14 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      # The commit the build passed on, which master may have moved past
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Put master on the built commit
+        run: git switch -C master
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
           toolchain: stable
@@ -36,7 +52,7 @@ jobs:
 
   release-pr:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'frenzox'
+    if: github.repository_owner == 'frenzox' && github.event_name == 'push'
     permissions:
       contents: write
       pull-requests: write
