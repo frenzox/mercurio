@@ -92,7 +92,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>reconnect(delay)</code>, <code>reconnect_max(max)</code></td><td>Reconnect automatically after losing the connection, waiting from <code>delay</code> up to <code>max</code> (60 seconds by default) between attempts</td></tr>
 <tr><td><code>tls(true)</code>, <code>ca_path(path)</code></td><td>TLS, verified with the system's roots or the given CA; <code>ca_path</code> turns TLS on</td></tr>
 <tr><td><code>client_cert(cert, key)</code></td><td>Authenticate with a client certificate; turns TLS on</td></tr>
-<tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker</td></tr>
+<tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker; packets over <code>maximum_packet_size</code>, 1 MiB by default as on the broker, are refused from their header</td></tr>
 <tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
 <tr><td><code>connector(f)</code></td><td>Open the stream with <code>f</code> instead of TCP</td></tr>

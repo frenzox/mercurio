@@ -290,7 +290,7 @@ impl MqttClient {
                 session_expiry_interval: (options.session_expiry > 0)
                     .then(|| SessionExpiryInterval::new(options.session_expiry)),
                 receive_maximum: options.receive_maximum.map(ReceiveMaximum::new),
-                maximum_packet_size: options.maximum_packet_size.map(MaximumPacketSize::new),
+                maximum_packet_size: Some(MaximumPacketSize::new(options.incoming_packet_limit())),
                 topic_alias_maximum: (options.topic_alias_maximum > 0)
                     .then(|| TopicAliasMaximum::new(options.topic_alias_maximum)),
                 request_response_information: options

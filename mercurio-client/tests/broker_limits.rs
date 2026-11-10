@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mercurio_client::{ClientError, ConnectOptions, MqttClient, QoS};
+use mercurio_client::{ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, QoS};
 use mercurio_core::reason::ReasonCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -153,4 +153,82 @@ async fn unsupported_features_are_refused_locally() {
         .unwrap();
     assert_eq!(sent[0], 0xe0, "sent {sent:02x?}");
     assert_eq!(sent.len(), 2 + sent[1] as usize, "sent {sent:02x?}");
+}
+
+/// Announces a packet of `remaining` bytes but sends only its start, and
+/// returns what the client sent: CONNECT, then its answer.
+async fn announce_oversized_packet(
+    options: impl FnOnce(ConnectOptions) -> ConnectOptions,
+    remaining: [u8; 4],
+) -> (Vec<u8>, Vec<u8>, Option<Event>) {
+    let (port, listener) = limited_broker().await;
+    let broker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let connect = read_packet(&mut socket).await;
+        socket
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        let mut start = vec![0x30];
+        start.extend_from_slice(&remaining);
+        start.extend_from_slice(&[0x00, 0x01, b't', 0x00]);
+        start.resize(start.len() + 100, b'x');
+        socket.write_all(&start).await.unwrap();
+        let mut answer = Vec::new();
+        timeout(Duration::from_secs(2), socket.read_to_end(&mut answer))
+            .await
+            .expect("the client waited for the rest of the packet")
+            .unwrap();
+        (connect, answer)
+    });
+
+    let client = MqttClient::connect(options(
+        ConnectOptions::new("127.0.0.1", port).keep_alive(0),
+    ))
+        .await
+        .unwrap();
+    let event = timeout(Duration::from_secs(2), client.recv())
+        .await
+        .unwrap_or_default();
+    let (connect, answer) = broker.await.unwrap();
+    (connect, answer, event)
+}
+
+fn refused_as_too_large(answer: &[u8], event: Option<Event>) {
+    assert_eq!(answer, [0xe0, 0x01, 0x95], "{answer:02x?}");
+    assert!(
+        matches!(
+            event,
+            Some(Event::Disconnected {
+                reason: DisconnectReason::ProtocolError(_)
+            })
+        ),
+        "{event:?}"
+    );
+}
+
+#[tokio::test]
+async fn packets_over_the_default_limit_are_refused_from_their_header() {
+    // 2 MiB, over the 1 MiB default
+    let (connect, answer, event) =
+        announce_oversized_packet(|o| o, [0x80, 0x80, 0x80, 0x01]).await;
+    // Maximum Packet Size of 1 MiB, announced in CONNECT
+    assert!(
+        connect
+            .windows(5)
+            .any(|w| w == [0x27, 0x00, 0x10, 0x00, 0x00]),
+        "{connect:02x?}"
+    );
+    refused_as_too_large(&answer, event);
+}
+
+#[tokio::test]
+async fn packets_over_the_set_limit_are_refused_from_their_header() {
+    // 1,000 bytes, over the 500 set
+    let (_, answer, event) = announce_oversized_packet(
+        |o| o.maximum_packet_size(500),
+        [0xe8, 0x07, 0x00, 0x00],
+    )
+    .await;
+    refused_as_too_large(&answer, event);
 }

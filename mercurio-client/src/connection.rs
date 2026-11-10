@@ -24,7 +24,7 @@ pub struct Connection {
     /// The largest packet the broker accepts, once it said so
     max_packet_size: Option<u32>,
     /// The largest packet this client accepts
-    max_incoming_size: Option<u32>,
+    max_incoming_size: u32,
     /// Longest a packet may take to write before the connection counts
     /// as lost
     write_timeout: Duration,
@@ -42,7 +42,7 @@ impl Connection {
             read_buffer: BytesMut::with_capacity(4096),
             protocol_version: options.protocol_version,
             max_packet_size: None,
-            max_incoming_size: options.maximum_packet_size,
+            max_incoming_size: options.incoming_packet_limit(),
             write_timeout: Duration::from_secs(options.connect_timeout_secs),
             broken: false,
         }
@@ -99,26 +99,20 @@ impl Connection {
     /// Uses version-aware parsing based on the configured protocol version.
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
-            match ControlPacket::check(&self.read_buffer) {
-                Ok(()) => {
-                    let buffered = self.read_buffer.len();
+            // Refused from the fixed header, before buffering the body
+            match ControlPacket::frame_len(&self.read_buffer) {
+                Ok(len) if len > self.max_incoming_size as usize => {
+                    return Err(ClientError::BrokerViolation(ReasonCode::PacketTooLarge));
+                }
+                Ok(len) if self.read_buffer.len() >= len => {
                     let packet = ControlPacket::parse_with_version(
                         &mut self.read_buffer,
                         self.protocol_version,
                     )
                     .map_err(ClientError::Packet)?;
-                    // ponytail: checked once the packet is buffered; checking
-                    // the fixed header first would cap memory too
-                    let size = buffered - self.read_buffer.len();
-                    if self
-                        .max_incoming_size
-                        .is_some_and(|max| size > max as usize)
-                    {
-                        return Err(ClientError::BrokerViolation(ReasonCode::PacketTooLarge));
-                    }
                     return Ok(Some(packet));
                 }
-                Err(mercurio_core::error::Error::PacketIncomplete) => {}
+                Ok(_) | Err(mercurio_core::error::Error::PacketIncomplete) => {}
                 Err(e) => return Err(ClientError::Packet(e)),
             }
 

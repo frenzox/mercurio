@@ -18,6 +18,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::connection::Stream;
 use crate::error::ClientError;
 
+/// Largest packet accepted from the broker unless set otherwise, as
+/// Mercurio's own default `max_packet_size`
+const DEFAULT_MAXIMUM_PACKET_SIZE: u32 = 1024 * 1024;
+
 const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 /// Exponential backoff with jitter: the waits between attempts to reach a
@@ -536,11 +540,18 @@ impl ConnectOptions {
         self
     }
 
-    /// Largest packet the broker may send; it drops larger messages
-    /// instead. MQTT 5 only.
+    /// Largest packet the broker may send, 1 MiB unless set, the broker's
+    /// own default limit. An MQTT 5 broker is told and drops larger
+    /// messages; one that sends a larger packet anyway, as an MQTT 3.x
+    /// broker may, is disconnected.
     pub fn maximum_packet_size(mut self, bytes: u32) -> Self {
         self.maximum_packet_size = Some(bytes);
         self
+    }
+
+    pub(crate) fn incoming_packet_limit(&self) -> u32 {
+        self.maximum_packet_size
+            .unwrap_or(DEFAULT_MAXIMUM_PACKET_SIZE)
     }
 
     /// Let the broker replace topic names with up to this many aliases,
