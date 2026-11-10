@@ -9,7 +9,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -173,6 +176,14 @@ impl BridgeStatus {
 /// to date. Fails only on an invalid configuration; an unreachable remote
 /// broker is retried.
 pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeStatus>, String> {
+    let bridge = prepare(config, local)?;
+    let status = Arc::clone(&bridge.status);
+    tokio::spawn(bridge.run());
+    Ok(status)
+}
+
+/// The bridge, ready to run.
+fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String> {
     let (outbound, inbound) = routes(&config)?;
     let client_id = config
         .client_id
@@ -181,16 +192,23 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeSt
     let addresses = addresses(&config)?;
 
     // Stays connected while the remote broker is unreachable, so messages
-    // to forward wait in its queue meanwhile
+    // to forward wait in its queue meanwhile. The connector only fails
+    // once this broker stopped.
+    let broker_stopped = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&broker_stopped);
     let local_options = ConnectOptions::new("localhost", 0)
         .client_id(client_id.clone())
-        .connector(move || local.connect());
+        .connector(move || {
+            local
+                .connect()
+                .inspect_err(|_| stopped.store(true, Ordering::Relaxed))
+        });
 
     let protocol_version = match config.protocol_version {
         BridgeProtocol::Mqttv5 => ProtocolVersion::V5,
         BridgeProtocol::Mqttv311 => ProtocolVersion::V3_1_1,
     };
-    let remote_options = addresses
+    let remotes = addresses
         .into_iter()
         .map(|(host, port)| {
             let address = crate::address(&host, port);
@@ -216,9 +234,8 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeSt
         })
         .collect();
 
-    let status = Arc::new(BridgeStatus::new(&config.name, &client_id));
-    let bridge = Bridge {
-        status: Arc::clone(&status),
+    Ok(Bridge {
+        status: Arc::new(BridgeStatus::new(&config.name, &client_id)),
         name: config.name,
         state_topic: config
             .notifications
@@ -226,9 +243,11 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeSt
         echoes: (protocol_version == ProtocolVersion::V3_1_1).then(|| Mutex::new(VecDeque::new())),
         outbound,
         inbound,
-    };
-    tokio::spawn(bridge.run(local_options, remote_options));
-    Ok(status)
+        local_options,
+        remotes,
+        retry_delay: RETRY_DELAY,
+        broker_stopped,
+    })
 }
 
 /// The remote brokers to try, in order.
@@ -266,54 +285,82 @@ struct Bridge {
     echoes: Option<Mutex<VecDeque<(String, Bytes)>>>,
     outbound: Vec<Route>,
     inbound: Vec<Route>,
+    local_options: ConnectOptions,
+    /// Each remote broker's address and options
+    remotes: Vec<(String, ConnectOptions)>,
+    retry_delay: Duration,
+    broker_stopped: Arc<AtomicBool>,
 }
 
 impl Bridge {
     /// Forwards messages through the remote brokers, trying them in turn,
-    /// until this broker stops.
-    async fn run(self, local_options: ConnectOptions, remotes: Vec<(String, ConnectOptions)>) {
-        let local = loop {
-            match MqttClient::connect(local_options.clone()).await {
-                Ok(local) => break local,
+    /// until this broker stops. This broker may also close the local
+    /// connection, as when another client takes the bridge's client id;
+    /// the bridge then connects again.
+    async fn run(self) {
+        let mut remotes = self.remotes.iter().cycle();
+        while let Some(local) = self.connect_locally().await {
+            // What was published before may be stale, after a crash or a
+            // lost connection
+            self.notify(&local, "0").await;
+            self.forward_through(&local, &mut remotes).await;
+            warn!("Bridge {}: connection to this broker lost", self.name);
+        }
+    }
+
+    /// The local client, subscribed to the outbound routes, or `None` once
+    /// this broker stopped.
+    async fn connect_locally(&self) -> Option<MqttClient> {
+        loop {
+            match MqttClient::connect(self.local_options.clone()).await {
+                Ok(local) if self.subscribe(&local, &self.outbound).await => return Some(local),
+                Ok(_) => {}
                 Err(e) => warn!("Bridge {}: connecting locally failed: {}", self.name, e),
             }
-            tokio::time::sleep(RETRY_DELAY).await;
-        };
-        if !self.subscribe(&local, &self.outbound).await {
-            return;
+            if self.broker_stopped.load(Ordering::Relaxed) {
+                return None;
+            }
+            tokio::time::sleep(self.retry_delay).await;
         }
+    }
 
-        for (address, options) in remotes.iter().cycle() {
+    /// Forwards between `local` and the remote brokers until `local`
+    /// closes.
+    async fn forward_through<'a>(
+        &self,
+        local: &MqttClient,
+        remotes: &mut impl Iterator<Item = &'a (String, ConnectOptions)>,
+    ) {
+        for (address, options) in remotes {
             let remote = match MqttClient::connect(options.clone()).await {
                 Ok(remote) => remote,
                 Err(e) => {
                     warn!(
                         "Bridge {}: connecting to {} failed, trying the next address in {:?}: {}",
-                        self.name, address, RETRY_DELAY, e
+                        self.name, address, self.retry_delay, e
                     );
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    tokio::time::sleep(self.retry_delay).await;
                     continue;
                 }
             };
             if self.subscribe(&remote, &self.inbound).await {
                 info!("Bridge {} connected to {}", self.name, address);
                 self.status.set(true, Some(address.as_str()));
-                self.notify(&local, "1").await;
+                self.notify(local, "1").await;
                 let local_closed = tokio::select! {
-                    _ = self.forward(&local, &remote, &self.outbound, true) => true,
-                    _ = self.forward(&remote, &local, &self.inbound, false) => false,
+                    _ = self.forward(local, &remote, &self.outbound, true) => true,
+                    _ = self.forward(&remote, local, &self.inbound, false) => false,
                 };
+                self.status.set(false, None);
                 if local_closed {
-                    // This broker is stopping
                     let _ = remote.disconnect().await;
                     return;
                 }
                 error!("Bridge {} lost its connection", self.name);
-                self.status.set(false, None);
-                self.notify(&local, "0").await;
+                self.notify(local, "0").await;
             }
             let _ = remote.disconnect().await;
-            tokio::time::sleep(RETRY_DELAY).await;
+            tokio::time::sleep(self.retry_delay).await;
         }
     }
 
@@ -541,5 +588,229 @@ mod tests {
         status.set(true, Some(&crate::address("2001:db8::1", 1883)));
         let entry = serde_json::to_value(status.entry(0)).unwrap();
         assert_eq!(entry["remoteAddress"], "[2001:db8::1]:1883");
+    }
+
+    mod running {
+        use std::{
+            future::Future,
+            net::SocketAddr,
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+        use mercurio_server::server::{LocalConnector, ServerConfig};
+        use tokio::{
+            net::{TcpListener, TcpStream},
+            sync::{oneshot, watch},
+            task::JoinHandle,
+            time::timeout,
+        };
+
+        use super::super::{prepare, BridgeStatus};
+        use crate::config::BridgeConfig;
+
+        const STATE_TOPIC: &str = "$SYS/broker/connection/mercurio-bridge-cloud/state";
+
+        async fn start_remote() -> SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(mercurio_server::server::run(
+                listener,
+                std::future::pending::<()>(),
+            ));
+            addr
+        }
+
+        /// This broker, reached in process, until `shutdown` completes.
+        async fn start_local(shutdown: impl Future + Send + 'static) -> LocalConnector {
+            let (connector, local_listener) = LocalConnector::new();
+            let mut config = ServerConfig::default();
+            config.local_listener = Some(local_listener);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tokio::spawn(mercurio_server::server::run_with_config(
+                listener, config, shutdown,
+            ));
+            connector
+        }
+
+        /// Passes connections through to `target` while `up` holds, and
+        /// cuts them when it stops holding.
+        async fn proxy(target: SocketAddr, up: watch::Receiver<bool>) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let (mut inbound, _) = listener.accept().await.unwrap();
+                    if !*up.borrow() {
+                        continue;
+                    }
+                    let mut up = up.clone();
+                    tokio::spawn(async move {
+                        let mut outbound = TcpStream::connect(target).await.unwrap();
+                        tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                            _ = up.wait_for(|up| !up) => {}
+                        }
+                    });
+                }
+            });
+            port
+        }
+
+        fn local_client(connector: &LocalConnector, id: &str) -> ConnectOptions {
+            let connector = connector.clone();
+            ConnectOptions::new("localhost", 0)
+                .client_id(id)
+                .connector(move || connector.connect())
+        }
+
+        /// Runs a bridge forwarding `a/#` to `port`, its local client
+        /// pinging every half second and given up on after 1.5 s of silence.
+        fn run_bridge(
+            connector: &LocalConnector,
+            port: u16,
+        ) -> (Arc<BridgeStatus>, JoinHandle<()>) {
+            let config: BridgeConfig = toml::from_str(&format!(
+                "name = \"cloud\"\nhost = \"127.0.0.1\"\nport = {port}\n\
+                 [[topics]]\npattern = \"a/#\"\nqos = 1\n"
+            ))
+            .unwrap();
+            let mut bridge = prepare(config, connector.clone()).unwrap();
+            bridge.retry_delay = Duration::from_millis(200);
+            bridge.local_options = bridge.local_options.keep_alive(1).connect_timeout(1);
+            let status = Arc::clone(&bridge.status);
+            (status, tokio::spawn(bridge.run()))
+        }
+
+        fn connected(status: &BridgeStatus) -> bool {
+            status.link.lock().unwrap().connected
+        }
+
+        async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !condition() {
+                assert!(Instant::now() < deadline, "timed out waiting until {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn remote_watcher(remote: SocketAddr) -> MqttClient {
+            let watcher =
+                MqttClient::connect(ConnectOptions::new("127.0.0.1", remote.port()).client_id("w"))
+                    .await
+                    .unwrap();
+            watcher
+                .subscribe(&[("a/#", QoS::AtLeastOnce)])
+                .await
+                .unwrap();
+            watcher
+        }
+
+        async fn next_payload(client: &MqttClient) -> String {
+            loop {
+                match timeout(Duration::from_secs(10), client.recv()).await {
+                    Ok(Some(Event::Message { payload, .. })) => {
+                        return String::from_utf8(payload.to_vec()).unwrap();
+                    }
+                    Ok(Some(_)) => {}
+                    other => panic!("no message: {other:?}"),
+                }
+            }
+        }
+
+        /// The retained state of the bridge on this broker.
+        async fn state(connector: &LocalConnector) -> String {
+            let client = MqttClient::connect(local_client(connector, "state"))
+                .await
+                .unwrap();
+            client
+                .subscribe(&[(STATE_TOPIC, QoS::AtMostOnce)])
+                .await
+                .unwrap();
+            let state = next_payload(&client).await;
+            client.disconnect().await.unwrap();
+            state
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_bridge_comes_back_after_a_long_outage_with_a_backlog() {
+            let remote = start_remote().await;
+            let (up, up_rx) = watch::channel(true);
+            let port = proxy(remote, up_rx).await;
+            let connector = start_local(std::future::pending::<()>()).await;
+            let watcher = remote_watcher(remote).await;
+            let (status, _bridge) = run_bridge(&connector, port);
+            wait_until("connected", || connected(&status)).await;
+
+            up.send_replace(false);
+            wait_until("disconnected", || !connected(&status)).await;
+            assert_eq!(state(&connector).await, "0");
+
+            // More than the bridge's client holds, over twice its keep-alive
+            let publisher = MqttClient::connect(local_client(&connector, "pub"))
+                .await
+                .unwrap();
+            for i in 0..300 {
+                publisher
+                    .publish(&format!("a/{i}"), i.to_string(), QoS::AtLeastOnce)
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!connected(&status));
+
+            up.send_replace(true);
+            wait_until("reconnected", || connected(&status)).await;
+            for i in 0..300 {
+                assert_eq!(next_payload(&watcher).await, i.to_string());
+            }
+            assert_eq!(state(&connector).await, "1");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_bridge_reconnects_when_this_broker_drops_it() {
+            let remote = start_remote().await;
+            let connector = start_local(std::future::pending::<()>()).await;
+            let watcher = remote_watcher(remote).await;
+            let (status, _bridge) = run_bridge(&connector, remote.port());
+            wait_until("connected", || connected(&status)).await;
+
+            // Takes the bridge's session over, closing its connection
+            let intruder = MqttClient::connect(local_client(&connector, "mercurio-bridge-cloud"))
+                .await
+                .unwrap();
+            assert!(matches!(
+                timeout(Duration::from_secs(10), intruder.recv()).await,
+                Ok(Some(Event::Disconnected { .. }))
+            ));
+            wait_until("reconnected", || connected(&status)).await;
+
+            let publisher = MqttClient::connect(local_client(&connector, "pub"))
+                .await
+                .unwrap();
+            publisher
+                .publish("a/after", "after", QoS::AtLeastOnce)
+                .await
+                .unwrap();
+            assert_eq!(next_payload(&watcher).await, "after");
+            assert_eq!(state(&connector).await, "1");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_bridge_stops_with_this_broker() {
+            let remote = start_remote().await;
+            let (stop, stopped) = oneshot::channel::<()>();
+            let connector = start_local(stopped).await;
+            let (status, bridge) = run_bridge(&connector, remote.port());
+            wait_until("connected", || connected(&status)).await;
+
+            stop.send(()).unwrap();
+            timeout(Duration::from_secs(10), bridge)
+                .await
+                .expect("the bridge outlived the broker")
+                .unwrap();
+            assert!(!connected(&status));
+        }
     }
 }

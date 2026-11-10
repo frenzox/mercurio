@@ -66,7 +66,7 @@ the password.
 | `-H, --host`, `-p, --port` | Broker over TCP | admin socket, else `localhost:1883` |
 | `--unix` | Broker over a Unix socket | |
 | `-u, --username`, `-P, --password` | Credentials | |
-| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification | |
+| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
 | `--json` | Print the response data as JSON | tables |
 | `--timeout` | Seconds to wait for the answer (`MERCURIOCTL_TIMEOUT`) | `10` |
 

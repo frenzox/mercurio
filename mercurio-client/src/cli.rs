@@ -46,11 +46,13 @@ pub struct ConnectArgs {
     #[arg(long)]
     pub tls: bool,
 
-    /// Path to CA certificate file (PEM format) for TLS verification
+    /// Path to CA certificate file (PEM format) for TLS verification;
+    /// implies --tls
     #[arg(long)]
     pub cafile: Option<String>,
 
-    /// Skip TLS certificate verification (insecure, for testing only)
+    /// Skip TLS certificate verification (insecure, for testing only);
+    /// implies --tls
     #[arg(long)]
     pub insecure: bool,
 }
@@ -151,6 +153,14 @@ mod tests {
         assert_eq!((options.host.as_str(), options.port), ("broker", 8883));
         assert!(options.tls.enabled);
         assert_eq!(options.tls.ca_path.as_deref(), Some("ca.pem"));
+    }
+
+    #[test]
+    fn a_ca_file_or_insecure_turns_tls_on() {
+        for args in [&["--cafile", "ca.pem"][..], &["--insecure"]] {
+            let options = parse(args).unwrap().to_connect_options();
+            assert!(options.tls.enabled, "{args:?}");
+        }
     }
 
     #[test]

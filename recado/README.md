@@ -56,7 +56,7 @@ Connection options, for both commands:
 | `-i, --client-id` | Client id | generated |
 | `-u, --username`, `-P, --password` | Credentials | |
 | `-V, --protocol-version` | `5`, `311` or `31` | `5` |
-| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification | |
+| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
 
 Run `recado pub --help` or `recado sub --help` for every option, or see
 the [CLI guide](https://frenzox.github.io/mercurio/cli.html).
