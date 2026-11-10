@@ -243,7 +243,8 @@ allow_anonymous = false
 # does. Its clients skip authentication and access control, so only root,
 # the broker's own user and the members of `group` may connect; others are
 # closed at once. Every directory on a custom socket path must be writable
-# only by root or the broker's user. "" turns it off. Linux only: elsewhere this is ignored.
+# only by root or the broker's user. "" turns it off. Linux only: elsewhere
+# this is ignored.
 socket = "/run/mercurio/admin.sock"
 # Members are read when the broker starts; add an administrator with
 # `usermod -aG mercurio <user>`. "" leaves only root and the broker's user.
