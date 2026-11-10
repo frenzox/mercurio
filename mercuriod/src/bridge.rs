@@ -18,7 +18,8 @@ use std::{
 
 use bytes::Bytes;
 use mercurio_client::{
-    ConnectOptions, Event, MqttClient, ProtocolVersion, QoS, SubscriptionOptions,
+    AckToken, Backoff, ClientError, ConnectOptions, Event, MessageProperties, MqttClient,
+    PendingPublish, ProtocolVersion, QoS, SubscriptionOptions,
 };
 use mercurio_core::message::unix_millis;
 use mercurio_core::topic::topic_matches_filter;
@@ -28,7 +29,13 @@ use tracing::{error, info, warn};
 
 use crate::config::{BridgeConfig, BridgeProtocol, Direction};
 
-const RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Waits between attempts to connect
+const RETRY: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(5));
+
+/// Messages a bridge takes from one side before the other accepted them:
+/// the Receive Maximum it announces to each broker, and the most publishes
+/// it has in flight in each direction
+const IN_FLIGHT: u16 = 100;
 
 // ponytail: fixed, so the remote broker keeps inbound messages through a
 // day of downtime; make it configurable if someone needs another value
@@ -195,6 +202,8 @@ fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String
     let stopped = Arc::clone(&broker_stopped);
     let local_options = ConnectOptions::new("localhost", 0)
         .client_id(client_id.clone())
+        .manual_acks(true)
+        .receive_maximum(IN_FLIGHT)
         .connector(move || {
             local
                 .connect()
@@ -214,6 +223,8 @@ fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String
                 .protocol_version(protocol_version)
                 .clean_start(false)
                 .session_expiry(REMOTE_SESSION_EXPIRY)
+                .manual_acks(true)
+                .receive_maximum(IN_FLIGHT)
                 .tls(config.tls.enabled);
             if let Some(ca_path) = &config.tls.ca_path {
                 options = options.ca_path(ca_path.clone());
@@ -242,7 +253,7 @@ fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String
         inbound,
         local_options,
         remotes,
-        retry_delay: RETRY_DELAY,
+        retry: Backoff::new(RETRY.0, RETRY.1),
         broker_stopped,
     })
 }
@@ -285,22 +296,58 @@ struct Bridge {
     local_options: ConnectOptions,
     /// Each remote broker's address and options
     remotes: Vec<(String, ConnectOptions)>,
-    retry_delay: Duration,
+    /// Waits between attempts to connect, on either side
+    retry: Backoff,
     broker_stopped: Arc<AtomicBool>,
+}
+
+/// A message taken from one side and not yet accepted by the other. It is
+/// acknowledged to the side it came from only once the other has it, so a
+/// lost connection on either side can't lose it.
+struct Message {
+    /// Renamed for the side it goes to
+    topic: String,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+    properties: MessageProperties,
+    ack: Option<AckToken>,
+}
+
+/// One direction of a bridge: the messages taken from its source and not
+/// yet accepted by its destination, oldest first. It outlives the
+/// forwarding, which a lost connection on the other direction cancels, so
+/// the messages are sent again over the next connection.
+#[derive(Default)]
+struct Pipeline {
+    messages: VecDeque<Message>,
+}
+
+/// Why forwarding in one direction stopped.
+#[derive(Debug, PartialEq)]
+enum Stop {
+    /// The client messages come from closed
+    SourceClosed,
+    /// The client messages go to failed to take one
+    DestinationFailed,
 }
 
 impl Bridge {
     /// Forwards messages through the remote brokers, trying them in turn,
     /// until this broker stops. This broker may also close the local
     /// connection, as when another client takes the bridge's client id;
-    /// the bridge then connects again.
+    /// the bridge then connects again, still holding the messages it took
+    /// for the remote broker.
     async fn run(self) {
         let mut remotes = self.remotes.iter().cycle();
+        let mut outgoing = Pipeline::default();
+        let mut retry = self.retry.clone();
         while let Some(local) = self.connect_locally().await {
             // What was published before may be stale, after a crash or a
             // lost connection
             self.notify(&local, "0").await;
-            self.forward_through(&local, &mut remotes).await;
+            self.forward_through(&local, &mut remotes, &mut outgoing, &mut retry)
+                .await;
             warn!("Bridge {}: connection to this broker lost", self.name);
         }
     }
@@ -308,6 +355,7 @@ impl Bridge {
     /// The local client, subscribed to the outbound routes, or `None` once
     /// this broker stopped.
     async fn connect_locally(&self) -> Option<MqttClient> {
+        let mut retry = self.retry.clone();
         loop {
             match MqttClient::connect(self.local_options.clone()).await {
                 Ok(local) if self.subscribe(&local, &self.outbound).await => return Some(local),
@@ -317,36 +365,48 @@ impl Bridge {
             if self.broker_stopped.load(Ordering::Relaxed) {
                 return None;
             }
-            tokio::time::sleep(self.retry_delay).await;
+            tokio::time::sleep(retry.next_delay()).await;
         }
     }
 
     /// Forwards between `local` and the remote brokers until `local`
-    /// closes.
+    /// closes. Messages for the remote brokers stay in `outgoing` until
+    /// one accepts them.
     async fn forward_through<'a>(
         &self,
         local: &MqttClient,
         remotes: &mut impl Iterator<Item = &'a (String, ConnectOptions)>,
+        outgoing: &mut Pipeline,
+        retry: &mut Backoff,
     ) {
         for (address, options) in remotes {
             let remote = match MqttClient::connect(options.clone()).await {
                 Ok(remote) => remote,
                 Err(e) => {
+                    let delay = retry.next_delay();
                     warn!(
                         "Bridge {}: connecting to {} failed, trying the next address in {:?}: {}",
-                        self.name, address, self.retry_delay, e
+                        self.name, address, delay, e
                     );
-                    tokio::time::sleep(self.retry_delay).await;
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             };
             if self.subscribe(&remote, &self.inbound).await {
                 info!("Bridge {} connected to {}", self.name, address);
+                retry.reset();
                 self.status.set(true, Some(address.as_str()));
                 self.notify(local, "1").await;
+                // The remote broker sends unacknowledged messages again,
+                // so those taken from it last time aren't kept
+                let mut incoming = Pipeline::default();
                 let local_closed = tokio::select! {
-                    _ = self.forward(local, &remote, &self.outbound, true) => true,
-                    _ = self.forward(&remote, local, &self.inbound, false) => false,
+                    stop = self.forward(local, &remote, &self.outbound, true, outgoing) => {
+                        stop == Stop::SourceClosed
+                    }
+                    stop = self.forward(&remote, local, &self.inbound, false, &mut incoming) => {
+                        stop == Stop::DestinationFailed
+                    }
                 };
                 self.status.set(false, None);
                 if local_closed {
@@ -357,7 +417,7 @@ impl Bridge {
                 self.notify(local, "0").await;
             }
             let _ = remote.disconnect().await;
-            tokio::time::sleep(self.retry_delay).await;
+            tokio::time::sleep(retry.next_delay()).await;
         }
     }
 
@@ -401,65 +461,175 @@ impl Bridge {
         true
     }
 
-    /// Forwards what `from` receives through `to` until `from` closes;
-    /// `outbound` when `to` is the remote broker.
-    async fn forward(&self, from: &MqttClient, to: &MqttClient, routes: &[Route], outbound: bool) {
-        while let Some(event) = from.recv().await {
-            match event {
-                Event::Message {
-                    topic,
-                    payload,
-                    qos,
-                    retain,
-                    properties,
-                    subscription_ids,
-                    ..
-                } => {
-                    // MQTT 3.1.1 brokers send no subscription identifiers
-                    let route = match subscription_ids.first() {
-                        Some(id) => (*id as usize).checked_sub(1).and_then(|i| routes.get(i)),
-                        None => routes
-                            .iter()
-                            .find(|r| topic_matches_filter(&topic, &r.filter)),
-                    };
-                    let Some(renamed) = forwarded_topic(route, &topic, outbound) else {
-                        warn!(
-                            "Bridge {}: dropping `{}`, which no route covers",
-                            self.name, topic
-                        );
-                        continue;
-                    };
-                    if let Some(echoes) = &self.echoes {
-                        let mut echoes = echoes.lock().unwrap();
-                        if outbound {
-                            if echoes.len() == ECHO_WINDOW {
-                                echoes.pop_front();
-                            }
-                            echoes.push_back((renamed.clone(), payload.clone()));
-                        } else if let Some(position) = echoes
-                            .iter()
-                            .position(|(t, p)| *t == topic && *p == payload)
-                        {
-                            // The remote broker sent back what was forwarded
-                            echoes.remove(position);
-                            continue;
+    /// Forwards what `from` receives through `to`, `outbound` when `to` is
+    /// the remote broker, until either fails. The messages `pipeline` holds
+    /// from earlier go first. Up to `IN_FLIGHT` publishes are in flight at
+    /// once, which `to` keeps within its broker's Receive Maximum, and each
+    /// message is acknowledged to `from` once `to` has it, in order.
+    async fn forward(
+        &self,
+        from: &MqttClient,
+        to: &MqttClient,
+        routes: &[Route],
+        outbound: bool,
+        pipeline: &mut Pipeline,
+    ) -> Stop {
+        let window = usize::from(IN_FLIGHT);
+        // Publishes of the first messages of the pipeline, in order
+        let mut started: VecDeque<PendingPublish> = VecDeque::new();
+        loop {
+            // Start what the pipeline holds, as far as the window allows
+            while started.len() < pipeline.messages.len() && started.len() < window {
+                let message = &pipeline.messages[started.len()];
+                let publish = to
+                    .start_publish(
+                        &message.topic,
+                        message.payload.clone(),
+                        message.qos,
+                        message.retain,
+                        message.properties.clone(),
+                    )
+                    .await;
+                match publish {
+                    Ok(publish) => started.push_back(publish),
+                    Err(e) => return self.give_up(e),
+                }
+            }
+
+            tokio::select! {
+                // The oldest publish first, as its message must be
+                // acknowledged first
+                done = oldest(&mut started) => {
+                    started.pop_front();
+                    let message = pipeline.messages.pop_front().expect("one per publish");
+                    if let Err(e) = done {
+                        if !refused(&e) {
+                            // Kept, with those after it, for the next try
+                            pipeline.messages.push_front(message);
+                            return self.give_up(e);
                         }
+                        warn!(
+                            "Bridge {}: dropping `{}`, refused: {}",
+                            self.name, message.topic, e
+                        );
                     }
-                    let published = to
-                        .publish_with_properties(&renamed, payload, qos, retain, properties)
-                        .await;
-                    if let Err(e) = published {
-                        warn!("Bridge {}: forwarding `{}` failed: {}", self.name, topic, e);
+                    if let Some(token) = message.ack {
+                        let _ = from.ack(token).await;
                     }
                 }
-                Event::Reconnected { .. } => {}
-                Event::Disconnected { reason } => {
-                    warn!("Bridge {} disconnected: {:?}", self.name, reason);
+                event = from.recv(), if pipeline.messages.len() < window => {
+                    let Some(event) = event else {
+                        return Stop::SourceClosed;
+                    };
+                    match event {
+                        Event::Message {
+                            topic,
+                            payload,
+                            qos,
+                            retain,
+                            properties,
+                            subscription_ids,
+                            ack,
+                            ..
+                        } => {
+                            let Some(topic) =
+                                self.take(&topic, &payload, &subscription_ids, routes, outbound)
+                            else {
+                                if let Some(token) = ack {
+                                    let _ = from.ack(token).await;
+                                }
+                                continue;
+                            };
+                            pipeline.messages.push_back(Message {
+                                topic,
+                                payload,
+                                qos,
+                                retain,
+                                properties,
+                                ack,
+                            });
+                        }
+                        Event::Disconnected { reason } => {
+                            warn!("Bridge {} disconnected: {:?}", self.name, reason);
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
     }
+
+    fn give_up(&self, error: ClientError) -> Stop {
+        warn!(
+            "Bridge {}: forwarding stopped, kept for the next connection: {}",
+            self.name, error
+        );
+        Stop::DestinationFailed
+    }
+
+    /// The topic a message received on `topic` is forwarded to, or `None`
+    /// if it isn't forwarded: no route covers it, or it is the echo of a
+    /// message forwarded to an MQTT 3.1.1 remote broker.
+    fn take(
+        &self,
+        topic: &str,
+        payload: &Bytes,
+        subscription_ids: &[u32],
+        routes: &[Route],
+        outbound: bool,
+    ) -> Option<String> {
+        // MQTT 3.1.1 brokers send no subscription identifiers
+        let route = match subscription_ids.first() {
+            Some(id) => (*id as usize).checked_sub(1).and_then(|i| routes.get(i)),
+            None => routes
+                .iter()
+                .find(|r| topic_matches_filter(topic, &r.filter)),
+        };
+        let Some(renamed) = forwarded_topic(route, topic, outbound) else {
+            warn!(
+                "Bridge {}: dropping `{}`, which no route covers",
+                self.name, topic
+            );
+            return None;
+        };
+        if let Some(echoes) = &self.echoes {
+            let mut echoes = echoes.lock().unwrap();
+            if outbound {
+                if echoes.len() == ECHO_WINDOW {
+                    echoes.pop_front();
+                }
+                echoes.push_back((renamed.clone(), payload.clone()));
+            } else if let Some(position) =
+                echoes.iter().position(|(t, p)| t == topic && p == payload)
+            {
+                // The remote broker sent back what was forwarded
+                echoes.remove(position);
+                return None;
+            }
+        }
+        Some(renamed)
+    }
+}
+
+/// The outcome of the oldest publish, once there is one.
+async fn oldest(started: &mut VecDeque<PendingPublish>) -> mercurio_client::Result<()> {
+    match started.front_mut() {
+        Some(publish) => publish.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the destination refused this message itself, so trying it
+/// again can't help, rather than failed to take it.
+fn refused(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::PublishRefused(_)
+            | ClientError::NotSupported(_)
+            | ClientError::PacketTooLarge
+            | ClientError::TooLong(_)
+            | ClientError::InvalidArgument(_)
+    )
 }
 
 #[cfg(test)]
@@ -609,15 +779,17 @@ mod tests {
 
     mod running {
         use std::{
+            collections::HashSet,
             future::Future,
             net::SocketAddr,
             sync::Arc,
             time::{Duration, Instant},
         };
 
-        use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
+        use mercurio_client::{Backoff, ConnectOptions, Event, MqttClient, QoS};
         use mercurio_server::server::{LocalConnector, ServerConfig};
         use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
             net::{TcpListener, TcpStream},
             sync::{oneshot, watch},
             task::JoinHandle,
@@ -694,7 +866,7 @@ mod tests {
             ))
             .unwrap();
             let mut bridge = prepare(config, connector.clone()).unwrap();
-            bridge.retry_delay = Duration::from_millis(200);
+            bridge.retry = Backoff::new(Duration::from_millis(100), Duration::from_millis(400));
             bridge.local_options = bridge.local_options.keep_alive(1).connect_timeout(1);
             let status = Arc::clone(&bridge.status);
             (status, tokio::spawn(bridge.run()))
@@ -828,6 +1000,134 @@ mod tests {
                 .expect("the bridge outlived the broker")
                 .unwrap();
             assert!(!connected(&status));
+        }
+
+        /// Collects payloads from `client` until it has each of `expected`,
+        /// copies allowed.
+        async fn receive_all(client: &MqttClient, expected: usize) -> HashSet<usize> {
+            let mut received = HashSet::new();
+            while received.len() < expected {
+                match timeout(Duration::from_secs(10), client.recv()).await {
+                    Ok(Some(Event::Message { payload, .. })) => {
+                        received.insert(
+                            String::from_utf8(payload.to_vec())
+                                .unwrap()
+                                .parse()
+                                .unwrap(),
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            received
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_messages_in_flight_when_the_remote_drops_are_forwarded_later() {
+            const MESSAGES: usize = 400;
+            let remote = start_remote().await;
+            let (up, up_rx) = watch::channel(true);
+            let port = proxy(remote, up_rx).await;
+            let connector = start_local(std::future::pending::<()>()).await;
+            let watcher = remote_watcher(remote).await;
+            let (status, _bridge) = run_bridge(&connector, port);
+            wait_until("connected", || connected(&status)).await;
+
+            let publisher = MqttClient::connect(local_client(&connector, "pub"))
+                .await
+                .unwrap();
+            let publishing = tokio::spawn(async move {
+                for i in 0..MESSAGES {
+                    publisher
+                        .publish(&format!("a/{i}"), i.to_string(), QoS::AtLeastOnce)
+                        .await
+                        .unwrap();
+                }
+            });
+            // Cut the link while messages flow, a few times
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                up.send_replace(false);
+                wait_until("disconnected", || !connected(&status)).await;
+                up.send_replace(true);
+                wait_until("reconnected", || connected(&status)).await;
+            }
+            publishing.await.unwrap();
+
+            let received = receive_all(&watcher, MESSAGES).await;
+            let missing: Vec<usize> = (0..MESSAGES).filter(|i| !received.contains(i)).collect();
+            assert!(missing.is_empty(), "lost {missing:?}");
+        }
+
+        /// Passes connections through to `target`, each chunk `delay`
+        /// late, as over a long link.
+        async fn slow_proxy(target: SocketAddr, delay: Duration) -> u16 {
+            async fn pass(
+                mut from: tokio::net::tcp::OwnedReadHalf,
+                mut to: tokio::net::tcp::OwnedWriteHalf,
+                delay: Duration,
+            ) {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+                tokio::spawn(async move {
+                    while let Some((at, chunk)) = rx.recv().await {
+                        tokio::time::sleep_until(at).await;
+                        if to.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut buffer = [0u8; 4096];
+                while let Ok(n @ 1..) = from.read(&mut buffer).await {
+                    let at = tokio::time::Instant::now() + delay;
+                    if tx.send((at, buffer[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let (inbound, _) = listener.accept().await.unwrap();
+                    let outbound = TcpStream::connect(target).await.unwrap();
+                    let (in_read, in_write) = inbound.into_split();
+                    let (out_read, out_write) = outbound.into_split();
+                    tokio::spawn(pass(in_read, out_write, delay));
+                    tokio::spawn(pass(out_read, in_write, delay));
+                }
+            });
+            port
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_forwarding_does_not_wait_a_round_trip_per_message() {
+            const MESSAGES: usize = 50;
+            let remote = start_remote().await;
+            // 50 ms each way: one message per round trip would take 5 s
+            let port = slow_proxy(remote, Duration::from_millis(50)).await;
+            let connector = start_local(std::future::pending::<()>()).await;
+            let watcher = remote_watcher(remote).await;
+            let (status, _bridge) = run_bridge(&connector, port);
+            wait_until("connected", || connected(&status)).await;
+
+            let publisher = MqttClient::connect(local_client(&connector, "pub"))
+                .await
+                .unwrap();
+            let start = Instant::now();
+            for i in 0..MESSAGES {
+                publisher
+                    .publish(&format!("a/{i}"), i.to_string(), QoS::AtLeastOnce)
+                    .await
+                    .unwrap();
+            }
+            for i in 0..MESSAGES {
+                assert_eq!(next_payload(&watcher).await, i.to_string());
+            }
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
         }
     }
 }
