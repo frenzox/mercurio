@@ -305,7 +305,9 @@ impl ConnectOptions {
         #[cfg(unix)]
         if self.unix_path.is_some() && self.tls.enabled {
             return Err(ClientError::Tls(
-                "TLS isn't supported over a Unix socket".to_string(),
+                "TLS isn't supported over a Unix socket; a CA path, a client \
+                 certificate or skipping verification turns it on"
+                    .to_string(),
             ));
         }
         if let Some(client_id) = &self.client_id {
@@ -362,32 +364,39 @@ impl ConnectOptions {
         }
     }
 
-    /// Enable TLS for the connection.
+    /// Enable TLS for the connection. Setting a CA path, a client
+    /// certificate or skipping verification enables it too; the last call
+    /// wins.
     pub fn tls(mut self, enabled: bool) -> Self {
         self.tls.enabled = enabled;
         self
     }
 
-    /// Set custom CA certificate file path for TLS verification.
+    /// Set custom CA certificate file path for TLS verification, and
+    /// enable TLS.
     pub fn ca_path(mut self, path: impl Into<String>) -> Self {
+        self.tls.enabled = true;
         self.tls.ca_path = Some(path.into());
         self
     }
 
     /// Authenticate with a client certificate and its private key, both
-    /// PEM files.
+    /// PEM files, and enable TLS.
     pub fn client_cert(
         mut self,
         cert_path: impl Into<String>,
         key_path: impl Into<String>,
     ) -> Self {
+        self.tls.enabled = true;
         self.tls.cert_path = Some(cert_path.into());
         self.tls.key_path = Some(key_path.into());
         self
     }
 
     /// Skip TLS certificate verification (insecure, for testing only).
+    /// `true` enables TLS.
     pub fn danger_skip_tls_verify(mut self, skip: bool) -> Self {
+        self.tls.enabled |= skip;
         self.tls.danger_skip_verify = skip;
         self
     }
@@ -539,11 +548,29 @@ mod tests {
         assert!(ConnectOptions::new("localhost", 1883).check().is_ok());
     }
 
+    #[test]
+    fn test_tls_settings_turn_tls_on() {
+        let options = || ConnectOptions::new("broker", 8883);
+        assert!(!options().tls.enabled);
+        assert!(options().ca_path("ca.pem").tls.enabled);
+        assert!(options().client_cert("c.pem", "k.pem").tls.enabled);
+        assert!(options().danger_skip_tls_verify(true).tls.enabled);
+        assert!(!options().danger_skip_tls_verify(false).tls.enabled);
+        // The last call wins
+        assert!(!options().ca_path("ca.pem").tls(false).tls.enabled);
+        assert!(options().tls(false).ca_path("ca.pem").tls.enabled);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_tls_is_refused_over_unix_sockets() {
         let options = ConnectOptions::unix("/run/mercurio/admin.sock").tls(true);
         assert!(matches!(options.check(), Err(ClientError::Tls(_))));
+        let options = ConnectOptions::unix("/run/mercurio/admin.sock").ca_path("ca.pem");
+        let Err(ClientError::Tls(message)) = options.check() else {
+            panic!("a CA path over a Unix socket was accepted");
+        };
+        assert!(message.contains("CA"), "{message}");
         assert!(ConnectOptions::unix("/run/mercurio/admin.sock")
             .check()
             .is_ok());

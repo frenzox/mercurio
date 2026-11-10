@@ -108,12 +108,12 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
 <tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code></td><td><code>5</code></td></tr>
 <tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
-<tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with</td><td>system roots</td></tr>
-<tr><td><code>--insecure</code></td><td>Skip certificate verification; for testing only</td><td></td></tr>
+<tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with; implies <code>--tls</code></td><td>system roots</td></tr>
+<tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
 </table>
 <pre><span class="comment"># Over TLS, with credentials</span>
-recado sub -H broker.example.com -p 8883 --tls --cafile ca.crt -u alice -P secret -t '#'
+recado sub -H broker.example.com -p 8883 --cafile ca.crt -u alice -P secret -t '#'
 
 <span class="comment"># MQTT 3.1.1</span>
 recado pub -V 311 -t test -m hello

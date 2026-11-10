@@ -66,7 +66,7 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <tr><td><code>-H, --host</code>, <code>-p, --port</code></td><td><code>MERCURIOCTL_HOST</code>, <code>MERCURIOCTL_PORT</code></td><td>Broker over TCP</td><td>admin socket, else <code>localhost:1883</code></td></tr>
 <tr><td><code>--unix PATH</code></td><td><code>MERCURIOCTL_UNIX</code></td><td>Broker over a Unix socket</td><td></td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td><code>MERCURIOCTL_USERNAME</code>, <code>MERCURIOCTL_PASSWORD</code></td><td>Credentials</td><td></td></tr>
-<tr><td><code>--tls</code>, <code>--cafile</code>, <code>--insecure</code></td><td><code>MERCURIOCTL_TLS</code>, <code>MERCURIOCTL_CAFILE</code>, <code>MERCURIOCTL_INSECURE</code></td><td>TLS, its CA, or no verification</td><td></td></tr>
+<tr><td><code>--tls</code>, <code>--cafile</code>, <code>--insecure</code></td><td><code>MERCURIOCTL_TLS</code>, <code>MERCURIOCTL_CAFILE</code>, <code>MERCURIOCTL_INSECURE</code></td><td>TLS, its CA, or no verification; <code>--cafile</code> and <code>--insecure</code> imply <code>--tls</code></td><td></td></tr>
 <tr><td><code>-i, --client-id</code></td><td><code>MERCURIOCTL_CLIENT_ID</code></td><td>Client id</td><td>assigned by the broker</td></tr>
 <tr><td><code>--timeout SECONDS</code></td><td><code>MERCURIOCTL_TIMEOUT</code></td><td>Longest wait for the answer, connecting included</td><td><code>10</code></td></tr>
 <tr><td><code>--json</code></td><td></td><td>Print the answer's data as JSON</td><td>tables</td></tr>
