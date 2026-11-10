@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/frenzox/mercurio/compare/recado-v0.2.3...recado-v0.2.4) - 2026-11-10
+
+### Added
+
+- *(recado)* connect through Unix sockets with --unix
+
+### Other
+
+- point the READMEs at mercurioctl and the admin guide
+
 ## [0.2.3](https://github.com/frenzox/mercurio/compare/recado-v0.2.2...recado-v0.2.3) - 2026-11-09
 
 ### Fixed

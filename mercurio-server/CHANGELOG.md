@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.4.1...mercurio-server-v0.5.0) - 2026-11-10
+
+### Added
+
+- *(server)* serve trusted Unix socket listeners behind a peer filter
+- *(server)* drop bans once they expire
+- *(server)* close the connections a new ban matches
+- *(server)* ban clients by client id, user name or address
+- *(server)* report plugin status through the admin API
+- *(server)* inspect subscriptions through the admin API
+- *(server)* manage retained messages through the admin API
+- *(server)* disconnect clients and delete sessions through the admin API
+- *(server)* list clients and their sessions through the admin API
+- *(server)* serve the broker admin API on $CONTROL/broker/v1
+- *(server)* split starting the broker from running it, with an Admin handle
+- *(server)* [**breaking**] answer $CONTROL requests only to the client that sent them
+
+### Other
+
+- point the READMEs at mercurioctl and the admin guide
+
 ## [0.4.1](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.4.0...mercurio-server-v0.4.1) - 2026-11-09
 
 ### Other

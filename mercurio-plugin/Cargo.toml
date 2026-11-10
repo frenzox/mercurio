@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-plugin"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Write plugins for the mercurio MQTT broker as WebAssembly components"
