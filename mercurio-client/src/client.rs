@@ -11,6 +11,7 @@ use mercurio_core::properties::{
 };
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
+use mercurio_core::topic::{validate_publish_topic, validate_subscribe_filter};
 use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
@@ -427,6 +428,8 @@ impl MqttClient {
         properties: MessageProperties,
     ) -> Result<()> {
         check_length("topic", topic)?;
+        validate_publish_topic(topic)
+            .map_err(|e| ClientError::InvalidArgument(format!("topic `{topic}`: {e}")))?;
         properties.check()?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -466,8 +469,12 @@ impl MqttClient {
         topics: &[(&str, SubscriptionOptions)],
         subscription_id: Option<u32>,
     ) -> Result<Vec<SubscribeResult>> {
-        for (topic, _) in topics {
-            check_length("topic filter", topic)?;
+        check_filters(topics.iter().map(|(t, _)| *t))?;
+        // A Variable Byte Integer from 1 [MQTT-3.8.2.1.2]
+        if subscription_id.is_some_and(|id| !(1..=268_435_455).contains(&id)) {
+            return Err(ClientError::InvalidArgument(
+                "subscription identifiers range from 1 to 268,435,455".into(),
+            ));
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -485,9 +492,7 @@ impl MqttClient {
     /// Unsubscribe from one or more topics. MQTT 3.x brokers report
     /// success for every topic.
     pub async fn unsubscribe(&self, topics: &[&str]) -> Result<Vec<UnsubscribeResult>> {
-        for topic in topics {
-            check_length("topic filter", topic)?;
-        }
+        check_filters(topics.iter().copied())?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Unsubscribe {
@@ -551,6 +556,23 @@ impl MqttClient {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
+}
+
+/// SUBSCRIBE and UNSUBSCRIBE need at least one filter [MQTT-3.8.3-2,
+/// MQTT-3.10.3-2], each well formed.
+fn check_filters<'a>(filters: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
+    if filters.len() == 0 {
+        return Err(ClientError::InvalidArgument(
+            "at least one topic filter is needed".into(),
+        ));
+    }
+    for filter in filters {
+        check_length("topic filter", filter)?;
+        validate_subscribe_filter(filter).map_err(|e| {
+            ClientError::InvalidArgument(format!("topic filter `{filter}`: {e}"))
+        })?;
+    }
+    Ok(())
 }
 
 fn auth_data(data: Option<Bytes>) -> Result<Option<AuthenticationData>> {

@@ -39,6 +39,11 @@ pub enum ClientError {
     #[error("{0} is longer than 65,535 bytes")]
     TooLong(&'static str),
 
+    /// The request is invalid on its face, such as a topic name with
+    /// wildcards or an empty list of filters; nothing was sent.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     /// The broker announced it lacks what the request needs: a QoS above
     /// its maximum, retained messages, or subscription identifiers.
     #[error("Not supported by the broker: {0}")]

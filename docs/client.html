@@ -175,7 +175,7 @@ impl Authenticator for Token {
 let options = ConnectOptions::new("localhost", 1883).authenticator(Token("secret".into()));</pre>
 
 <h2>Errors and disconnections</h2>
-<p>Calls return <code>ClientError</code>, for example <code>ConnectionRefused(reason)</code>, <code>Redirected { server_reference, .. }</code>, <code>PublishRefused(reason)</code> when the broker refuses a QoS 1 or 2 publish, <code>Timeout</code>, <code>Tls(..)</code> or <code>Disconnected</code>. <code>Event::Disconnected</code> says why the connection ended with a <code>DisconnectReason</code>: closed by the client, by the broker with a reason code, lost, or timed out.</p>
+<p>Calls return <code>ClientError</code>, for example <code>ConnectionRefused(reason)</code>, <code>Redirected { server_reference, .. }</code>, <code>PublishRefused(reason)</code> when the broker refuses a QoS 1 or 2 publish, <code>InvalidArgument(..)</code> for a topic name with wildcards, an empty or malformed filter list or a subscription identifier outside 1 to 268,435,455, which never reach the broker, <code>Timeout</code>, <code>Tls(..)</code> or <code>Disconnected</code>. <code>Event::Disconnected</code> says why the connection ended with a <code>DisconnectReason</code>: closed by the client, by the broker with a reason code, lost, or timed out.</p>
 
 <h2>Examples in the repository</h2>
 <ul>
