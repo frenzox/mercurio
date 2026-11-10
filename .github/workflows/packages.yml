@@ -16,6 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Build provenance attestations
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,9 +60,42 @@ jobs:
               mercuriod/contrib/mercurio.sysusers "$name/"
           fi
           tar czf "$name.tar.gz" "$name"
+          mkdir dist
+          mv "$name.tar.gz" target/"$TARGET"/debian/*.deb target/"$TARGET"/generate-rpm/*.rpm dist/
+      # Verify a download with: gh attestation verify <file> -R frenzox/mercurio
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      # For the checksums job
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
       - name: Upload
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release upload "$TAG" --clobber "$CRATE-${TAG#"$CRATE"-v}-$TARGET.tar.gz"
-          target/"$TARGET"/debian/*.deb target/"$TARGET"/generate-rpm/*.rpm
+        run: gh release upload "$TAG" --clobber dist/*
+
+  # One SHA256SUMS for every file the matrix built, checked with
+  # sha256sum --ignore-missing -c SHA256SUMS
+  checksums:
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" --clobber --repo "$GITHUB_REPOSITORY" dist/SHA256SUMS
