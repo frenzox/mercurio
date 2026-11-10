@@ -58,6 +58,10 @@ Connection options, for both commands:
 | `-V, --protocol-version` | `5`, `311` or `31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
 
+Exit status: 0 on success, 1 when the broker refused a subscription or a
+message, 2 when it couldn't be reached, refused the login or closed the
+connection, 3 on wrong usage. Messages go to standard error.
+
 Run `recado pub --help` or `recado sub --help` for every option, or see
 the [CLI guide](https://frenzox.github.io/mercurio/cli.html).
 

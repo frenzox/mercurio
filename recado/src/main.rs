@@ -1,6 +1,7 @@
 //! Mercurio - MQTT command-line client
 
 use std::io::{self, Read, Write};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,12 +13,19 @@ use mercurio_core::qos::QoS;
 use tokio::signal;
 
 mod common;
+mod failure;
 use common::{init_logging, ConnectionArgs};
+use failure::Failure;
+
+const AFTER_HELP: &str = "\
+Exit status: 0 on success, 1 when the broker refused a subscription or a \
+message, 2 when the broker couldn't be reached, refused the login or \
+closed the connection, 3 on wrong usage.";
 
 #[derive(Parser, Debug)]
 #[command(name = "recado")]
 #[command(about = "MQTT command-line client")]
-#[command(version)]
+#[command(version, after_help = AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,8 +47,8 @@ enum Commands {
         message: Option<String>,
 
         /// QoS level (0, 1, or 2)
-        #[arg(short = 'q', long, default_value = "0")]
-        qos: u8,
+        #[arg(short = 'q', long, default_value = "0", value_parser = qos_level)]
+        qos: QoS,
 
         /// Retain the message on the broker
         #[arg(short = 'r', long)]
@@ -59,8 +67,8 @@ enum Commands {
         topic: Vec<String>,
 
         /// QoS level for subscriptions (0, 1, or 2)
-        #[arg(short = 'q', long, default_value = "0")]
-        qos: u8,
+        #[arg(short = 'q', long, default_value = "0", value_parser = qos_level)]
+        qos: QoS,
 
         /// Print topic name before each message
         #[arg(short = 'T', long)]
@@ -90,8 +98,8 @@ struct WillArgs {
     will_message: Option<String>,
 
     /// Will message QoS level (0, 1, or 2)
-    #[arg(long, default_value = "0")]
-    will_qos: u8,
+    #[arg(long, default_value = "0", value_parser = qos_level)]
+    will_qos: QoS,
 
     /// Retain the will message on the broker
     #[arg(long)]
@@ -173,9 +181,24 @@ fn parse_user_property(value: &str) -> Result<(String, String), String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return ExitCode::from(if e.use_stderr() { failure::USAGE } else { 0 });
+        }
+    };
+    match run(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            eprintln!("recado: {failure}");
+            ExitCode::from(failure.exit_code())
+        }
+    }
+}
 
+async fn run(cli: Cli) -> Result<(), Failure> {
     match cli.command {
         Commands::Pub {
             connection,
@@ -186,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             properties,
         } => {
             init_logging(connection.verbose);
-            run_publish(connection, topic, message, qos, retain, properties.into()).await?;
+            run_publish(connection, topic, message, qos, retain, properties.into()).await
         }
         Commands::Sub {
             connection,
@@ -207,21 +230,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconnect,
                 will,
             )
-            .await?;
+            .await
         }
     }
-
-    Ok(())
 }
 
 async fn run_publish(
     connection: ConnectionArgs,
     topic: String,
     message: Option<String>,
-    qos_level: u8,
+    qos: QoS,
     retain: bool,
     properties: MessageProperties,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Failure> {
     // Get the message payload
     let payload = match message {
         Some(msg) => msg,
@@ -232,9 +253,6 @@ async fn run_publish(
             buffer
         }
     };
-
-    // Parse QoS
-    let qos = parse_qos(qos_level)?;
 
     // Connect to broker
     let options = connection.to_connect_options();
@@ -254,15 +272,12 @@ async fn run_publish(
 async fn run_subscribe(
     connection: ConnectionArgs,
     topics: Vec<String>,
-    qos_level: u8,
+    qos: QoS,
     print_topic: bool,
     subscription: SubscriptionArgs,
     reconnect: Option<u64>,
     will: WillArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse QoS
-    let qos = parse_qos(qos_level)?;
-
+) -> Result<(), Failure> {
     // Connect to broker
     let mut options = connection.to_connect_options();
 
@@ -271,7 +286,7 @@ async fn run_subscribe(
         let payload = will.will_message.unwrap_or_default();
         options = options.will(
             Will::new(topic, Bytes::from(payload))
-                .qos(parse_qos(will.will_qos)?)
+                .qos(will.will_qos)
                 .retain(will.will_retain)
                 .delay(will.will_delay),
         );
@@ -293,15 +308,30 @@ async fn run_subscribe(
         .iter()
         .map(|t| (t.as_str(), subscription_options))
         .collect();
-    let subscribe = || client.subscribe_with(&subscriptions, subscription.subscription_id);
-    subscribe().await?;
+    let subscribe = || async {
+        let granted = client
+            .subscribe_with(&subscriptions, subscription.subscription_id)
+            .await?;
+        match granted.iter().find(|result| !result.success) {
+            Some(refused) => Err(Failure::Rejected(format!(
+                "the broker refused the subscription to {}: {}",
+                refused.topic, refused.reason
+            ))),
+            None => Ok(()),
+        }
+    };
+    if let Err(failure) = subscribe().await {
+        let _ = client.disconnect().await;
+        return Err(failure);
+    }
 
     // Handle Ctrl+C for graceful shutdown
-    tokio::select! {
+    let outcome = tokio::select! {
         _ = signal::ctrl_c() => {
             eprintln!("\nDisconnecting...");
+            Ok(())
         }
-        _ = async {
+        outcome = async {
             loop {
                 match client.recv().await {
                     Some(Event::Message { topic, payload, .. }) => {
@@ -315,53 +345,47 @@ async fn run_subscribe(
                         // The reader went away, as `head` does once it has
                         // enough lines
                         if written.is_err() {
-                            break;
+                            return Ok(());
                         }
                     }
                     Some(Event::Disconnected { reason }) => {
-                        eprintln!("Disconnected: {:?}", reason);
                         // With reconnection on, the client says when it
                         // gives up by closing the event stream
                         if reconnect.is_none() {
-                            break;
+                            return Err(Failure::disconnected(&reason));
                         }
+                        eprintln!("recado: {}; reconnecting", Failure::disconnected(&reason));
                     }
                     Some(Event::Reconnected { session_present }) => {
-                        eprintln!("Reconnected");
+                        eprintln!("recado: reconnected");
                         // A broker that lost the session lost the
                         // subscriptions with it
                         if !session_present {
-                            if let Err(e) = subscribe().await {
-                                eprintln!("Resubscribing failed: {}", e);
-                                break;
-                            }
+                            subscribe().await?;
                         }
                     }
                     // Events added in later versions of the client
                     Some(_) => {}
                     None => {
-                        break;
+                        return Err(Failure::Connection("the connection was lost".to_string()));
                     }
                 }
             }
-        } => {}
-    }
+        } => outcome,
+    };
 
     // Disconnect gracefully
     let _ = client.disconnect().await;
 
-    Ok(())
+    outcome
 }
 
-fn parse_qos(qos: u8) -> Result<QoS, Box<dyn std::error::Error>> {
-    match qos {
-        0 => Ok(QoS::AtMostOnce),
-        1 => Ok(QoS::AtLeastOnce),
-        2 => Ok(QoS::ExactlyOnce),
-        _ => {
-            eprintln!("Invalid QoS level: {}. Must be 0, 1, or 2.", qos);
-            std::process::exit(1);
-        }
+fn qos_level(value: &str) -> Result<QoS, String> {
+    match value {
+        "0" => Ok(QoS::AtMostOnce),
+        "1" => Ok(QoS::AtLeastOnce),
+        "2" => Ok(QoS::ExactlyOnce),
+        _ => Err(format!("`{value}` isn't a QoS level, 0, 1 or 2")),
     }
 }
 

@@ -56,6 +56,7 @@ impl Broker {
         let input = input.to_vec();
         tokio::task::spawn_blocking(move || {
             let mut child = command.spawn().unwrap();
+            watchdog(&child);
             let mut stdin = child.stdin.take().unwrap();
             stdin.write_all(&input).unwrap();
             drop(stdin);
@@ -80,6 +81,7 @@ impl Broker {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        watchdog(&child);
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let stdout = tokio::task::spawn_blocking(move || {
             let mut line = String::new();
@@ -118,13 +120,25 @@ impl Subscriber {
             let mut rest = Vec::new();
             std::io::Read::read_to_end(&mut stdout.into_inner(), &mut rest).unwrap();
             let mut stderr = String::new();
-            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)
-                .unwrap();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
             (child.wait().unwrap().code(), rest, stderr)
         })
         .await
         .unwrap()
     }
+}
+
+/// Kills `child` if it still runs after 20 s, so a recado that never exits
+/// fails its test instead of hanging it.
+fn watchdog(child: &Child) {
+    let pid = child.id().to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        let _ = Command::new("kill")
+            .args(["-9", &pid])
+            .stderr(Stdio::null())
+            .status();
+    });
 }
 
 fn stderr(output: &Output) -> String {
@@ -142,4 +156,45 @@ async fn logs_go_to_standard_error() {
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(stderr(&output).contains("Connect"), "{}", stderr(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_subscription_fails() {
+    let broker = start().await;
+    let output = broker.run(&["sub", "-t", "a/#/b"]).await;
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(message.contains("a/#/b"), "{message}");
+    assert!(message.contains("Topic filter invalid"), "{message}");
+    assert_eq!(message.lines().count(), 1, "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn losing_the_connection_fails() {
+    let broker = start().await;
+    let subscriber = broker
+        .subscriber(&["sub", "-i", "taken", "-t", "lost/ready"], "lost/ready")
+        .await;
+    let _thief = broker.client("taken").await;
+    let (status, _, message) = subscriber.finish().await;
+    assert_eq!(status, Some(2), "{message}");
+    assert!(message.contains("Session taken over"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failures_print_one_line_and_set_the_exit_status() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let unreachable = Broker { port }.run(&["pub", "-t", "a", "-m", "x"]).await;
+    let message = stderr(&unreachable);
+    assert_eq!(unreachable.status.code(), Some(2), "{message}");
+    assert!(message.starts_with("recado: "), "{message}");
+    assert_eq!(message.lines().count(), 1, "{message}");
+
+    let broker = start().await;
+    let usage = broker.run(&["pub", "-t", "a", "-m", "x", "-q", "3"]).await;
+    assert_eq!(usage.status.code(), Some(3), "{}", stderr(&usage));
+    let help = broker.run(&["sub", "--help"]).await;
+    assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
 }
