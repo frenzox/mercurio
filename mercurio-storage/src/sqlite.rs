@@ -377,16 +377,12 @@ impl BatchStore for SqliteStore {
         let client_id = client_id.to_string();
         let writes = writes.to_vec();
         self.blocking(move |conn| {
-            conn.execute_batch("BEGIN")?;
-            let applied = writes
-                .iter()
-                .try_for_each(|write| apply_write(conn, &client_id, write));
-            conn.execute_batch(if applied.is_ok() {
-                "COMMIT"
-            } else {
-                "ROLLBACK"
-            })?;
-            applied
+            // Rolls back on drop, also when COMMIT itself fails
+            let tx = conn.unchecked_transaction()?;
+            for write in &writes {
+                apply_write(&tx, &client_id, write)?;
+            }
+            tx.commit()
         })
         .await
     }
@@ -1193,6 +1189,56 @@ mod tests {
 
         let retained = store.get_retained("#").await.unwrap();
         assert!(retained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failed_commit_does_not_wedge_the_store() {
+        let path = std::env::temp_dir().join(format!("mercurio-commit-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::new(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            // A reader blocks COMMIT only under the rollback journal
+            conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        }
+        let session = |client_id: &str| SessionState {
+            client_id: client_id.to_string(),
+            subscriptions: Vec::new(),
+            expiry_interval: None,
+            expires_at: None,
+            owner: Default::default(),
+        };
+
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert!(store
+            .save_session("blocked", &session("blocked"))
+            .await
+            .is_err());
+        reader.execute_batch("COMMIT").unwrap();
+
+        store
+            .save_session("after", &session("after"))
+            .await
+            .unwrap();
+        drop(store);
+        let fresh = Connection::open(&path).unwrap();
+        let saved: Vec<String> = fresh
+            .prepare("SELECT client_id FROM sessions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(saved, ["after"]);
+        drop(fresh);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]
