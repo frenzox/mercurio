@@ -103,6 +103,23 @@ jobs:
       - name: Check the no_std crates on bare metal
         run: cargo check -p mercurio-core -p mercurio-packets --no-default-features --target thumbv7em-none-eabihf
 
+  # Not a workspace member: cargo fuzz builds with sanitizers, on nightly
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      - name: Build the fuzz targets
+        run: cargo fuzz build
+
   test:
     runs-on: ubuntu-latest
     services:
