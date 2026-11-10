@@ -105,7 +105,7 @@ cert_path = "/etc/mercurio/site1.crt"
 key_path = "/etc/mercurio/site1.key"</pre>
 
 <h2>Monitoring</h2>
-<p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while connected, <code>0</code> after losing the connection.</p>
+<p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost.</p>
 <pre>recado sub -t '$SYS/broker/connection/+/state' -T
 <span class="comment"># $SYS/broker/connection/mercurio-bridge-cloud/state: 1</span></pre>
 
@@ -114,6 +114,7 @@ key_path = "/etc/mercurio/site1.key"</pre>
 <li>Messages to forward wait in the bridge's queue on this broker, up to <code>max_queued_messages</code>, and are sent once the bridge reconnects.</li>
 <li>The bridge's session on the remote broker lasts a day, so messages for <code>in</code> topics wait there across short outages.</li>
 <li>The bridge retries forever; the broker starts even if every remote broker is down.</li>
+<li>If this broker closes the bridge's own connection, for instance when another client takes its client id, the bridge connects again.</li>
 </ul>
 
 <h2>Access control</h2>
