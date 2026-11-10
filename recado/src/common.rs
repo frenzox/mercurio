@@ -1,7 +1,7 @@
 //! Shared utilities for recado.
 
 use clap::{Args, ValueEnum};
-use mercurio_client::{cli::ConnectArgs, ConnectOptions};
+use mercurio_client::{cli::ConnectArgs, ConnectOptions, QoS};
 use mercurio_core::protocol::ProtocolVersion;
 
 /// Common connection arguments shared between pub and sub tools.
@@ -63,6 +63,16 @@ impl From<Protocol> for ProtocolVersion {
             Protocol::V311 => ProtocolVersion::V3_1_1,
             Protocol::V31 => ProtocolVersion::V3_1,
         }
+    }
+}
+
+/// Parses a QoS level, 0, 1 or 2.
+pub fn qos_level(value: &str) -> Result<QoS, String> {
+    match value {
+        "0" => Ok(QoS::AtMostOnce),
+        "1" => Ok(QoS::AtLeastOnce),
+        "2" => Ok(QoS::ExactlyOnce),
+        _ => Err(format!("`{value}` isn't a QoS level, 0, 1 or 2")),
     }
 }
 
