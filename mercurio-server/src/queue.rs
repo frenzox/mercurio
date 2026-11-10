@@ -104,8 +104,19 @@ impl MessageQueue {
         self.state.lock().unwrap().messages.len()
     }
 
-    /// Queues `message` unless the queue is full. Returns whether it did.
+    /// Queues `message` unless the queue is full, in which case the message
+    /// is lost. Returns whether it was queued.
     pub(crate) fn push(&self, message: Message) -> bool {
+        self.insert(message, true)
+    }
+
+    /// Queues `message` unless the queue is full. Returns whether it did;
+    /// unlike `push`, a refusal is left for the caller to retry.
+    pub(crate) fn try_push(&self, message: Message) -> bool {
+        self.insert(message, false)
+    }
+
+    fn insert(&self, message: Message, lost_if_full: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let limit = if message.qos == QoS::AtMostOnce {
             self.limits.max_qos0
@@ -124,6 +135,9 @@ impl MessageQueue {
             state.evict_expired();
         }
         if full(&state) {
+            if !lost_if_full {
+                return false;
+            }
             if state.dropped == 0 {
                 warn!(
                     "Message queue full, dropping messages, starting with a QoS {} one on `{}`",
@@ -304,14 +318,22 @@ impl Subscriber {
     }
 
     /// Queues a retained message sent because of a new subscription.
-    /// Returns whether the queue took it.
+    /// Returns whether the queue took it; if not, it can be offered again
+    /// once the queue drains.
     pub(crate) fn deliver_retained(&self, message: Message) -> bool {
         let identifiers = self.subscription_identifier.into_iter().collect();
-        self.queue_message(message, self.granted_qos, identifiers)
+        let message = self.prepare(message, self.granted_qos, identifiers);
+        self.queue.try_push(message)
     }
 
-    /// Queues a message, downgraded to the QoS granted [MQTT-3.8.4-8].
-    fn queue_message(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> bool {
+    fn queue_message(&self, message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> bool {
+        let message = self.prepare(message, granted_qos, identifiers);
+        self.queue.push(message)
+    }
+
+    /// The copy of `message` to queue, downgraded to the QoS granted
+    /// [MQTT-3.8.4-8].
+    fn prepare(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> Message {
         message.subscription_identifiers = identifiers;
         if self.queue.limits.upgrade_qos {
             message.qos = granted_qos;
@@ -321,7 +343,7 @@ impl Subscriber {
                 message.packet_id = None;
             }
         }
-        self.queue.push(message)
+        message
     }
 }
 

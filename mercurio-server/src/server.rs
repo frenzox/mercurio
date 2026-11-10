@@ -2021,6 +2021,11 @@ where
 
         let client_id = session.get_client_id().await;
         while !self.shutdown.is_shutdown() {
+            // Every turn of the loop follows a message sent or a packet
+            // read, so retained messages are queued as the queue drains
+            if session.owes_retained() {
+                Box::pin(session.feed_retained(&self.broker, &self.chain)).await;
+            }
             // Re-evaluated after every packet, so acknowledgements reopen it
             let window_open = session.can_send_more().await;
 
