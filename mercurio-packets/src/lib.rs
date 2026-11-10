@@ -366,6 +366,14 @@ where
     Ok(packet)
 }
 
+/// Reads a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
+pub(crate) fn decode_packet_id<T: Buf>(buffer: &mut T) -> Result<u16> {
+    match u16::decode(buffer)? {
+        0 => Err(ReasonCode::ProtocolError.into()),
+        packet_id => Ok(packet_id),
+    }
+}
+
 /// Size of a whole packet whose body is `remaining_len` bytes: the first
 /// byte, the Remaining Length and the body.
 pub(crate) fn packet_size(remaining_len: usize) -> usize {
@@ -716,6 +724,38 @@ mod robustness_tests {
         );
         assert_eq!(ControlPacket::connect_version(&[0xc0, 0x00]), None);
         assert_eq!(ControlPacket::connect_version(&v5[..6]), None);
+    }
+
+    fn assert_protocol_error(packets: &[(&[u8], ProtocolVersion)]) {
+        for &(bytes, version) in packets {
+            let result = ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
+            assert!(
+                matches!(result, Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))),
+                "{bytes:02x?} ({version}): {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packet_identifier_zero_is_a_protocol_error() {
+        use ProtocolVersion::{V3_1_1, V5};
+
+        assert_protocol_error(&[
+            (&[0x32, 0x06, 0x00, 0x01, b't', 0x00, 0x00, 0x00], V5),
+            (&[0x32, 0x05, 0x00, 0x01, b't', 0x00, 0x00], V3_1_1),
+            (&[0x40, 0x02, 0x00, 0x00], V5),
+            (&[0x50, 0x02, 0x00, 0x00], V5),
+            (&[0x62, 0x02, 0x00, 0x00], V5),
+            (&[0x70, 0x02, 0x00, 0x00], V3_1_1),
+            (&[0x82, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01, b'a', 0x00], V5),
+            (&[0x82, 0x06, 0x00, 0x00, 0x00, 0x01, b'a', 0x00], V3_1_1),
+            (&[0x90, 0x04, 0x00, 0x00, 0x00, 0x00], V5),
+            (&[0x90, 0x03, 0x00, 0x00, 0x00], V3_1_1),
+            (&[0xa2, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, b'a'], V5),
+            (&[0xa2, 0x05, 0x00, 0x00, 0x00, 0x01, b'a'], V3_1_1),
+            (&[0xb0, 0x04, 0x00, 0x00, 0x00, 0x00], V5),
+            (&[0xb0, 0x02, 0x00, 0x00], V3_1_1),
+        ]);
     }
 
     #[test]

@@ -156,7 +156,7 @@ impl Decoder for SubAckPacket {
     /// Decodes a SUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
-            let packet_id = u16::decode(buffer)?;
+            let packet_id = crate::decode_packet_id(buffer)?;
             let properties = crate::present(SubAckProperties::decode(buffer)?);
 
             if !buffer.has_remaining() {
@@ -188,7 +188,7 @@ impl SubAckPacket {
     }
 
     fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let packet_id = u16::decode(buffer)?;
+        let packet_id = crate::decode_packet_id(buffer)?;
 
         // No properties in MQTT 3.x
         // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure

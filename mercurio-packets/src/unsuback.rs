@@ -137,7 +137,7 @@ impl Decoder for UnsubAckPacket {
     /// Decodes an UNSUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
-            let packet_id = u16::decode(buffer)?;
+            let packet_id = crate::decode_packet_id(buffer)?;
             let properties = crate::present(UnsubAckProperties::decode(buffer)?);
 
             if !buffer.has_remaining() {
@@ -164,7 +164,7 @@ impl UnsubAckPacket {
     /// MQTT 3.x UNSUBACK: just packet_id (no properties, no payload)
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
-            let packet_id = u16::decode(buffer)?;
+            let packet_id = crate::decode_packet_id(buffer)?;
 
             Ok(UnsubAckPacket {
                 protocol_version: ProtocolVersion::V3_1_1,

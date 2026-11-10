@@ -103,7 +103,7 @@ impl PubRecPacket {
 impl Decoder for PubRecPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::PubRec, |_, buffer| {
-            let packet_id = u16::decode(buffer)?;
+            let packet_id = crate::decode_packet_id(buffer)?;
 
             // Reason and properties may be left out (section 3.4.2.1)
             let reason = if buffer.has_remaining() {

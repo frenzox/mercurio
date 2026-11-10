@@ -267,7 +267,7 @@ impl SubscribePacket {
     }
 
     fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        let packet_id = u16::decode(buffer)?;
+        let packet_id = crate::decode_packet_id(buffer)?;
         let properties = if with_properties {
             crate::present(SubscribeProperties::decode(buffer)?)
         } else {

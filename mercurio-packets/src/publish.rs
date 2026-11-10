@@ -188,7 +188,7 @@ impl PublishPacket {
         let packet_id = match qos_level {
             QoS::AtMostOnce => None,
             QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
-            _ => Some(u16::decode(buffer)?),
+            _ => Some(crate::decode_packet_id(buffer)?),
         };
         // A QoS 0 message is never retransmitted [MQTT-3.3.1-2]
         if dup && qos_level == QoS::AtMostOnce {
