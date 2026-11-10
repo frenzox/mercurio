@@ -1401,7 +1401,7 @@ mod tests {
             .restore_inflight(started.inflight_to_retry)
             .await;
 
-        let pending = started.session.pending_retransmissions().await;
+        let pending = started.session.pending_retransmissions().await.packets;
         assert!(matches!(&pending[0], ControlPacket::PubRel(p) if p.packet_id == 9));
         assert!(
             matches!(&pending[1], ControlPacket::Publish(p) if p.packet_id == Some(4) && p.dup)

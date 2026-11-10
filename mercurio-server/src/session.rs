@@ -308,6 +308,9 @@ struct State {
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
     /// sequence they were sent in
     pubrecs: HashMap<u16, u64>,
+    /// Unacknowledged messages a resumed session has yet to resend on this
+    /// connection, in order, held back by the client's Receive Maximum
+    unsent: VecDeque<u16>,
     /// Sequence number of the next outgoing QoS 1/2 message
     next_sequence: u64,
     /// Incoming QoS 2 packet ids already delivered and awaiting PUBREL
@@ -424,6 +427,7 @@ impl Session {
                     retained: VecDeque::new(),
                     unacknowledged_messages: HashMap::new(),
                     pubrecs: HashMap::new(),
+                    unsent: VecDeque::new(),
                     next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
@@ -1152,8 +1156,8 @@ impl Session {
         packet: PubAckPacket,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        // O(1) removal instead of O(n) search + remove
         session.unacknowledged_messages.remove(&packet.packet_id);
+        session.unsent.retain(|id| *id != packet.packet_id);
         Ok(None)
     }
 
@@ -1167,6 +1171,7 @@ impl Session {
             Some((sequence, _)) => Some(sequence),
             None => session.pubrecs.get(&packet_id).copied(),
         };
+        session.unsent.retain(|id| *id != packet_id);
 
         // A failure reason ends the exchange: the client won't take the message
         if packet.reason.get_code() >= 0x80 {
@@ -1627,14 +1632,25 @@ impl Session {
     /// limit.
     pub(crate) async fn can_send_more(&self) -> bool {
         let session = self.shared.state.lock().await;
-        let receive_maximum = session
-            .connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.receive_maximum.as_ref())
-            .map_or(u16::MAX, |r| r.value);
-        let window = receive_maximum.min(session.max_inflight);
-        session.unacknowledged_messages.len() + session.pubrecs.len() < usize::from(window)
+        session.in_flight() < session.window()
+    }
+
+    /// The next unacknowledged message a resumed session holds back, once
+    /// the window has room for it. Resent before anything newer, keeping
+    /// the order messages were first sent in [MQTT-4.6.0-1].
+    pub(crate) async fn next_retransmission(&self) -> Option<ControlPacket> {
+        let mut session = self.shared.state.lock().await;
+        if session.in_flight() >= session.window() {
+            return None;
+        }
+        while let Some(packet_id) = session.unsent.pop_front() {
+            if let Some((_, publish)) = session.unacknowledged_messages.get(&packet_id) {
+                let mut publish = publish.clone();
+                publish.dup = true;
+                return Some(ControlPacket::Publish(publish));
+            }
+        }
+        None
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
@@ -1693,16 +1709,12 @@ impl Session {
 
             // Packets the client can't take are discarded as if delivered
             // [MQTT-3.1.2-25]
-            if let Some(maximum) = session.client_maximum_packet_size() {
-                let mut encoded = BytesMut::new();
-                publish.encode(&mut encoded);
-                if encoded.len() > maximum {
-                    warn!(
-                        "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
-                        publish.topic_name, session.client_id
-                    );
-                    return None;
-                }
+            if session.too_big(&publish) {
+                warn!(
+                    "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
+                    publish.topic_name, session.client_id
+                );
+                return None;
             }
 
             let inflight = packet_id.map(|packet_id| {
@@ -1761,17 +1773,21 @@ impl Session {
 
     /// Packets to resend when a session resumes: unacknowledged PUBLISH
     /// packets flagged as duplicates and pending PUBRELs, in the order they
-    /// were first sent [MQTT-4.4.0-1].
-    pub(crate) async fn pending_retransmissions(&self) -> Vec<ControlPacket> {
-        let session = self.shared.state.lock().await;
+    /// were first sent [MQTT-4.4.0-1]. Only as many PUBLISH packets as the
+    /// client's Receive Maximum allows are returned [MQTT-3.3.4-9]; the
+    /// rest wait for `next_retransmission`. Those larger than the client's
+    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25].
+    pub(crate) async fn pending_retransmissions(&self) -> Retransmissions {
+        let mut session = self.shared.state.lock().await;
+        let session = &mut *session;
 
-        let mut pending: Vec<(u64, ControlPacket)> = session
+        let mut pending: Vec<(u64, Option<u16>, ControlPacket)> = session
             .unacknowledged_messages
-            .values()
-            .map(|(sequence, publish)| {
+            .iter()
+            .map(|(packet_id, (sequence, publish))| {
                 let mut publish = publish.clone();
                 publish.dup = true;
-                (*sequence, ControlPacket::Publish(publish))
+                (*sequence, Some(*packet_id), ControlPacket::Publish(publish))
             })
             .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
                 let pubrel = PubRelPacket {
@@ -1779,13 +1795,44 @@ impl Session {
                     reason: ReasonCode::Success,
                     properties: None,
                 };
-                (*sequence, ControlPacket::PubRel(pubrel))
+                (*sequence, None, ControlPacket::PubRel(pubrel))
             }))
             .collect();
+        pending.sort_by_key(|(sequence, _, _)| *sequence);
 
-        pending.sort_by_key(|(sequence, _)| *sequence);
-        pending.into_iter().map(|(_, packet)| packet).collect()
+        let mut resend = Retransmissions::default();
+        session.unsent.clear();
+        let mut room = session.window().saturating_sub(session.pubrecs.len());
+        for (_, packet_id, packet) in pending {
+            let (Some(packet_id), ControlPacket::Publish(publish)) = (packet_id, &packet) else {
+                resend.packets.push(packet);
+                continue;
+            };
+            if session.too_big(publish) {
+                warn!(
+                    "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
+                    publish.topic_name, session.client_id
+                );
+                session.unacknowledged_messages.remove(&packet_id);
+                resend.dropped.push(packet_id);
+            } else if room > 0 {
+                room -= 1;
+                resend.packets.push(packet);
+            } else {
+                session.unsent.push_back(packet_id);
+            }
+        }
+        resend
     }
+}
+
+/// What a resumed session resends at once.
+#[derive(Default)]
+pub(crate) struct Retransmissions {
+    pub packets: Vec<ControlPacket>,
+    /// Packet ids of unacknowledged messages discarded as too large for
+    /// the client
+    pub dropped: Vec<u16>,
 }
 
 /// A PUBLISH ready to send.
@@ -1829,6 +1876,36 @@ impl State {
             .get_or_insert_with(Default::default)
             .topic_alias = Some(TopicAlias::new(alias));
         publish
+    }
+
+    /// Most QoS 1 and 2 messages that may be in flight: the client's
+    /// Receive Maximum, capped by the broker's limit.
+    fn window(&self) -> usize {
+        let receive_maximum = self
+            .connect_packet
+            .properties
+            .as_ref()
+            .and_then(|p| p.receive_maximum.as_ref())
+            .map_or(u16::MAX, |r| r.value);
+        usize::from(receive_maximum.min(self.max_inflight))
+    }
+
+    /// QoS 1 and 2 messages sent on this connection or an earlier one and
+    /// not yet acknowledged, leaving out those still to be resent.
+    fn in_flight(&self) -> usize {
+        self.unacknowledged_messages
+            .len()
+            .saturating_sub(self.unsent.len())
+            + self.pubrecs.len()
+    }
+
+    /// Whether `publish` is larger than the client accepts.
+    fn too_big(&self, publish: &PublishPacket) -> bool {
+        self.client_maximum_packet_size().is_some_and(|maximum| {
+            let mut encoded = BytesMut::new();
+            publish.encode(&mut encoded);
+            encoded.len() > maximum
+        })
     }
 
     /// The largest packet the client accepts, if it set a limit.
