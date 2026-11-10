@@ -30,6 +30,11 @@ batch in one transaction. A store overriding it can pass the changes it
 has no batch form for, including kinds added in later versions, to
 `apply_each`.
 
+The broker retries a batch that fails with `StorageError::Transient`, such
+as on a lost connection, until storage recovers, and gives up others after
+a few attempts. `StorageError::Fenced` means another broker took the
+database over: the broker drops the batch, and should stop.
+
 ## Features
 
 - `sqlite`: the SQLite store, with schema migrations applied on open.

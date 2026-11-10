@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use mercurio_storage::{BatchStore, Write};
+use mercurio_storage::{BatchStore, StorageError, Write};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tracing::{error, warn};
 
@@ -19,7 +19,7 @@ const MAX_BATCH: usize = 256;
 /// keep no task, channel or buffer.
 const LINGER: Duration = Duration::from_secs(1);
 
-/// Attempts at a batch before its changes are given up.
+/// Attempts at a batch failing for good before its changes are given up.
 const ATTEMPTS: u32 = 5;
 
 /// Changes a client's connection may have waiting for storage before it
@@ -289,25 +289,61 @@ fn compact(batch: &mut Vec<Write>) {
 /// host fails now and then. Changes are applied again whole, which they
 /// allow.
 async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) {
-    for attempt in 1..=ATTEMPTS {
-        match storage.apply(client_id, batch).await {
-            Ok(()) => return,
-            Err(e) if attempt == ATTEMPTS => {
+    let mut retry = Retry::default();
+    loop {
+        let Err(e) = storage.apply(client_id, batch).await else {
+            return;
+        };
+        match retry.after(&e) {
+            Some(delay) => {
+                warn!(
+                    "Failed to store changes for `{}`, retrying: {}",
+                    client_id, e
+                );
+                tokio::time::sleep(delay).await;
+            }
+            None => {
                 error!(
                     "Gave up storing {} changes for `{}`, a restart will lose them: {}",
                     batch.len(),
                     client_id,
                     e
                 );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to store changes for `{}`, retrying: {}",
-                    client_id, e
-                );
-                tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+                return;
             }
         }
+    }
+}
+
+/// Longest wait between attempts at a batch.
+const MAX_DELAY: Duration = Duration::from_secs(4);
+
+/// Whether a failed batch is worth another attempt. Transient failures,
+/// such as a lost connection, are retried until storage recovers; others
+/// give the batch up after `ATTEMPTS`.
+#[derive(Default)]
+struct Retry {
+    failures: u32,
+    permanent: u32,
+}
+
+impl Retry {
+    /// How long to wait before the next attempt after `error`, or None to
+    /// give the batch up.
+    fn after(&mut self, error: &StorageError) -> Option<Duration> {
+        match error {
+            // Another broker holds the database; this one is stopping
+            StorageError::Fenced => return None,
+            StorageError::Transient(_) => {}
+            _ => {
+                self.permanent += 1;
+                if self.permanent == ATTEMPTS {
+                    return None;
+                }
+            }
+        }
+        self.failures = self.failures.saturating_add(1);
+        Some(Duration::from_millis(250 << self.failures.min(4)).min(MAX_DELAY))
     }
 }
 
@@ -362,6 +398,29 @@ mod tests {
         let mut batch = vec![inflight(3), Write::DeleteSession, inflight(4)];
         compact(&mut batch);
         assert_eq!(describe(&batch), ["delete", "store 4"]);
+    }
+
+    #[test]
+    fn test_transient_failures_are_retried_until_they_pass() {
+        let transient = || StorageError::Transient("pool wait timed out".into());
+        let permanent = || StorageError::OperationFailed("constraint".into());
+        let mut retry = Retry::default();
+        let delays: Vec<_> = (0..20).map(|_| retry.after(&transient())).collect();
+        assert!(delays
+            .iter()
+            .all(|delay| delay.is_some_and(|d| d <= MAX_DELAY)));
+        assert_eq!(delays[19], Some(MAX_DELAY));
+
+        // Permanent failures still give the batch up after a few attempts,
+        // however many transient ones came before
+        for _ in 1..ATTEMPTS {
+            assert!(retry.after(&permanent()).is_some());
+            assert!(retry.after(&transient()).is_some());
+        }
+        assert_eq!(retry.after(&permanent()), None);
+
+        // Another broker holds the database: retrying can't help
+        assert_eq!(Retry::default().after(&StorageError::Fenced), None);
     }
 
     #[tokio::test]

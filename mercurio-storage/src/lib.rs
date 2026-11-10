@@ -38,12 +38,33 @@ pub enum StorageError {
     /// libraries' own types stay out of this crate's API.
     #[error("Database: {}", error_chain(.0.as_ref()))]
     Database(Box<dyn std::error::Error + Send + Sync>),
+
+    /// A failure that may pass if the operation is tried again, such as a
+    /// lost connection, a timed out wait for a pooled connection, a busy
+    /// database or a transaction that lost a serialization race.
+    #[error("Database, temporarily: {}", error_chain(.0.as_ref()))]
+    Transient(Box<dyn std::error::Error + Send + Sync>),
+
+    /// Another broker took over the database. Its writes are refused from
+    /// then on, so this broker should stop.
+    #[error("another broker took over the database")]
+    Fenced,
 }
 
 impl StorageError {
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn database(error: impl std::error::Error + Send + Sync + 'static) -> Self {
-        StorageError::Database(Box::new(error))
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+        #[cfg(feature = "sqlite")]
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) = error.downcast_ref() {
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) {
+                return StorageError::Transient(error);
+            }
+        }
+        StorageError::Database(error)
     }
 }
 
@@ -460,5 +481,30 @@ pub(crate) mod testing {
             sorted(store.load_bans().await.unwrap()),
             vec![address, exact]
         );
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_busy_sqlite_database_is_transient() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(matches!(
+            StorageError::database(busy),
+            StorageError::Transient(_)
+        ));
+        let constraint = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            None,
+        );
+        assert!(matches!(
+            StorageError::database(constraint),
+            StorageError::Database(_)
+        ));
     }
 }

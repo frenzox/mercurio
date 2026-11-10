@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use deadpool_postgres::{Manager, Object, Pool, Runtime};
+use deadpool_postgres::{Manager, Object, Pool, PoolError, Runtime};
 use futures_util::future::join_all;
 use mercurio_core::{
     codec::Decoder,
@@ -24,7 +24,7 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{sync::watch, task::JoinHandle};
-use tokio_postgres::{types::ToSql, Row};
+use tokio_postgres::{error::SqlState, types::ToSql, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::{
@@ -170,7 +170,30 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON bans
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
 ",
+    // Fenced writes fail with a code of their own, FENCED
+    "
+    CREATE OR REPLACE FUNCTION mercurio_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        held TEXT := current_setting('mercurio.epoch', true);
+    BEGIN
+        IF held IS NULL OR held = ''
+            OR current_setting('mercurio.fenced', true) = 'yes' THEN
+            RETURN NULL;
+        END IF;
+        PERFORM 1 FROM mercurio_lease WHERE epoch = held::BIGINT FOR KEY SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'another broker took over the database'
+                USING ERRCODE = 'MQ001';
+        END IF;
+        PERFORM set_config('mercurio.fenced', 'yes', true);
+        RETURN NULL;
+    END
+    $$;
+",
 ];
+
+/// The SQLSTATE the fence triggers refuse a write with.
+const FENCED: &str = "MQ001";
 
 /// Brings the schema up to date, one broker at a time.
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -232,7 +255,44 @@ trait Db<T> {
 
 impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
     fn db(self) -> Result<T> {
-        self.map_err(StorageError::database)
+        self.map_err(classify)
+    }
+}
+
+fn classify(error: tokio_postgres::Error) -> StorageError {
+    let Some(code) = error.code() else {
+        // No answer from the server: the connection failed or closed
+        let io = std::iter::successors(std::error::Error::source(&error), |e| e.source())
+            .any(|e| e.is::<std::io::Error>());
+        return if error.is_closed() || io {
+            StorageError::Transient(Box::new(error))
+        } else {
+            StorageError::database(error)
+        };
+    };
+    if code.code() == FENCED {
+        return StorageError::Fenced;
+    }
+    let class = &code.code()[..2];
+    let transient = [
+        &SqlState::T_R_SERIALIZATION_FAILURE,
+        &SqlState::T_R_DEADLOCK_DETECTED,
+        &SqlState::QUERY_CANCELED,
+        &SqlState::LOCK_NOT_AVAILABLE,
+        &SqlState::ADMIN_SHUTDOWN,
+        &SqlState::CRASH_SHUTDOWN,
+        &SqlState::CANNOT_CONNECT_NOW,
+        // A standby promoted late in a failover
+        &SqlState::READ_ONLY_SQL_TRANSACTION,
+    ]
+    .contains(&code)
+        // Connection exceptions and insufficient resources
+        || class == "08"
+        || class == "53";
+    if transient {
+        StorageError::Transient(Box::new(error))
+    } else {
+        StorageError::database(error)
     }
 }
 
@@ -241,6 +301,8 @@ impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: Pool,
+    /// Tells the [`DatabaseLock`], if any, that a write was fenced
+    lost: Option<watch::Sender<bool>>,
 }
 
 /// The database, held by one broker at a time; see
@@ -252,7 +314,8 @@ pub struct DatabaseLock {
 
 impl DatabaseLock {
     /// Completes once the database may have been taken over by another
-    /// broker, as the connection holding it closed or stopped answering.
+    /// broker, as the connection holding it closed or stopped answering,
+    /// or the store had a write refused with [`StorageError::Fenced`].
     /// The store refuses writes from then on; the broker should stop.
     pub async fn lost(&self) {
         let _ = self.lost.clone().wait_for(|lost| *lost).await;
@@ -286,7 +349,7 @@ impl PostgresStore {
     pub async fn connect(url: &str, ca_path: Option<&Path>) -> Result<Self> {
         let config = base_config(url)?;
         let tls = tls(ca_path)?;
-        let store = Self::with_pool(config, tls, None)?;
+        let store = Self::with_pool(config, tls, None, None)?;
         let client = store.client().await?;
         migrate(&client).await?;
         Ok(store)
@@ -356,6 +419,7 @@ impl PostgresStore {
             .try_get(0)
             .db()?;
 
+        let fenced = lost_tx.clone();
         let heartbeat = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEARTBEAT).await;
@@ -366,7 +430,7 @@ impl PostgresStore {
                 }
             }
         });
-        let store = Self::with_pool(config, tls, Some(epoch))?;
+        let store = Self::with_pool(config, tls, Some(epoch), Some(fenced))?;
         Ok(Some((store, DatabaseLock { heartbeat, lost })))
     }
 
@@ -374,6 +438,7 @@ impl PostgresStore {
         mut config: tokio_postgres::Config,
         tls: MakeRustlsConnect,
         epoch: Option<i64>,
+        lost: Option<watch::Sender<bool>>,
     ) -> Result<Self> {
         let mut options = format!(
             "{} -c statement_timeout={}",
@@ -391,20 +456,32 @@ impl PostgresStore {
             .recycle_timeout(Some(TIMEOUT))
             .build()
             .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(PostgresStore { pool })
+        Ok(PostgresStore { pool, lost })
     }
 
     async fn client(&self) -> Result<Object> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| StorageError::OperationFailed(crate::error_chain(&e)))
+        self.pool.get().await.map_err(|e| match e {
+            PoolError::Backend(e) => classify(e),
+            PoolError::Timeout(_) => StorageError::Transient(Box::new(e)),
+            e => StorageError::OperationFailed(crate::error_chain(&e)),
+        })
+    }
+
+    /// Passes `result` on, giving the database up if another broker took
+    /// it over, so the broker stops without waiting for the lock's
+    /// heartbeat to notice.
+    fn fence<T>(&self, result: Result<T>) -> Result<T> {
+        if let (Err(StorageError::Fenced), Some(lost)) = (&result, &self.lost) {
+            lost.send_replace(true);
+        }
+        result
     }
 
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
         let client = self.client().await?;
         let statement = client.prepare_cached(sql).await.db()?;
-        client.query(&statement, params).await.db()
+        // Some, such as the retained lookup, delete what has expired
+        self.fence(client.query(&statement, params).await.db())
     }
 }
 
@@ -700,9 +777,15 @@ impl BatchStore for PostgresStore {
         Some(self)
     }
 
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+        self.fence(self.apply_batch(client_id, writes).await)
+    }
+}
+
+impl PostgresStore {
     /// Applies the batch in one transaction, its statements pipelined, so
     /// it costs about one round trip.
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+    async fn apply_batch(&self, client_id: &str, writes: &[Write]) -> Result<()> {
         let mut statements = Vec::new();
         let mut run = Vec::new();
         for write in writes {
@@ -856,7 +939,7 @@ impl SessionStore for PostgresStore {
             .prepare_cached("DELETE FROM sessions WHERE client_id = $1")
             .await
             .db()?;
-        client.execute(&statement, &[&client_id]).await.db()?;
+        self.fence(client.execute(&statement, &[&client_id]).await.db())?;
         Ok(())
     }
 
@@ -878,7 +961,7 @@ impl RetainedMessageStore for PostgresStore {
                 .prepare_cached("DELETE FROM retained_messages WHERE topic = $1")
                 .await
                 .db()?;
-            client.execute(&statement, &[&topic]).await.db()?;
+            self.fence(client.execute(&statement, &[&topic]).await.db())?;
             return Ok(());
         };
         let origin = msg.origin.as_deref();
@@ -896,7 +979,7 @@ impl RetainedMessageStore for PostgresStore {
             )
             .await
             .db()?;
-        client
+        let stored = client
             .execute(
                 &statement,
                 &[
@@ -911,7 +994,8 @@ impl RetainedMessageStore for PostgresStore {
                 ],
             )
             .await
-            .db()?;
+            .db();
+        self.fence(stored)?;
         Ok(())
     }
 
@@ -970,11 +1054,13 @@ impl RetainedMessageStore for PostgresStore {
     }
 
     async fn clear_all_retained(&self) -> Result<()> {
-        self.client()
-            .await?
-            .execute("DELETE FROM retained_messages", &[])
-            .await
-            .db()?;
+        let client = self.client().await?;
+        self.fence(
+            client
+                .execute("DELETE FROM retained_messages", &[])
+                .await
+                .db(),
+        )?;
         Ok(())
     }
 
@@ -1019,7 +1105,7 @@ impl BanStore for PostgresStore {
             )
             .await
             .db()?;
-        client
+        let stored = client
             .execute(
                 &statement,
                 &[
@@ -1032,7 +1118,8 @@ impl BanStore for PostgresStore {
                 ],
             )
             .await
-            .db()?;
+            .db();
+        self.fence(stored)?;
         Ok(())
     }
 
@@ -1042,10 +1129,12 @@ impl BanStore for PostgresStore {
             .prepare_cached("DELETE FROM bans WHERE kind = $1 AND value = $2 AND prefix = $3")
             .await
             .db()?;
-        client
-            .execute(&statement, &[&kind, &value, &prefix])
-            .await
-            .db()?;
+        self.fence(
+            client
+                .execute(&statement, &[&kind, &value, &prefix])
+                .await
+                .db(),
+        )?;
         Ok(())
     }
 }
@@ -1575,12 +1664,10 @@ mod tests {
         assert!(!standby_lock.is_lost());
 
         // The old holder's writes are refused, the new holder's accepted
-        assert!(active
-            .apply("c", &[Write::ClearQueue])
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("another broker took over"));
+        assert!(matches!(
+            active.apply("c", &[Write::ClearQueue]).await,
+            Err(StorageError::Fenced)
+        ));
         assert!(active.store_retained("t", None).await.is_err());
         standby.apply("c", &[Write::ClearQueue]).await.unwrap();
 
@@ -1602,5 +1689,83 @@ mod tests {
             .unwrap()
             .expect("dropping the lock frees the database");
         drop(lock);
+    }
+
+    /// A takeover the holder's lock connection hasn't noticed yet, as when
+    /// that connection hangs: the first fenced write gives the lock up.
+    #[tokio::test]
+    async fn test_a_fenced_write_loses_the_lock() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let (active, lock) = PostgresStore::connect_exclusive(&url, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        active.apply("c", &[Write::ClearQueue]).await.unwrap();
+        assert!(!lock.is_lost());
+
+        database
+            .client()
+            .await
+            .unwrap()
+            .batch_execute("UPDATE mercurio_lease SET epoch = epoch + 1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            active.apply("c", &[Write::ClearQueue]).await,
+            Err(StorageError::Fenced)
+        ));
+        assert!(lock.is_lost());
+    }
+
+    #[tokio::test]
+    async fn test_errors_worth_retrying_are_transient() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let client = store.client().await.unwrap();
+        let raise = |code: &str| {
+            format!("DO $$ BEGIN RAISE EXCEPTION 'test' USING ERRCODE = '{code}'; END $$")
+        };
+        for code in ["40001", "40P01", "57P01", "53300", "08006"] {
+            let error = client.batch_execute(&raise(code)).await.db().unwrap_err();
+            assert!(
+                matches!(error, StorageError::Transient(_)),
+                "{code}: {error}"
+            );
+        }
+        let error = client
+            .batch_execute(&raise("23505"))
+            .await
+            .db()
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Database(_)), "{error}");
+
+        // The server ends the connection, as on a failover
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        store
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .unwrap();
+        let error = client.batch_execute("SELECT 1").await.db().unwrap_err();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_an_unreachable_database_is_transient() {
+        let error = PostgresStore::connect("postgres://mercurio@127.0.0.1:1/mercurio", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
     }
 }
