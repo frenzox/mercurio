@@ -51,9 +51,13 @@ struct PropertyArgs {
     #[arg(long)]
     response_topic: Option<String>,
 
-    /// Data that ties a reply to its request
+    /// Data that ties a reply to its request, as text
     #[arg(long)]
     correlation_data: Option<String>,
+
+    /// Correlation data as bytes, in hex, such as 00ff7a
+    #[arg(long, value_name = "HEX", value_parser = parse_hex, conflicts_with = "correlation_data")]
+    correlation_data_hex: Option<Bytes>,
 
     /// Seconds the broker keeps the message for subscribers yet to get it
     #[arg(long)]
@@ -75,10 +79,25 @@ impl From<PropertyArgs> for MessageProperties {
             message_expiry: args.message_expiry,
             content_type: args.content_type,
             response_topic: args.response_topic,
-            correlation_data: args.correlation_data.map(Bytes::from),
+            correlation_data: args
+                .correlation_data
+                .map(Bytes::from)
+                .or(args.correlation_data_hex),
             user_properties: args.user_properties,
         }
     }
+}
+
+fn parse_hex(value: &str) -> Result<Bytes, String> {
+    let wrong = || format!("`{value}` isn't bytes in hex, two digits each");
+    if !value.len().is_multiple_of(2) || !value.is_ascii() {
+        return Err(wrong());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).map_err(|_| wrong()))
+        .collect::<Result<Vec<u8>, _>>()
+        .map(Bytes::from)
 }
 
 fn parse_user_property(value: &str) -> Result<(String, String), String> {
@@ -121,4 +140,44 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
     client.disconnect().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use clap::Parser;
+    use mercurio_client::MessageProperties;
+
+    use super::PropertyArgs;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        properties: PropertyArgs,
+    }
+
+    fn correlation(args: &[&str]) -> Result<Option<Bytes>, clap::Error> {
+        Cli::try_parse_from(std::iter::once("recado").chain(args.iter().copied()))
+            .map(|cli| MessageProperties::from(cli.properties).correlation_data)
+    }
+
+    #[test]
+    fn correlation_data_is_text_or_hex() {
+        assert_eq!(
+            correlation(&["--correlation-data", "42"]).unwrap(),
+            Some(Bytes::from_static(b"42"))
+        );
+        assert_eq!(
+            correlation(&["--correlation-data-hex", "00fF7a"]).unwrap(),
+            Some(Bytes::from_static(&[0x00, 0xff, 0x7a]))
+        );
+        for wrong in ["0", "zz", "0x00"] {
+            assert!(
+                correlation(&["--correlation-data-hex", wrong]).is_err(),
+                "{wrong}"
+            );
+        }
+        let both = ["--correlation-data", "a", "--correlation-data-hex", "00"];
+        assert!(correlation(&both).is_err());
+    }
 }

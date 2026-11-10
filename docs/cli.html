@@ -66,7 +66,8 @@ recado pub -t requests/lamp -m on --response-topic replies/me \
 <tr><td><code>-r, --retain</code></td><td>Retain the message on the broker</td></tr>
 <tr><td><code>--content-type</code></td><td>Content type of the payload, such as a MIME type</td></tr>
 <tr><td><code>--response-topic</code></td><td>Topic a reply should be published to</td></tr>
-<tr><td><code>--correlation-data</code></td><td>Data that ties a reply to its request</td></tr>
+<tr><td><code>--correlation-data</code></td><td>Data that ties a reply to its request, as text</td></tr>
+<tr><td><code>--correlation-data-hex</code></td><td>The same as bytes, in hex, such as <code>00ff7a</code></td></tr>
 <tr><td><code>--message-expiry</code></td><td>Seconds the broker keeps the message for subscribers yet to get it</td></tr>
 <tr><td><code>--utf8</code></td><td>Mark the payload as UTF-8 text</td></tr>
 <tr><td><code>--user-property key=value</code></td><td>User property; may be repeated</td></tr>
