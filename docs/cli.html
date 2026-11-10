@@ -162,7 +162,7 @@ recado sub --unix /run/mercurio/mqtt.sock -t 'sensors/#' -T</pre>
 <p>recado uses the exit statuses of <a href="mercurioctl.html#exit-status">mercurioctl</a>, and 4 for <code>sub -W</code>:</p>
 <table>
 <tr><th>Status</th><th>Means</th></tr>
-<tr><td><code>0</code></td><td>Success, or <code>sub</code> stopped by Ctrl-C or by its reader going away</td></tr>
+<tr><td><code>0</code></td><td>Success, or <code>sub</code> stopped by Ctrl-C, SIGTERM or its reader going away. On Ctrl-C and SIGTERM it disconnects cleanly, so the broker drops its will</td></tr>
 <tr><td><code>1</code></td><td>The broker refused a subscription, or a QoS 1 or 2 message; the message names the filter and the reason</td></tr>
 <tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, or closed the connection; with <code>--reconnect</code>, when the client gives up</td></tr>
 <tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or a QoS above 2</td></tr>

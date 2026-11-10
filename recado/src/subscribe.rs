@@ -132,12 +132,8 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     }
 
     let received = Cell::new(0);
-    // Handle Ctrl+C for graceful shutdown
     let outcome = tokio::select! {
-        _ = signal::ctrl_c() => {
-            eprintln!("\nDisconnecting...");
-            Ok(())
-        }
+        _ = stop_signal() => Ok(()),
         _ = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -222,6 +218,24 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     let _ = client.disconnect().await;
 
     outcome
+}
+
+/// Ctrl-C, or SIGTERM as from `kill` or a service manager: either ends the
+/// run with a DISCONNECT, which tells the broker to drop the will.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use signal::unix::{signal, SignalKind};
+
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = signal::ctrl_c().await;
 }
 
 /// A message as `--format json` prints it. The payload is always there in

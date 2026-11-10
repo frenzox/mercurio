@@ -453,6 +453,41 @@ async fn json_lines_carry_the_message_and_its_properties() {
     subscriber.kill().await;
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_disconnects_cleanly() {
+    let broker = start().await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("term/status", QoS::AtLeastOnce)])
+        .await
+        .unwrap();
+    let subscriber = broker
+        .subscriber(
+            &[
+                "sub",
+                "-t",
+                "term/ready",
+                "--will-topic",
+                "term/status",
+                "--will-message",
+                "died",
+            ],
+            "term/ready",
+        )
+        .await;
+    let status = Command::new("kill")
+        .args(["-TERM", &subscriber.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (status, _, message) = subscriber.finish().await;
+    assert_eq!(status, Some(0), "{message}");
+    // A clean DISCONNECT discards the will
+    let will = tokio::time::timeout(std::time::Duration::from_millis(500), receiver.recv()).await;
+    assert!(will.is_err(), "{will:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sub_exits_after_count_messages() {
     let broker = start().await;
