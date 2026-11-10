@@ -364,3 +364,28 @@ async fn retained_messages_beyond_the_limit_are_refused() {
     // Updating the retained topic is still allowed
     assert!(accepted(publish_retained(&mut stream, "a").await));
 }
+
+#[tokio::test]
+async fn an_address_holds_its_slots_through_the_tls_handshake() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.tls = Some(mercurio_server::tls::TlsConfig::new(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+    ));
+    config.limits.max_connections_per_ip = Some(1);
+    config.limits.connect_timeout = Duration::from_secs(30);
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    // Neither starts its TLS handshake: the first takes the address's
+    // only slot, the second is closed at once
+    let _first = TcpStream::connect(addr).await.unwrap();
+    sleep(Duration::from_millis(50)).await;
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(read_until_closed(&mut second).await.is_empty());
+}

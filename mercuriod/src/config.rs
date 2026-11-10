@@ -622,7 +622,8 @@ pub struct ServerConfig {
     pub max_retained_messages: Option<usize>,
 
     /// Connections one client address may hold at once, the address a PROXY
-    /// header gives counted; unbounded when unset
+    /// header gives counted and IPv6 clients counted by /64; unbounded when
+    /// unset
     pub max_connections_per_ip: Option<usize>,
 
     /// TLS configuration

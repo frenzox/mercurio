@@ -163,7 +163,9 @@ pub struct Limits {
     /// then refused with Quota Exceeded. Unbounded when unset.
     pub max_retained_messages: Option<usize>,
     /// Connections one client address may hold at once, counting the
-    /// address a PROXY header gives; further ones are closed. Unbounded
+    /// address a PROXY header gives; further ones are closed before any
+    /// TLS or WebSocket handshake. IPv6 clients count by /64 block, and
+    /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
 }
@@ -589,7 +591,9 @@ struct HandlerParts<St: MqttStore + 'static> {
 impl<St: MqttStore + 'static> HandlerParts<St> {
     /// Serves a connection accepted on a listener, after the PROXY header
     /// and the TLS handshake if the listener has them. `_slots` and
-    /// `_listener` are held for as long as it runs.
+    /// `_listener` are held for as long as it runs, and `address_slot` too;
+    /// on a PROXY listener that slot is taken here instead, once the header
+    /// gave the client's own address.
     ///
     /// Everything here is boxed: the task holds this function's state for
     /// the whole connection, so it keeps only pointers, and the handshakes'
@@ -601,24 +605,25 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         peer_addr: Option<SocketAddr>,
         _slots: [Option<OwnedSemaphorePermit>; 2],
         _listener: ListenerSlot,
+        address_slot: Option<AddressSlot>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let transport = settings.transport;
+        let proxied = settings.proxy_protocol;
         let Some((parts, stream, peer_addr)) =
             Box::pin(self.handshake(socket, settings, peer_addr)).await
         else {
             return;
         };
-        // Counted once the PROXY header gave the client's own address
-        let _address_slot = match (parts.limits.max_connections_per_ip, peer_addr) {
-            (Some(max), Some(peer)) => match parts.address_slots.acquire(peer.ip(), max) {
+        let _address_slot = match (proxied, parts.limits.max_connections_per_ip, peer_addr) {
+            (true, Some(max), Some(peer)) => match parts.address_slots.acquire(peer.ip(), max) {
                 Some(slot) => Some(slot),
                 None => {
                     return warn!("{} holds the most connections allowed, closing", peer.ip());
                 }
             },
-            _ => None,
+            _ => address_slot,
         };
         match stream {
             Secured::Plain(stream) => Box::pin(parts.serve(stream, transport, peer_addr)).await,
@@ -1250,6 +1255,22 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             let slots = [slot, listener_slot];
 
+            // Taken before any handshake, so an address can't hold more
+            // half-open TLS or WebSocket connections than served ones.
+            // Behind a proxy it waits for the PROXY header's address.
+            let address_slot = match (self.limits.max_connections_per_ip, peer_addr) {
+                (Some(max), Some(peer)) if !proxied => {
+                    match self.address_slots.acquire(peer.ip(), max) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            warn!("{} holds the most connections allowed, closing", peer.ip());
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             info!(target: CONNECTIONS, "Got a connection: {:?}", peer_addr);
 
             let parts = HandlerParts {
@@ -1279,9 +1300,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
-                    );
+                    tokio::spawn(Box::new(parts).serve_accepted(
+                        socket,
+                        settings,
+                        peer_addr,
+                        slots,
+                        counted,
+                        address_slot,
+                    ));
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
@@ -1300,9 +1326,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(
-                        Box::new(parts).serve_accepted(socket, settings, peer_addr, slots, counted),
-                    );
+                    tokio::spawn(Box::new(parts).serve_accepted(
+                        socket,
+                        settings,
+                        peer_addr,
+                        slots,
+                        counted,
+                        address_slot,
+                    ));
                 }
                 Accepted::Local(stream) => {
                     let parts = HandlerParts {
@@ -2394,13 +2425,28 @@ where
     }
 }
 
-/// Connections each client address holds.
+/// Connections each client address holds, keyed by `address_key`.
 #[derive(Default)]
 struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
 
+/// Whom `ip` counts as for the per-address limit. An IPv4 client of an
+/// IPv6 socket counts as its IPv4 address. An IPv6 client counts as its
+/// /64, the block one subscriber is usually given, so it can't take a new
+/// address from it for every connection.
+fn address_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        },
+        v4 => v4,
+    }
+}
+
 impl AddressSlots {
-    /// A slot for `ip`, unless it holds `max` already.
+    /// A slot for `ip`, unless its address or block holds `max` already.
     fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<AddressSlot> {
+        let ip = address_key(ip);
         let mut counts = self.0.lock().unwrap();
         let count = counts.entry(ip).or_default();
         if *count >= max {
@@ -2636,6 +2682,20 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_address_slots_count_mapped_addresses_as_ipv4_and_ipv6_by_64() {
+        let slots = Arc::new(AddressSlots::default());
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        let _v4 = slots.acquire(ip("192.0.2.7"), 1).unwrap();
+        assert!(slots.acquire(ip("::ffff:192.0.2.7"), 1).is_none());
+        assert!(slots.acquire(ip("192.0.2.8"), 1).is_some());
+
+        let _v6 = slots.acquire(ip("2001:db8:0:1::1"), 1).unwrap();
+        assert!(slots.acquire(ip("2001:db8:0:1:ffff::2"), 1).is_none());
+        assert!(slots.acquire(ip("2001:db8:0:2::1"), 1).is_some());
+    }
 
     #[test]
     fn test_address_ranges_print_their_first_address() {
