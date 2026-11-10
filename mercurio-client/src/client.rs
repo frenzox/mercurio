@@ -593,12 +593,20 @@ fn should_reconnect(reason: &DisconnectReason) -> bool {
 }
 
 /// Whether a failed reconnection attempt means the broker won't take the
-/// client back.
+/// client back. Refusals for want of capacity pass and are retried; bad
+/// credentials, a ban, an unsupported version or a redirection don't.
 fn refused_for_good(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::ConnectionRefused(_) | ClientError::Redirected { .. }
-    )
+    match error {
+        ClientError::Redirected { .. } => true,
+        ClientError::ConnectionRefused(reason) => !matches!(
+            reason,
+            ReasonCode::ServerUnavailable
+                | ReasonCode::ServerBusy
+                | ReasonCode::QuotaExceeded
+                | ReasonCode::ConnectionRateExceeded
+        ),
+        _ => false,
+    }
 }
 
 /// A QoS 1 or 2 message sent to the broker and not acknowledged yet.

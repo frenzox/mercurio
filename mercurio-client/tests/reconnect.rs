@@ -222,11 +222,14 @@ async fn refusing_broker(
     protocol: ProtocolVersion,
     refusals: Vec<u8>,
 ) -> TcpStream {
-    drop(accept(&listener, false).await);
     let connack = |code| match protocol {
         ProtocolVersion::V5 => vec![0x20, 0x03, 0x00, code, 0x00],
         _ => vec![0x20, 0x02, 0x00, code],
     };
+    let (mut socket, _) = listener.accept().await.unwrap();
+    read_packet(&mut socket).await;
+    socket.write_all(&connack(0)).await.unwrap();
+    drop(socket);
     for code in refusals {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_packet(&mut socket).await;
@@ -246,6 +249,38 @@ async fn events_until_none(client: &MqttClient) -> Vec<Event> {
             Ok(None) => return events,
             Err(_) => panic!("the client neither stopped nor sent more: {events:?}"),
         }
+    }
+}
+
+#[tokio::test]
+async fn transient_refusals_are_retried() {
+    for (protocol, refusals) in [
+        (ProtocolVersion::V5, vec![0x88, 0x89, 0x97, 0x9f]),
+        // Server unavailable
+        (ProtocolVersion::V3_1_1, vec![0x03]),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let broker = tokio::spawn(refusing_broker(listener, protocol, refusals));
+        let client = MqttClient::connect(
+            ConnectOptions::new("127.0.0.1", port)
+                .protocol_version(protocol)
+                .client_id("c")
+                .keep_alive(0)
+                .reconnect(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.recv().await,
+            Some(Event::Disconnected { .. })
+        ));
+        let event = timeout(Duration::from_secs(5), client.recv()).await;
+        assert!(
+            matches!(event, Ok(Some(Event::Reconnected { .. }))),
+            "{protocol:?}: {event:?}"
+        );
+        let _socket = broker.await.unwrap();
     }
 }
 

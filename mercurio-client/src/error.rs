@@ -14,7 +14,9 @@ pub enum ClientError {
     ConnectionFailed(String),
 
     /// The broker answered CONNECT with this failure, such as bad
-    /// credentials. Reconnecting doesn't retry after it.
+    /// credentials. Reconnecting retries after Server Unavailable, Server
+    /// Busy, Quota Exceeded and Connection Rate Exceeded, and stops after
+    /// any other.
     #[error("Connection refused: {0:?}")]
     ConnectionRefused(ReasonCode),
 
