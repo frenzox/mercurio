@@ -34,6 +34,10 @@ max_connections = 10000
 # Largest packet accepted from a client, in bytes
 max_packet_size = 1048576
 
+# Largest CONNECT accepted from a client, in bytes. It comes before the
+# client is authenticated, so it gets less room than other packets
+max_connect_packet_size = 65536
+
 # Messages that may wait for one client (QoS 1 and 2 included) before
 # further ones are dropped
 max_queued_messages = 10000

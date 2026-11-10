@@ -89,7 +89,10 @@ pub struct AuthConfig {
     pub allow_anonymous: bool,
 }
 
-pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
+pub use crate::{
+    connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
+    queue::QueueLimits,
+};
 
 /// Subscriptions a session may hold unless configured otherwise: far more
 /// than clients need, far fewer than it takes to exhaust the broker.
@@ -114,6 +117,11 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Largest packet accepted from a client, fixed header included.
     pub max_packet_size: usize,
+    /// Largest CONNECT accepted, and AUTH during enhanced authentication,
+    /// fixed header included. These come before the client is
+    /// authenticated, so they get less room than `max_packet_size`, which
+    /// still caps it. A larger one is refused as Packet Too Large.
+    pub max_connect_packet_size: usize,
     /// Messages waiting to be sent to one session.
     pub queue: QueueLimits,
     /// Connections beyond this many are closed right after being accepted.
@@ -166,6 +174,7 @@ impl Default for Limits {
             connect_timeout: Duration::from_secs(10),
             write_timeout: crate::connection::DEFAULT_WRITE_TIMEOUT,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            max_connect_packet_size: DEFAULT_MAX_CONNECT_PACKET_SIZE,
             queue: QueueLimits::default(),
             max_connections: None,
             topic_alias_maximum: 10,
@@ -1315,9 +1324,11 @@ impl<St: MqttStore + 'static> Listener<St> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // Until the client is authenticated; see `Handler::run`
+        let limits = &handler.limits;
         handler
             .connection
-            .set_max_packet_size(handler.limits.max_packet_size);
+            .set_max_packet_size(limits.max_connect_packet_size.min(limits.max_packet_size));
 
         let first_packet =
             time::timeout_at(handler.connect_deadline, handler.connection.read_packet()).await;
@@ -1523,6 +1534,8 @@ where
                     .await;
             }
         }
+        self.connection
+            .set_max_packet_size(self.limits.max_packet_size);
 
         if let Some(reason) = self.refused_will(&connect_packet) {
             return self.reject_connect(&connect_packet, reason).await;
