@@ -4,7 +4,7 @@
 use core::mem;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, BufMut};
 
@@ -44,31 +44,16 @@ impl Decoder for SubscribeProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = SubscribeProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                SubscriptionIdentifier(v) => set_once(&mut properties.subscription_id, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            SubscriptionIdentifier(v) => set_once(&mut properties.subscription_id, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }

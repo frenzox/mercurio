@@ -716,3 +716,60 @@ mod robustness_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod property_list_tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    fn decode_all(bytes: &'static [u8]) -> [Result<()>; 14] {
+        fn run<P: Decoder>(bytes: &'static [u8]) -> Result<()> {
+            P::decode(&mut Bytes::from_static(bytes)).map(|_| ())
+        }
+        [
+            run::<connect::ConnectProperties>(bytes),
+            run::<connect::WillProperties>(bytes),
+            run::<connack::ConnAckProperties>(bytes),
+            run::<publish::PublishProperties>(bytes),
+            run::<puback::PubAckProperties>(bytes),
+            run::<pubrec::PubRecProperties>(bytes),
+            run::<pubrel::PubRelProperties>(bytes),
+            run::<pubcomp::PubCompProperties>(bytes),
+            run::<subscribe::SubscribeProperties>(bytes),
+            run::<suback::SubAckProperties>(bytes),
+            run::<unsubscribe::UnsubscribeProperties>(bytes),
+            run::<unsuback::UnsubAckProperties>(bytes),
+            run::<disconnect::DisconnectProperties>(bytes),
+            run::<auth::AuthProperties>(bytes),
+        ]
+    }
+
+    #[test]
+    fn test_property_list_past_the_packet_is_malformed() {
+        // A length of 5 with one byte after it, and a User Property cut
+        // short inside a list whose length fits
+        for bytes in [&[0x05, 0x26][..], &[0x02, 0x26, 0x00]] {
+            for (i, result) in decode_all(bytes).into_iter().enumerate() {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    ),
+                    "{bytes:02x?} in decoder {i}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_every_property_list_takes_user_properties() {
+        // Two User Properties "k" = "" and "" = ""
+        let list = &[
+            0x0b, 0x26, 0x00, 0x01, b'k', 0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x00,
+        ][..];
+        for (i, result) in decode_all(list).into_iter().enumerate() {
+            assert!(result.is_ok(), "decoder {i}: {result:?}");
+        }
+    }
+}

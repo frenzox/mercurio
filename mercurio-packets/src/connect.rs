@@ -4,7 +4,7 @@
 use core::mem;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -169,42 +169,27 @@ impl Decoder for ConnectProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = ConnectProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
-                AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v)?,
-                AuthenticationData(v) => set_once(&mut properties.authentication_data, v)?,
-                RequestProblemInformation(v) => {
-                    set_once(&mut properties.request_problem_information, v)?
-                }
-                RequestResponseInformation(v) => {
-                    set_once(&mut properties.request_response_information, v)?
-                }
-                ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v)?,
-                TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_maximum, v)?,
-                MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v),
+            AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v),
+            AuthenticationData(v) => set_once(&mut properties.authentication_data, v),
+            RequestProblemInformation(v) => {
+                set_once(&mut properties.request_problem_information, v)
             }
-        }
+            RequestResponseInformation(v) => {
+                set_once(&mut properties.request_response_information, v)
+            }
+            ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v),
+            TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_maximum, v),
+            MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
+            }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
@@ -255,37 +240,21 @@ impl Decoder for WillProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = WillProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                WillDelayInterval(v) => set_once(&mut properties.will_delay_interval, v)?,
-                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
-                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
-                ContentType(v) => set_once(&mut properties.content_type, v)?,
-                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
-                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            WillDelayInterval(v) => set_once(&mut properties.will_delay_interval, v),
+            PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v),
+            MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v),
+            ContentType(v) => set_once(&mut properties.content_type, v),
+            ResponseTopic(v) => set_once(&mut properties.response_topic, v),
+            CorrelationData(v) => set_once(&mut properties.correlation_data, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }

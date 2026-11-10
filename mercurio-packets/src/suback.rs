@@ -2,13 +2,12 @@
 //! filter (section 3.9).
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -40,31 +39,16 @@ impl Decoder for SubAckProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = SubAckProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }

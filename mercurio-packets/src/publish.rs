@@ -1,13 +1,12 @@
 //! PUBLISH, an application message, in either direction (section 3.3).
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     qos::QoS,
     reason::ReasonCode,
@@ -63,37 +62,25 @@ impl Decoder for PublishProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = PublishProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
-                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
-                TopicAlias(v) => set_once(&mut properties.topic_alias, v)?,
-                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
-                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                SubscriptionIdentifier(v) => properties.subscription_identifiers.push(v),
-                ContentType(v) => set_once(&mut properties.content_type, v)?,
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v),
+            MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v),
+            TopicAlias(v) => set_once(&mut properties.topic_alias, v),
+            ResponseTopic(v) => set_once(&mut properties.response_topic, v),
+            CorrelationData(v) => set_once(&mut properties.correlation_data, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            SubscriptionIdentifier(v) => {
+                properties.subscription_identifiers.push(v);
+                Ok(())
+            }
+            ContentType(v) => set_once(&mut properties.content_type, v),
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
