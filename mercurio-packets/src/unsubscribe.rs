@@ -183,6 +183,8 @@ impl UnsubscribePacket {
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use bytes::{Bytes, BytesMut};
 
     use crate::unsubscribe::*;

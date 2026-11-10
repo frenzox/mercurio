@@ -236,6 +236,8 @@ impl PublishPacket {
 
 #[cfg(test)]
 mod tests {
+    use std::{string::ToString, vec::Vec};
+
     use crate::publish::*;
 
     #[test]

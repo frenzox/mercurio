@@ -341,6 +341,8 @@ impl ConnAckPacket {
 
 #[cfg(test)]
 mod tests {
+    use std::string::String;
+
     use crate::connack::*;
     use bytes::{Bytes, BytesMut};
 
