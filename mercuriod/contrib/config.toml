@@ -272,10 +272,14 @@ group = "mercurio"
 # protocol_version = "mqttv5"
 # Publish "1"/"0", retained, to $SYS/broker/connection/<client id>/state
 # notifications = true
+# Each bridge needs its own name and client id; with notifications, the
+# client id must be a single topic level, without `/`, `+` or `#`
 # [bridges.tls]
+# TLS with the system's root certificates
 # enabled = true
+# A CA, or a client certificate, turns TLS on even without `enabled`
 # ca_path = "/etc/mercurio/cloud-ca.crt"
-# Client certificate, for brokers that require mutual TLS
+# Client certificate, for brokers that require mutual TLS; both or neither
 # cert_path = "/etc/mercurio/site1.crt"
 # key_path = "/etc/mercurio/site1.key"
 #

@@ -185,10 +185,7 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeSt
 /// The bridge, ready to run.
 fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String> {
     let (outbound, inbound) = routes(&config)?;
-    let client_id = config
-        .client_id
-        .clone()
-        .unwrap_or_else(|| format!("mercurio-bridge-{}", config.name));
+    let client_id = config.client_id();
     let addresses = addresses(&config)?;
 
     // Stays connected while the remote broker is unreachable, so messages
@@ -489,6 +486,25 @@ mod tests {
                 ("2001:db8::1".to_string(), 1883)
             ]
         );
+    }
+
+    #[test]
+    fn test_a_ca_or_client_certificate_turns_tls_on() {
+        for tls in [
+            "ca_path = \"ca.pem\"",
+            "cert_path = \"c.pem\"\nkey_path = \"k.pem\"",
+        ] {
+            let config: Config = toml::from_str(&format!(
+                "[[bridges]]\nname = \"cloud\"\nhost = \"h\"\ntopics = []\n\
+                 [bridges.tls]\nenabled = false\n{tls}\n"
+            ))
+            .unwrap();
+            let config = config.bridges.into_iter().next().unwrap();
+            let (connector, _) = mercurio_server::server::LocalConnector::new();
+            let bridge = super::prepare(config, connector).unwrap();
+            let options = format!("{:?}", bridge.remotes[0].1);
+            assert!(options.contains("enabled: true"), "{tls}: {options}");
+        }
     }
 
     #[test]

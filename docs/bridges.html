@@ -60,7 +60,7 @@ qos = 1
 pattern = "commands/#"
 direction = "in"
 qos = 1</pre>
-<p>The bridge connects to the central broker as an MQTT client with the id <code>mercurio-bridge-central</code>. Messages published here on <code>sensors/#</code> are published there, and messages published there on <code>commands/#</code> are published here.</p>
+<p>The bridge connects to the central broker as an MQTT client with the id <code>mercurio-bridge-central</code>, or <code>client_id</code> when set. Each bridge needs its own <code>name</code> and client id, or the two would keep taking over each other's session; with <code>notifications</code> on, the client id is a level of the state topic, so it can't hold <code>/</code>, <code>+</code> or <code>#</code>. Messages published here on <code>sensors/#</code> are published there, and messages published there on <code>commands/#</code> are published here.</p>
 
 <h2>Topics and prefixes</h2>
 <p>Each <code>[[bridges.topics]]</code> entry forwards <code>pattern</code> <code>out</code> (the default), <code>in</code> or <code>both</code> ways. The prefixes place the pattern in each broker's topic tree, so topics are renamed on the way:</p>
@@ -103,6 +103,7 @@ ca_path = "/etc/mercurio/cloud-ca.crt"
 <span class="comment"># Authenticate with a client certificate</span>
 cert_path = "/etc/mercurio/site1.crt"
 key_path = "/etc/mercurio/site1.key"</pre>
+<p><code>enabled = true</code> alone verifies the remote broker with the system's root certificates. A <code>ca_path</code> or a client certificate turns TLS on even without <code>enabled</code>, as <code>--cafile</code> does for recado and mercurioctl, so the password never crosses the network in the clear by mistake. <code>cert_path</code> and <code>key_path</code> go together; the broker refuses to start with only one.</p>
 
 <h2>Monitoring</h2>
 <p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost.</p>
