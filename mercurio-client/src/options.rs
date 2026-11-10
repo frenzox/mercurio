@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,49 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::connection::Stream;
 use crate::error::ClientError;
+
+const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+/// Exponential backoff with jitter: the waits between attempts to reach a
+/// broker, doubling from `min` up to `max`.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    min: Duration,
+    max: Duration,
+    attempt: u32,
+}
+
+impl Backoff {
+    /// Waits from `min` up to `max`, or `min` if `max` is shorter.
+    pub fn new(min: Duration, max: Duration) -> Self {
+        Backoff {
+            min,
+            max: max.max(min),
+            attempt: 0,
+        }
+    }
+
+    /// The wait before the next attempt: somewhere between half of and the
+    /// full doubled wait, and within `min` and `max`.
+    pub fn next_delay(&mut self) -> Duration {
+        let ceiling = self
+            .min
+            .saturating_mul(1 << self.attempt.min(30))
+            .saturating_mul(2)
+            .min(self.max);
+        self.attempt = self.attempt.saturating_add(1);
+        let floor = (ceiling / 2).max(self.min);
+        // A fresh RandomState is seeded randomly, which is all the
+        // randomness jitter needs
+        let random = RandomState::new().hash_one(self.attempt);
+        floor + (ceiling - floor).mul_f64(random as f64 / u64::MAX as f64)
+    }
+
+    /// Starts over from `min`, after an attempt succeeded.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
 
 /// How long a write may take without a keep-alive to bound it
 const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -255,6 +299,7 @@ pub struct ConnectOptions {
     pub(crate) connect_timeout_secs: u64,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
+    pub(crate) reconnect_max: Option<Duration>,
     pub(crate) write_timeout: Option<Duration>,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
@@ -285,6 +330,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("tls", &self.tls)
             .field("reconnect_delay", &self.reconnect_delay)
+            .field("reconnect_max", &self.reconnect_max)
             .field("write_timeout", &self.write_timeout)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
@@ -346,6 +392,7 @@ impl ConnectOptions {
             connect_timeout_secs: 30,
             tls: TlsOptions::default(),
             reconnect_delay: None,
+            reconnect_max: None,
             write_timeout: None,
             receive_maximum: None,
             maximum_packet_size: None,
@@ -456,12 +503,30 @@ impl ConnectOptions {
         self
     }
 
-    /// Reconnect after losing the connection, waiting `delay` between
-    /// attempts. Combine with `clean_start(false)` and a session expiry so
+    /// Reconnect after losing the connection, waiting `delay` before the
+    /// first attempt and doubling the wait after each failed one, up to
+    /// [`reconnect_max`](Self::reconnect_max), each wait randomised by up
+    /// to half so clients that lost the same broker don't all return at
+    /// once. Combine with `clean_start(false)` and a session expiry so
     /// the broker keeps subscriptions and messages in flight meanwhile.
     pub fn reconnect(mut self, delay: Duration) -> Self {
         self.reconnect_delay = Some(delay);
         self
+    }
+
+    /// Longest wait between reconnection attempts, 60 seconds unless set.
+    pub fn reconnect_max(mut self, max: Duration) -> Self {
+        self.reconnect_max = Some(max);
+        self
+    }
+
+    /// The waits between reconnection attempts, if reconnecting is on.
+    pub(crate) fn reconnect_backoff(&self) -> Option<Backoff> {
+        let min = self.reconnect_delay?;
+        Some(Backoff::new(
+            min,
+            self.reconnect_max.unwrap_or(DEFAULT_RECONNECT_MAX),
+        ))
     }
 
     /// Most QoS 2 messages the broker may have in flight to this client at
@@ -547,6 +612,28 @@ impl ConnectOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_backoff_doubles_up_to_the_maximum_with_jitter() {
+        let ms = Duration::from_millis;
+        let mut backoff = Backoff::new(ms(100), ms(1000));
+        let waits: Vec<Duration> = (0..8).map(|_| backoff.next_delay()).collect();
+        assert!((ms(100)..=ms(200)).contains(&waits[0]), "{waits:?}");
+        assert!((ms(200)..=ms(400)).contains(&waits[1]), "{waits:?}");
+        assert!((ms(400)..=ms(800)).contains(&waits[2]), "{waits:?}");
+        for wait in &waits[3..] {
+            assert!((ms(500)..=ms(1000)).contains(wait), "{waits:?}");
+        }
+        backoff.reset();
+        assert!(backoff.next_delay() <= ms(200));
+
+        let spread: std::collections::HashSet<Duration> = (0..20)
+            .map(|_| Backoff::new(ms(100), ms(1000)).next_delay())
+            .collect();
+        assert!(spread.len() > 1, "no jitter");
+        // A maximum below the minimum gives way
+        assert_eq!(Backoff::new(ms(100), ms(10)).next_delay(), ms(100));
+    }
 
     #[test]
     fn test_debug_output_hides_the_password() {

@@ -63,6 +63,8 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
             }
             Event::Disconnected { reason } =&gt; eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } =&gt; eprintln!("reconnected"),
+            Event::Stopped { error } =&gt; eprintln!("gave up: {error}"),
+            _ =&gt; {}
         }
     }
     Ok(())
@@ -87,7 +89,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>keep_alive(seconds)</code></td><td>Keep-alive, 60 by default</td></tr>
 <tr><td><code>clean_start(bool)</code>, <code>session_expiry(seconds)</code></td><td>Start a new session or resume one, and how long the broker keeps it</td></tr>
 <tr><td><code>will(Will)</code></td><td>Message the broker publishes if the client disappears</td></tr>
-<tr><td><code>reconnect(delay)</code></td><td>Reconnect automatically after losing the connection</td></tr>
+<tr><td><code>reconnect(delay)</code>, <code>reconnect_max(max)</code></td><td>Reconnect automatically after losing the connection, waiting from <code>delay</code> up to <code>max</code> (60 seconds by default) between attempts</td></tr>
 <tr><td><code>tls(true)</code>, <code>ca_path(path)</code></td><td>TLS, verified with the system's roots or the given CA; <code>ca_path</code> turns TLS on</td></tr>
 <tr><td><code>client_cert(cert, key)</code></td><td>Authenticate with a client certificate; turns TLS on</td></tr>
 <tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker</td></tr>
@@ -95,6 +97,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
 <tr><td><code>connector(f)</code></td><td>Open the stream with <code>f</code> instead of TCP</td></tr>
 <tr><td><code>connect_timeout(seconds)</code></td><td>Longest wait for the connection, 30 by default</td></tr>
+<tr><td><code>write_timeout(duration)</code></td><td>Longest a packet may take to write before the connection counts as lost; the keep-alive by default, or 30 seconds with a keep-alive of 0</td></tr>
 </table>
 <p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own.</p>
 <p>The optional <code>clap</code> feature adds <code>cli::ConnectArgs</code>: the connection options recado and mercurioctl share, to flatten into your own <code>clap</code> command, and turned into <code>ConnectOptions</code> by <code>to_connect_options()</code>.</p>
@@ -110,7 +113,7 @@ let options = ConnectOptions::new("broker.example.com", 1883)
     .reconnect(Duration::from_secs(5))
     .will(Will::new("status/monitor", "offline").retain(true));
 let client = MqttClient::connect(options).await?;</pre>
-<p>When the connection drops, the client emits <code>Event::Disconnected</code>, retries every five seconds, and emits <code>Event::Reconnected { session_present }</code>. Messages not yet acknowledged are sent again. QoS 1 and 2 publishes made while disconnected wait and are sent after reconnecting; QoS 0 ones fail with <code>ClientError::Disconnected</code>. Without <code>session_present</code>, the broker forgot the session and the subscriptions have to be made again.</p>
+<p>When the connection drops, the client emits <code>Event::Disconnected</code>, retries, and emits <code>Event::Reconnected { session_present }</code>. The first attempt comes five to ten seconds later; each failed one doubles the wait, up to <code>reconnect_max</code>, and every wait is randomised by up to half, so clients that lost the same broker don't all come back at once. The client keeps trying while the broker answers Server Unavailable, Server Busy, Quota Exceeded or Connection Rate Exceeded. It stops for any other refusal, such as bad credentials or a ban, and for a redirection: then <code>Event::Stopped { error }</code> is the last event before <code>recv</code> returns <code>None</code>. A write that takes longer than the write timeout, as on a half-open connection, also counts as a lost connection. Messages not yet acknowledged are sent again. QoS 1 and 2 publishes made while disconnected wait and are sent after reconnecting; QoS 0 ones fail with <code>ClientError::Disconnected</code>. Without <code>session_present</code>, the broker forgot the session and the subscriptions have to be made again.</p>
 
 <h2>MQTT 5 properties</h2>
 <pre>use mercurio_client::{MessageProperties, QoS};

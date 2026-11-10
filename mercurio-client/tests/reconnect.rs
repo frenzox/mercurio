@@ -313,3 +313,41 @@ async fn a_permanent_refusal_stops_the_client_with_its_reason() {
     );
     assert_eq!(events.len(), 2, "{events:?}");
 }
+
+#[tokio::test]
+async fn reconnection_backs_off() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        drop(accept(&listener, false).await);
+        // Each attempt fails before CONNACK
+        let mut attempts = Vec::new();
+        for _ in 0..6 {
+            drop(listener.accept().await.unwrap());
+            attempts.push(std::time::Instant::now());
+        }
+        attempts
+    });
+    let _client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(20))
+            .reconnect_max(Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+
+    let attempts = timeout(Duration::from_secs(5), broker)
+        .await
+        .expect("the client stopped retrying")
+        .unwrap();
+    let gaps: Vec<Duration> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
+    // Doubling from 20 ms, jittered, up to the 200 ms cap
+    assert!(gaps[0] < Duration::from_millis(120), "{gaps:?}");
+    assert!(gaps[3] >= Duration::from_millis(100), "{gaps:?}");
+    assert!(
+        gaps.iter().all(|g| *g < Duration::from_millis(300)),
+        "{gaps:?}"
+    );
+}

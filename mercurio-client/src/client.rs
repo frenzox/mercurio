@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
 use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
-use crate::options::{check_length, ConnectOptions, MessageProperties, SharedAuthenticator, Will};
+use crate::options::{check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
@@ -326,14 +326,13 @@ impl MqttClient {
             pending_events: VecDeque::new(),
         };
         let mut keep_alive = session.keep_alive;
+        let mut backoff = options.reconnect_backoff();
 
         loop {
             let reason = state.run(&mut command_rx, keep_alive).await;
-            let reconnect = options
-                .reconnect_delay
-                .filter(|_| should_reconnect(&reason));
+            let reconnect = backoff.as_mut().filter(|_| should_reconnect(&reason));
             state.deliver(Event::Disconnected { reason });
-            let Some(delay) = reconnect else { break };
+            let Some(backoff) = reconnect else { break };
 
             // Requests the broker never answered can't be answered now
             state.subscribes.clear();
@@ -341,7 +340,7 @@ impl MqttClient {
             if let Some(response) = state.reauthentication.take() {
                 let _ = response.send(Err(ClientError::Disconnected));
             }
-            let (connection, session) = match state.reconnect(&mut command_rx, &options, delay).await
+            let (connection, session) = match state.reconnect(&mut command_rx, &options, backoff).await
             {
                 Ok(opened) => opened,
                 Err(Some(error)) => {
@@ -965,7 +964,8 @@ impl EventLoop {
         DisconnectReason::ProtocolError(reason.to_string())
     }
 
-    /// Waits `delay` between attempts to reopen the connection. Meanwhile
+    /// Waits as `backoff` says between attempts to reopen the connection,
+    /// starting it over once one succeeds. Meanwhile
     /// QoS 1 and 2 publishes queue up, and other requests fail. Gives up
     /// with the error when the broker refuses the client for good, or
     /// without one when the application disconnects.
@@ -973,11 +973,11 @@ impl EventLoop {
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
         options: &ConnectOptions,
-        delay: Duration,
+        backoff: &mut Backoff,
     ) -> std::result::Result<(Connection, Session), Option<ClientError>> {
         let event_tx = self.event_tx.clone();
         loop {
-            let wait = time::sleep(delay);
+            let wait = time::sleep(backoff.next_delay());
             tokio::pin!(wait);
             loop {
                 tokio::select! {
@@ -1010,7 +1010,10 @@ impl EventLoop {
             }
 
             match MqttClient::open(options).await {
-                Ok(opened) => return Ok(opened),
+                Ok(opened) => {
+                    backoff.reset();
+                    return Ok(opened);
+                }
                 Err(e) if refused_for_good(&e) => {
                     error!("Broker refused to reconnect: {}", e);
                     return Err(Some(e));
