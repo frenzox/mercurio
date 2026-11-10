@@ -48,6 +48,9 @@ recado pub -t sensors/kitchen -m 21.5 -q 1
 <span class="comment"># From standard input</span>
 echo '{"temp": 21.5}' | recado pub -t sensors/kitchen --content-type application/json
 
+<span class="comment"># Each new log line as a message</span>
+tail -F /var/log/app.log | recado pub -t logs/app -l
+
 <span class="comment"># A binary file, such as an image or a firmware image</span>
 recado pub -t cameras/door/snapshot -f snapshot.jpg
 
@@ -62,6 +65,7 @@ recado pub -t requests/lamp -m on --response-topic replies/me \
 <tr><td><code>-t, --topic</code></td><td>Topic to publish to (required)</td></tr>
 <tr><td><code>-m, --message</code></td><td>Payload, as text. Without it or <code>-f</code>, standard input is published byte for byte</td></tr>
 <tr><td><code>-f, --file PATH</code></td><td>Publish the contents of a file, binary or not</td></tr>
+<tr><td><code>-l, --line</code></td><td>Publish each line of standard input as its own message as it comes, on one connection. The line feed, and a carriage return before it, are left out; empty lines are skipped</td></tr>
 <tr><td><code>-q, --qos</code></td><td>0, 1 or 2 (default 0)</td></tr>
 <tr><td><code>-r, --retain</code></td><td>Retain the message on the broker</td></tr>
 <tr><td><code>--content-type</code></td><td>Content type of the payload, such as a MIME type</td></tr>

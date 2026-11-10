@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use clap::Args;
 use mercurio_client::{MessageProperties, MqttClient, QoS};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::common::{qos_level, ConnectionArgs};
 use crate::failure::Failure;
@@ -27,6 +28,11 @@ pub struct PubArgs {
     /// Publish the contents of this file, binary or not
     #[arg(short = 'f', long, value_name = "PATH", conflicts_with = "message")]
     file: Option<PathBuf>,
+
+    /// Publish each line of standard input as its own message, as it
+    /// comes, on one connection; empty lines are skipped
+    #[arg(short = 'l', long, conflicts_with_all = ["message", "file"])]
+    line: bool,
 
     /// QoS level (0, 1, or 2)
     #[arg(short = 'q', long, default_value = "0", value_parser = qos_level)]
@@ -108,15 +114,18 @@ fn parse_user_property(value: &str) -> Result<(String, String), String> {
 }
 
 pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
-    let payload = match (args.message, &args.file) {
-        (Some(message), _) => Bytes::from(message),
-        (None, Some(path)) => std::fs::read(path)
-            .map(Bytes::from)
-            .map_err(|e| Failure::Usage(format!("can't read {}: {e}", path.display())))?,
+    let payload = match (args.message.take(), &args.file) {
+        _ if args.line => None,
+        (Some(message), _) => Some(Bytes::from(message)),
+        (None, Some(path)) => Some(
+            std::fs::read(path)
+                .map(Bytes::from)
+                .map_err(|e| Failure::Usage(format!("can't read {}: {e}", path.display())))?,
+        ),
         (None, None) => {
             let mut buffer = Vec::new();
             io::stdin().read_to_end(&mut buffer)?;
-            Bytes::from(buffer)
+            Some(Bytes::from(buffer))
         }
     };
 
@@ -125,16 +134,31 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
     let options = args.connection.to_connect_options();
     let client = MqttClient::connect(options).await?;
 
-    // Publish the message
-    client
-        .publish_with_properties(
+    let properties = MessageProperties::from(args.properties);
+    let publish = |payload: Bytes| {
+        client.publish_with_properties(
             &args.topic,
             payload,
             args.qos,
             args.retain,
-            args.properties.into(),
+            properties.clone(),
         )
-        .await?;
+    };
+    match payload {
+        Some(payload) => publish(payload).await?,
+        None => {
+            let mut stdin = BufReader::new(tokio::io::stdin());
+            let mut line = Vec::new();
+            while stdin.read_until(b'\n', &mut line).await? > 0 {
+                let text = line.strip_suffix(b"\n").unwrap_or(&line);
+                let text = text.strip_suffix(b"\r").unwrap_or(text);
+                if !text.is_empty() {
+                    publish(Bytes::copy_from_slice(text)).await?;
+                }
+                line.clear();
+            }
+        }
+    }
 
     // Disconnect gracefully
     client.disconnect().await?;

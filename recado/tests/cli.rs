@@ -307,6 +307,29 @@ async fn binary_payloads_are_published_from_stdin_and_files() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn line_mode_publishes_each_line() {
+    let broker = start().await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("lines", QoS::AtLeastOnce)])
+        .await
+        .unwrap();
+    let output = broker
+        .run_with_input(
+            &["pub", "-t", "lines", "-l", "-q", "1"],
+            b"one\n\ntwo\r\nthree",
+        )
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    for expected in ["one", "two", "three"] {
+        assert_eq!(next_payload(&receiver).await, expected.as_bytes());
+    }
+
+    let both = broker.run(&["pub", "-t", "lines", "-l", "-m", "x"]).await;
+    assert_eq!(both.status.code(), Some(3), "{}", stderr(&both));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn binary_payloads_are_printed_as_they_are() {
     let broker = start().await;
     let mut subscriber = broker

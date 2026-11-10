@@ -35,6 +35,9 @@ recado pub -t sensors/kitchen -m 21.5 -q 1
 # From standard input, retained
 date | recado pub -t system/time -r
 
+# Each line of standard input as its own message, on one connection
+tail -F /var/log/app.log | recado pub -t logs/app -l
+
 # A binary file; sub prints payloads byte for byte
 recado pub -t cameras/door/snapshot -f snapshot.jpg
 
