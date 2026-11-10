@@ -451,20 +451,20 @@ impl Data {
                     .get("acls")
                     .and_then(Value::as_array)
                     .ok_or("Invalid/missing acls")?;
+                // Applied to a copy, so an invalid entry leaves no half of
+                // the change behind for a later command of the batch to save
+                let mut access = self.default_acl_access;
                 for acl in acls {
                     let allow = acl.get("allow").and_then(Value::as_bool);
-                    let access = match acl.get("acltype").and_then(Value::as_str) {
-                        Some("publishClientSend") => {
-                            &mut self.default_acl_access.publish_client_send
-                        }
-                        Some("publishClientReceive") => {
-                            &mut self.default_acl_access.publish_client_receive
-                        }
-                        Some("subscribe") => &mut self.default_acl_access.subscribe,
+                    let field = match acl.get("acltype").and_then(Value::as_str) {
+                        Some("publishClientSend") => &mut access.publish_client_send,
+                        Some("publishClientReceive") => &mut access.publish_client_receive,
+                        Some("subscribe") => &mut access.subscribe,
                         _ => return Err("Invalid/missing acltype".to_string()),
                     };
-                    *access = allow.ok_or("Invalid/missing allow")?;
+                    *field = allow.ok_or("Invalid/missing allow")?;
                 }
+                self.default_acl_access = access;
                 Ok((None, true))
             }
             "getDefaultACLAccess" => {
@@ -1136,6 +1136,38 @@ mod tests {
                 "{filter}"
             );
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_invalid_default_access_changes_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "mercuriod-dynsec-default-{}",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "setDefaultACLAccess", "acls": [
+                    { "acltype": "publishClientSend", "allow": true },
+                    { "acltype": "bogus", "allow": true },
+                ]},
+                { "command": "createClient", "username": "s1", "password": "pw" },
+            ]),
+        );
+        assert!(responses[0].get("error").is_some(), "{responses:?}");
+        assert!(responses[1].get("error").is_none(), "{responses:?}");
+
+        security.reload().unwrap();
+        let access = run(&security, json!([{ "command": "getDefaultACLAccess" }]));
+        assert_eq!(
+            access[0]["data"]["acls"][0],
+            json!({ "acltype": "publishClientSend", "allow": false })
+        );
         std::fs::remove_file(path).unwrap();
     }
 
