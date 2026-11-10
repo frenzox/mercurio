@@ -120,6 +120,25 @@ jobs:
       - name: Build the fuzz targets
         run: cargo fuzz build
 
+  # Experimental: this job has not passed yet, so a failure does not fail the
+  # build. Remove continue-on-error once it is green. macOS limits Unix
+  # socket paths to 104 bytes and its temporary directory is long, which the
+  # Unix socket tests may run into. mercuriod is left out: it is packaged for
+  # Linux only, and wasmtime makes it the slowest crate to build.
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Check
+        run: cargo check --workspace --all-features --exclude mercuriod
+      - name: Test the client and the command-line tools
+        run: cargo test -p mercurio-client -p recado -p mercurioctl --all-features
+
   test:
     runs-on: ubuntu-latest
     services:
