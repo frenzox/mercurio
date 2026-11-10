@@ -40,6 +40,15 @@ impl Stats {
     }
 }
 
+/// Traffic of one connection since it connected, for the admin API.
+#[derive(Default)]
+pub(crate) struct ClientCounters {
+    pub messages_in: AtomicU64,
+    pub messages_out: AtomicU64,
+    pub bytes_in: AtomicU64,
+    pub bytes_out: AtomicU64,
+}
+
 /// Rates per minute averaged over 1, 5 and 15 minutes, as mosquitto's
 /// `$SYS/broker/load/` topics are: exponentially weighted, updated every
 /// `interval`.

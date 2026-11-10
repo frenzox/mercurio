@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    properties::{CorrelationData, ResponseTopic},
+    properties::{CorrelationData, ResponseTopic, SessionExpiryInterval},
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
@@ -155,6 +155,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
         ));
     }
 
+    /// Publishes at QoS 1 and returns the PUBACK reason.
+    async fn publish(&mut self, topic: &str, payload: &'static [u8], retain: bool) -> ReasonCode {
+        self.send(ControlPacket::Publish(PublishPacket {
+            topic_name: topic.into(),
+            packet_id: Some(7),
+            qos_level: QoS::AtLeastOnce,
+            retain,
+            payload: Some(Bytes::from_static(payload)),
+            ..Default::default()
+        }))
+        .await;
+        match self.receive().await {
+            Some(ControlPacket::PubAck(ack)) => ack.reason,
+            other => panic!("Expected PUBACK, got {other:?}"),
+        }
+    }
+
     /// Sends a request to the broker API, answered on
     /// `replies/<client id>`, and returns the parsed answer.
     async fn request(&mut self, payload: Bytes) -> Value {
@@ -189,6 +206,30 @@ async fn admin_client(addr: SocketAddr) -> Client {
     let mut admin = Client::connect(addr, "admin").await;
     admin.subscribe("replies/admin").await;
     admin
+}
+
+/// A CONNECT whose session outlives the connection by 300 seconds.
+fn persistent(client_id: &str) -> ConnectPacket {
+    let mut packet = connect_packet(client_id);
+    packet.properties = Some(ConnectProperties {
+        session_expiry_interval: Some(SessionExpiryInterval::new(300)),
+        ..Default::default()
+    });
+    packet
+}
+
+/// Runs getClient until `done` holds for its data, for two seconds at most.
+async fn wait_for(admin: &mut Client, client_id: &str, done: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..100 {
+        let response = admin
+            .run(json!({"command": "getClient", "clientid": client_id}))
+            .await;
+        if done(&response["data"]) {
+            return response["data"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("`{client_id}` never got there");
 }
 
 #[tokio::test]
@@ -402,4 +443,83 @@ async fn listeners_are_listed_with_their_connections() {
     assert_eq!(listeners[1].protocol, "websocket");
     assert_eq!(listeners[1].mount_point.as_deref(), Some("tenant/"));
     assert_eq!(listeners[1].connections, 0);
+}
+
+#[tokio::test]
+async fn clients_are_listed_with_their_state() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect_with(addr, persistent("device")).await;
+    device.subscribe("a/#").await;
+
+    let all = admin.run(json!({"command": "listClients"})).await;
+    assert_eq!(all["data"]["totalCount"], 2);
+    // Sorted by client id
+    assert_eq!(all["data"]["clients"][0]["clientid"], "admin");
+    let entry = &all["data"]["clients"][1];
+    assert_eq!(entry["clientid"], "device");
+    assert_eq!(entry["username"], Value::Null);
+    assert_eq!(entry["connected"], true);
+    assert!(entry["address"].as_str().unwrap().starts_with("127.0.0.1:"));
+    assert_eq!(entry["listener"], addr.to_string());
+    assert_eq!(entry["protocolVersion"], 5);
+    assert!(entry["connectedSince"].is_u64());
+    assert!(entry.get("disconnectedSince").is_none());
+    assert_eq!(entry["subscriptions"], 1);
+    assert_eq!(entry["queued"], 0);
+    assert_eq!(entry["inflight"], 0);
+
+    let total = |response: Value| response["data"]["totalCount"].as_u64().unwrap();
+    let by_prefix = json!({"command": "listClients", "clientidPrefix": "dev"});
+    assert_eq!(total(admin.run(by_prefix).await), 1);
+    let local = json!({"command": "listClients", "address": "127.0.0.0/8"});
+    assert_eq!(total(admin.run(local).await), 2);
+    let elsewhere = json!({"command": "listClients", "address": "10.0.0.0/8"});
+    assert_eq!(total(admin.run(elsewhere).await), 0);
+    let offline = json!({"command": "listClients", "connected": false});
+    assert_eq!(total(admin.run(offline).await), 0);
+    let by_user = json!({"command": "listClients", "username": "nobody"});
+    assert_eq!(total(admin.run(by_user).await), 0);
+    let page = admin
+        .run(json!({"command": "listClients", "offset": 1, "count": 1}))
+        .await;
+    assert_eq!(page["data"]["clients"].as_array().unwrap().len(), 1);
+    assert_eq!(page["data"]["clients"][0]["clientid"], "device");
+    let bad = json!({"command": "listClients", "address": "nowhere"});
+    assert_eq!(admin.run(bad).await["code"], "invalidArgument");
+}
+
+#[tokio::test]
+async fn client_details_follow_the_connection() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect_with(addr, persistent("device")).await;
+    device.subscribe("a/#").await;
+    device.publish("t", b"hello", false).await;
+
+    let details = wait_for(&mut admin, "device", |d| d["messagesIn"] == 1).await;
+    assert_eq!(details["connected"], true);
+    assert_eq!(details["keepAlive"], 60);
+    assert_eq!(details["cleanStart"], true);
+    assert_eq!(details["sessionExpiry"], 300);
+    assert!(details.get("sessionExpiresIn").is_none());
+    assert_eq!(details["willPending"], false);
+    assert_eq!(details["messagesOut"], 0);
+    assert!(details["bytesIn"].as_u64().unwrap() > 0);
+    assert!(details["bytesOut"].as_u64().unwrap() > 0);
+    assert_eq!(details["subscriptions"][0]["filter"], "a/#");
+    assert_eq!(details["subscriptions"][0]["qos"], 1);
+    assert_eq!(details["subscriptions"][0]["noLocal"], false);
+
+    drop(device);
+    let details = wait_for(&mut admin, "device", |d| d["connected"] == false).await;
+    assert!(details["disconnectedSince"].is_u64());
+    assert!(details.get("connectedSince").is_none());
+    let expires_in = details["sessionExpiresIn"].as_u64().unwrap();
+    assert!((290..=300).contains(&expires_in), "{expires_in}");
+
+    let missing = admin
+        .run(json!({"command": "getClient", "clientid": "nobody"}))
+        .await;
+    assert_eq!(missing["code"], "notFound");
 }

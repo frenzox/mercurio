@@ -9,7 +9,7 @@ mod protocol;
 mod types;
 
 pub(crate) use protocol::handle as handle_request;
-pub use types::{BrokerInfo, ListenerInfo};
+pub use types::{BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo};
 
 use std::{
     sync::{atomic::Ordering, Arc},
@@ -24,8 +24,9 @@ use serde_json::Value;
 use crate::{
     plugin::BoxFuture,
     queue::Subscriber,
-    server::ListenerState,
-    session_manager::SessionManager,
+    server::{AddressRange, ListenerState},
+    session::SessionSnapshot,
+    session_manager::{ClientEntry, SessionManager},
     sys::{self, Stats},
     topic_tree::TopicTree,
 };
@@ -157,6 +158,18 @@ impl<T> Page<T> {
     }
 }
 
+/// Which clients `listClients` returns.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ClientQuery {
+    pub connected: Option<bool>,
+    pub client_id_prefix: Option<String>,
+    /// The user the session belongs to, exactly
+    pub username: Option<String>,
+    pub address: Option<AddressRange>,
+    pub paging: Paging,
+}
+
 /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know, such
 /// as the ones `mercuriod` adds. Set in `ServerConfig::admin_extension`.
 pub trait AdminExtension: Send + Sync + 'static {
@@ -188,6 +201,8 @@ pub(crate) struct AdminParts {
 pub(crate) trait Directory: Send + Sync {
     fn session_count(&self) -> BoxFuture<'_, usize>;
     fn expired_count(&self) -> u64;
+    fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
+    fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
 }
 
 impl<S: BatchStore + 'static> Directory for SessionManager<S> {
@@ -197,6 +212,14 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
 
     fn expired_count(&self) -> u64 {
         SessionManager::expired_count(self)
+    }
+
+    fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>> {
+        Box::pin(SessionManager::entries(self))
+    }
+
+    fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>> {
+        Box::pin(SessionManager::entry(self, client_id))
     }
 }
 
@@ -249,6 +272,87 @@ impl Admin {
         }
     }
 
+    /// Every session, connected or not, sorted by client id: `listClients`.
+    pub async fn clients(&self, query: &ClientQuery) -> Page<ClientSummary> {
+        let mut entries = self.inner.directory.entries().await;
+        entries.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        let mut found = Vec::new();
+        for entry in entries {
+            if query.connected.is_some_and(|c| c != entry.connected)
+                || query
+                    .client_id_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !entry.client_id.starts_with(prefix))
+            {
+                continue;
+            }
+            let snapshot = entry.session.snapshot().await;
+            if query
+                .username
+                .as_ref()
+                .is_some_and(|user| snapshot.username.as_ref() != Some(user))
+            {
+                continue;
+            }
+            if let Some(range) = &query.address {
+                if !snapshot.peer.is_some_and(|peer| range.contains(peer.ip())) {
+                    continue;
+                }
+            }
+            found.push(summary(&entry, &snapshot));
+        }
+        Page::of(found, query.paging)
+    }
+
+    /// One session in detail: `getClient`.
+    pub async fn client(&self, client_id: &str) -> Result<ClientDetails, AdminError> {
+        let entry =
+            self.inner.directory.entry(client_id).await.ok_or_else(|| {
+                AdminError::not_found(format!("no session for client `{client_id}`"))
+            })?;
+        let s = entry.session.snapshot().await;
+        let summary = summary(&entry, &s);
+        let now = unix_millis();
+        let get = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::Relaxed);
+        let mut subscriptions: Vec<ClientSubscription> = s
+            .subscriptions
+            .iter()
+            .map(|sub| ClientSubscription {
+                filter: sub.topic_filter.clone(),
+                qos: sub.qos as u8,
+                no_local: sub.no_local,
+                retain_as_published: sub.retain_as_published,
+                subscription_identifier: sub.subscription_identifier,
+            })
+            .collect();
+        subscriptions.sort_by(|a, b| a.filter.cmp(&b.filter));
+        Ok(ClientDetails {
+            client_id: summary.client_id,
+            username: summary.username,
+            connected: summary.connected,
+            address: summary.address,
+            listener: summary.listener,
+            protocol_version: summary.protocol_version,
+            connected_since: summary.connected_since,
+            disconnected_since: summary.disconnected_since,
+            subscriptions,
+            queued: summary.queued,
+            inflight: summary.inflight,
+            keep_alive: s.keepalive,
+            clean_start: s.clean_start,
+            session_expiry: s.session_expiry.map(|e| e.as_secs()),
+            session_expires_in: s
+                .expires_at
+                .filter(|_| !entry.connected)
+                .map(|at| at.saturating_sub(now) / 1000),
+            will_pending: s.will_pending || entry.restored_will,
+            messages_in: get(&s.counters.messages_in),
+            messages_out: get(&s.counters.messages_out),
+            bytes_in: get(&s.counters.bytes_in),
+            bytes_out: get(&s.counters.bytes_out),
+        })
+    }
+
     /// The listeners, the main one first: `listListeners`.
     pub async fn listeners(&self) -> Vec<ListenerInfo> {
         self.inner
@@ -259,6 +363,22 @@ impl Admin {
                 ..listener.info.clone()
             })
             .collect()
+    }
+}
+
+fn summary(entry: &ClientEntry, s: &SessionSnapshot) -> ClientSummary {
+    ClientSummary {
+        client_id: entry.client_id.clone(),
+        username: s.username.clone(),
+        connected: entry.connected,
+        address: s.peer.map(|peer| peer.to_string()),
+        listener: s.listener.as_deref().map(str::to_string),
+        protocol_version: s.protocol_version.map(|v| v as u8),
+        connected_since: s.connected_at.filter(|_| entry.connected),
+        disconnected_since: s.disconnected_at.filter(|_| !entry.connected),
+        subscriptions: s.subscriptions.len(),
+        queued: s.queued,
+        inflight: s.inflight,
     }
 }
 

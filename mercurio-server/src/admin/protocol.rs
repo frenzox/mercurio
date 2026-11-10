@@ -5,8 +5,11 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{Admin, AdminError, ErrorCode, Page, Paging};
-use crate::plugin::{Access, Chain, ClientInfo, Decision};
+use super::{Admin, AdminError, ClientQuery, ErrorCode, Page, Paging};
+use crate::{
+    plugin::{Access, Chain, ClientInfo, Decision},
+    server::AddressRange,
+};
 
 /// Served by `mercuriod` through its `AdminExtension`.
 const DAEMON_COMMANDS: [&str; 5] = [
@@ -78,6 +81,39 @@ impl PageArgs {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListClientsArgs {
+    connected: Option<bool>,
+    clientid_prefix: Option<String>,
+    username: Option<String>,
+    address: Option<String>,
+    #[serde(flatten)]
+    page: PageArgs,
+}
+
+impl ListClientsArgs {
+    fn query(self) -> Result<ClientQuery, AdminError> {
+        let address = self
+            .address
+            .map(|a| a.parse::<AddressRange>())
+            .transpose()
+            .map_err(AdminError::invalid_argument)?;
+        Ok(ClientQuery {
+            connected: self.connected,
+            client_id_prefix: self.clientid_prefix,
+            username: self.username,
+            address,
+            paging: self.page.paging()?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ClientArgs {
+    clientid: String,
+}
+
 /// Runs the commands `client` sent in `payload`, in order, and returns the
 /// response payload.
 pub(crate) async fn handle(
@@ -141,6 +177,15 @@ async fn run(
             let paging = arguments::<PageArgs>(args)?.paging()?;
             listing("listeners", Page::of(admin.listeners().await, paging))
         }
+        "listClients" => {
+            let query = arguments::<ListClientsArgs>(args)?.query()?;
+            listing("clients", admin.clients(&query).await)
+        }
+        "getClient" => json(
+            admin
+                .client(&arguments::<ClientArgs>(args)?.clientid)
+                .await?,
+        ),
         _ => extension(admin, command, args).await?,
     })
 }

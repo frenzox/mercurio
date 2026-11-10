@@ -82,6 +82,11 @@ impl MessageQueue {
         }
     }
 
+    /// How many messages wait to be sent.
+    pub(crate) fn len(&self) -> usize {
+        self.state.lock().unwrap().messages.len()
+    }
+
     pub(crate) fn push(&self, message: Message) {
         let mut state = self.state.lock().unwrap();
         let limit = if message.qos == QoS::AtMostOnce {

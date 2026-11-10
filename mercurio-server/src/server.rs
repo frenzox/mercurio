@@ -336,7 +336,6 @@ struct Endpoint {
 /// A listener as the admin API reports it, with its open connections.
 pub(crate) struct ListenerState {
     /// How its clients' listener is reported: its address or path
-    #[allow(dead_code)]
     pub name: Arc<str>,
     pub info: ListenerInfo,
     pub connections: AtomicUsize,
@@ -454,6 +453,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// take the time allowed once per step
     connect_deadline: Instant,
     address_slots: Arc<AddressSlots>,
+    /// Reported as the client's listener: its address or path
+    listener: Arc<str>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -629,6 +630,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             cert_identity: self.cert_identity,
             local: self.local,
             connect_deadline: self.connect_deadline,
+            listener: self.listener,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -719,6 +721,8 @@ where
     /// An in-process connection, from the local listener
     local: bool,
     connect_deadline: Instant,
+    /// Reported as the client's listener: its address or path
+    listener: Arc<str>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1079,9 +1083,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
+                listener: Arc::from("local"),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
+                    let parts = HandlerParts {
+                        listener: Arc::clone(&self.endpoints[endpoint].state.name),
+                        ..parts
+                    };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
                     tokio::spawn(
@@ -1090,6 +1099,10 @@ impl<St: MqttStore + 'static> Listener<St> {
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
+                    let parts = HandlerParts {
+                        listener: Arc::clone(&self.endpoints[endpoint].state.name),
+                        ..parts
+                    };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
                     tokio::spawn(
@@ -1411,6 +1424,10 @@ where
 
         session.set_verified_user(verified_user).await;
         session.set_peer(self.peer).await;
+        let counters = session
+            .attach(Arc::clone(&self.listener), keepalive, expiry)
+            .await;
+        self.connection.set_counters(counters);
 
         let mut announced = false;
         let result = async {
@@ -1484,12 +1501,17 @@ where
             }
         }
 
+        session.detach(lease.generation, expiry).await;
+
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
         if let Some(will) = session.take_will().await {
             // Published after the will delay or when the session ends, whichever
             // comes first, unless the client reconnects before then [MQTT-3.1.3-9]
             let delay = expiry.map_or(will.delay, |expiry| expiry.min(will.delay));
+            if !delay.is_zero() {
+                session.set_delayed_will(true).await;
+            }
             let generation = lease.generation;
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
@@ -1505,6 +1527,7 @@ where
                 let client_id = session.get_client_id().await;
                 publish_will(&broker, will, &client_id).await;
                 session_manager.delete_will(&client_id);
+                session.set_delayed_will(false).await;
             };
 
             if delay.is_zero() {

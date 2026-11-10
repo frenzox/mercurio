@@ -74,6 +74,17 @@ struct State {
     restored_wills: HashSet<String>,
 }
 
+impl State {
+    fn entry(&self, client_id: &str, guard: &SessionDropGuard) -> ClientEntry {
+        ClientEntry {
+            client_id: client_id.to_string(),
+            session: guard.session(),
+            connected: self.connections.contains_key(client_id),
+            restored_will: self.restored_wills.contains(client_id),
+        }
+    }
+}
+
 /// Tracks the network connection currently using a client id.
 struct ConnectionSlot {
     /// Held by the active connection until it has fully shut down
@@ -82,6 +93,15 @@ struct ConnectionSlot {
     takeover: watch::Sender<bool>,
     /// Identifies the latest connection to acquire this client id
     generation: u64,
+}
+
+/// A session as the admin API lists it.
+pub(crate) struct ClientEntry {
+    pub client_id: String,
+    pub session: Session,
+    pub connected: bool,
+    /// A will from before a restart waits for its delay
+    pub restored_will: bool,
 }
 
 /// Ownership of a client id for the lifetime of one connection.
@@ -507,6 +527,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         let mut session = SessionDropGuard::new(connect_packet, self.queue_limits).session();
         session.set_owner(state.owner.clone()).await;
+        let expires_at = state.expires_at.or_else(|| {
+            state
+                .expiry_interval
+                .map(|i| unix_millis() + u64::from(i) * 1000)
+        });
+        let expiry = state.expiry_interval.map(|i| Duration::from_secs(i.into()));
+        session.mark_restored(expiry, expires_at).await;
 
         if let Err(e) = session
             .restore_subscriptions(state.subscriptions, broker)
@@ -549,6 +576,22 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
     pub(crate) async fn session_count(&self) -> usize {
         self.shared.state.lock().await.sessions.len()
+    }
+
+    /// Every session, connected or not.
+    pub(crate) async fn entries(&self) -> Vec<ClientEntry> {
+        let manager = self.shared.state.lock().await;
+        manager
+            .sessions
+            .iter()
+            .map(|(client_id, guard)| manager.entry(client_id, guard))
+            .collect()
+    }
+
+    pub(crate) async fn entry(&self, client_id: &str) -> Option<ClientEntry> {
+        let manager = self.shared.state.lock().await;
+        let guard = manager.sessions.get(client_id)?;
+        Some(manager.entry(client_id, guard))
     }
 
     /// Claims a will returned by `restore_from_storage` for publishing.
