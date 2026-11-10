@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
 
+use crate::credentials::unknown_user_hash;
 use crate::reload::Reload;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -715,13 +716,22 @@ impl DynamicSecurity {
                     password: Some(hash),
                     clientid,
                     ..
-                }) => (hash.clone(), clientid.clone()),
-                _ => return false,
+                }) => (Some(hash.clone()), clientid.clone()),
+                _ => (None, None),
             }
         };
-        let valid = PasswordHash::new(&hash)
-            .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok());
-        valid && bound.is_none_or(|bound| bound == client_id)
+        match hash.as_deref().and_then(|hash| PasswordHash::new(hash).ok()) {
+            Some(hash) => {
+                let valid = Argon2::default().verify_password(password, &hash).is_ok();
+                valid && bound.is_none_or(|bound| bound == client_id)
+            }
+            None => {
+                // As slow as a wrong password, so timing doesn't tell which
+                // users exist or can log in
+                let _ = Argon2::default().verify_password(password, &unknown_user_hash());
+                false
+            }
+        }
     }
 }
 
@@ -1231,6 +1241,38 @@ mod tests {
                 security.authenticate(&client, &credentials).await,
                 decision,
                 "{client_id:?}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_users_cost_a_password_check() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-timing-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "off", "password": "pw" },
+                { "command": "disableClient", "username": "off" },
+                { "command": "createClient", "username": "nopassword" },
+            ]),
+        );
+        let time = |username: &str| {
+            let started = std::time::Instant::now();
+            assert!(!security.check_password(username, b"wrong", "c"));
+            started.elapsed()
+        };
+        let wrong = time("admin");
+        for username in ["nobody", "off", "nopassword"] {
+            let elapsed = time(username);
+            assert!(
+                elapsed * 4 > wrong,
+                "{username}: {elapsed:?}, a wrong password {wrong:?}"
             );
         }
         std::fs::remove_file(path).unwrap();

@@ -122,7 +122,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// An argon2 hash of a password no one has, checked for unknown users.
-fn unknown_user_hash() -> PasswordHash<'static> {
+pub(crate) fn unknown_user_hash() -> PasswordHash<'static> {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let hash = HASH.get_or_init(|| {
         use argon2::{password_hash::SaltString, PasswordHasher};
