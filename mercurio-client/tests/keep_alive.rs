@@ -124,6 +124,58 @@ async fn stall(ping_first: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_write_ends_the_connection_and_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        // Stops reading after CONNACK, as a half-open connection would
+        let (mut stuck, _) = listener.accept().await.unwrap();
+        read_packet(&mut stuck).await.unwrap();
+        stuck
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await.unwrap();
+        socket
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        (stuck, socket)
+    });
+
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .keep_alive(1)
+            .reconnect(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    // Far more than the socket buffers take. Encoding it is slow in a
+    // debug build on a busy machine, hence the long timeout.
+    let published = timeout(
+        Duration::from_secs(15),
+        client.publish("t", vec![0u8; 32 << 20], mercurio_client::QoS::AtMostOnce),
+    )
+    .await
+    .expect("the write never gave up");
+    assert!(published.is_err());
+    let event = timeout(Duration::from_secs(5), client.recv()).await.unwrap();
+    assert!(
+        matches!(
+            event,
+            Some(Event::Disconnected {
+                reason: DisconnectReason::ConnectionLost
+            })
+        ),
+        "{event:?}"
+    );
+    let event = timeout(Duration::from_secs(5), client.recv()).await.unwrap();
+    assert!(matches!(event, Some(Event::Reconnected { .. })), "{event:?}");
+    let _sockets = broker.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stall_does_not_fire_missed_pings_in_a_burst() {
     stall(false).await;
 }

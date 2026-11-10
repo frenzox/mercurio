@@ -65,7 +65,8 @@ pub enum ClientError {
     #[error("Packet error: {0}")]
     Packet(#[from] mercurio_core::error::Error),
 
-    /// Connecting took longer than `connect_timeout`.
+    /// Connecting took longer than `connect_timeout`, or writing a packet
+    /// longer than `write_timeout`, which ends the connection.
     #[error("Timeout")]
     Timeout,
 

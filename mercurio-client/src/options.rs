@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::connection::Stream;
 use crate::error::ClientError;
 
+/// How long a write may take without a keep-alive to bound it
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// MQTT strings and binary data have a two-byte length (section 1.5.4).
 pub(crate) fn check_length(
     field: &'static str,
@@ -252,6 +255,7 @@ pub struct ConnectOptions {
     pub(crate) connect_timeout_secs: u64,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
+    pub(crate) write_timeout: Option<Duration>,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
@@ -281,6 +285,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("tls", &self.tls)
             .field("reconnect_delay", &self.reconnect_delay)
+            .field("write_timeout", &self.write_timeout)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
@@ -341,6 +346,7 @@ impl ConnectOptions {
             connect_timeout_secs: 30,
             tls: TlsOptions::default(),
             reconnect_delay: None,
+            write_timeout: None,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
@@ -512,6 +518,23 @@ impl ConnectOptions {
             connect().map(|stream| Box::new(stream) as Box<dyn Stream>)
         })));
         self
+    }
+
+    /// Longest a packet may take to write before the connection counts as
+    /// lost, which with reconnection on starts a reconnect. Defaults to the
+    /// keep-alive interval the broker settled on, or to 30 seconds with a
+    /// keep-alive of 0.
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn write_timeout_for(&self, keep_alive: u16) -> Duration {
+        self.write_timeout.unwrap_or(if keep_alive > 0 {
+            Duration::from_secs(keep_alive.into())
+        } else {
+            DEFAULT_WRITE_TIMEOUT
+        })
     }
 
     /// Set the connection timeout in seconds.

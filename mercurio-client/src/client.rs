@@ -99,11 +99,7 @@ impl MqttClient {
         if let Some(connector) = &options.connector {
             let stream =
                 (connector.0)().map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            );
+            let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
         }
@@ -116,11 +112,7 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            );
+            let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
         }
@@ -140,17 +132,9 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
-            Connection::new(
-                tls_stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            )
+            Connection::new(tls_stream, options)
         } else {
-            Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            )
+            Connection::new(stream, options)
         };
 
         let session = Self::perform_connect(&mut connection, options).await?;
@@ -248,6 +232,7 @@ impl MqttClient {
         );
 
         connection.set_max_packet_size(limits.maximum_packet_size);
+        connection.set_write_timeout(options.write_timeout_for(keep_alive));
         Ok(Session {
             client_id,
             keep_alive,
@@ -730,6 +715,9 @@ impl EventLoop {
         let event_tx = self.event_tx.clone();
 
         loop {
+            if self.connection.is_broken() {
+                return DisconnectReason::ConnectionLost;
+            }
             let reading = self.pending_events.is_empty() || self.waits_for_broker();
             paused_since_ping |= !reading;
             tokio::select! {

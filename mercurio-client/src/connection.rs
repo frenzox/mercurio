@@ -1,11 +1,15 @@
+use std::time::Duration;
+
 use bytes::BytesMut;
 use mercurio_core::codec::MAX_PACKET_SIZE;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_core::reason::ReasonCode;
 use mercurio_packets::ControlPacket;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::error::{ClientError, Result};
+use crate::options::ConnectOptions;
 
 /// A byte stream to the broker: plain TCP or TLS.
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -21,24 +25,38 @@ pub struct Connection {
     max_packet_size: Option<u32>,
     /// The largest packet this client accepts
     max_incoming_size: Option<u32>,
+    /// Longest a packet may take to write before the connection counts
+    /// as lost
+    write_timeout: Duration,
+    /// A write failed or timed out, maybe halfway through a packet, so
+    /// nothing more can go over this connection
+    broken: bool,
 }
 
 impl Connection {
-    pub fn new(
-        stream: impl Stream + 'static,
-        protocol_version: ProtocolVersion,
-        max_incoming_size: Option<u32>,
-    ) -> Self {
+    /// A connection still to be set up, writes bounded by the connect
+    /// timeout until CONNACK settles the keep-alive.
+    pub fn new(stream: impl Stream + 'static, options: &ConnectOptions) -> Self {
         Self {
             stream: Box::new(stream),
             read_buffer: BytesMut::with_capacity(4096),
-            protocol_version,
+            protocol_version: options.protocol_version,
             max_packet_size: None,
-            max_incoming_size,
+            max_incoming_size: options.maximum_packet_size,
+            write_timeout: Duration::from_secs(options.connect_timeout_secs),
+            broken: false,
         }
     }
 
-    /// Write a control packet to the connection.
+    pub fn set_write_timeout(&mut self, write_timeout: Duration) {
+        self.write_timeout = write_timeout;
+    }
+
+    /// Whether a failed write ended the connection.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
     pub fn set_max_packet_size(&mut self, max_packet_size: Option<u32>) {
         self.max_packet_size = max_packet_size;
     }
@@ -54,9 +72,26 @@ impl Connection {
         if buffer.len() > max {
             return Err(ClientError::PacketTooLarge);
         }
-        self.stream.write_all(&buffer).await?;
-        self.stream.flush().await?;
-        Ok(())
+        if self.broken {
+            return Err(ClientError::Disconnected);
+        }
+        let stream = &mut self.stream;
+        let written = timeout(self.write_timeout, async {
+            stream.write_all(&buffer).await?;
+            stream.flush().await
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.broken = true;
+                Err(e.into())
+            }
+            Err(_) => {
+                self.broken = true;
+                Err(ClientError::Timeout)
+            }
+        }
     }
 
     /// Read a control packet from the connection.
