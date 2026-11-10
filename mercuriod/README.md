@@ -56,8 +56,8 @@ full list with the defaults, also available as
 
 ```toml
 # Merge the *.toml files of this directory, in name order: their tables
-# extend this file's, their [[listeners]] and [[bridges]] are added, and
-# their other values replace this file's
+# extend this file's, their [[listeners]], [[bridges]] and [[plugins]] are
+# added, and their other values replace this file's
 # include_dir = "/etc/mercurio/conf.d"
 
 [server]
@@ -308,6 +308,8 @@ group = "mercurio"
 # host = "0.0.0.0"
 # port = 1885
 # mount_point = "tenant1/"
+# Names of the [[plugins]] its clients go through; all of them when unset
+# plugins = ["deny"]
 # [listeners.auth]
 # enabled = true
 # allow_anonymous = false
@@ -342,6 +344,27 @@ group = "mercurio"
 # qos = 1
 # local_prefix = ""
 # remote_prefix = "site1/"
+
+# WebAssembly plugins, run in this order after the built-in authentication
+# and access control. SIGHUP rereads the file at `path`; other changes need
+# a restart
+# [[plugins]]
+# path = "/etc/mercurio/plugins/deny_topic.wasm"
+# Names the plugin in logs, in $CONTROL/<name>/ and in a listener's
+# `plugins`; the file name without .wasm by default
+# name = "deny"
+# Strings passed to the plugin's init
+# config = { prefix = "$internal/" }
+# Hosts it may send HTTP requests to, as "host" (port 443) or "host:port"
+# allow_http = ["audit.internal:80"]
+# Addresses it may open sockets to, as "address:port"
+# allow_sockets = ["10.0.0.5:6379"]
+# Copies that run calls at once; the number of CPUs by default
+# instances = 4
+# Longest one call may run, in milliseconds
+# timeout_ms = 5000
+# Memory each copy may use, in MiB
+# memory_mb = 64
 ```
 
 ### Authentication
@@ -448,11 +471,14 @@ every message is checked. `user_url` replaces `password_file` and
 
 Send `SIGHUP` (`systemctl reload mercuriod`), or run
 `mercurioctl broker reload`, to reread `password_file`,
-`acl_file` and `dynamic_security` without dropping connections. New ACL
-rules apply to every later publish and subscribe, including those of
-connected clients. Password changes apply to later logins. If a file fails
-to load, the broker logs the error and keeps the previous version. Other
-settings still need a restart.
+`acl_file`, `dynamic_security` and the `.wasm` file of each `[[plugins]]`
+entry without dropping connections. New ACL rules apply to every later
+publish and subscribe, including those of connected clients. Password
+changes apply to later logins. A reloaded plugin takes over once its
+`init` has run; calls already running finish on the old code. If a file
+fails to load, the broker logs the error and keeps the previous version.
+Other settings, the other `[[plugins]]` keys among them, still need a
+restart.
 
 ### Administration
 
