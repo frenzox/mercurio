@@ -655,7 +655,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 return None;
             }
             let header = proxy::read_header(&mut socket);
-            match time::timeout_at(self.connect_deadline, header).await {
+            match connect_step(&mut self.shutdown, self.connect_deadline, header).await? {
                 Ok(Ok(source)) => {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
@@ -685,7 +685,8 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let Some(acceptor) = settings.tls_acceptor else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
-        match time::timeout_at(self.connect_deadline, acceptor.accept(socket)).await {
+        let accept = acceptor.accept(socket);
+        match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
                 debug!("TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
@@ -713,7 +714,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
 
     /// Serves one client on `stream`, after the WebSocket handshake if it
     /// came in on the WebSocket listener.
-    async fn serve<S>(self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
+    async fn serve<S>(mut self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -723,7 +724,12 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 let stream = match self.http_dir.clone() {
                     Some(dir) => {
                         let request = Box::pin(http::serve_or_upgrade(stream, &dir));
-                        match time::timeout_at(self.connect_deadline, request).await {
+                        let request =
+                            connect_step(&mut self.shutdown, self.connect_deadline, request);
+                        let Some(request) = request.await else {
+                            return;
+                        };
+                        match request {
                             Ok(Ok(Some(upgrade))) => upgrade,
                             Ok(Ok(None)) => return,
                             Ok(Err(e)) => {
@@ -737,7 +743,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
                 let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
-                match time::timeout_at(self.connect_deadline, handshake).await {
+                let handshake = connect_step(&mut self.shutdown, self.connect_deadline, handshake);
+                let Some(handshake) = handshake.await else {
+                    return;
+                };
+                match handshake {
                     Ok(Ok(websocket)) => {
                         Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
                     }
@@ -898,26 +908,37 @@ fn describe(packet: &ControlPacket) -> String {
 
 /// Checks credentials, at most one login per core at a time, so a flood of
 /// logins queues instead of starving the broker of CPU for password hashes.
-/// None if the wait and the check outlast `deadline`: the client's time to
-/// connect is up, so a queued login gives up its place without a check.
+/// Run as a `connect_step`, so a login still queued when the client's time
+/// to connect is up gives up its place without a check.
 async fn validate_credentials(
     chain: &Chain,
     client: &ClientInfo,
     credentials: &Credentials<'_>,
-    deadline: Instant,
-) -> Option<Decision> {
+) -> Decision {
     static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let checks = CHECKS.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         Arc::new(tokio::sync::Semaphore::new(cores))
     });
-    let check = async {
-        let Ok(_permit) = checks.acquire().await else {
-            return Decision::Deny;
-        };
-        chain.authenticate(client, credentials).await
+    let Ok(_permit) = checks.acquire().await else {
+        return Decision::Deny;
     };
-    time::timeout_at(deadline, check).await.ok()
+    chain.authenticate(client, credentials).await
+}
+
+/// Runs one step of connecting, such as a handshake or reading CONNECT,
+/// within the connect deadline. None if the server starts shutting down
+/// first: a client that isn't connected has nothing to be told, so it is
+/// just closed.
+async fn connect_step<F: Future>(
+    shutdown: &mut Shutdown,
+    deadline: Instant,
+    step: F,
+) -> Option<std::result::Result<F::Output, time::error::Elapsed>> {
+    tokio::select! {
+        result = time::timeout_at(deadline, step) => Some(result),
+        _ = shutdown.recv() => None,
+    }
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -1361,8 +1382,14 @@ impl<St: MqttStore + 'static> Listener<St> {
             .connection
             .set_max_packet_size(limits.max_connect_packet_size.min(limits.max_packet_size));
 
-        let first_packet =
-            time::timeout_at(handler.connect_deadline, handler.connection.read_packet()).await;
+        let first_packet = connect_step(
+            &mut handler.shutdown,
+            handler.connect_deadline,
+            handler.connection.read_packet(),
+        );
+        let Some(first_packet) = first_packet.await else {
+            return debug!("Connection closed for shutdown before CONNECT");
+        };
 
         // Boxed, as it is kept until the connection ends
         let first_packet = Box::new(first_packet);
@@ -1529,13 +1556,10 @@ where
                         peer: self.peer,
                     };
                     let credentials = Credentials::new(username, password);
-                    let checked = validate_credentials(
-                        &self.chain,
-                        &client,
-                        &credentials,
-                        self.connect_deadline,
-                    );
-                    let Some(decision) = checked.await else {
+                    let checked = validate_credentials(&self.chain, &client, &credentials);
+                    let checked = connect_step(&mut self.shutdown, self.connect_deadline, checked);
+                    let decision = checked.await.ok_or(ReasonCode::ServerShuttingDown)?;
+                    let Ok(decision) = decision else {
                         warn!("Login of user `{}` not checked in time, closing", username);
                         return Ok(());
                     };
@@ -1910,9 +1934,14 @@ where
                 .await?;
 
             // The exchange counts towards the time allowed to connect
-            let response = time::timeout_at(self.connect_deadline, self.connection.read_packet())
-                .await
-                .map_err(|_| ReasonCode::MaximumConnectTime)??;
+            let response = connect_step(
+                &mut self.shutdown,
+                self.connect_deadline,
+                self.connection.read_packet(),
+            )
+            .await
+            .ok_or(ReasonCode::ServerShuttingDown)?
+            .map_err(|_| ReasonCode::MaximumConnectTime)??;
 
             // Only AUTH continuing the same method may answer a challenge
             let Some(ControlPacket::Auth(auth)) = response else {
