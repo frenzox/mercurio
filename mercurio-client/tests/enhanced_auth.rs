@@ -16,7 +16,11 @@ use mercurio_server::{
     plugin::{ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Plugin},
     server::ServerConfig,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
 
 /// Asks for "hello", challenges with a nonce, and accepts the nonce signed.
 struct ChallengeMethod;
@@ -177,4 +181,68 @@ async fn client_can_reject_the_broker() {
         MqttClient::connect(options).await,
         Err(ClientError::AuthenticationFailed(_))
     ));
+}
+
+/// Reads one packet whose remaining length fits in a byte.
+async fn read_packet(socket: &mut TcpStream) -> Vec<u8> {
+    let mut header = [0u8; 2];
+    socket.read_exact(&mut header).await.unwrap();
+    let mut body = vec![0u8; header[1] as usize];
+    socket.read_exact(&mut body).await.unwrap();
+    [header.to_vec(), body].concat()
+}
+
+async fn accept(listener: &TcpListener) -> TcpStream {
+    let (mut socket, _) = listener.accept().await.unwrap();
+    assert_eq!(read_packet(&mut socket).await[0], 0x10);
+    socket
+        .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+        .await
+        .unwrap();
+    socket
+}
+
+#[tokio::test]
+async fn reauthentication_cut_short_by_a_reconnect_fails_and_can_be_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        // The connection drops while the re-authentication is under way
+        let mut socket = accept(&listener).await;
+        assert_eq!(read_packet(&mut socket).await[0], 0xf0);
+        drop(socket);
+
+        let mut socket = accept(&listener).await;
+        assert_eq!(read_packet(&mut socket).await[0], 0xf0);
+        socket.write_all(&[0xf0, 0x02, 0x00, 0x00]).await.unwrap();
+        socket
+    });
+
+    let forge = Arc::new(AtomicBool::new(false));
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(50))
+            .authenticator(Signer { forge }),
+    )
+    .await
+    .unwrap();
+
+    let first = timeout(Duration::from_secs(3), client.reauthenticate())
+        .await
+        .expect("the interrupted re-authentication never completed");
+    assert!(matches!(first, Err(ClientError::Disconnected)), "{first:?}");
+    loop {
+        match timeout(Duration::from_secs(3), client.recv()).await {
+            Ok(Some(Event::Reconnected { .. })) => break,
+            Ok(Some(_)) => {}
+            other => panic!("no reconnection: {other:?}"),
+        }
+    }
+    timeout(Duration::from_secs(3), client.reauthenticate())
+        .await
+        .expect("the second re-authentication never completed")
+        .unwrap();
+    let _socket = broker.await.unwrap();
 }

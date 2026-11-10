@@ -352,6 +352,9 @@ impl MqttClient {
             // Requests the broker never answered can't be answered now
             state.subscribes.clear();
             state.unsubscribes.clear();
+            if let Some(response) = state.reauthentication.take() {
+                let _ = response.send(Err(ClientError::Disconnected));
+            }
             let Some((connection, session)) =
                 state.reconnect(&mut command_rx, &options, delay).await
             else {
