@@ -11,7 +11,9 @@ use tokio::{
 use tracing::info;
 use uuid::Uuid;
 
-use mercurio_core::{message::unix_millis, protocol::ProtocolVersion, reason::ReasonCode, Result};
+use mercurio_core::{
+    error::Error, message::unix_millis, protocol::ProtocolVersion, reason::ReasonCode,
+};
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
@@ -129,6 +131,49 @@ struct ConnectionSlot {
     close: watch::Sender<Option<Close>>,
     /// Identifies the latest connection to acquire this client id
     generation: u64,
+    /// Whom the latest connection to acquire this client id starts its
+    /// session for; None while the admin API holds the id
+    owner: Option<SessionOwner>,
+}
+
+/// A claim on a client id, whose lease is free once the connection that
+/// held the id before has finished.
+struct PendingLease {
+    lease: Arc<Mutex<()>>,
+    client_id: String,
+    generation: u64,
+    close: watch::Receiver<Option<Close>>,
+}
+
+impl PendingLease {
+    async fn acquire(self) -> ConnectionLease {
+        ConnectionLease {
+            guard: self.lease.lock_owned().await,
+            client_id: self.client_id,
+            generation: self.generation,
+            close: self.close,
+        }
+    }
+}
+
+/// Why `start_session` started no session.
+#[derive(Debug)]
+pub(crate) enum StartError {
+    /// The client id belongs to the session of another owner, which is left
+    /// as it was. Hands the CONNECT back to refuse it.
+    OwnedByAnother(Box<ConnectPacket>),
+    Storage(Error),
+}
+
+fn describe(owner: &SessionOwner) -> String {
+    let user = match &owner.username {
+        Some(username) => format!("user `{username}`"),
+        None => "an anonymous client".to_string(),
+    };
+    match &owner.mount_point {
+        Some(mount_point) => format!("{user} on mount point `{mount_point}`"),
+        None => user,
+    }
 }
 
 /// A session as the admin API lists it.
@@ -212,13 +257,15 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     }
 
     /// Starts or resumes the session of the client in `connect_packet`,
-    /// authenticated as `owner`. A session another owner left is never
-    /// resumed: it is discarded as if the client asked for a clean start.
+    /// authenticated as `owner`. A client id belongs to the owner of its
+    /// session for as long as that session exists: a client of another owner
+    /// is refused, Clean Start or not, and the session and any connection
+    /// using it are left alone.
     pub(crate) async fn start_session(
         &mut self,
         mut connect_packet: ConnectPacket,
         owner: SessionOwner,
-    ) -> Result<SessionStartResult> {
+    ) -> std::result::Result<SessionStartResult, StartError> {
         // Clients without an identifier each get a unique one, so they never
         // share a session entry
         let assigned_client_id = connect_packet.payload.client_id.is_empty();
@@ -229,9 +276,24 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let expiry_interval = session_expiry(&connect_packet).map(|e| e.as_secs() as u32);
         let persistent = expiry_interval != Some(0);
 
-        let lease = self
-            .acquire_client_id(&connect_packet.payload.client_id, Close::TakenOver)
-            .await;
+        let storage_error =
+            |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e.to_string()));
+        let lease = match self
+            .acquire_client_id(&connect_packet.payload.client_id, &owner)
+            .await
+            .map_err(storage_error)?
+        {
+            Ok(lease) => lease,
+            Err(holder) => {
+                warn!(
+                    "Client `{}` belongs to {}, refusing a connection from {}",
+                    connect_packet.payload.client_id,
+                    describe(&holder),
+                    describe(&owner)
+                );
+                return Err(StartError::OwnedByAnother(Box::new(connect_packet)));
+            }
+        };
 
         let client_id = &connect_packet.payload.client_id;
         let mut manager = self.shared.state.lock().await;
@@ -249,18 +311,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let mut inflight_to_retry = Vec::new();
         let mut queue_to_restore = Vec::new();
 
-        let foreign = match manager.sessions.get(client_id) {
-            Some(existing) => existing.session().owner().await != owner,
-            None => false,
-        };
-        if foreign && !connect_packet.flags.clean_start {
-            warn!(
-                "Client `{}` connected as another user or on another mount point than its session's; starting a new session",
-                client_id
-            );
-        }
-
-        if connect_packet.flags.clean_start || foreign {
+        if connect_packet.flags.clean_start {
             if let Some(discarded) = manager.sessions.remove(client_id) {
                 discarded.session().stop_queue_journal();
                 discarded.session().unsubscribe_all().await;
@@ -276,21 +327,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 // wrote there is in place. Failing to read it fails the
                 // connection: resuming without it would lose messages.
                 self.writers.settle(client_id).await;
-                let storage_error = |e: mercurio_storage::StorageError| {
-                    mercurio_core::error::Error::Storage(e.to_string())
-                };
                 let stored = self
                     .storage
                     .load_session(client_id)
                     .await
                     .map_err(storage_error)?;
-                if stored.as_ref().is_some_and(|stored| stored.owner != owner) {
-                    warn!(
-                        "Client `{}` connected as another user or on another mount point than its stored session's; starting a new session",
-                        client_id
-                    );
-                    self.writers.write(client_id, Write::DeleteSession);
-                } else if let Some(stored_session) = stored {
+                if let Some(stored_session) = stored {
                     info!(
                         "Restoring session for client `{}` with {} subscriptions",
                         client_id,
@@ -388,17 +430,67 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         })
     }
 
-    /// Asks any connection already using `client_id` to close for `reason`
-    /// [MQTT-3.1.4-3] and waits until it has, so the two never share
-    /// session state.
-    async fn acquire_client_id(&self, client_id: &str, reason: Close) -> ConnectionLease {
-        self.claim_client_id(client_id, reason, false)
-            .await
-            .expect("a claim without conditions succeeds")
+    /// Takes over `client_id` for a connection of `owner`: asks any
+    /// connection already using it to close [MQTT-3.1.4-3] and waits until
+    /// it has, so the two never share session state. Gives up with the
+    /// owner the id belongs to, touching nothing, when that is another one.
+    ///
+    /// The owner is checked and the id claimed under one lock, and the owner
+    /// of a pending claim counts before the session it is about to take.
+    /// Of two clients of different owners connecting at once, the second
+    /// is then refused even when the first has yet to start its session.
+    async fn acquire_client_id(
+        &self,
+        client_id: &str,
+        owner: &SessionOwner,
+    ) -> mercurio_storage::Result<std::result::Result<ConnectionLease, SessionOwner>> {
+        let pending = {
+            let mut manager = self.shared.state.lock().await;
+            if let Some(holder) = self.holder(&manager, client_id).await? {
+                if holder != *owner {
+                    return Ok(Err(holder));
+                }
+            }
+            Self::claim(
+                &mut manager,
+                client_id,
+                Close::TakenOver,
+                Some(owner.clone()),
+            )
             .0
+        };
+        Ok(Ok(pending.acquire().await))
     }
 
-    /// Like `acquire_client_id`, but with `only_if_free` gives up, touching
+    /// Whom `client_id` belongs to: the owner of the latest connection to
+    /// claim it, else of its session, in memory or in storage.
+    async fn holder(
+        &self,
+        state: &State,
+        client_id: &str,
+    ) -> mercurio_storage::Result<Option<SessionOwner>> {
+        if let Some(owner) = state
+            .connections
+            .get(client_id)
+            .and_then(|slot| slot.owner.clone())
+        {
+            return Ok(Some(owner));
+        }
+        if let Some(existing) = state.sessions.get(client_id) {
+            return Ok(Some(existing.session().owner().await));
+        }
+        // What an earlier session wrote, its removal included, is in place
+        // before the stored one is read
+        self.writers.settle(client_id).await;
+        Ok(self
+            .storage
+            .load_session(client_id)
+            .await?
+            .map(|stored| stored.owner))
+    }
+
+    /// Like `acquire_client_id` for the admin API, closing a connection for
+    /// `reason` whoever it belongs to. With `only_if_free` gives up, touching
     /// nothing, when a connection holds the client id. The check and the
     /// claim happen under one lock, so no connection is closed by a claim it
     /// wasn't meant to close. Also tells whether a connection held the id.
@@ -408,38 +500,50 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         reason: Close,
         only_if_free: bool,
     ) -> Option<(ConnectionLease, bool)> {
-        let (close_tx, close) = watch::channel(None);
-
-        let (lease, generation, held) = {
+        let (pending, held) = {
             let mut manager = self.shared.state.lock().await;
-            let held = manager.connections.contains_key(client_id);
-            if only_if_free && held {
+            if only_if_free && manager.connections.contains_key(client_id) {
                 return None;
             }
-            manager.next_generation += 1;
-            let generation = manager.next_generation;
-            let slot = manager
-                .connections
-                .entry(client_id.to_string())
-                .or_insert_with(|| ConnectionSlot {
-                    lease: Arc::new(Mutex::new(())),
-                    close: watch::channel(None).0,
-                    generation,
-                });
-            slot.close
-                .send_modify(|pending| merge_close(pending, reason));
-            slot.close = close_tx;
-            slot.generation = generation;
-            (Arc::clone(&slot.lease), generation, held)
+            Self::claim(&mut manager, client_id, reason, None)
         };
+        Some((pending.acquire().await, held))
+    }
 
-        let lease = ConnectionLease {
-            guard: lease.lock_owned().await,
+    /// Makes a new connection of `owner` the one holding `client_id` and
+    /// asks the one holding it until now to close for `reason`. Also tells
+    /// whether a connection held the id.
+    fn claim(
+        state: &mut State,
+        client_id: &str,
+        reason: Close,
+        owner: Option<SessionOwner>,
+    ) -> (PendingLease, bool) {
+        let (close_tx, close) = watch::channel(None);
+        let held = state.connections.contains_key(client_id);
+        state.next_generation += 1;
+        let generation = state.next_generation;
+        let slot = state
+            .connections
+            .entry(client_id.to_string())
+            .or_insert_with(|| ConnectionSlot {
+                lease: Arc::new(Mutex::new(())),
+                close: watch::channel(None).0,
+                generation,
+                owner: None,
+            });
+        slot.close
+            .send_modify(|pending| merge_close(pending, reason));
+        slot.close = close_tx;
+        slot.generation = generation;
+        slot.owner = owner;
+        let pending = PendingLease {
+            lease: Arc::clone(&slot.lease),
             client_id: client_id.to_string(),
             generation,
             close,
         };
-        Some((lease, held))
+        (pending, held)
     }
 
     /// Releases the client id once its connection has finished and ends the
@@ -1529,8 +1633,18 @@ mod tests {
         connect
     }
 
+    fn assert_refused(result: std::result::Result<SessionStartResult, StartError>) {
+        assert!(matches!(result, Err(StartError::OwnedByAnother(_))));
+    }
+
+    fn clean(client_id: &str) -> ConnectPacket {
+        let mut connect = connect_packet(client_id);
+        connect.flags.clean_start = true;
+        connect
+    }
+
     #[tokio::test]
-    async fn test_another_owner_never_resumes_a_session() {
+    async fn test_another_owner_is_refused_a_session() {
         let storage = durable_storage();
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         let started = manager
@@ -1546,34 +1660,29 @@ mod tests {
             .await;
         manager.end_connection(started.lease, None).await;
 
-        // The same client id, authenticated as someone else
-        let taken = manager
-            .start_session(resuming("gw-01"), owned_by("mallory"))
-            .await
-            .unwrap();
-        assert!(!taken.resume);
-        assert!(taken.session.get_subscriptions().await.is_empty());
-        manager.end_connection(taken.lease, None).await;
-
-        // And on a mounted listener, by the same user
+        // The same client id, authenticated as someone else, as an anonymous
+        // client, or by the same user on a mounted listener
         let mounted = SessionOwner {
             mount_point: Some("tenant/".into()),
-            ..owned_by("mallory")
+            ..owned_by("alice")
         };
-        let taken = manager
-            .start_session(resuming("gw-01"), mounted)
-            .await
-            .unwrap();
-        assert!(!taken.resume);
-        manager.end_connection(taken.lease, None).await;
+        for owner in [owned_by("mallory"), SessionOwner::default(), mounted] {
+            assert_refused(
+                manager
+                    .start_session(resuming("gw-01"), owner.clone())
+                    .await,
+            );
+            assert_refused(manager.start_session(clean("gw-01"), owner).await);
+        }
+        // A refusal leaves no claim on the client id behind, and the
+        // session as it was
+        assert!(!manager.entry("gw-01").await.unwrap().connected);
+        manager.flush().await;
+        let stored = storage.load_session("gw-01").await.unwrap().unwrap();
+        assert_eq!(stored.owner, owned_by("alice"));
+        assert_eq!(stored.subscriptions.len(), 1);
 
-        let mut alice_again = manager
-            .start_session(resuming("gw-01"), owned_by("alice"))
-            .await
-            .unwrap();
-        assert!(!alice_again.resume, "the session was replaced");
-        manager.end_connection(alice_again.lease, None).await;
-        alice_again = manager
+        let alice_again = manager
             .start_session(resuming("gw-01"), owned_by("alice"))
             .await
             .unwrap();
@@ -1581,7 +1690,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_another_owner_never_resumes_a_stored_session() {
+    async fn test_another_owner_cannot_close_a_connection() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(connect_packet("c"), owned_by("alice"))
+            .await
+            .unwrap();
+        assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
+        assert_eq!(*started.lease.close.borrow(), None);
+        assert_eq!(
+            manager.entry("c").await.unwrap().generation,
+            Some(started.lease.generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_pending_claim_holds_the_client_id_for_its_owner() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let first = manager
+            .start_session(connect_packet("c"), owned_by("alice"))
+            .await
+            .unwrap();
+        // Alice's second connection waits for the first to finish
+        let mut taking_over = manager.clone();
+        let second = tokio::spawn(async move {
+            taking_over
+                .start_session(connect_packet("c"), owned_by("alice"))
+                .await
+                .map(|started| started.lease.generation)
+        });
+        let mut close = first.lease.close.clone();
+        close.changed().await.unwrap();
+        assert_eq!(*close.borrow(), Some(Close::TakenOver));
+
+        assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
+        manager.end_connection(first.lease, None).await;
+        assert!(second.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_another_owner_is_refused_a_stored_session() {
         let storage = durable_storage();
         storage
             .save_session(
@@ -1599,16 +1747,27 @@ mod tests {
 
         // As after a restart, before restore_from_storage loads it
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
-        let taken = manager
-            .start_session(resuming("gw-01"), owned_by("mallory"))
-            .await
-            .unwrap();
-        assert!(!taken.resume);
-        assert!(taken.subscriptions_to_restore.is_empty());
+        assert_refused(
+            manager
+                .start_session(resuming("gw-01"), owned_by("mallory"))
+                .await,
+        );
+        assert_refused(
+            manager
+                .start_session(clean("gw-01"), owned_by("mallory"))
+                .await,
+        );
         manager.flush().await;
         let stored = storage.load_session("gw-01").await.unwrap().unwrap();
-        assert_eq!(stored.owner, owned_by("mallory"));
-        assert!(stored.subscriptions.is_empty());
+        assert_eq!(stored.owner, owned_by("alice"));
+        assert_eq!(stored.subscriptions.len(), 1);
+
+        let alice = manager
+            .start_session(resuming("gw-01"), owned_by("alice"))
+            .await
+            .unwrap();
+        assert!(alice.resume);
+        assert_eq!(alice.subscriptions_to_restore.len(), 1);
     }
 
     #[tokio::test]

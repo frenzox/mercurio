@@ -64,7 +64,7 @@ use crate::{
     proxy,
     session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
     session_manager::{
-        session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard,
+        session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
@@ -1564,7 +1564,15 @@ where
             mount_point: self.connection.mount_point().map(str::to_string),
         };
         let mut start_result =
-            Box::pin(self.session_manager.start_session(*connect_packet, owner)).await?;
+            match Box::pin(self.session_manager.start_session(*connect_packet, owner)).await {
+                Ok(start_result) => start_result,
+                Err(StartError::OwnedByAnother(connect_packet)) => {
+                    return self
+                        .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                        .await;
+                }
+                Err(StartError::Storage(e)) => return Err(e),
+            };
         start_result.assigned_client_id |= assigned_client_id;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
