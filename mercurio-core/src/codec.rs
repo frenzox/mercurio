@@ -77,6 +77,11 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
         value |= ((encoded_byte & 0b0111_1111) as u32) << shift;
 
         if (encoded_byte & 0b1000_0000) == 0 {
+            // A last byte of zero after the first adds nothing: the value
+            // fits in fewer bytes [MQTT-1.5.5-1]
+            if shift > 0 && encoded_byte == 0 {
+                return Err(ReasonCode::MalformedPacket.into());
+            }
             return Ok(VariableByteInteger(value));
         }
     }
@@ -93,7 +98,8 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 ///
 /// Decoding fails with [`Error::PacketIncomplete`] when the buffer ends
 /// before the last byte, and with [`ReasonCode::MalformedPacket`] when a
-/// fourth byte still has its continuation bit set [MQTT-1.5.5-1].
+/// fourth byte still has its continuation bit set or the value uses more
+/// bytes than it needs [MQTT-1.5.5-1].
 /// Values above 268,435,455 encode to five bytes, which no peer accepts;
 /// packets that large are longer than [`MAX_PACKET_SIZE`].
 ///
@@ -355,6 +361,24 @@ mod tests {
             Err(Error::MQTTReasonCode(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
             _ => unreachable!(),
         };
+    }
+
+    #[test]
+    fn test_decoder_refuses_non_minimal_integers() {
+        for bytes in [&[0x80, 0x00][..], &[0xff, 0x00], &[0x80, 0x80, 0x80, 0x00]] {
+            assert!(
+                matches!(
+                    VariableByteInteger::decode(&mut Bytes::copy_from_slice(bytes)),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{bytes:02x?}"
+            );
+        }
+
+        let mut minimal = Bytes::from_static(&[0x80, 0x01]);
+        assert_eq!(VariableByteInteger::decode(&mut minimal).unwrap().0, 128);
+        let mut zero = Bytes::from_static(&[0x00]);
+        assert_eq!(VariableByteInteger::decode(&mut zero).unwrap().0, 0);
     }
 
     #[test]
