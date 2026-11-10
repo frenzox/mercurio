@@ -1,4 +1,6 @@
 target
+# What the fuzzer generates; the seeds it starts from live in seeds/,
+# which is tracked: cargo fuzz run <target> corpus/<target> seeds/<target>
 corpus
 artifacts
 coverage
