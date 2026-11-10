@@ -140,6 +140,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
 
+    // Before any wait, as SIGHUP's default action ends the process. Signals
+    // that come before the broker serves wait here and cause one reload
+    // once it does.
+    #[cfg(unix)]
+    let hangup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
+
     // Load configuration
     let config = if cli.config.exists() {
         Config::from_file(&cli.config)?
@@ -335,7 +341,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     server_config.sys_interval =
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     #[cfg(unix)]
-    tokio::spawn(reload_on_sighup(reloadable));
+    tokio::spawn(reload_on_sighup(hangup, reloadable));
 
     let result = match config.storage {
         StorageConfig::Memory {} => {
@@ -612,9 +618,7 @@ async fn load_plugins(
 /// plugin changes apply to every later check or call; password changes
 /// apply to later connections.
 #[cfg(unix)]
-async fn reload_on_sighup(files: Arc<[Arc<dyn Reload>]>) {
-    let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
-        .expect("failed to listen for SIGHUP");
+async fn reload_on_sighup(mut hangup: signal::unix::Signal, files: Arc<[Arc<dyn Reload>]>) {
     while hangup.recv().await.is_some() {
         info!("Received SIGHUP, reloading");
         reload::reload_all(&files);
