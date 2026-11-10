@@ -143,6 +143,7 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
 <tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with; implies <code>--tls</code></td><td>system roots</td></tr>
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
+<tr><td><code>--cert PATH</code>, <code>--key PATH</code></td><td>Client certificate and its private key, both PEM, for brokers that authenticate clients by certificate; each needs the other, and they imply <code>--tls</code></td><td></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
 </table>
 <pre><span class="comment"># Over TLS, as alice; asks for the password</span>

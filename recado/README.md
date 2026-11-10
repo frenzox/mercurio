@@ -73,6 +73,7 @@ Connection options, for both commands:
 | `-u, --username`, `-P, --password` | Credentials; the password also comes from `RECADO_PASSWORD`, and `-u` alone asks for it on a terminal | |
 | `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
+| `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a
 message, 2 when it couldn't be reached, refused the login or closed the

@@ -54,6 +54,8 @@ pub fn command() -> clap::Command {
         ("tls", "MERCURIOCTL_TLS"),
         ("cafile", "MERCURIOCTL_CAFILE"),
         ("insecure", "MERCURIOCTL_INSECURE"),
+        ("cert", "MERCURIOCTL_CERT"),
+        ("key", "MERCURIOCTL_KEY"),
         ("timeout", "MERCURIOCTL_TIMEOUT"),
         #[cfg(unix)]
         ("unix", "MERCURIOCTL_UNIX"),
@@ -299,6 +301,8 @@ mod tests {
             "MERCURIOCTL_TLS",
             "MERCURIOCTL_CAFILE",
             "MERCURIOCTL_INSECURE",
+            "MERCURIOCTL_CERT",
+            "MERCURIOCTL_KEY",
             "MERCURIOCTL_TIMEOUT",
         ] {
             assert!(help.contains(variable), "{variable} missing from:\n{help}");

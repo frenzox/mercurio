@@ -26,7 +26,7 @@ pub struct ConnectArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure"]
+        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure", "cert", "key"]
     )]
     pub unix: Option<PathBuf>,
 
@@ -56,6 +56,15 @@ pub struct ConnectArgs {
     /// implies --tls
     #[arg(long)]
     pub insecure: bool,
+
+    /// Client certificate (PEM) to log in with; needs --key and implies
+    /// --tls
+    #[arg(long, value_name = "PATH", requires = "key")]
+    pub cert: Option<String>,
+
+    /// Private key (PEM) of the --cert certificate
+    #[arg(long, value_name = "PATH", requires = "cert")]
+    pub key: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectArgs {
@@ -71,6 +80,8 @@ impl std::fmt::Debug for ConnectArgs {
             .field("tls", &self.tls)
             .field("cafile", &self.cafile)
             .field("insecure", &self.insecure)
+            .field("cert", &self.cert)
+            .field("key", &self.key)
             .finish()
     }
 }
@@ -121,6 +132,9 @@ impl ConnectArgs {
         }
         if self.insecure {
             options = options.danger_skip_tls_verify(true);
+        }
+        if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
+            options = options.client_cert(cert, key);
         }
         options
     }
@@ -221,6 +235,18 @@ mod tests {
     }
 
     #[test]
+    fn a_client_certificate_needs_its_key_and_turns_tls_on() {
+        let options = parse(&["--cert", "client.pem", "--key", "client.key"])
+            .unwrap()
+            .to_connect_options();
+        assert!(options.tls.enabled);
+        assert_eq!(options.tls.cert_path.as_deref(), Some("client.pem"));
+        assert_eq!(options.tls.key_path.as_deref(), Some("client.key"));
+        assert!(parse(&["--cert", "client.pem"]).is_err());
+        assert!(parse(&["--key", "client.key"]).is_err());
+    }
+
+    #[test]
     fn credentials_and_client_id_are_passed_on() {
         let options = parse(&["-i", "me", "-u", "alice", "-P", "secret", "--insecure"])
             .unwrap()
@@ -247,6 +273,7 @@ mod tests {
             &["--tls"],
             &["--cafile", "ca.pem"],
             &["--insecure"],
+            &["--cert", "c.pem", "--key", "c.key"],
         ] {
             let args: Vec<&str> = ["--unix", "/x.sock"]
                 .into_iter()
