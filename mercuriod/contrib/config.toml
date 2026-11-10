@@ -160,6 +160,8 @@ level = "info"
 backend = "memory"
 # path = "/var/lib/mercurio/mercurio.db"
 # url = "postgres://mercurio:password@localhost/mercurio?sslmode=require"
+# Connections to another host, or with ca_path, are encrypted unless the URL
+# sets sslmode=prefer or disable; the certificate and host name are verified
 # CA that signed the PostgreSQL server's certificate; Mozilla's roots otherwise
 # ca_path = "/etc/mercurio/postgres-ca.pem"
 # One broker serves from a PostgreSQL database at a time. When another is,

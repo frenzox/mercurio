@@ -5,6 +5,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -24,8 +25,14 @@ use rustls::{
     ClientConfig, RootCertStore,
 };
 use tokio::{sync::watch, task::JoinHandle};
-use tokio_postgres::{error::SqlState, types::ToSql, Row};
+use tokio_postgres::{
+    config::{Host, SslMode},
+    error::SqlState,
+    types::ToSql,
+    Row,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
+use tracing::{info, warn};
 
 use crate::{
     encoding::{
@@ -366,18 +373,22 @@ impl PostgresStore {
     /// `postgres://user:password@localhost/mercurio`, and create or update
     /// the tables.
     ///
-    /// The connection is encrypted when the server supports it, or always
-    /// with `?sslmode=require` in the URL, and never with `sslmode=disable`.
-    /// The server's certificate is verified against `options.ca_path`, a
-    /// PEM file, or else the Mozilla root certificates.
+    /// The connection is encrypted, with the server's certificate and host
+    /// name verified against `options.ca_path`, a PEM file, or else the
+    /// Mozilla root certificates. Without `sslmode` in the URL, a server on
+    /// this host, over loopback or a Unix socket, may decline encryption
+    /// unless `ca_path` is given. `sslmode=require`, `verify-ca` and
+    /// `verify-full` all verify the certificate and host name;
+    /// `sslmode=prefer` and `disable` allow plaintext.
     ///
     /// Nothing stops another broker from using the database meanwhile; a
     /// broker serving clients should use [`Self::connect_exclusive`].
     pub async fn connect(url: &str, options: &ConnectOptions) -> Result<Self> {
-        let config = base_config(url)?;
+        let config = base_config(url, options.ca_path.is_some())?;
         let tls = tls(options.ca_path.as_deref())?;
         let store = Self::with_pool(config, tls, options, None, None)?;
         let client = store.client().await?;
+        log_encryption(&client).await?;
         migrate(&client).await?;
         Ok(store)
     }
@@ -394,7 +405,7 @@ impl PostgresStore {
         options: &ConnectOptions,
         wait: bool,
     ) -> Result<Option<(Self, DatabaseLock)>> {
-        let config = base_config(url)?;
+        let config = base_config(url, options.ca_path.is_some())?;
         let tls = tls(options.ca_path.as_deref())?;
 
         // The lock belongs to a connection of its own, outside the pool, so
@@ -406,6 +417,7 @@ impl PostgresStore {
             let _ = connection.await;
             let _ = closed.send(true);
         });
+        log_encryption(&client).await?;
         // The database releases the lock within seconds of this host
         // vanishing, so a standby can take over
         client
@@ -516,8 +528,35 @@ impl PostgresStore {
 
 /// The connection settings in `url`, with the timeouts and keepalives the
 /// broker needs where the URL sets none.
-fn base_config(url: &str) -> Result<tokio_postgres::Config> {
+///
+/// TLS is required where the URL sets no `sslmode` and the connection
+/// leaves the host or `ca` is given, as tokio-postgres would otherwise fall
+/// back to plaintext when the server has TLS off. libpq's `verify-ca` and
+/// `verify-full` become `require`, which verifies the certificate chain
+/// and host name with rustls.
+fn base_config(url: &str, ca: bool) -> Result<tokio_postgres::Config> {
+    let url = url
+        .replace("sslmode=verify-full", "sslmode=require")
+        .replace("sslmode=verify-ca", "sslmode=require");
     let mut config: tokio_postgres::Config = url.parse().db()?;
+    let local = config.get_hosts().iter().all(|host| match host {
+        Host::Tcp(name) => {
+            name == "localhost"
+                || name
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        #[cfg(unix)]
+        Host::Unix(_) => true,
+    });
+    if !url.contains("sslmode=") {
+        if ca || !local {
+            config.ssl_mode(SslMode::Require);
+        }
+    } else if config.get_ssl_mode() != SslMode::Require && !local {
+        warn!("The PostgreSQL URL allows an unencrypted connection to a remote host");
+    }
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(TIMEOUT);
     }
@@ -527,6 +566,25 @@ fn base_config(url: &str) -> Result<tokio_postgres::Config> {
         .keepalives_interval(Duration::from_secs(2))
         .keepalives_retries(3);
     Ok(config)
+}
+
+/// Logs whether the session is encrypted, which a URL allowing plaintext
+/// leaves to the server.
+async fn log_encryption(client: &tokio_postgres::Client) -> Result<()> {
+    let row = client
+        .query_one(
+            "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+        .db()?;
+    match row.try_get::<_, Option<String>>(1).db()? {
+        Some(version) if row.try_get(0).db()? => {
+            info!("Connected to PostgreSQL over {version}")
+        }
+        _ => info!("Connected to PostgreSQL without encryption"),
+    }
+    Ok(())
 }
 
 fn tls(ca_path: Option<&Path>) -> Result<MakeRustlsConnect> {
@@ -1817,6 +1875,84 @@ mod tests {
         let _held = store.client().await.unwrap();
         let error = store.client().await.err().unwrap();
         assert!(matches!(error, StorageError::Transient(_)), "{error}");
+    }
+
+    #[test]
+    fn test_remote_or_verified_connections_require_tls() {
+        use tokio_postgres::config::SslMode;
+        let mode = |url: &str, ca: bool| base_config(url, ca).unwrap().get_ssl_mode();
+        for local in [
+            "postgres://u@localhost/m",
+            "postgres://u@127.0.0.1/m",
+            "postgres://u@[::1]/m",
+            "host=/var/run/postgresql user=u",
+            "postgres://u@%2Fvar%2Frun%2Fpostgresql/m",
+        ] {
+            assert_eq!(mode(local, false), SslMode::Prefer, "{local}");
+            assert_eq!(mode(local, true), SslMode::Require, "{local}");
+        }
+        assert_eq!(
+            mode("postgres://u@db.example.com/m", false),
+            SslMode::Require
+        );
+        assert_eq!(
+            mode("host=localhost,db.example.com user=u", false),
+            SslMode::Require
+        );
+
+        // libpq's verifying modes, which rustls's require already does
+        for url in [
+            "postgres://u@db.example.com/m?sslmode=verify-full",
+            "postgres://u@localhost/m?connect_timeout=3&sslmode=verify-ca",
+            "host=db.example.com sslmode=verify-full user=u",
+        ] {
+            assert_eq!(mode(url, false), SslMode::Require, "{url}");
+        }
+
+        // The operator's explicit choice stands
+        assert_eq!(
+            mode("postgres://u@db.example.com/m?sslmode=disable", true),
+            SslMode::Disable
+        );
+        assert_eq!(
+            mode("postgres://u@db.example.com/m?sslmode=prefer", false),
+            SslMode::Prefer
+        );
+    }
+
+    /// The server in the tests has TLS off, as PostgreSQL's images do.
+    #[tokio::test]
+    async fn test_a_ca_path_refuses_plaintext() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        if url.contains("sslmode=") {
+            return;
+        }
+        let options = ConnectOptions {
+            ca_path: Some(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../mercurio-server/tests/fixtures/cert.pem"
+                )
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let ssl: bool = store
+            .client()
+            .await
+            .unwrap()
+            .query_one("SELECT current_setting('ssl')::bool", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if ssl {
+            return;
+        }
+        assert!(PostgresStore::connect(&url, &options).await.is_err());
     }
 
     #[test]

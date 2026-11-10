@@ -9,9 +9,10 @@ implementations:
 - `memory::MemoryStore`: everything in memory, lost on restart.
 - `sqlite::SqliteStore`: a SQLite database, behind the `sqlite` feature.
 - `postgres::PostgresStore`: a PostgreSQL database, behind the `postgres`
-  feature, over TLS when the server supports it. A broker serving from it
-  opens it with `PostgresStore::connect_exclusive(url, &options, wait)`,
-  which keeps any other broker from writing to the database meanwhile.
+  feature, over TLS, required unless the server is on the same host. A
+  broker serving from it opens it with
+  `PostgresStore::connect_exclusive(url, &options, wait)`, which keeps any
+  other broker from writing to the database meanwhile.
 
 ```rust,ignore
 use std::sync::Arc;
