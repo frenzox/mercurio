@@ -61,8 +61,10 @@ async fn new_connection_takes_over_client_id() {
         .unwrap();
     read(&mut old, 6).await;
 
+    // The old session had no expiry, so it ended with the connection taken
+    // over, and the new one starts afresh [MQTT-3.1.2-6]
     let (mut new, session_present) = connect(addr, false).await;
-    assert_eq!(session_present, 0x01);
+    assert_eq!(session_present, 0x00);
 
     // The old connection is told why, then closed
     assert_eq!(
@@ -71,7 +73,6 @@ async fn new_connection_takes_over_client_id() {
     );
     assert_eq!(old.read(&mut [0u8; 1]).await.unwrap(), 0);
 
-    // The resumed subscription now delivers to the new connection
     let mut publisher = TcpStream::connect(addr).await.unwrap();
     publisher
         .write_all(&[
@@ -85,10 +86,71 @@ async fn new_connection_takes_over_client_id() {
         .write_all(&[0x30, 0x06, 0x00, 0x01, b't', 0x00, b'h', b'i'])
         .await
         .unwrap();
+    assert_nothing_arrives(&mut new).await;
+}
+
+async fn assert_nothing_arrives(stream: &mut TcpStream) {
+    let mut buf = [0u8; 1];
+    let read = timeout(Duration::from_millis(300), stream.read(&mut buf)).await;
+    assert!(read.is_err(), "received {read:?}: {buf:02x?}");
+}
+
+/// MQTT 3.1.1 CONNECT with client id "dup"; returns the CONNACK.
+async fn connect_311(addr: SocketAddr, clean_session: bool) -> (TcpStream, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let flags = if clean_session { 0x02 } else { 0x00 };
+    let connect = [
+        0x10, 0x0f, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, flags, 0x00, 0x3c, 0x00, 0x03, b'd',
+        b'u', b'p',
+    ];
+    stream.write_all(&connect).await.unwrap();
+    let connack = common::read_connack(&mut stream).await;
+    (stream, connack)
+}
+
+#[tokio::test]
+async fn mqtt311_takeover_of_a_clean_session_starts_a_new_one() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(mercurio_server::server::run(
+        listener,
+        std::future::pending::<()>(),
+    ));
+
+    let (mut old, _) = connect_311(addr, true).await;
+    // SUBSCRIBE packet id 1, "t" at QoS 0, then wait for SUBACK
+    old.write_all(&[0x82, 0x06, 0x00, 0x01, 0x00, 0x01, b't', 0x00])
+        .await
+        .unwrap();
+    read(&mut old, 5).await;
+
+    let (mut new, connack) = connect_311(addr, false).await;
+    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00], "Session Present set");
     assert_eq!(
-        read(&mut new, 8).await,
-        [0x30, 0x06, 0x00, 0x01, b't', 0x00, b'h', b'i']
+        timeout(Duration::from_secs(2), old.read(&mut [0u8; 1]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
     );
+
+    let (mut publisher, _) = {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(&[
+                0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x01,
+                b'p',
+            ])
+            .await
+            .unwrap();
+        let connack = common::read_connack(&mut stream).await;
+        (stream, connack)
+    };
+    publisher
+        .write_all(&[0x30, 0x05, 0x00, 0x01, b't', b'h', b'i'])
+        .await
+        .unwrap();
+    assert_nothing_arrives(&mut new).await;
 }
 
 /// Broker with users alice and mallory, whose passwords are `<user>-pw`.
@@ -340,15 +402,43 @@ async fn another_user_cannot_take_over_an_offline_session() {
 #[tokio::test]
 async fn the_same_user_takes_over_its_client_id() {
     let addr = start_authenticating_broker().await;
-    let (mut old, _) = Client::connect(addr, "sensor-1", alice()).await;
+    let persistent = Options {
+        session_expiry: Some(300),
+        ..alice()
+    };
+    let (mut old, _) = Client::connect(addr, "sensor-1", persistent).await;
+    old.subscribe("t").await;
     let options = Options {
         clean_start: false,
         ..alice()
     };
-    let (_new, connack) = Client::connect(addr, "sensor-1", options).await;
+    let (mut new, connack) = Client::connect(addr, "sensor-1", options).await;
     assert_eq!(connack.reason_code, ReasonCode::Success);
     assert!(connack.flags.session_present);
     old.expect_taken_over().await;
+
+    let (mut publisher, _) = Client::connect(addr, "publisher", Options::default()).await;
+    publisher.publish("t", b"resumed").await;
+    new.expect_publish(b"resumed").await;
+}
+
+#[tokio::test]
+async fn takeover_of_a_session_without_expiry_starts_a_new_one() {
+    let addr = start_authenticating_broker().await;
+    let (mut old, _) = Client::connect(addr, "sensor-1", alice()).await;
+    old.subscribe("t").await;
+    let options = Options {
+        clean_start: false,
+        ..alice()
+    };
+    let (mut new, connack) = Client::connect(addr, "sensor-1", options).await;
+    assert_eq!(connack.reason_code, ReasonCode::Success);
+    assert!(!connack.flags.session_present);
+    old.expect_taken_over().await;
+
+    let (mut publisher, _) = Client::connect(addr, "publisher", Options::default()).await;
+    publisher.publish("t", b"lost").await;
+    assert!(new.receive().await.is_none());
 }
 
 #[tokio::test]
