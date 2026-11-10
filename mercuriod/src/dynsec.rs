@@ -626,7 +626,9 @@ impl DynamicSecurity {
 
     /// Writes a new state file with an administrator client, `admin`, whose
     /// role may send every dynamic security and broker admin command and
-    /// read `$SYS`.
+    /// read `$SYS`. Created by root in another user's directory, such as the
+    /// service's state directory, the file is given to that directory's
+    /// owner and group, so the service can read it.
     pub fn init(path: &str, admin: &str, password: &str) -> Result<(), String> {
         if Path::new(path).exists() {
             return Err(format!("{path} already exists"));
@@ -661,7 +663,11 @@ impl DynamicSecurity {
             }],
             ..Default::default()
         };
-        write(path, &data)
+        write(path, &data)?;
+        #[cfg(unix)]
+        give_to_directory_owner(path)
+            .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
+        Ok(())
     }
 
     /// Runs a batch of commands, `{"commands": [...]}`, and returns the
@@ -806,14 +812,44 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
+/// The directory holding `path`.
+#[cfg(unix)]
+fn directory_of(path: &str) -> &Path {
+    match Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// Flushes the directory holding `path`, where a rename is recorded.
 #[cfg(unix)]
 fn sync_directory(path: &str) -> std::io::Result<()> {
-    let directory = match Path::new(path).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    std::fs::File::open(directory)?.sync_all()
+    std::fs::File::open(directory_of(path))?.sync_all()
+}
+
+/// Gives the file at `path` to the owner and group of its directory, when
+/// [`adopted_owner`] says so.
+#[cfg(unix)]
+fn give_to_directory_owner(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = std::fs::metadata(path)?;
+    let directory = std::fs::metadata(directory_of(path))?;
+    match adopted_owner(file.uid(), (directory.uid(), directory.gid())) {
+        Some((uid, gid)) => std::os::unix::fs::chown(path, Some(uid), Some(gid)),
+        None => Ok(()),
+    }
+}
+
+/// The owner and group a file created by `file_uid` takes from its
+/// directory's: those of the directory when root created the file in a
+/// directory of another user. The service's state directory belongs to its
+/// user, and systemd doesn't change the owner of files in a directory whose
+/// owner is already right, so a file root leaves there is unreadable to the
+/// service.
+#[cfg(unix)]
+fn adopted_owner(file_uid: u32, directory: (u32, u32)) -> Option<(u32, u32)> {
+    (file_uid == 0 && directory.0 != 0).then_some(directory)
 }
 
 #[cfg(not(unix))]
@@ -1615,6 +1651,29 @@ mod tests {
                 "{access:?}"
             );
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_gives_the_new_file_to_the_owner_of_its_directory() {
+        // Root creating it in the service's state directory
+        assert_eq!(adopted_owner(0, (998, 997)), Some((998, 997)));
+        // Root's own directory, or a user creating it: kept as created
+        assert_eq!(adopted_owner(0, (0, 0)), None);
+        assert_eq!(adopted_owner(1000, (998, 997)), None);
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-owner-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let directory = std::fs::metadata(std::env::temp_dir()).unwrap();
+        let expected = adopted_owner(metadata.uid(), (directory.uid(), directory.gid()));
+        assert!(expected.is_none_or(|owner| owner == (metadata.uid(), metadata.gid())));
         std::fs::remove_file(path).unwrap();
     }
 

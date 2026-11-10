@@ -399,8 +399,15 @@ roles and access rules that change while the broker runs, as with
 mosquitto's dynamic security plugin. Create the file with an administrator:
 
 ```bash
-mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
+sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
 ```
+
+The file is created with mode 0600. Run as root in a directory owned by
+another user, as the service's state directory `/var/lib/mercurio` is, the
+command gives the file to that directory's owner and group, so the service
+can read it. systemd creates that directory when the service first starts:
+start it once before, with `systemctl start mercuriod`, if it has never
+run.
 
 The administrator manages it with `mercurioctl`, which names mosquitto's
 commands in kebab-case, as `mosquitto_ctrl` does:

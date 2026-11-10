@@ -133,7 +133,8 @@ pattern read devices/%u/commands</pre>
 <h2 id="dynamic-security">Dynamic security</h2>
 <p>Dynamic security manages clients, roles and access while the broker runs, with the JSON commands of mosquitto's dynamic security plugin. It replaces <code>password_file</code> and <code>acl_file</code>.</p>
 <pre><span class="comment"># Create the state file with an administrator (prompts for the password)</span>
-mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
+sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
+<p>The file is created with mode 0600. Run as root in a directory owned by another user, as the service's state directory <code>/var/lib/mercurio</code> is, <code>dynsec-init</code> gives the file to that directory's owner and group, so the service can read it. systemd creates that directory when the service first starts: start it once before, with <code>systemctl start mercuriod</code>, if it has never run.</p>
 <pre>[auth]
 enabled = true
 allow_anonymous = false
