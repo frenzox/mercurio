@@ -40,7 +40,8 @@ mercurioctl client list --connected
 mercurioctl client disconnect sensor-7 --no-will
 mercurioctl ban add address 203.0.113.0/24 --duration 3600 --reason flooding
 
-# Retained messages under sensors/, and deleting them
+# Retained messages under sensors/, and deleting them; a filter with
+# wildcards asks first, and needs --yes in scripts
 mercurioctl retained list 'sensors/#'
 mercurioctl retained delete 'sensors/#'
 

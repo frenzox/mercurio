@@ -45,6 +45,9 @@ async fn run(cli: Cli) -> Result<(), Failure> {
         cli::completions(shell, &mut std::io::stdout());
         return Ok(());
     }
+    if let Some(question) = cli.command.confirmation() {
+        confirm(&question)?;
+    }
     let request = commands::request(cli.command, new_password)?;
     let mut connect = client::resolve(cli.connect, Path::new(client::ADMIN_SOCKET));
     connect
@@ -73,6 +76,27 @@ fn new_password(username: &str) -> Result<String, Failure> {
         return Err(Failure::Usage("the passwords don't match".to_string()));
     }
     Ok(password)
+}
+
+/// Asks `question` on the terminal and fails unless the answer is yes; off
+/// a terminal, where nobody can answer, it fails and points at `--yes`.
+fn confirm(question: &str) -> Result<(), Failure> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return Err(Failure::Usage(format!(
+            "{question} Add --yes to confirm when not on a terminal"
+        )));
+    }
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| Failure::Usage(format!("can't read the answer: {e}")))?;
+    match answer.trim() {
+        "y" | "Y" | "yes" | "Yes" | "YES" => Ok(()),
+        _ => Err(Failure::Usage("not confirmed".to_string())),
+    }
 }
 
 fn prompt(text: &str) -> Result<String, Failure> {

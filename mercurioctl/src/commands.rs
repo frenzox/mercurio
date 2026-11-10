@@ -111,6 +111,7 @@ fn client(c: ClientCommand) -> Value {
         ClientCommand::DeleteSession {
             clientid,
             disconnect,
+            ..
         } => named(
             "deleteSession",
             json!({ "clientid": clientid, "disconnect": disconnect }),
@@ -154,7 +155,9 @@ fn retained(c: RetainedCommand) -> Value {
             paged("listRetained", json!({ "filter": filter }), page)
         }
         RetainedCommand::Show { topic } => named("getRetained", json!({ "topic": topic })),
-        RetainedCommand::Delete { filter } => named("deleteRetained", json!({ "filter": filter })),
+        RetainedCommand::Delete { filter, .. } => {
+            named("deleteRetained", json!({ "filter": filter }))
+        }
     }
 }
 

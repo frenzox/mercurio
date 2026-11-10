@@ -88,13 +88,13 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <tr><td><code>client list</code> <code>[--connected | --offline]</code> <code>[--prefix P]</code> <code>[--user U]</code> <code>[--address A]</code></td><td><code>listClients</code></td></tr>
 <tr><td><code>client show &lt;clientid&gt;</code></td><td><code>getClient</code></td></tr>
 <tr><td><code>client disconnect &lt;clientid&gt; [--no-will] [--reason-code C]</code></td><td><code>disconnectClient</code>; <code>C</code> in decimal or <code>0x..</code></td></tr>
-<tr><td><code>client delete-session &lt;clientid&gt; [--disconnect]</code></td><td><code>deleteSession</code></td></tr>
+<tr><td><code>client delete-session &lt;clientid&gt; [--disconnect] [--yes]</code></td><td><code>deleteSession</code>; asks for confirmation first, or needs <code>--yes</code> off a terminal</td></tr>
 <tr><td><code>ban add</code> <code>&lt;clientid|username|address&gt;</code> <code>&lt;value&gt;</code> <code>[--prefix]</code> <code>[--duration S]</code> <code>[--reason R]</code></td><td><code>addBan</code></td></tr>
 <tr><td><code>ban remove &lt;type&gt; &lt;value&gt; [--prefix]</code></td><td><code>removeBan</code></td></tr>
 <tr><td><code>ban list</code></td><td><code>listBans</code></td></tr>
 <tr><td><code>retained list [filter]</code></td><td><code>listRetained</code>, <code>#</code> by default</td></tr>
 <tr><td><code>retained show &lt;topic&gt;</code></td><td><code>getRetained</code></td></tr>
-<tr><td><code>retained delete &lt;filter&gt;</code></td><td><code>deleteRetained</code></td></tr>
+<tr><td><code>retained delete &lt;filter&gt; [--yes]</code></td><td><code>deleteRetained</code>; a filter with <code>+</code> or <code>#</code> asks for confirmation first, or needs <code>--yes</code> off a terminal</td></tr>
 <tr><td><code>subscription list [--prefix P]</code></td><td><code>listSubscriptions</code></td></tr>
 <tr><td><code>subscription subscribers &lt;filter&gt;</code></td><td><code>getSubscribers</code></td></tr>
 <tr><td><code>broker info</code></td><td><code>getBrokerInfo</code></td></tr>
@@ -158,7 +158,7 @@ mercurioctl completions zsh &gt; "${fpath[1]}/_mercurioctl"</pre>
 <tr><td><code>0</code></td><td>Success</td></tr>
 <tr><td><code>1</code></td><td>The broker refused: the command failed, with its <code>code</code> in parentheses after the message, or access control refused the request or its answer topic. <code>broker reload</code> also exits 1 when any file failed to load, after printing the table.</td></tr>
 <tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, closed the connection, or didn't answer within <code>--timeout</code></td></tr>
-<tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or mismatched passwords</td></tr>
+<tr><td><code>3</code></td><td>Wrong usage, such as an unknown option, mismatched passwords, or a destructive command not confirmed</td></tr>
 </table>
 <p>Messages go to standard error, so scripts can read the output:</p>
 <pre><span class="comment"># Disconnect every client of a retired user</span>

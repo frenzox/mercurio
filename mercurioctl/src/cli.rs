@@ -175,6 +175,9 @@ pub enum ClientCommand {
         /// Disconnect the client first if it is connected
         #[arg(long)]
         disconnect: bool,
+        /// Don't ask for confirmation; needed off a terminal
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -245,7 +248,38 @@ pub enum RetainedCommand {
     Show { topic: String },
     /// Delete the retained message of a topic, or of every topic a filter
     /// with wildcards matches
-    Delete { filter: String },
+    Delete {
+        filter: String,
+        /// Don't ask for confirmation of a filter with wildcards; needed off
+        /// a terminal
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+impl Command {
+    /// What to ask before running this command, for those that delete more
+    /// than one named thing or can't be undone; `None` when nothing needs
+    /// asking or `--yes` was given.
+    pub fn confirmation(&self) -> Option<String> {
+        match self {
+            Command::Retained(RetainedCommand::Delete { filter, yes: false })
+                if filter.contains(['#', '+']) =>
+            {
+                Some(format!(
+                    "Delete the retained message of every topic matching {filter}?"
+                ))
+            }
+            Command::Client(ClientCommand::DeleteSession {
+                clientid,
+                yes: false,
+                ..
+            }) => Some(format!(
+                "Delete the session of {clientid}, with its subscriptions and queued messages?"
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
