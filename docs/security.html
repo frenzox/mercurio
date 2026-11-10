@@ -211,6 +211,10 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <h2 id="enhanced">MQTT 5 enhanced authentication</h2>
 <p>MQTT 5 clients can authenticate with a method such as SCRAM through the AUTH packet, and re-authenticate during a connection. The daemon has no method configured; applications embedding the broker register methods through the server library. See <a href="embedding.html#auth">Embedding</a>.</p>
 
+<h2 id="client-ids">Client id ownership</h2>
+<p>A client id belongs to the owner of its session for as long as that session exists, connected or not. The owner is the user the client authenticated as, or anonymous, together with the mount point of its listener. A client of the same owner takes over the id as usual: the connection that held it closes with Session Taken Over. A client of another owner is refused with Not Authorized (return code 5 in MQTT 3.1.1), Clean Start or not, and the connection, session, queued messages and will of the owner stay as they were. The broker logs each refusal at warn level with the client id and both owners.</p>
+<p>A session left by a previous owner blocks the id until it expires. To give the id to someone else sooner, delete the session with <code>mercurioctl client delete-session &lt;clientid&gt;</code>.</p>
+
 <h2 id="reloading">Reloading</h2>
 <p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
 <ul>
