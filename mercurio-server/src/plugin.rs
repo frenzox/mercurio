@@ -6,10 +6,12 @@
 //!
 //! - [`Plugin::authenticate`] and [`Plugin::authorize`]: the first
 //!   [`Decision::Allow`] or [`Decision::Deny`] decides, and
-//!   [`Decision::Defer`] asks the next plugin. When every plugin defers,
-//!   a client with credentials is refused, an anonymous one follows
-//!   `allow_anonymous`, and access is allowed, except publishing to
-//!   `$CONTROL`, which needs an explicit `Allow`.
+//!   [`Decision::Defer`] asks the next plugin. Credentials are checked
+//!   whenever a client sends them, even when authentication isn't
+//!   required. When every plugin defers, a client with credentials is
+//!   refused if authentication is required and let in unverified if not, an
+//!   anonymous one follows `allow_anonymous`, and access is allowed, except
+//!   publishing to `$CONTROL`, which needs an explicit `Allow`.
 //! - [`Plugin::on_message`]: every plugin, each seeing the changes of the
 //!   ones before; the first [`MessageAction::Drop`] drops the message.
 //! - [`Plugin::on_event`] and [`Plugin::on_tick`]: every plugin.
@@ -261,8 +263,10 @@ pub trait Plugin: Send + Sync + 'static {
         PluginStatus::new(self.name(), PluginKind::Rust)
     }
 
-    /// Checks the user name and password of a CONNECT, when the broker
-    /// requires authentication.
+    /// Checks the user name and password of a CONNECT. It runs whenever a
+    /// client sends both, whether or not the broker requires
+    /// authentication, and [`Decision::Deny`] refuses the client either
+    /// way. A plugin that only does access control leaves it deferring.
     ///
     /// `client.client_id` is empty when the client asked the server to
     /// assign one, because assignment happens after authentication.

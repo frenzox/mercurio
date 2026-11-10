@@ -4,8 +4,8 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use mercurio_server::{
     auth::SimpleCredentialValidator,
-    plugin::{ready, BoxFuture, ClientInfo, Credentials, Decision, Plugin},
-    server::{ListenerConfig, ServerConfig, Transport},
+    plugin::{ready, BoxFuture, ClientInfo, Credentials, Decision, Event, Plugin},
+    server::{AuthConfig, ListenerConfig, ServerConfig, Transport},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -163,4 +163,57 @@ async fn listener_plugins_replace_the_brokers() {
 
     assert_eq!(connect(main, Some(("user", "secret"))).await, REFUSED);
     assert_eq!(connect(extra_addr, Some(("user", "secret"))).await, 0x00);
+}
+
+/// Reports the user name of each client the broker accepts.
+struct Connections(tokio::sync::mpsc::UnboundedSender<Option<String>>);
+
+impl Plugin for Connections {
+    fn name(&self) -> &str {
+        "connections"
+    }
+
+    fn on_event<'a>(&'a self, event: &'a Event) -> BoxFuture<'a, ()> {
+        if let Event::Connected { client, .. } = event {
+            let _ = self.0.send(client.username.clone());
+        }
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn credentials_are_checked_without_require_auth() {
+    let credentials = HashMap::from([("user".to_string(), "secret".to_string())]);
+    let (sender, mut connected) = tokio::sync::mpsc::unbounded_channel();
+    let addr = start_broker_with(
+        vec![
+            Arc::new(SimpleCredentialValidator::new(credentials)),
+            Arc::new(Connections(sender)),
+        ],
+        |config| config.auth = AuthConfig::default(),
+    )
+    .await;
+
+    assert_eq!(connect(addr, Some(("user", "wrong"))).await, REFUSED);
+    assert_eq!(connect(addr, Some(("user", "secret"))).await, 0x00);
+    // Verified, so access control sees the user
+    assert_eq!(connected.recv().await.unwrap().as_deref(), Some("user"));
+    assert_eq!(connect(addr, None).await, 0x00);
+    assert_eq!(connected.recv().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn without_require_auth_unchecked_credentials_stay_unverified() {
+    let (sender, mut connected) = tokio::sync::mpsc::unbounded_channel();
+    let addr = start_broker_with(
+        vec![
+            authenticator(Behaviour::Defer),
+            Arc::new(Connections(sender)),
+        ],
+        |config| config.auth = AuthConfig::default(),
+    )
+    .await;
+
+    assert_eq!(connect(addr, Some(("user", "secret"))).await, 0x00);
+    assert_eq!(connected.recv().await.unwrap(), None);
 }
