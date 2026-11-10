@@ -80,6 +80,25 @@ impl Plugin for AllowAll {
     }
 }
 
+/// Allows every login, counting them.
+#[derive(Default)]
+struct CountLogins(std::sync::atomic::AtomicUsize);
+
+impl Plugin for CountLogins {
+    fn name(&self) -> &str {
+        "count-logins"
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ready(Decision::Allow)
+    }
+}
+
 /// Bans `late` while the broker checks its will's topic, which comes after
 /// the CONNECT ban check and before the client id is claimed.
 struct BansDuringConnect(Arc<std::sync::OnceLock<Admin>>);
@@ -1249,6 +1268,48 @@ async fn user_name_bans_match_the_verified_user() {
     );
 }
 
+/// Sends `header` and `packet` on a new connection and checks that the
+/// broker closes it without answering anything.
+async fn closed_unanswered(addr: SocketAddr, header: &[u8], packet: ConnectPacket) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = BytesMut::from(header);
+    ControlPacket::Connect(packet).encode_with_version(&mut bytes, ProtocolVersion::V5);
+    // The broker may have closed already, which is what is checked below
+    let _ = stream.write_all(&bytes).await;
+    let mut answer = Vec::new();
+    let read = timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
+    assert!(read.is_ok(), "the connection was left open");
+    assert_eq!(answer, b"", "the broker answered");
+}
+
+#[tokio::test]
+async fn address_bans_refuse_before_authentication() {
+    let logins = Arc::new(CountLogins::default());
+    let mut config = config(vec![logins.clone()]);
+    config.auth.require_auth = true;
+    let (addr, admin) = start(config).await;
+    let key = BanKey::new(BanKind::Address, "127.0.0.0/8");
+    admin.add_ban(NewBan::new(key.clone())).await.unwrap();
+
+    let as_alice = || {
+        let mut packet = connect_packet("a");
+        packet.flags.user_name = true;
+        packet.flags.password = true;
+        packet.payload.user_name = Some("alice".into());
+        packet.payload.password = Some(Bytes::from_static(b"secret"));
+        packet
+    };
+    closed_unanswered(addr, b"", as_alice()).await;
+    assert_eq!(logins.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    admin.remove_ban(&key).await.unwrap();
+    assert_eq!(
+        connack_reason(addr, b"", as_alice()).await,
+        ReasonCode::Success
+    );
+    assert_eq!(logins.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
 #[tokio::test]
 async fn address_bans_match_the_address_a_proxy_reports() {
     let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1266,15 +1327,12 @@ async fn address_bans_match_the_address_a_proxy_reports() {
         .unwrap();
 
     let from = |ip: &str| format!("PROXY TCP4 {ip} 127.0.0.1 56324 1883\r\n");
-    assert_eq!(
-        connack_reason(
-            proxied_addr,
-            from("192.0.2.9").as_bytes(),
-            connect_packet("a")
-        )
-        .await,
-        ReasonCode::Banned
-    );
+    closed_unanswered(
+        proxied_addr,
+        from("192.0.2.9").as_bytes(),
+        connect_packet("a"),
+    )
+    .await;
     assert_eq!(
         connack_reason(
             proxied_addr,
@@ -1366,15 +1424,12 @@ async fn address_bans_on_mapped_blocks_apply_to_ipv4_clients() {
         admin.bans(Paging::default()).await.items[0].value,
         "192.0.2.0/24"
     );
-    assert_eq!(
-        connack_reason(
-            proxied_addr,
-            b"PROXY TCP4 192.0.2.9 127.0.0.1 56324 1883\r\n",
-            connect_packet("a")
-        )
-        .await,
-        ReasonCode::Banned
-    );
+    closed_unanswered(
+        proxied_addr,
+        b"PROXY TCP4 192.0.2.9 127.0.0.1 56324 1883\r\n",
+        connect_packet("a"),
+    )
+    .await;
 }
 
 #[tokio::test]

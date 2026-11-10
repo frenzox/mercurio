@@ -630,6 +630,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 Ok(Ok(source)) => {
                     debug!("{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
+                    if let Some(peer) = peer_addr.filter(|p| self.bans.refuses_address(p.ip())) {
+                        warn!("{} is banned, closing", peer.ip());
+                        return None;
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("Bad PROXY header from {:?}: {}", peer_addr, e);
@@ -1174,6 +1178,17 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Unix(_, endpoint) => Some(*endpoint),
                 Accepted::Local(_) => None,
             };
+
+            // Before any handshake, file or password check: a banned
+            // address gets nothing from the broker. Behind a proxy the
+            // client's address comes with the PROXY header.
+            let proxied = endpoint.is_some_and(|i| self.endpoints[i].settings.proxy_protocol);
+            if let Some(peer) = peer_addr.filter(|_| !proxied) {
+                if self.bans.refuses_address(peer.ip()) {
+                    warn!("{} is banned, closing", peer.ip());
+                    continue;
+                }
+            }
 
             let trusted = endpoint.is_some_and(|i| self.endpoints[i].trusted);
 
