@@ -73,6 +73,9 @@ struct Client {
     /// Argon2 hash; a client without one can't log in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
+    /// The only client id it may connect with, when set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clientid: Option<String>,
     #[serde(default)]
     disabled: bool,
     #[serde(default)]
@@ -229,6 +232,13 @@ impl Data {
                 if let Some(missing) = groups.iter().find(|g| self.group(g).is_err()) {
                     return Err(format!("Group {missing} not found"));
                 }
+                // Empty, as mosquitto takes it, binds no client id
+                let clientid = match args.get("clientid") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if id.is_empty() => None,
+                    Some(Value::String(id)) => Some(id.clone()),
+                    Some(_) => return Err("Invalid clientid".to_string()),
+                };
                 let password = match args.get("password").and_then(Value::as_str) {
                     Some(password) => Some(hash_password(password)?),
                     None => None,
@@ -236,6 +246,7 @@ impl Data {
                 self.clients.push(Client {
                     username,
                     password,
+                    clientid,
                     disabled: false,
                     roles,
                     groups,
@@ -287,6 +298,7 @@ impl Data {
                     .collect();
                 let data = json!({ "client": {
                     "username": client.username,
+                    "clientid": client.clientid,
                     "disabled": client.disabled,
                     "roles": roles,
                     "groups": groups,
@@ -536,6 +548,7 @@ impl DynamicSecurity {
             clients: vec![Client {
                 username: admin.to_string(),
                 password: Some(hash_password(password)?),
+                clientid: None,
                 disabled: false,
                 roles: vec!["admin".to_string()],
                 groups: Vec::new(),
@@ -670,21 +683,25 @@ fn sync_directory(_: &str) -> std::io::Result<()> {
 }
 
 impl DynamicSecurity {
-    fn check_password(&self, username: &str, password: &[u8]) -> bool {
+    /// Whether `username` may log in with `password` as `client_id`; an
+    /// empty `client_id` is one the broker is to assign.
+    fn check_password(&self, username: &str, password: &[u8], client_id: &str) -> bool {
         // Copied out so Argon2, which is slow on purpose, runs without the lock
-        let hash = {
+        let (hash, bound) = {
             let data = self.data.read().unwrap();
             let client = data.clients.iter().find(|c| c.username == username);
-            match client
-                .filter(|c| !c.disabled)
-                .and_then(|c| c.password.clone())
-            {
-                Some(hash) => hash,
-                None => return false,
+            match client.filter(|c| !c.disabled) {
+                Some(Client {
+                    password: Some(hash),
+                    clientid,
+                    ..
+                }) => (hash.clone(), clientid.clone()),
+                _ => return false,
             }
         };
-        PasswordHash::new(&hash)
-            .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
+        let valid = PasswordHash::new(&hash)
+            .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok());
+        valid && bound.is_none_or(|bound| bound == client_id)
     }
 }
 
@@ -719,7 +736,7 @@ impl Plugin for DynamicSecurity {
 
     fn authenticate<'a>(
         &'a self,
-        _: &'a ClientInfo,
+        client: &'a ClientInfo,
         credentials: &'a Credentials<'a>,
     ) -> BoxFuture<'a, Decision> {
         // Hashes take tens of milliseconds of CPU; keep them off the runtime
@@ -728,7 +745,9 @@ impl Plugin for DynamicSecurity {
             credentials.password.to_vec(),
         );
         Box::pin(async move {
-            let valid = tokio::task::block_in_place(|| self.check_password(&username, &password));
+            let valid = tokio::task::block_in_place(|| {
+                self.check_password(&username, &password, &client.client_id)
+            });
             if valid {
                 Decision::Allow
             } else {
@@ -907,7 +926,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
-        assert!(security.check_password("admin", b"secret"));
+        assert!(security.check_password("admin", b"secret", "c"));
         assert_eq!(
             security
                 .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
@@ -938,7 +957,7 @@ mod tests {
         assert_eq!(responses[5]["data"]["clients"], json!(["admin", "s1"]));
 
         let s1 = identity("s1");
-        assert!(security.check_password("s1", b"pw"));
+        assert!(security.check_password("s1", b"pw", "c"));
         assert_eq!(
             security.authorize(&s1, "sensors/t1", Access::Write).await,
             Decision::Allow
@@ -1023,11 +1042,11 @@ mod tests {
             &security,
             json!([{ "command": "disableClient", "username": "s1" }]),
         );
-        assert!(!security.check_password("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw", "c"));
 
         // Saved, so a reload or a restart keeps the changes
         security.reload().unwrap();
-        assert!(!security.check_password("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw", "c"));
         run(
             &security,
             json!([{ "command": "enableClient", "username": "s1" }]),
@@ -1156,6 +1175,42 @@ mod tests {
                 security.authorize(&acme, filter, Access::Subscribe).await,
                 decision,
                 "{filter}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_client_id_binds_the_client() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-bound-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "s1", "password": "pw",
+                  "clientid": "dev1" },
+                { "command": "getClient", "username": "s1" },
+            ]),
+        );
+        assert!(responses[0].get("error").is_none(), "{responses:?}");
+        assert_eq!(responses[1]["data"]["client"]["clientid"], "dev1");
+
+        let credentials = Credentials::new("s1", b"pw");
+        // An empty client id is one the broker is to assign
+        for (client_id, decision) in [
+            ("dev1", Decision::Allow),
+            ("dev2", Decision::Deny),
+            ("", Decision::Deny),
+        ] {
+            let client = ClientInfo::new(client_id, Some("s1".to_string()));
+            assert_eq!(
+                security.authenticate(&client, &credentials).await,
+                decision,
+                "{client_id:?}"
             );
         }
         std::fs::remove_file(path).unwrap();
