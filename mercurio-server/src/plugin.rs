@@ -27,6 +27,8 @@ use futures_util::FutureExt;
 use mercurio_core::{message::MessageProperties, qos::QoS, reason::ReasonCode};
 use tracing::{error, warn};
 
+use crate::admin::Admin;
+
 pub use crate::acl::Access;
 
 /// The future a hook returns.
@@ -194,6 +196,9 @@ pub trait Plugin: Send + Sync + 'static {
     ///
     /// Publishes to `$CONTROL/<name>/...` go to the plugin with that name,
     /// see [`Plugin::on_control`], so pick a name no client topic needs.
+    ///
+    /// The name `broker` is taken: `$CONTROL/broker/...` is the broker's own
+    /// admin API, so a plugin with that name never sees those requests.
     fn name(&self) -> &str;
 
     /// Checks the user name and password of a CONNECT, when the broker
@@ -331,6 +336,8 @@ pub(crate) struct Chain {
     trusted: bool,
     /// Shared by the clones of a chain.
     events: Arc<Events>,
+    /// Serves `$CONTROL/broker/v1`; set on every chain the server builds
+    admin: Option<Admin>,
 }
 
 /// An enhanced authentication in progress, with the plugin carrying it out.
@@ -358,6 +365,14 @@ impl Chain {
             timeout,
             trusted: false,
             events: Arc::default(),
+            admin: None,
+        }
+    }
+
+    pub(crate) fn with_admin(self, admin: Admin) -> Chain {
+        Chain {
+            admin: Some(admin),
+            ..self
         }
     }
 
@@ -518,6 +533,15 @@ impl Chain {
     ) -> Option<Option<Bytes>> {
         let rest = topic.strip_prefix("$CONTROL/")?;
         let (name, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if let (Some(admin), "broker") = (&self.admin, name) {
+            // Anything else under `$CONTROL/broker/`, responses included,
+            // is consumed unanswered
+            let answer = match path {
+                "v1" => Some(crate::admin::handle_request(admin, self, client, &payload).await),
+                _ => None,
+            };
+            return Some(answer);
+        }
         let plugin = self.plugins.iter().find(|p| p.name() == name)?;
         Some(
             guarded(plugin.name(), "on_control", self.timeout, || {

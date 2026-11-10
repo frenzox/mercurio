@@ -1433,6 +1433,7 @@ dependencies = [
  "rand 0.8.8",
  "rustls",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",

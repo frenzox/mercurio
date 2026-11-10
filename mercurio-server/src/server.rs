@@ -55,7 +55,7 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 
 use crate::{
     acl::Access,
-    admin::{Admin, AdminParts, ListenerInfo},
+    admin::{Admin, AdminExtension, AdminParts, ListenerInfo},
     broker::Broker,
     connection::Connection,
     http,
@@ -185,6 +185,8 @@ pub struct ServerConfig {
     pub plugin_timeout: Duration,
     /// How often plugins' `on_tick` runs.
     pub plugin_tick_interval: Duration,
+    /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know.
+    pub admin_extension: Option<Arc<dyn AdminExtension>>,
 }
 
 impl Default for ServerConfig {
@@ -200,6 +202,7 @@ impl Default for ServerConfig {
             plugins: Vec::new(),
             plugin_timeout: Duration::from_secs(5),
             plugin_tick_interval: Duration::from_secs(1),
+            admin_extension: None,
         }
     }
 }
@@ -846,6 +849,7 @@ impl<St: MqttStore + 'static> Server<St> {
             plugins,
             plugin_timeout,
             plugin_tick_interval,
+            admin_extension,
         } = config;
         let stats = Arc::new(Stats::default());
         let policy = Arc::new(policy);
@@ -858,14 +862,13 @@ impl<St: MqttStore + 'static> Server<St> {
             tls: tls_config,
             ..ListenerConfig::new(listener, Transport::Mqtt)
         };
-        let endpoints = std::iter::once(main)
+        let mut endpoints = std::iter::once(main)
             .chain(listeners)
             .map(|l| Endpoint::new(l, plugin_timeout))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-        let chain = Chain::new(plugins, plugin_timeout);
         let broker = Broker::new(Arc::clone(&storage));
         let session_manager_holder =
             SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue);
@@ -878,7 +881,16 @@ impl<St: MqttStore + 'static> Server<St> {
             stats: Arc::clone(&stats),
             listeners: endpoints.iter().map(|e| Arc::clone(&e.state)).collect(),
             storage: storage.backend_name(),
+            extension: admin_extension,
         });
+        let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
+        for endpoint in &mut endpoints {
+            endpoint.settings.chain = endpoint
+                .settings
+                .chain
+                .take()
+                .map(|chain| chain.with_admin(admin.clone()));
+        }
 
         let server = Listener {
             endpoints,
