@@ -14,7 +14,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
     /// Replaces the session expiry from CONNECT. Sent by the client only
     /// [MQTT-3.14.2-2].
@@ -66,7 +66,7 @@ impl Decoder for DisconnectProperties {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
     /// Decodes as `NormalDisconnection` when left out or 0x00. Not encoded in
     /// MQTT 3.x, see [`Self::encode_v3`].

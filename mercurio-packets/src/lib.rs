@@ -47,7 +47,7 @@ use crate::{
 pub use mercurio_core::protocol::PacketType;
 
 #[repr(u8)]
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 /// Any MQTT control packet, as decoded from or encoded to the wire.
 pub enum ControlPacket {
     Connect(ConnectPacket),
@@ -68,6 +68,29 @@ pub enum ControlPacket {
 }
 
 impl ControlPacket {
+    /// The type of this packet.
+    pub fn packet_type(&self) -> PacketType {
+        use ControlPacket::*;
+
+        match self {
+            Connect(_) => PacketType::Connect,
+            ConnAck(_) => PacketType::ConnAck,
+            Publish(_) => PacketType::Publish,
+            PubAck(_) => PacketType::PubAck,
+            PubRec(_) => PacketType::PubRec,
+            PubRel(_) => PacketType::PubRel,
+            PubComp(_) => PacketType::PubComp,
+            Subscribe(_) => PacketType::Subscribe,
+            SubAck(_) => PacketType::SubAck,
+            Unsubscribe(_) => PacketType::Unsubscribe,
+            UnsubAck(_) => PacketType::UnsubAck,
+            PingReq(_) => PacketType::PingReq,
+            PingResp(_) => PacketType::PingResp,
+            Disconnect(_) => PacketType::Disconnect,
+            Auth(_) => PacketType::Auth,
+        }
+    }
+
     /// Check if the buffer contains a complete MQTT packet.
     ///
     /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
@@ -496,9 +519,8 @@ mod tests {
             &[0xaa, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'],
         ];
         for bytes in resent {
-            let parse = |version| {
-                ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version)
-            };
+            let parse =
+                |version| ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
             assert!(parse(ProtocolVersion::V3_1).is_ok(), "{bytes:02x?}");
             assert!(
                 matches!(
@@ -638,6 +660,17 @@ mod robustness_tests {
             (vec![0xb0, 0x02, 0x00, 0x01], ProtocolVersion::V3_1_1),
         ]);
         packets
+    }
+
+    #[test]
+    fn test_packet_type_is_the_first_nibble() {
+        for (bytes, version) in versioned_samples() {
+            let packet =
+                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
+                    .unwrap();
+            assert_eq!(packet.packet_type() as u8, bytes[0] >> 4, "{packet:?}");
+            assert_eq!(packet.clone(), packet);
+        }
     }
 
     #[test]

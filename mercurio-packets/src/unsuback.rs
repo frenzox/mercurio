@@ -14,7 +14,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubAckProperties {
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
@@ -55,7 +55,7 @@ impl Decoder for UnsubAckProperties {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubAckPayload {
     /// Result for the topic filter at the same position in the UNSUBSCRIBE.
     pub reason_code: ReasonCode,
@@ -83,7 +83,7 @@ impl Decoder for UnsubAckPayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubAckPacket {
     /// Selects the wire format on encode. `decode` sets `V5`, and
     /// `decode_v3` sets `V3_1_1`.

@@ -203,7 +203,7 @@ def_prop!(SharedSubscriptionAvailable {
 /// a Topic Alias of 0) is a [`ReasonCode::ProtocolError`]. Decoding does
 /// not check that the packet type allows the property; the packet decoders
 /// do that.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 #[allow(clippy::enum_variant_names)] // Warns because of UserProperty
 #[non_exhaustive]
 pub enum Property {

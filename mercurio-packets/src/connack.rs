@@ -16,7 +16,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
     /// Whether the server resumed a session it already held for this client.
     /// Always false after a CONNECT with clean start [MQTT-3.2.2-2].
@@ -48,7 +48,7 @@ impl Decoder for ConnAckFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct ConnAckProperties {
     /// Set when the server uses a session expiry other than the one the
@@ -229,7 +229,7 @@ impl From<ReasonCode> for ConnAckReturnCode {
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
     /// Selects the wire format on encode: in MQTT 3.x a return code and no
     /// properties. `decode` sets `V5`, and `decode_v3` sets `V3_1_1` for both

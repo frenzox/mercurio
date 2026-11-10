@@ -6,7 +6,7 @@ use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
 
 use crate::PacketType;
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PingReqPacket {}
 
 const PACKET_TYPE: u8 = 0x0c;

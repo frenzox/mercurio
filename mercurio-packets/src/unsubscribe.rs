@@ -14,7 +14,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
     pub user_property: Option<Vec<UserProperty>>,
 }
@@ -51,7 +51,7 @@ impl Decoder for UnsubscribeProperties {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubscribePayload {
     pub topic_filter: String,
 }
@@ -78,7 +78,7 @@ impl Decoder for UnsubscribePayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubscribePacket {
     pub packet_id: u16,
     pub properties: Option<UnsubscribeProperties>,

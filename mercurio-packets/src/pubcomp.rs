@@ -14,7 +14,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PubCompProperties {
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
@@ -55,7 +55,7 @@ impl Decoder for PubCompProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PubCompPacket {
     pub packet_id: u16,
     /// Decodes as `Success` when left out. Left out on encode when `Success`

@@ -19,7 +19,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// The Connect Flags byte (section 3.1.2.3). The flags decide which
 /// optional fields of the payload are encoded and decoded.
 pub struct ConnectFlags {
@@ -110,7 +110,7 @@ impl Decoder for ConnectFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct ConnectProperties {
     /// Seconds the session outlives the connection. Absent means 0, the
@@ -202,7 +202,7 @@ impl Decoder for ConnectProperties {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// Properties of the will message (section 3.1.3.2). MQTT 5 only.
 pub struct WillProperties {
     /// Seconds the server waits after the connection closes before it
@@ -267,7 +267,7 @@ impl Decoder for WillProperties {
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnectPayload {
     /// May be empty, and the server then assigns one (section 3.1.3.1).
     pub client_id: String,
@@ -378,7 +378,7 @@ impl Decoder for ConnectPayload {
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ConnectPacket {
     /// Read from the protocol name and level. Selects the wire format on
     /// encode.

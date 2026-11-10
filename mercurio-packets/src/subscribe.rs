@@ -17,7 +17,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct SubscribeProperties {
     /// Number the server adds to each PUBLISH it sends for these
@@ -157,7 +157,7 @@ impl Decoder for SubscriptionOptions {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscribePayload {
     pub topic_filter: String,
     pub subs_opt: SubscriptionOptions,
@@ -191,7 +191,7 @@ impl Decoder for SubscribePayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscribePacket {
     pub packet_id: u16,
     pub properties: Option<SubscribeProperties>,

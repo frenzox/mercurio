@@ -15,7 +15,7 @@ use mercurio_core::{
 
 use crate::PacketType;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
@@ -56,7 +56,7 @@ impl Decoder for SubAckProperties {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubAckPayload {
     /// Result for the topic filter at the same position in the SUBSCRIBE. In
     /// MQTT 3.x every failure is encoded as 0x80, and decoded as
@@ -90,7 +90,7 @@ impl Decoder for SubAckPayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubAckPacket {
     /// Selects the wire format on encode. `decode` sets `V5`, and
     /// `decode_v3` sets `V3_1_1`.
