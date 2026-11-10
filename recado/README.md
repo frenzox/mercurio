@@ -38,6 +38,10 @@ date | recado pub -t system/time -r
 # A binary file; sub prints payloads byte for byte
 recado pub -t cameras/door/snapshot -f snapshot.jpg
 
+# One JSON object per message, with its topic and properties; the payload
+# is in `payload_base64`, and in `payload` too when it is UTF-8
+recado sub -t 'sensors/#' --format json | jq .topic
+
 # Over TLS, with credentials
 recado sub -H broker.example.com -p 8883 --tls -u alice -t '#'
 

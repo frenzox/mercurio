@@ -3,9 +3,13 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bytes::Bytes;
-use clap::Args;
-use mercurio_client::{Event, MqttClient, QoS, RetainHandling, SubscriptionOptions, Will};
+use clap::{Args, ValueEnum};
+use mercurio_client::{
+    Event, MessageProperties, MqttClient, QoS, RetainHandling, SubscriptionOptions, Will,
+};
+use serde_json::{json, Value};
 use tokio::signal;
 
 use crate::common::{qos_level, ConnectionArgs};
@@ -25,8 +29,13 @@ pub struct SubArgs {
     qos: QoS,
 
     /// Print topic name before each message
-    #[arg(short = 'T', long)]
+    #[arg(short = 'T', long, conflicts_with = "format")]
     print_topic: bool,
+
+    /// How to print each message: its payload as received, or a JSON
+    /// object on one line with the topic and the properties
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
 
     #[command(flatten)]
     subscription: SubscriptionArgs,
@@ -38,6 +47,12 @@ pub struct SubArgs {
 
     #[command(flatten)]
     will: WillArgs,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Text,
+    Json,
 }
 
 #[derive(Args, Debug)]
@@ -147,15 +162,35 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
         outcome = async {
             loop {
                 match client.recv().await {
-                    Some(Event::Message { topic, payload, .. }) => {
+                    Some(Event::Message {
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        properties,
+                        subscription_ids,
+                    }) => {
                         let mut out = io::stdout().lock();
-                        let written = (|| {
-                            if args.print_topic {
-                                write!(out, "{topic}: ")?;
+                        let written = match args.format {
+                            Format::Text => (|| {
+                                if args.print_topic {
+                                    write!(out, "{topic}: ")?;
+                                }
+                                out.write_all(&payload)?;
+                                out.write_all(b"\n")
+                            })(),
+                            Format::Json => {
+                                let line = json_line(
+                                    &topic,
+                                    &payload,
+                                    qos,
+                                    retain,
+                                    &properties,
+                                    &subscription_ids,
+                                );
+                                writeln!(out, "{line}")
                             }
-                            out.write_all(&payload)?;
-                            out.write_all(b"\n")
-                        })();
+                        };
                         // The reader went away, as `head` does once it has
                         // enough lines
                         if written.is_err() {
@@ -192,4 +227,48 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     let _ = client.disconnect().await;
 
     outcome
+}
+
+/// A message as `--format json` prints it. The payload is always there in
+/// base64, and as text too when it is UTF-8; properties the message doesn't
+/// have are left out.
+fn json_line(
+    topic: &str,
+    payload: &[u8],
+    qos: QoS,
+    retain: bool,
+    properties: &MessageProperties,
+    subscription_ids: &[u32],
+) -> Value {
+    let mut line = json!({
+        "topic": topic,
+        "qos": qos as u8,
+        "retain": retain,
+        "payload_base64": BASE64.encode(payload),
+    });
+    if let Ok(text) = std::str::from_utf8(payload) {
+        line["payload"] = json!(text);
+    }
+    if properties.payload_is_utf8 {
+        line["payload_is_utf8"] = json!(true);
+    }
+    if let Some(expiry) = properties.message_expiry {
+        line["message_expiry"] = json!(expiry);
+    }
+    if let Some(content_type) = &properties.content_type {
+        line["content_type"] = json!(content_type);
+    }
+    if let Some(response_topic) = &properties.response_topic {
+        line["response_topic"] = json!(response_topic);
+    }
+    if let Some(data) = &properties.correlation_data {
+        line["correlation_data_base64"] = json!(BASE64.encode(data));
+    }
+    if !properties.user_properties.is_empty() {
+        line["user_properties"] = json!(properties.user_properties);
+    }
+    if !subscription_ids.is_empty() {
+        line["subscription_ids"] = json!(subscription_ids);
+    }
+    line
 }

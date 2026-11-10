@@ -6,11 +6,13 @@ use std::{
     sync::Arc,
 };
 
-use mercurio_client::{ConnectOptions, MqttClient, QoS};
+use bytes::Bytes;
+use mercurio_client::{ConnectOptions, MessageProperties, MqttClient, QoS};
 use mercurio_server::{
     auth::SimpleCredentialValidator,
     server::{run_with_config, ServerConfig},
 };
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 struct Broker {
@@ -316,5 +318,74 @@ async fn binary_payloads_are_printed_as_they_are() {
         .await
         .unwrap();
     assert_eq!(subscriber.next_line(), b"bin/x: \xff\x00\xfe\n");
+    subscriber.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_lines_carry_the_message_and_its_properties() {
+    let broker = start().await;
+    let mut subscriber = broker
+        .subscriber(
+            &[
+                "sub",
+                "-t",
+                "json/#",
+                "--format",
+                "json",
+                "--subscription-id",
+                "7",
+                "-q",
+                "1",
+            ],
+            "json/ready",
+        )
+        .await;
+    let sender = broker.client("sender").await;
+    let properties = MessageProperties {
+        content_type: Some("text/plain".to_string()),
+        response_topic: Some("replies/me".to_string()),
+        correlation_data: Some(Bytes::from_static(&[0x01, 0xff])),
+        user_properties: vec![
+            ("k".to_string(), "v1".to_string()),
+            ("k".to_string(), "v2".to_string()),
+        ],
+        ..Default::default()
+    };
+    sender
+        .publish_with_properties("json/text", "héllo", QoS::AtLeastOnce, false, properties)
+        .await
+        .unwrap();
+    let text: Value = serde_json::from_slice(&subscriber.next_line()).unwrap();
+    assert_eq!(
+        text,
+        json!({
+            "topic": "json/text",
+            "qos": 1,
+            "retain": false,
+            "payload": "héllo",
+            "payload_base64": "aMOpbGxv",
+            "content_type": "text/plain",
+            "response_topic": "replies/me",
+            "correlation_data_base64": "Af8=",
+            "user_properties": [["k", "v1"], ["k", "v2"]],
+            "subscription_ids": [7],
+        })
+    );
+
+    sender
+        .publish("json/binary", &[0xff, 0x00][..], QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let binary: Value = serde_json::from_slice(&subscriber.next_line()).unwrap();
+    assert_eq!(
+        binary,
+        json!({
+            "topic": "json/binary",
+            "qos": 0,
+            "retain": false,
+            "payload_base64": "/wA=",
+            "subscription_ids": [7],
+        })
+    );
     subscriber.kill().await;
 }

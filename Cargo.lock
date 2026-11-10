@@ -1914,11 +1914,13 @@ dependencies = [
 name = "recado"
 version = "0.2.4"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "clap",
  "mercurio-client",
  "mercurio-core",
  "mercurio-server",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

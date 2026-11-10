@@ -89,6 +89,7 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>-t, --topic</code></td><td>Topic filter; may be repeated (required)</td></tr>
 <tr><td><code>-q, --qos</code></td><td>QoS of the subscriptions (default 0)</td></tr>
 <tr><td><code>-T, --print-topic</code></td><td>Print the topic and <code>: </code> before each message</td></tr>
+<tr><td><code>--format text|json</code></td><td><code>text</code> prints each payload byte for byte, then a line feed; <code>json</code> prints one JSON object per line (below)</td></tr>
 <tr><td><code>--no-local</code></td><td>Don't receive messages this client publishes itself</td></tr>
 <tr><td><code>--retain-as-published</code></td><td>Keep the retain flag messages were published with</td></tr>
 <tr><td><code>--retain-handling</code></td><td>Retained messages on subscribing: 0 always, 1 only for new subscriptions, 2 never</td></tr>
@@ -97,6 +98,23 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>--will-topic</code>, <code>--will-message</code></td><td>Will published by the broker if the client disconnects unexpectedly</td></tr>
 <tr><td><code>--will-qos</code>, <code>--will-retain</code>, <code>--will-delay</code></td><td>QoS, retain flag and delay (MQTT 5) of the will</td></tr>
 </table>
+
+<h3 id="json">JSON lines</h3>
+<p>With <code>--format json</code>, each message is one line holding a JSON object:</p>
+<pre>$ recado sub -t 'sensors/#' --format json
+{"payload":"21.5","payload_base64":"MjEuNQ==","qos":0,"retain":false,"topic":"sensors/kitchen"}</pre>
+<table>
+<tr><th>Field</th><th>Holds</th></tr>
+<tr><td><code>topic</code>, <code>qos</code>, <code>retain</code></td><td>Always there</td></tr>
+<tr><td><code>payload_base64</code></td><td>The payload in base64; always there</td></tr>
+<tr><td><code>payload</code></td><td>The payload as text, only when it is valid UTF-8</td></tr>
+<tr><td><code>content_type</code>, <code>response_topic</code>, <code>message_expiry</code>, <code>payload_is_utf8</code></td><td>The MQTT 5 properties of the same name, when the message has them</td></tr>
+<tr><td><code>correlation_data_base64</code></td><td>The correlation data in base64, when there is some</td></tr>
+<tr><td><code>user_properties</code></td><td><code>[name, value]</code> pairs in the order they came, when there are some; a name may repeat</td></tr>
+<tr><td><code>subscription_ids</code></td><td>The identifiers of the matching subscriptions that have one</td></tr>
+</table>
+<pre><span class="comment"># The payloads of binary messages, decoded</span>
+recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre>
 
 <h2>Connection options</h2>
 <p>Both commands take these:</p>
