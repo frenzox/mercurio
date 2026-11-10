@@ -353,6 +353,11 @@ mercuriod passwd -f /etc/mercurio/passwd -u alice
 mercuriod passwd -f /etc/mercurio/passwd -u alice -d
 ```
 
+`passwd` replaces the file in one step, keeping its owner, group and mode
+(at most 0640). A new file gets mode 0600: let the broker read it with
+`chgrp mercurio` and `chmod 640`. It refuses to change a file it
+cannot read in full, so fix a malformed line by hand first.
+
 ### Access control
 
 `acl_file` restricts which topics each client may publish and subscribe to,

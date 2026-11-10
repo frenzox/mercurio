@@ -1,8 +1,6 @@
 //! Mercuriod - MQTT broker daemon
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +34,7 @@ mod credentials;
 mod dynsec;
 mod http_auth;
 mod logging;
+mod password_file;
 mod reload;
 #[cfg(unix)]
 mod syslog;
@@ -629,38 +628,13 @@ fn load_acl_file(path: &str) -> Result<AclFile, String> {
 }
 
 fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
-    let credentials = load_password_file(path).map_err(|e| e.to_string())?;
-    Ok(HashedCredentialValidator::new(credentials))
-}
-
-/// Load a password file with format: `username:hash` per line.
-/// Lines starting with `#` and empty lines are ignored.
-fn load_password_file(path: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read password file `{}`: {}", path, e))?;
-
-    let mut credentials = HashMap::new();
-    for (line_num, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((username, password_hash)) = line.split_once(':') else {
-            return Err(format!(
-                "Invalid format in password file `{}` at line {}: expected `username:hash`",
-                path,
-                line_num + 1
-            )
-            .into());
-        };
-        credentials.insert(username.to_string(), password_hash.to_string());
-    }
-
-    Ok(credentials)
+    Ok(HashedCredentialValidator::new(password_file::load(path)?))
 }
 
 /// Add or update a user in the password file.
 fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
+    password_file::check_username(username)?;
+    let mut users = password_file::read_users(path)?;
     let password = prompt_new_password(username)?;
 
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
@@ -669,9 +643,8 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
         .map_err(|e| format!("Failed to hash password: {}", e))?
         .to_string();
 
-    let mut entries = load_password_file_entries(path);
-    entries.insert(username.to_string(), hash);
-    write_password_file(path, &entries)?;
+    users.insert(username.to_string(), hash);
+    password_file::write_users(path, &users)?;
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
     Ok(())
@@ -692,34 +665,12 @@ fn prompt_new_password(username: &str) -> Result<String, Box<dyn std::error::Err
 
 /// Delete a user from the password file.
 fn delete_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut entries = load_password_file_entries(path);
-    if entries.remove(username).is_none() {
+    let mut users = password_file::read_users(path)?;
+    if users.remove(username).is_none() {
         return Err(format!("User `{}` not found in `{}`", username, path).into());
     }
-    write_password_file(path, &entries)?;
+    password_file::write_users(path, &users)?;
     eprintln!("User `{}` deleted from `{}`", username, path);
-    Ok(())
-}
-
-/// Load password file entries, returning empty map if file doesn't exist.
-fn load_password_file_entries(path: &str) -> HashMap<String, String> {
-    load_password_file(path).unwrap_or_default()
-}
-
-/// Write entries to a password file.
-fn write_password_file(
-    path: &str,
-    entries: &HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = std::fs::File::create(path)?;
-    writeln!(file, "# Mercurio password file")?;
-    writeln!(
-        file,
-        "# Managed by `mercuriod passwd`. Do not edit manually."
-    )?;
-    for (username, hash) in entries {
-        writeln!(file, "{}:{}", username, hash)?;
-    }
     Ok(())
 }
 
