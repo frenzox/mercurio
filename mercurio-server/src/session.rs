@@ -298,6 +298,9 @@ struct State {
     check_retain_source: bool,
     /// QoS 2 messages the client may have awaiting PUBREL, as advertised
     receive_maximum: u16,
+    /// Most QoS 1 and 2 messages sent and not yet acknowledged, whatever
+    /// the client's Receive Maximum
+    max_inflight: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// Re-authentication in progress, if any
@@ -401,6 +404,7 @@ impl Session {
                     retain_available: true,
                     check_retain_source: false,
                     receive_maximum: u16::MAX,
+                    max_inflight: u16::MAX,
                     will_message,
                     auth_exchange: None,
                     verified_user: None,
@@ -524,6 +528,7 @@ impl Session {
             session.check_retain_source = limits.check_retain_source;
             session.topic_alias_maximum = limits.topic_alias_maximum;
             session.receive_maximum = limits.receive_maximum;
+            session.max_inflight = limits.max_inflight.max(1);
             session.max_subscriptions = limits.max_subscriptions;
             session.max_retained_messages = limits.max_retained_messages;
 
@@ -1474,7 +1479,8 @@ impl Session {
     }
 
     /// Whether another QoS 1 or 2 message may be sent without exceeding the
-    /// client's Receive Maximum [MQTT-3.3.4-9].
+    /// client's Receive Maximum [MQTT-3.3.4-9] or the broker's in-flight
+    /// limit.
     pub(crate) async fn can_send_more(&self) -> bool {
         let session = self.shared.state.lock().await;
         let receive_maximum = session
@@ -1483,7 +1489,8 @@ impl Session {
             .as_ref()
             .and_then(|p| p.receive_maximum.as_ref())
             .map_or(u16::MAX, |r| r.value);
-        session.unacknowledged_messages.len() + session.pubrecs.len() < usize::from(receive_maximum)
+        let window = receive_maximum.min(session.max_inflight);
+        session.unacknowledged_messages.len() + session.pubrecs.len() < usize::from(window)
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and

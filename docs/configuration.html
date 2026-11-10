@@ -75,6 +75,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>max_queued_qos0_messages</code></td><td><code>1000</code></td><td>Queued messages beyond which QoS 0 messages are dropped.</td></tr>
 <tr><td><code>max_queued_bytes</code></td><td><code>104857600</code></td><td>Payload bytes that may wait for one client before further messages are dropped.</td></tr>
 <tr><td><code>receive_maximum</code></td><td><code>65535</code></td><td>QoS 2 messages an MQTT 5 client may have awaiting PUBREL at once.</td></tr>
+<tr><td><code>max_inflight</code></td><td><code>64</code></td><td>QoS 1 and 2 messages sent to one client and not yet acknowledged, at most, whatever Receive Maximum the client announces. At least <code>1</code>.</td></tr>
 <tr><td><code>max_topic_alias</code></td><td><code>10</code></td><td>Highest topic alias MQTT 5 clients may use; <code>0</code> disables aliases.</td></tr>
 <tr><td><code>max_keepalive</code></td><td></td><td>Longest keep-alive, in seconds, MQTT 5 clients may use. Clients asking for more, or for none, are told to use this one.</td></tr>
 <tr><td><code>max_qos</code></td><td><code>2</code></td><td>Highest QoS clients may use. Subscriptions above it are granted this QoS; publishing above it closes the connection.</td></tr>

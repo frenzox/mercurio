@@ -89,6 +89,10 @@ pub use crate::{connection::DEFAULT_MAX_PACKET_SIZE, queue::QueueLimits};
 /// than clients need, far fewer than it takes to exhaust the broker.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
+/// Unacknowledged QoS 1 and 2 messages one client may have unless
+/// configured otherwise.
+pub const DEFAULT_MAX_INFLIGHT: u16 = 64;
+
 /// Tunable limits of the broker.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -107,6 +111,10 @@ pub struct Limits {
     pub topic_alias_maximum: u16,
     /// QoS 2 messages a client may have awaiting PUBREL at once.
     pub receive_maximum: u16,
+    /// QoS 1 and 2 messages sent to a client and not yet acknowledged, at
+    /// most, whatever Receive Maximum the client announces. Each holds its
+    /// whole message in memory. 0 counts as 1.
+    pub max_inflight: u16,
     /// Longest keep-alive MQTT 5 clients may use; those asking for more, or
     /// for none, are told to use this one instead.
     pub max_keepalive: Option<u16>,
@@ -150,6 +158,7 @@ impl Default for Limits {
             max_connections: None,
             topic_alias_maximum: 10,
             receive_maximum: u16::MAX,
+            max_inflight: DEFAULT_MAX_INFLIGHT,
             max_keepalive: None,
             send_topic_aliases: false,
             maximum_qos: QoS::ExactlyOnce,

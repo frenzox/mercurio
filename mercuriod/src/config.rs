@@ -542,6 +542,11 @@ pub struct ServerConfig {
     #[serde(default = "default_receive_maximum")]
     pub receive_maximum: u16,
 
+    /// QoS 1 and 2 messages sent to one client and not yet acknowledged, at
+    /// most, whatever Receive Maximum the client announces
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: u16,
+
     /// Longest keep-alive, in seconds, MQTT 5 clients may use
     pub max_keepalive: Option<u16>,
 
@@ -618,6 +623,7 @@ impl Default for ServerConfig {
             connect_timeout: default_connect_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
+            max_inflight: default_max_inflight(),
             max_keepalive: None,
             response_information: None,
             redirect: None,
@@ -784,11 +790,18 @@ fn default_receive_maximum() -> u16 {
     Limits::default().receive_maximum
 }
 
+fn default_max_inflight() -> u16 {
+    Limits::default().max_inflight
+}
+
 impl ServerConfig {
     pub fn limits(&self) -> Result<Limits, String> {
         let maximum_qos = QoS::from(self.max_qos);
         if maximum_qos == QoS::Invalid {
             return Err(format!("max_qos must be 0, 1 or 2, not {}", self.max_qos));
+        }
+        if self.max_inflight == 0 {
+            return Err("max_inflight must be at least 1".to_string());
         }
         let mut limits = Limits::default();
         limits.connect_timeout = Duration::from_secs(self.connect_timeout);
@@ -800,6 +813,7 @@ impl ServerConfig {
         limits.max_connections = Some(self.max_connections);
         limits.topic_alias_maximum = self.max_topic_alias;
         limits.receive_maximum = self.receive_maximum;
+        limits.max_inflight = self.max_inflight;
         limits.max_keepalive = self.max_keepalive;
         limits.send_topic_aliases = self.send_topic_aliases;
         limits.maximum_qos = maximum_qos;
@@ -1141,6 +1155,19 @@ mod tests {
         let config: Config = toml::from_str("[admin]\nsocket = \"\"\n").unwrap();
         assert!(config.admin.unwrap().socket.is_empty());
         assert!(toml::from_str::<Config>("[admin]\nsockets = \"/x\"\n").is_err());
+    }
+
+    #[test]
+    fn test_max_inflight_reaches_the_limits_and_rejects_zero() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.server.limits().unwrap().max_inflight,
+            mercurio_server::server::Limits::default().max_inflight
+        );
+        let config: Config = toml::from_str("[server]\nmax_inflight = 5\n").unwrap();
+        assert_eq!(config.server.limits().unwrap().max_inflight, 5);
+        let config: Config = toml::from_str("[server]\nmax_inflight = 0\n").unwrap();
+        assert!(config.server.limits().is_err());
     }
 
     #[test]
