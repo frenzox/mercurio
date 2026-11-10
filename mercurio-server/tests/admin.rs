@@ -175,6 +175,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
     /// Sends a request to the broker API, answered on
     /// `replies/<client id>`, and returns the parsed answer.
     async fn request(&mut self, payload: Bytes) -> Value {
+        self.send_request(payload).await;
+        let Some(ControlPacket::Publish(answer)) = self.receive().await else {
+            panic!("Expected the response");
+        };
+        serde_json::from_slice(answer.payload.as_deref().unwrap()).unwrap()
+    }
+
+    async fn send_request(&mut self, payload: Bytes) {
         let properties = PublishProperties {
             response_topic: Some(ResponseTopic::new(format!("replies/{}", self.client_id))),
             correlation_data: Some(CorrelationData::new(Bytes::from_static(b"admin"))),
@@ -187,10 +195,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
             ..Default::default()
         }))
         .await;
-        let Some(ControlPacket::Publish(answer)) = self.receive().await else {
-            panic!("Expected the response");
-        };
-        serde_json::from_slice(answer.payload.as_deref().unwrap()).unwrap()
     }
 
     /// Runs one command and returns its response.
@@ -215,6 +219,16 @@ fn persistent(client_id: &str) -> ConnectPacket {
         session_expiry_interval: Some(SessionExpiryInterval::new(300)),
         ..Default::default()
     });
+    packet
+}
+
+/// A persistent session with a will on `wills/<client id>`.
+fn with_will(client_id: &str) -> ConnectPacket {
+    let mut packet = persistent(client_id);
+    packet.flags.will_flag = true;
+    packet.payload.will_properties = Some(Default::default());
+    packet.payload.will_topic = Some(format!("wills/{client_id}"));
+    packet.payload.will_payload = Some(Bytes::from_static(b"gone"));
     packet
 }
 
@@ -522,4 +536,275 @@ async fn client_details_follow_the_connection() {
         .run(json!({"command": "getClient", "clientid": "nobody"}))
         .await;
     assert_eq!(missing["code"], "notFound");
+}
+
+#[tokio::test]
+async fn client_details_show_the_will_and_the_messages_sent() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect_with(addr, with_will("device")).await;
+    device.subscribe("news").await;
+    let mut publisher = Client::connect(addr, "publisher").await;
+    publisher.publish("news", b"hello", false).await;
+    assert!(matches!(
+        device.receive().await,
+        Some(ControlPacket::Publish(_))
+    ));
+
+    let details = wait_for(&mut admin, "device", |d| d["messagesOut"] == 1).await;
+    assert_eq!(details["willPending"], true);
+}
+
+#[tokio::test]
+async fn disconnect_client_sends_administrative_action_and_the_will() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+    let mut device = Client::connect_with(addr, with_will("device")).await;
+
+    let response = admin
+        .run(json!({"command": "disconnectClient", "clientid": "device"}))
+        .await;
+    assert!(response.get("error").is_none(), "{response}");
+    let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::AdministrativeAction);
+    let Some(ControlPacket::Publish(will)) = watcher.receive().await else {
+        panic!("Expected the will");
+    };
+    assert_eq!(will.topic_name, "wills/device");
+
+    // The session stays
+    let details = wait_for(&mut admin, "device", |d| d["connected"] == false).await;
+    assert_eq!(details["clientid"], "device");
+    let again = admin
+        .run(json!({"command": "disconnectClient", "clientid": "device"}))
+        .await;
+    assert_eq!(again["code"], "notFound");
+}
+
+#[tokio::test]
+async fn disconnect_client_can_drop_the_will_and_pick_the_reason() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+    let mut device = Client::connect_with(addr, with_will("device")).await;
+
+    let request = json!({
+        "command": "disconnectClient", "clientid": "device", "sendWill": false, "reasonCode": 0x89,
+    });
+    assert!(admin.run(request).await.get("error").is_none());
+    let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::ServerBusy);
+    assert!(watcher.receive().await.is_none());
+    let details = wait_for(&mut admin, "device", |d| d["connected"] == false).await;
+    assert_eq!(details["willPending"], false);
+
+    // 0x8A is a reason code, but not one DISCONNECT may carry
+    for code in [0x00, 0x05, 0x8a, 0xff] {
+        let request =
+            json!({"command": "disconnectClient", "clientid": "watcher", "reasonCode": code});
+        assert_eq!(
+            admin.run(request).await["code"],
+            "invalidArgument",
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_session_conflicts_until_asked_to_disconnect() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect_with(addr, persistent("device")).await;
+    device.subscribe("a/#").await;
+    let subscriptions = |info: &Value| info["data"]["stats"]["subscriptions/count"].clone();
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert_eq!(subscriptions(&info), 2);
+
+    let refused = admin
+        .run(json!({"command": "deleteSession", "clientid": "device"}))
+        .await;
+    assert_eq!(refused["code"], "conflict");
+    let deleted = admin
+        .run(json!({"command": "deleteSession", "clientid": "device", "disconnect": true}))
+        .await;
+    assert!(deleted.get("error").is_none(), "{deleted}");
+    let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::AdministrativeAction);
+
+    let missing = admin
+        .run(json!({"command": "getClient", "clientid": "device"}))
+        .await;
+    assert_eq!(missing["code"], "notFound");
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert_eq!(subscriptions(&info), 1);
+    let again = admin
+        .run(json!({"command": "deleteSession", "clientid": "device"}))
+        .await;
+    assert_eq!(again["code"], "notFound");
+}
+
+#[tokio::test]
+async fn a_client_cannot_delete_its_own_session() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+
+    let refused = admin
+        .run(json!({"command": "deleteSession", "clientid": "admin", "disconnect": true}))
+        .await;
+    assert_eq!(refused["code"], "conflict");
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert!(info.get("error").is_none(), "{info}");
+}
+
+/// Reads until the broker closes the connection, for `wait` at most.
+async fn closed_within(client: &mut Client, wait: Duration) {
+    let closed = timeout(wait, async {
+        let mut rest = BytesMut::new();
+        while matches!(client.stream.read_buf(&mut rest).await, Ok(n) if n > 0) {}
+    })
+    .await;
+    assert!(closed.is_ok(), "`{}` was never closed", client.client_id);
+}
+
+#[tokio::test]
+async fn clients_deleting_each_other_leave_both_client_ids_usable() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut one = Client::connect(addr, "one").await;
+    one.subscribe("replies/one").await;
+    let mut two = Client::connect(addr, "two").await;
+    two.subscribe("replies/two").await;
+
+    let delete = |target: &str| {
+        let command = json!({"command": "deleteSession", "clientid": target, "disconnect": true});
+        Bytes::from(json!({ "commands": [command] }).to_string())
+    };
+    one.send_request(delete("two")).await;
+    two.send_request(delete("one")).await;
+
+    // Each waits for the other at most 5 seconds before answering, then
+    // closes as asked
+    closed_within(&mut one, Duration::from_secs(7)).await;
+    closed_within(&mut two, Duration::from_secs(7)).await;
+    Client::connect(addr, "one").await;
+    Client::connect(addr, "two").await;
+}
+
+#[tokio::test]
+async fn delete_session_removes_a_disconnected_session() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let device = Client::connect_with(addr, persistent("device")).await;
+    drop(device);
+    wait_for(&mut admin, "device", |d| d["connected"] == false).await;
+
+    let deleted = admin
+        .run(json!({"command": "deleteSession", "clientid": "device"}))
+        .await;
+    assert!(deleted.get("error").is_none(), "{deleted}");
+    let missing = admin
+        .run(json!({"command": "getClient", "clientid": "device"}))
+        .await;
+    assert_eq!(missing["code"], "notFound");
+}
+
+#[tokio::test]
+async fn refused_delete_leaves_the_connected_client_alone() {
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut device = Client::connect_with(addr, persistent("device")).await;
+
+    for _ in 0..3 {
+        let refused = admin.delete_session("device", false).await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::Conflict);
+    }
+    assert!(device.receive().await.is_none());
+    assert!(admin.client("device").await.unwrap().connected);
+}
+
+/// Hears of the sessions that expire.
+#[derive(Default)]
+struct ExpiryRecorder(std::sync::Mutex<Vec<String>>);
+
+impl Plugin for ExpiryRecorder {
+    fn name(&self) -> &str {
+        "expiry-recorder"
+    }
+
+    fn on_event<'a>(&'a self, event: &'a mercurio_server::plugin::Event) -> BoxFuture<'a, ()> {
+        if let mercurio_server::plugin::Event::SessionExpired { client_id, .. } = event {
+            self.0.lock().unwrap().push(client_id.clone());
+        }
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_session_does_not_expire_later() {
+    let recorder = Arc::new(ExpiryRecorder::default());
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll), recorder.clone()])).await;
+    let mut packet = persistent("device");
+    packet.properties = Some(ConnectProperties {
+        session_expiry_interval: Some(SessionExpiryInterval::new(1)),
+        ..Default::default()
+    });
+    let device = Client::connect_with(addr, packet).await;
+    drop(device);
+    let mut watcher = admin_client(addr).await;
+    wait_for(&mut watcher, "device", |d| d["connected"] == false).await;
+
+    admin.delete_session("device", false).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(recorder.0.lock().unwrap().is_empty());
+    assert_eq!(admin.info().await.stats["clients/expired"], 0);
+}
+
+#[tokio::test]
+async fn deleting_a_connected_session_does_not_expire_it_later() {
+    let recorder = Arc::new(ExpiryRecorder::default());
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll), recorder.clone()])).await;
+    let mut packet = persistent("device");
+    packet.properties = Some(ConnectProperties {
+        session_expiry_interval: Some(SessionExpiryInterval::new(1)),
+        ..Default::default()
+    });
+    let mut device = Client::connect_with(addr, packet).await;
+
+    admin.delete_session("device", true).await.unwrap();
+    assert!(matches!(
+        device.receive().await,
+        Some(ControlPacket::Disconnect(_))
+    ));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(recorder.0.lock().unwrap().is_empty());
+    assert_eq!(admin.info().await.stats["clients/expired"], 0);
+    assert!(admin.client("device").await.is_err());
+}
+
+#[tokio::test]
+async fn disconnect_client_closes_mqtt311_connections() {
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut packet = connect_packet("old");
+    packet.protocol_version = ProtocolVersion::V3_1_1;
+    packet.properties = None;
+    packet.flags.clean_start = false;
+    let mut old = Client::connect_with(addr, packet).await;
+
+    admin.disconnect("old", Default::default()).await.unwrap();
+
+    let mut rest = BytesMut::new();
+    let read = timeout(Duration::from_secs(2), old.stream.read_buf(&mut rest))
+        .await
+        .expect("the connection should close");
+    assert_eq!(read.unwrap(), 0, "no packet before the close");
+    assert!(!admin.client("old").await.unwrap().connected);
 }

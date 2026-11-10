@@ -2,10 +2,11 @@
 //! command allowed on its own.
 
 use bytes::Bytes;
+use mercurio_core::{codec::Decoder, reason::ReasonCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{Admin, AdminError, ClientQuery, ErrorCode, Page, Paging};
+use super::{Admin, AdminError, ClientQuery, DisconnectOptions, ErrorCode, Page, Paging};
 use crate::{
     plugin::{Access, Chain, ClientInfo, Decision},
     server::AddressRange,
@@ -19,6 +20,25 @@ const DAEMON_COMMANDS: [&str; 5] = [
     "setLogLevel",
     "reload",
 ];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisconnectArgs {
+    clientid: String,
+    send_will: Option<bool>,
+    reason_code: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct DeleteSessionArgs {
+    clientid: String,
+    disconnect: Option<bool>,
+}
+
+fn reason_code(code: u8) -> Result<ReasonCode, AdminError> {
+    ReasonCode::decode(&mut &[code][..])
+        .map_err(|_| AdminError::invalid_argument(format!("0x{code:02x} is not a reason code")))
+}
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -186,6 +206,31 @@ async fn run(
                 .client(&arguments::<ClientArgs>(args)?.clientid)
                 .await?,
         ),
+        "disconnectClient" => {
+            let a: DisconnectArgs = arguments(args)?;
+            let mut options = DisconnectOptions::default();
+            options.send_will = a.send_will.unwrap_or(options.send_will);
+            if let Some(code) = a.reason_code {
+                options.reason = reason_code(code)?;
+            }
+            admin.disconnect(&a.clientid, options).await?;
+            Value::Null
+        }
+        "deleteSession" => {
+            let a: DeleteSessionArgs = arguments(args)?;
+            // The request runs in the client's own connection, which can't
+            // close while it waits for itself to
+            if a.clientid == client.client_id {
+                return Err(AdminError::new(
+                    ErrorCode::Conflict,
+                    "a client can't delete its own session",
+                ));
+            }
+            admin
+                .delete_session(&a.clientid, a.disconnect.unwrap_or(false))
+                .await?;
+            Value::Null
+        }
         _ => extension(admin, command, args).await?,
     })
 }

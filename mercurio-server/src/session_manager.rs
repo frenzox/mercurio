@@ -11,7 +11,7 @@ use tokio::{
 use tracing::info;
 use uuid::Uuid;
 
-use mercurio_core::{message::unix_millis, protocol::ProtocolVersion, Result};
+use mercurio_core::{message::unix_millis, protocol::ProtocolVersion, reason::ReasonCode, Result};
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
@@ -72,6 +72,9 @@ struct State {
     next_generation: u64,
     /// Clients whose will, left over from a previous run, is still due
     restored_wills: HashSet<String>,
+    /// The expiry timer that may end each session, by the token it holds.
+    /// Deleting a session drops its entry, which retires the timer.
+    expiry_timers: HashMap<String, u64>,
 }
 
 impl State {
@@ -85,12 +88,29 @@ impl State {
     }
 }
 
+/// Why a connection is closed from outside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Close {
+    /// A new connection with the same client id took over
+    TakenOver,
+    /// The admin API closes it with `reason`; without `send_will` the will
+    /// is dropped
+    Admin { reason: ReasonCode, send_will: bool },
+}
+
+/// Why `delete_session` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DeleteRefused {
+    NotFound,
+    Connected,
+}
+
 /// Tracks the network connection currently using a client id.
 struct ConnectionSlot {
     /// Held by the active connection until it has fully shut down
     lease: Arc<Mutex<()>>,
-    /// Tells the active connection that another one is taking over
-    takeover: watch::Sender<bool>,
+    /// Tells the active connection to close, and why
+    close: watch::Sender<Option<Close>>,
     /// Identifies the latest connection to acquire this client id
     generation: u64,
 }
@@ -109,8 +129,9 @@ pub(crate) struct ConnectionLease {
     guard: OwnedMutexGuard<()>,
     client_id: String,
     pub generation: u64,
-    /// Changes when a new connection takes over this client id
-    pub takeover: watch::Receiver<bool>,
+    /// Changes when the connection is to close, for a takeover or the
+    /// admin API
+    pub close: watch::Receiver<Option<Close>>,
 }
 
 impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
@@ -156,6 +177,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 connections: HashMap::new(),
                 next_generation: 0,
                 restored_wills: HashSet::new(),
+                expiry_timers: HashMap::new(),
             }),
             persistent: Default::default(),
             local: Default::default(),
@@ -190,7 +212,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let persistent = expiry_interval != Some(0);
 
         let lease = self
-            .acquire_client_id(&connect_packet.payload.client_id)
+            .acquire_client_id(&connect_packet.payload.client_id, Close::TakenOver)
             .await;
 
         let client_id = &connect_packet.payload.client_id;
@@ -348,13 +370,34 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         })
     }
 
-    /// Asks any connection already using `client_id` to close [MQTT-3.1.4-3]
-    /// and waits until it has, so the two never share session state.
-    async fn acquire_client_id(&self, client_id: &str) -> ConnectionLease {
-        let (takeover_tx, takeover) = watch::channel(false);
+    /// Asks any connection already using `client_id` to close for `reason`
+    /// [MQTT-3.1.4-3] and waits until it has, so the two never share
+    /// session state.
+    async fn acquire_client_id(&self, client_id: &str, reason: Close) -> ConnectionLease {
+        self.claim_client_id(client_id, reason, false)
+            .await
+            .expect("a claim without conditions succeeds")
+            .0
+    }
 
-        let (lease, generation) = {
+    /// Like `acquire_client_id`, but with `only_if_free` gives up, touching
+    /// nothing, when a connection holds the client id. The check and the
+    /// claim happen under one lock, so no connection is closed by a claim it
+    /// wasn't meant to close. Also tells whether a connection held the id.
+    async fn claim_client_id(
+        &self,
+        client_id: &str,
+        reason: Close,
+        only_if_free: bool,
+    ) -> Option<(ConnectionLease, bool)> {
+        let (close_tx, close) = watch::channel(None);
+
+        let (lease, generation, held) = {
             let mut manager = self.shared.state.lock().await;
+            let held = manager.connections.contains_key(client_id);
+            if only_if_free && held {
+                return None;
+            }
             manager.next_generation += 1;
             let generation = manager.next_generation;
             let slot = manager
@@ -362,21 +405,35 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 .entry(client_id.to_string())
                 .or_insert_with(|| ConnectionSlot {
                     lease: Arc::new(Mutex::new(())),
-                    takeover: watch::channel(false).0,
+                    close: watch::channel(None).0,
                     generation,
                 });
-            slot.takeover.send_replace(true);
-            slot.takeover = takeover_tx;
+            // A takeover doesn't undo an administrator's pending close, which
+            // may say to drop the will, while one that drops it always wins
+            let drops_will = matches!(
+                reason,
+                Close::Admin {
+                    send_will: false,
+                    ..
+                }
+            );
+            slot.close.send_modify(|pending| {
+                if drops_will || !matches!(pending, Some(Close::Admin { .. })) {
+                    *pending = Some(reason);
+                }
+            });
+            slot.close = close_tx;
             slot.generation = generation;
-            (Arc::clone(&slot.lease), generation)
+            (Arc::clone(&slot.lease), generation, held)
         };
 
-        ConnectionLease {
+        let lease = ConnectionLease {
             guard: lease.lock_owned().await,
             client_id: client_id.to_string(),
             generation,
-            takeover,
-        }
+            close,
+        };
+        Some((lease, held))
     }
 
     /// Releases the client id once its connection has finished and ends the
@@ -393,7 +450,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         // Ending before releasing the id means a connection waiting to take
         // over can never observe a session that is about to vanish
         if expiry == Some(Duration::ZERO) {
-            self.end_session(&client_id, generation).await;
+            self.end_session(&client_id, generation, None).await;
         } else if self.storage.is_durable() {
             // Messages for the client now wait in its queue until it returns;
             // keep them on disk meanwhile, unless another connection already
@@ -405,18 +462,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 }
             }
         }
-        drop(guard);
-
-        {
-            let mut manager = self.shared.state.lock().await;
-            if manager
-                .connections
-                .get(&client_id)
-                .is_some_and(|slot| slot.generation == generation)
-            {
-                manager.connections.remove(&client_id);
-            }
-        }
+        self.release(guard, &client_id, generation).await;
 
         if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
             // Recorded so a restarted broker still expires the session
@@ -427,8 +473,87 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     expires_at: unix_millis() + expiry.as_millis() as u64,
                 },
             );
-            self.schedule_end(client_id, generation, expiry);
+            self.schedule_end(client_id, generation, expiry).await;
         }
+    }
+
+    /// Gives the client id back, unless a newer connection took it since.
+    async fn release(&self, guard: OwnedMutexGuard<()>, client_id: &str, generation: u64) {
+        drop(guard);
+        let mut manager = self.shared.state.lock().await;
+        if manager
+            .connections
+            .get(client_id)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            manager.connections.remove(client_id);
+        }
+    }
+
+    /// Asks the connection using `client_id` to close. False if none does.
+    pub(crate) async fn close_connection(&self, client_id: &str, close: Close) -> bool {
+        let manager = self.shared.state.lock().await;
+        let Some(slot) = manager.connections.get(client_id) else {
+            return false;
+        };
+        slot.close.send_replace(Some(close));
+        true
+    }
+
+    /// Removes the session of `client_id` with everything stored for it,
+    /// its will included. A connected client is refused unless
+    /// `disconnect`, which closes it first with Administrative Action and
+    /// without its will.
+    pub(crate) async fn delete_session(
+        &self,
+        client_id: &str,
+        disconnect: bool,
+    ) -> std::result::Result<(), DeleteRefused> {
+        // Holding the client id like a new connection would: the current
+        // one closes first, and one arriving meanwhile waits for the removal.
+        // Without `disconnect` the claim fails instead of closing a client.
+        let close = Close::Admin {
+            reason: ReasonCode::AdministrativeAction,
+            send_will: false,
+        };
+        let Some((
+            ConnectionLease {
+                guard, generation, ..
+            },
+            was_connected,
+        )) = self.claim_client_id(client_id, close, !disconnect).await
+        else {
+            return Err(DeleteRefused::Connected);
+        };
+        let removed = {
+            let mut manager = self.shared.state.lock().await;
+            manager.expiry_timers.remove(client_id);
+            let was_restored = manager.restored_wills.remove(client_id);
+            let removed = manager.sessions.remove(client_id);
+            if let Some(removed) = &removed {
+                let session = removed.session();
+                // A will waiting for its delay sees a newer generation and
+                // stays unpublished
+                session.set_generation(generation).await;
+                session.stop_queue_journal();
+                session.unsubscribe_all().await;
+            }
+            removed.is_some() || was_restored
+        };
+        if removed {
+            self.shared.persistent.lock().unwrap().remove(client_id);
+            self.writers.write(client_id, Write::DeleteSession);
+            self.writers.close(client_id);
+        }
+        self.release(guard, client_id, generation).await;
+        // A clean session is gone by the time the closed connection lets go
+        if !removed && !was_connected {
+            return Err(DeleteRefused::NotFound);
+        }
+        if removed {
+            info!(target: CONNECTIONS, "Session for client `{}` deleted", client_id);
+        }
+        Ok(())
     }
 
     pub(crate) fn set_expiry_chain(&self, chain: Chain) {
@@ -437,11 +562,34 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
     /// Ends the session of `client_id` after `delay`, unless a connection
     /// newer than `generation` uses it in the meantime.
-    fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
+    async fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
+        let token = {
+            let mut manager = self.shared.state.lock().await;
+            // The session may be gone already, deleted while this connection
+            // was closing, and a deleted session never expires. Generation 0
+            // is a session restored from storage, which may have no
+            // in-memory session left to find.
+            if generation != 0 {
+                let current = match manager.sessions.get(&client_id) {
+                    Some(guard) => guard.session().generation().await == generation,
+                    None => false,
+                };
+                if !current {
+                    return;
+                }
+            }
+            manager.next_generation += 1;
+            let token = manager.next_generation;
+            manager.expiry_timers.insert(client_id.clone(), token);
+            token
+        };
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            if manager.end_session(&client_id, generation).await {
+            if manager
+                .end_session(&client_id, generation, Some(token))
+                .await
+            {
                 manager
                     .shared
                     .expired
@@ -499,7 +647,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
             if let Some(delay) = until_expiry {
                 // Generation 0 predates every connection of this run
-                self.schedule_end(client_id, 0, delay);
+                self.schedule_end(client_id, 0, delay).await;
             }
         }
 
@@ -606,9 +754,16 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     }
 
     /// Discards the session of `client_id` unless a connection newer than
-    /// `generation` has used it since.
-    async fn end_session(&self, client_id: &str, generation: u64) -> bool {
+    /// `generation` has used it since. An expiry timer passes its `timer`
+    /// token, and does nothing once deletion or a newer timer retired it.
+    async fn end_session(&self, client_id: &str, generation: u64, timer: Option<u64>) -> bool {
         let mut manager = self.shared.state.lock().await;
+        if let Some(token) = timer {
+            if manager.expiry_timers.get(client_id) != Some(&token) {
+                return false;
+            }
+            manager.expiry_timers.remove(client_id);
+        }
         let connected_since = manager
             .connections
             .get(client_id)
@@ -1272,6 +1427,40 @@ mod tests {
             username: Some(username.to_string()),
             mount_point: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_deletion_drops_the_will_a_pending_disconnect_kept() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let mut started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let disconnect = Close::Admin {
+            reason: ReasonCode::AdministrativeAction,
+            send_will: true,
+        };
+        assert!(manager.close_connection("c", disconnect).await);
+
+        let deleting = manager.clone();
+        let deletion = tokio::spawn(async move { deleting.delete_session("c", true).await });
+        // The deletion's claim replaces the sender once it has set the close
+        let close = &mut started.lease.close;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while close.changed().await.is_ok() {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *close.borrow(),
+            Some(Close::Admin {
+                reason: ReasonCode::AdministrativeAction,
+                send_will: false,
+            })
+        );
+
+        manager.end_connection(started.lease, None).await;
+        assert_eq!(deletion.await.unwrap(), Ok(()));
     }
 
     fn resuming(client_id: &str) -> ConnectPacket {

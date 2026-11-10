@@ -62,7 +62,9 @@ use crate::{
     plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
     proxy,
     session::{cap_session_expiry, effective_keepalive, Outgoing, Session, WillMessage},
-    session_manager::{session_expiry, ConnectionLease, SessionManager, SessionManagerDropGuard},
+    session_manager::{
+        session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard,
+    },
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
     tls::{certificate_name, CertificateName, TlsConfig},
@@ -1765,7 +1767,10 @@ where
                     Step::Done(self.send_outgoing(&session, &client_id, message).await?)
                 }
                 _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
-                Ok(()) = lease.takeover.changed() => Step::Wake(Wake::TakenOver),
+                Ok(()) = lease.close.changed() => {
+                    let close = (*lease.close.borrow_and_update()).unwrap_or(Close::TakenOver);
+                    Step::Wake(Wake::Closed(close))
+                }
                 _ = self.shutdown.recv() => {
                     return Err(ReasonCode::ServerShuttingDown.into());
                 }
@@ -2018,19 +2023,33 @@ where
                 // An abnormal disconnect: the will is published
                 Err(ReasonCode::KeepAliveTimeout.into())
             }
-            Wake::TakenOver => {
-                info!(
-                    "Client `{}` was taken over by a new connection",
-                    session.get_client_id().await
-                );
+            Wake::Closed(close) => {
+                let client_id = session.get_client_id().await;
+                let reason = match close {
+                    Close::TakenOver => {
+                        info!("Client `{}` was taken over by a new connection", client_id);
+                        ReasonCode::SessionTakenOver
+                    }
+                    Close::Admin { reason, send_will } => {
+                        info!(
+                            "Closing the connection of client `{}`: {}",
+                            client_id, reason
+                        );
+                        if !send_will {
+                            session.clear_will().await;
+                            self.session_manager.delete_will(&client_id);
+                        }
+                        reason
+                    }
+                };
                 if protocol_version.supports_reason_codes() {
                     let _ = self
                         .connection
                         .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                            reason: ReasonCode::SessionTakenOver,
+                            reason,
                             properties: Some(DisconnectProperties {
                                 reason_string: reason_string(
-                                    ReasonCode::SessionTakenOver,
+                                    reason,
                                     session.client_maximum_packet_size().await,
                                 ),
                                 ..Default::default()
@@ -2149,7 +2168,7 @@ enum Secured<S> {
 enum Wake {
     Packet(Option<ControlPacket>),
     KeepAliveExpired,
-    TakenOver,
+    Closed(Close),
 }
 
 /// The packets clients send most, handled without boxing.

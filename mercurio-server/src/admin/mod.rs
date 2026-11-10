@@ -13,20 +13,21 @@ pub use types::{BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, Li
 
 use std::{
     sync::{atomic::Ordering, Arc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use mercurio_core::message::unix_millis;
+use mercurio_core::{message::unix_millis, reason::ReasonCode};
 use mercurio_storage::{BatchStore, RetainedMessageStore};
 use serde::Serialize;
 use serde_json::Value;
+use tracing::info;
 
 use crate::{
     plugin::BoxFuture,
     queue::Subscriber,
     server::{AddressRange, ListenerState},
     session::SessionSnapshot,
-    session_manager::{ClientEntry, SessionManager},
+    session_manager::{ClientEntry, Close, DeleteRefused, SessionManager},
     sys::{self, Stats},
     topic_tree::TopicTree,
 };
@@ -100,6 +101,9 @@ pub enum ErrorCode {
     /// out, or the command is served by something not running
     Unavailable,
 }
+
+/// How long [`Admin::delete_session`] waits for a client to close.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Most items a list command returns at once.
 pub const MAX_PAGE: usize = 1000;
@@ -203,6 +207,12 @@ pub(crate) trait Directory: Send + Sync {
     fn expired_count(&self) -> u64;
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
     fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
+    fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool>;
+    fn delete_session<'a>(
+        &'a self,
+        client_id: &'a str,
+        disconnect: bool,
+    ) -> BoxFuture<'a, Result<(), DeleteRefused>>;
 }
 
 impl<S: BatchStore + 'static> Directory for SessionManager<S> {
@@ -220,6 +230,45 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
 
     fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>> {
         Box::pin(SessionManager::entry(self, client_id))
+    }
+
+    fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool> {
+        Box::pin(SessionManager::close_connection(self, client_id, close))
+    }
+
+    fn delete_session<'a>(
+        &'a self,
+        client_id: &'a str,
+        disconnect: bool,
+    ) -> BoxFuture<'a, Result<(), DeleteRefused>> {
+        Box::pin(SessionManager::delete_session(self, client_id, disconnect))
+    }
+}
+
+/// The reason codes of 0x80 and above a DISCONNECT may carry, MQTT 5
+/// section 3.14.2.1.
+const DISCONNECT_ERRORS: [u8; 27] = [
+    0x80, 0x81, 0x82, 0x83, 0x87, 0x89, 0x8B, 0x8D, 0x8E, 0x8F, 0x90, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2,
+];
+
+/// How `disconnectClient` closes a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DisconnectOptions {
+    /// Publish the client's will, as for any connection lost
+    pub send_will: bool,
+    /// Sent to MQTT 5 clients in the DISCONNECT; one of its error reason
+    /// codes, 0x80 or above
+    pub reason: ReasonCode,
+}
+
+impl Default for DisconnectOptions {
+    fn default() -> Self {
+        DisconnectOptions {
+            send_will: true,
+            reason: ReasonCode::AdministrativeAction,
+        }
     }
 }
 
@@ -302,6 +351,75 @@ impl Admin {
             found.push(summary(&entry, &snapshot));
         }
         Page::of(found, query.paging)
+    }
+
+    /// Closes the connection of `client_id`; its session stays:
+    /// `disconnectClient`.
+    pub async fn disconnect(
+        &self,
+        client_id: &str,
+        options: DisconnectOptions,
+    ) -> Result<(), AdminError> {
+        if !DISCONNECT_ERRORS.contains(&options.reason.get_code()) {
+            return Err(AdminError::invalid_argument(format!(
+                "0x{:02x} is not an error reason code a DISCONNECT may carry",
+                options.reason.get_code()
+            )));
+        }
+        let close = Close::Admin {
+            reason: options.reason,
+            send_will: options.send_will,
+        };
+        if !self
+            .inner
+            .directory
+            .close_connection(client_id, close)
+            .await
+        {
+            return Err(AdminError::not_found(format!(
+                "client `{client_id}` isn't connected"
+            )));
+        }
+        info!("Disconnecting client `{}` for the admin API", client_id);
+        Ok(())
+    }
+
+    /// Removes the session of `client_id`, its subscriptions, queue and
+    /// will: `deleteSession`. A connected client is closed first with
+    /// `disconnect`, and is a `conflict` otherwise.
+    ///
+    /// Closing a client waits for its connection to finish, for 5 seconds
+    /// at most before failing with `unavailable`; the session is still
+    /// deleted once the connection has closed. Code running in a client's
+    /// own connection, such as a plugin hook, must not delete that client's
+    /// session: the connection can't close while it waits.
+    pub async fn delete_session(
+        &self,
+        client_id: &str,
+        disconnect: bool,
+    ) -> Result<(), AdminError> {
+        // The caller is often a connection's task, which can't close while
+        // it waits here, so the wait gets a bound. The deletion runs on in
+        // its own task past it: given up half way, it would leave the client
+        // id claimed by no connection.
+        let directory = Arc::clone(&self.inner.directory);
+        let id = client_id.to_string();
+        let deletion = tokio::spawn(async move { directory.delete_session(&id, disconnect).await });
+        let unavailable = |message: &str| AdminError::new(ErrorCode::Unavailable, message);
+        let deleted = match tokio::time::timeout(DELETE_TIMEOUT, deletion).await {
+            Ok(Ok(deleted)) => deleted,
+            Ok(Err(_)) => return Err(unavailable("deleting the session failed")),
+            Err(_) => return Err(unavailable("timed out waiting for the client to close")),
+        };
+        deleted.map_err(|refused| match refused {
+            DeleteRefused::NotFound => {
+                AdminError::not_found(format!("no session for client `{client_id}`"))
+            }
+            DeleteRefused::Connected => AdminError::new(
+                ErrorCode::Conflict,
+                format!("client `{client_id}` is connected; set `disconnect` to close it first"),
+            ),
+        })
     }
 
     /// One session in detail: `getClient`.
