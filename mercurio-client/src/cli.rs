@@ -30,7 +30,8 @@ pub struct ConnectArgs {
     )]
     pub unix: Option<PathBuf>,
 
-    /// Client ID (auto-generated if not specified)
+    /// Client ID [default: one the broker assigns, or a random one where
+    /// the MQTT version needs it]
     #[arg(short = 'i', long)]
     pub client_id: Option<String>,
 

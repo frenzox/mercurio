@@ -198,6 +198,19 @@ async fn logs_go_to_standard_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mqtt_3_without_a_client_id_still_connects() {
+    let broker = start().await;
+    for args in [
+        &["pub", "-V", "311", "-c", "-t", "a", "-m", "x"][..],
+        &["pub", "-V", "31", "-t", "a", "-m", "x"],
+        &["pub", "-V", "311", "-t", "a", "-m", "x"],
+    ] {
+        let output = broker.run(args).await;
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refused_subscription_fails() {
     let broker = start().await;
     let output = broker.run(&["sub", "-t", "a/#/b"]).await;

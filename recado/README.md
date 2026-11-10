@@ -69,7 +69,7 @@ Connection options, for both commands:
 | `-H, --host` | Broker host | `localhost` |
 | `-p, --port` | Broker port | `1883` |
 | `--unix` | Unix socket, instead of host and port | |
-| `-i, --client-id` | Client id | generated |
+| `-i, --client-id` | Client id; for MQTT 3.1, and 3.1.1 with `-c`, recado makes up a `recado-` id | assigned by the broker |
 | `-u, --username`, `-P, --password` | Credentials; the password also comes from `RECADO_PASSWORD`, and `-u` alone asks for it on a terminal | |
 | `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |

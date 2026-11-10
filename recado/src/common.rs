@@ -76,13 +76,44 @@ impl WillArgs {
 impl ConnectionArgs {
     /// Convert CLI arguments to ConnectOptions.
     pub fn to_connect_options(&self) -> ConnectOptions {
-        self.connect
+        let options = self
+            .connect
             .to_connect_options()
             .keep_alive(self.keep_alive)
             .clean_start(!self.no_clean_start)
             .session_expiry(self.session_expiry)
-            .protocol_version(self.protocol_version.into())
+            .protocol_version(self.protocol_version.into());
+        match self.client_id() {
+            Some(id) => options.client_id(id),
+            None => options,
+        }
     }
+
+    /// The client id to send: the one given with -i, or one made up where
+    /// MQTT 3 needs an id and none was given. MQTT 3.1 takes no empty id,
+    /// and 3.1.1 only with a clean session. Otherwise the id stays empty
+    /// and the broker assigns one.
+    pub fn client_id(&self) -> Option<String> {
+        if let Some(id) = &self.connect.client_id {
+            return Some(id.clone());
+        }
+        let needed = match self.protocol_version {
+            Protocol::V31 => true,
+            Protocol::V311 => self.no_clean_start,
+            Protocol::V5 => false,
+        };
+        needed.then(made_up_client_id)
+    }
+}
+
+/// `recado-` and 16 hex digits, 23 characters, the most MQTT 3.1 takes.
+/// `RandomState`'s keys are seeded from the operating system, so each call
+/// gives another.
+fn made_up_client_id() -> String {
+    use std::hash::BuildHasher;
+
+    let random = std::collections::hash_map::RandomState::new();
+    format!("recado-{:016x}", random.hash_one(std::process::id()))
 }
 
 /// An MQTT version, as `-V` names it.
@@ -164,6 +195,27 @@ mod tests {
             for spelling in spellings {
                 assert_eq!(version(spelling).unwrap(), expected, "{spelling}");
             }
+        }
+    }
+
+    #[test]
+    fn a_client_id_is_made_up_only_where_mqtt_3_needs_one() {
+        let id = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("recado").chain(args.iter().copied()))
+                .unwrap()
+                .connection
+                .client_id()
+        };
+        assert_eq!(id(&[]), None);
+        assert_eq!(id(&["-c"]), None);
+        assert_eq!(id(&["-V", "311"]), None);
+        assert_eq!(id(&["-V", "31", "-i", "me"]).as_deref(), Some("me"));
+        for args in [&["-V", "31"][..], &["-V", "311", "-c"]] {
+            let made_up = id(args).unwrap();
+            // MQTT 3.1 takes 1 to 23 characters
+            assert!(made_up.starts_with("recado-"), "{made_up}");
+            assert!((1..=23).contains(&made_up.len()), "{made_up}");
+            assert_ne!(id(args), Some(made_up), "{args:?}");
         }
     }
 
