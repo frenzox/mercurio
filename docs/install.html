@@ -47,7 +47,7 @@ sudo apt install ./mercuriod_*.deb ./mercurioctl_*.deb ./recado_*.deb
 
 <span class="comment"># Fedora, RHEL, openSUSE</span>
 sudo dnf install ./mercuriod-*.rpm ./mercurioctl-*.rpm ./recado-*.rpm</pre>
-<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, create a <code>mercurio</code> system user and group for the service, and recommend <code>mercurioctl</code>. Members of the group may run <a href="mercurioctl.html">mercurioctl</a> on the broker's host. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
+<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, create a <code>mercurio</code> system user and group for the service, and recommend <code>mercurioctl</code>. Members of the group may run <a href="mercurioctl.html">mercurioctl</a> on the broker's host. The configuration can hold passwords, so only root and the group may read it (<code>0640 root:mercurio</code>). Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
 <pre>sudo systemctl enable --now mercuriod</pre>
 <p>The service runs as <code>mercurio</code>, so files it reads that aren't readable by everyone, such as TLS keys and password files, must belong to that user or its group:</p>
 <pre>sudo chown root:mercurio /etc/mercurio/server.key

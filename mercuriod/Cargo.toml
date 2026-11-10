@@ -62,7 +62,8 @@ maintainer-scripts = "contrib/debian"
 systemd-units = { unit-scripts = "contrib", enable = true, start = true }
 assets = [
     ["target/release/mercuriod", "usr/bin/", "755"],
-    ["contrib/config.toml", "etc/mercurio/config.toml", "644"],
+    # Group mercurio comes from postinst, as the archive can only hold root
+    ["contrib/config.toml", "etc/mercurio/config.toml", "640"],
     ["contrib/mercurio.sysusers", "usr/lib/sysusers.d/mercurio.conf", "644"],
     ["README.md", "usr/share/doc/mercuriod/README.md", "644"],
 ]
@@ -70,13 +71,17 @@ assets = [
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/mercuriod", dest = "/usr/bin/mercuriod", mode = "755" },
-    { source = "contrib/config.toml", dest = "/etc/mercurio/config.toml", mode = "644", config = "noreplace" },
+    { source = "contrib/config.toml", dest = "/etc/mercurio/config.toml", mode = "640", user = "root", group = "mercurio", config = "noreplace" },
     { source = "contrib/mercuriod.service", dest = "/usr/lib/systemd/system/mercuriod.service", mode = "644" },
     { source = "contrib/mercurio.sysusers", dest = "/usr/lib/sysusers.d/mercurio.conf", mode = "644" },
     { source = "README.md", dest = "/usr/share/doc/mercuriod/README.md", mode = "644", doc = true },
 ]
+# Before the files are installed, so config.toml can belong to the group;
+# the line repeats contrib/mercurio.sysusers, not installed yet
+pre_install_script = """
+echo 'u mercurio - "Mercurio MQTT broker" /var/lib/mercurio' | systemd-sysusers --replace=/usr/lib/sysusers.d/mercurio.conf - || :
+"""
 post_install_script = """
-systemd-sysusers mercurio.conf || :
 systemctl daemon-reload >/dev/null 2>&1 || :
 if [ $1 -eq 1 ]; then
     systemctl preset mercuriod.service >/dev/null 2>&1 || :
