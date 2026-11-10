@@ -1705,31 +1705,30 @@ where
             // Published after the will delay or when the session ends, whichever
             // comes first, unless the client reconnects before then [MQTT-3.1.3-9]
             let delay = expiry.map_or(will.delay, |expiry| expiry.min(will.delay));
-            if !delay.is_zero() {
-                session.set_delayed_will(true).await;
-            }
             let generation = lease.generation;
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
-            let session = session.clone();
+            let will_session = session.clone();
 
             let publish = async move {
                 if !delay.is_zero() {
                     time::sleep(delay).await;
-                    if session.generation().await != generation {
+                    if !will_session.claim_pending_will(generation).await {
                         return;
                     }
                 }
-                let client_id = session.get_client_id().await;
+                let client_id = will_session.get_client_id().await;
                 publish_will(&broker, will, &client_id).await;
                 session_manager.delete_will(&client_id);
-                session.set_delayed_will(false).await;
             };
 
             if delay.is_zero() {
                 Box::pin(publish).await;
             } else {
-                tokio::spawn(publish);
+                // Aborted, freeing the will, as soon as a new connection
+                // takes the session over or the session is deleted
+                let task = tokio::spawn(publish).abort_handle();
+                session.set_pending_will(generation, task).await;
             }
         }
 

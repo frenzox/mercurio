@@ -12,6 +12,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
+    task::AbortHandle,
     time::Duration,
 };
 use tracing::{info, warn};
@@ -303,6 +304,9 @@ struct State {
     max_inflight: u16,
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
+    /// The task holding the will of the last connection until its delay
+    /// passes; a newer generation aborts it
+    pending_will: Option<AbortHandle>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
@@ -331,8 +335,6 @@ struct Presence {
     /// Unix milliseconds, once disconnected
     expires_at: Option<u64>,
     counters: Arc<ClientCounters>,
-    /// A will waits for its delay before being published
-    delayed_will: bool,
 }
 
 /// A session's state at one moment, for the admin API.
@@ -406,6 +408,7 @@ impl Session {
                     receive_maximum: u16::MAX,
                     max_inflight: u16::MAX,
                     will_message,
+                    pending_will: None,
                     auth_exchange: None,
                     verified_user: None,
                     peer: None,
@@ -444,8 +447,38 @@ impl Session {
         self.shared.state.lock().await.generation
     }
 
+    /// Hands the session to `generation`, dropping the will an earlier
+    /// connection left waiting for its delay.
     pub(crate) async fn set_generation(&self, generation: u64) {
-        self.shared.state.lock().await.generation = generation;
+        let mut state = self.shared.state.lock().await;
+        state.generation = generation;
+        if let Some(will) = state.pending_will.take() {
+            will.abort();
+        }
+    }
+
+    /// Records the task holding the will of the connection of `generation`
+    /// until its delay passes, aborting it if a newer connection has
+    /// already taken over.
+    pub(crate) async fn set_pending_will(&self, generation: u64, will: AbortHandle) {
+        let mut state = self.shared.state.lock().await;
+        if state.generation == generation {
+            state.pending_will = Some(will);
+        } else {
+            will.abort();
+        }
+    }
+
+    /// Called by the pending will once its delay passed: whether it is still
+    /// the session's to publish. From then on no takeover aborts it, so the
+    /// will is never cut off half published.
+    pub(crate) async fn claim_pending_will(&self, generation: u64) -> bool {
+        let mut state = self.shared.state.lock().await;
+        if state.generation != generation {
+            return false;
+        }
+        state.pending_will = None;
+        true
     }
 
     /// Get a clone of the will message without removing it.
@@ -994,7 +1027,6 @@ impl Session {
             session_expiry: expiry,
             expires_at: None,
             counters: Arc::clone(&counters),
-            delayed_will: false,
         };
         counters
     }
@@ -1020,10 +1052,6 @@ impl Session {
         presence.expires_at = expires_at;
     }
 
-    pub(crate) async fn set_delayed_will(&self, delayed: bool) {
-        self.shared.state.lock().await.presence.delayed_will = delayed;
-    }
-
     pub(crate) async fn snapshot(&self) -> SessionSnapshot {
         let state = self.shared.state.lock().await;
         let presence = &state.presence;
@@ -1044,7 +1072,7 @@ impl Session {
             subscriptions: state.subscriptions.values().cloned().collect(),
             queued: self.shared.queue.len(),
             inflight: state.unacknowledged_messages.len() + state.pubrecs.len(),
-            will_pending: state.will_message.is_some() || presence.delayed_will,
+            will_pending: state.will_message.is_some() || state.pending_will.is_some(),
             counters: Arc::clone(&presence.counters),
         }
     }
@@ -2933,6 +2961,44 @@ mod tests {
         assert!(will.is_some());
         let will = will.unwrap();
         assert_eq!(will.topic, "will/topic");
+    }
+
+    /// A task that holds `will` until aborted, as a delayed will does.
+    fn holding(will: &Arc<WillMessage>) -> tokio::task::JoinHandle<()> {
+        let will = Arc::clone(will);
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(will);
+        })
+    }
+
+    #[tokio::test]
+    async fn test_a_newer_generation_frees_the_pending_will() {
+        let session = Session::new(create_connect_packet_with_will());
+        let will = Arc::new(session.take_will().await.unwrap());
+
+        let pending = holding(&will);
+        session.set_pending_will(0, pending.abort_handle()).await;
+        assert!(session.snapshot().await.will_pending);
+        session.set_generation(1).await;
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert_eq!(Arc::strong_count(&will), 1);
+        assert!(!session.snapshot().await.will_pending);
+
+        // One left by a connection already superseded is freed at once
+        let stale = holding(&will);
+        session.set_pending_will(0, stale.abort_handle()).await;
+        assert!(stale.await.unwrap_err().is_cancelled());
+        assert_eq!(Arc::strong_count(&will), 1);
+
+        // Once claimed, a takeover no longer cuts the will off
+        let claimed = holding(&will);
+        session.set_pending_will(1, claimed.abort_handle()).await;
+        assert!(session.claim_pending_will(1).await);
+        session.set_generation(2).await;
+        tokio::task::yield_now().await;
+        assert!(!claimed.is_finished());
+        claimed.abort();
     }
 
     #[tokio::test]
