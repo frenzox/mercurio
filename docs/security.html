@@ -152,7 +152,7 @@ mercurioctl -H broker.example.com -u admin dynsec list-clients</pre>
 
 <h3>Model</h3>
 <ul>
-<li><strong>Clients</strong> log in with a user name and password, and can be disabled. A client created with a <code>clientid</code> may connect only with that client id, not with one the broker assigns.</li>
+<li><strong>Clients</strong> log in with a user name and password, and can be disabled. A client created with a <code>clientid</code> may connect only with that client id, not with one the broker assigns. A user name dynamic security has no client for, such as one taken from a certificate with <code>identity_as_username</code>, gets no access at all: create a client of that name, without a password, to give it roles. A client deleted while connected loses its access at once.</li>
 <li><strong>Roles</strong> hold ACLs. A client has its own roles and those of its groups.</li>
 <li><strong>Groups</strong> give their roles to their members. The anonymous group's roles apply to clients without a user name.</li>
 <li><strong>ACLs</strong> have a type, a topic filter, an optional <code>priority</code> and <code>allow</code>. The matching ACL with the highest priority decides.</li>

@@ -422,7 +422,9 @@ Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
 `addGroupRole`, `removeGroupRole`, `addGroupClient`, `removeGroupClient`,
 `getGroup`, `listGroups`, `setAnonymousGroup` and `getAnonymousGroup`. A
 client created with a `clientid` may connect only with that client id. A
-client has its own roles and those of its groups; clients without a user
+user name with no client, such as one from a client certificate, gets no
+access at all; create a client of that name, without a password, to give
+it roles. A client has its own roles and those of its groups; clients without a user
 name get those of the anonymous group. ACLs of type `publishClientSend`
 decide publishing, `publishClientReceive` receiving, and
 `subscribePattern` and `subscribeLiteral` subscribing. The ACL with the

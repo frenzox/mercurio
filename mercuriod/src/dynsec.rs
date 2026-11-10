@@ -4,7 +4,8 @@
 //! a JSON file, saved after every change.
 //!
 //! A client's roles are its own and those of its groups; clients without a
-//! user name get the roles of the anonymous group, when one is set.
+//! user name get the roles of the anonymous group, when one is set. A user
+//! name with no client gets no access.
 
 use std::{
     path::Path,
@@ -173,14 +174,13 @@ impl Data {
     }
 
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
-        // A client disabled while connected loses its access at once
+        // A client disabled or deleted while connected loses its access at
+        // once; a user name from elsewhere, such as a client certificate,
+        // needs a client of that name, as in mosquitto
         if let Some(username) = username {
-            if self
-                .clients
-                .iter()
-                .any(|c| c.username == username && c.disabled)
-            {
-                return false;
+            match self.clients.iter().find(|c| c.username == username) {
+                Some(client) if !client.disabled => {}
+                _ => return false,
             }
         }
         let decision = self
@@ -1241,6 +1241,68 @@ mod tests {
                 security.authenticate(&client, &credentials).await,
                 decision,
                 "{client_id:?}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_users_it_does_not_know_get_no_access() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-gone-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        run(
+            &security,
+            json!([
+                { "command": "setDefaultACLAccess", "acls": [
+                    { "acltype": "publishClientSend", "allow": true },
+                    { "acltype": "subscribe", "allow": true },
+                ]},
+                { "command": "createClient", "username": "s1", "password": "pw" },
+                // A user name from a client certificate, with no password
+                { "command": "createClient", "username": "device-7" },
+            ]),
+        );
+        let all = [Access::Write, Access::Read, Access::Subscribe];
+        for username in ["s1", "device-7"] {
+            for access in all {
+                assert_eq!(
+                    security
+                        .authorize(&identity(username), "anything", access)
+                        .await,
+                    Decision::Allow,
+                    "{username} {access:?}"
+                );
+            }
+        }
+
+        // Deleted while connected, or never created, as a user name from a
+        // certificate or another plugin may be
+        run(
+            &security,
+            json!([{ "command": "deleteClient", "username": "s1" }]),
+        );
+        for username in ["s1", "stranger"] {
+            for access in all {
+                assert_eq!(
+                    security
+                        .authorize(&identity(username), "anything", access)
+                        .await,
+                    Decision::Deny,
+                    "{username} {access:?}"
+                );
+            }
+        }
+        // Anonymous clients keep the default access
+        let anonymous = ClientInfo::new("a", None);
+        for access in all {
+            assert_eq!(
+                security.authorize(&anonymous, "anything", access).await,
+                Decision::Allow,
+                "{access:?}"
             );
         }
         std::fs::remove_file(path).unwrap();
