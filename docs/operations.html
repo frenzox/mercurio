@@ -57,6 +57,7 @@ url = "postgres://mercurio:password@localhost/mercurio"</pre>
 </ul>
 <p>After a restart, clients with persistent sessions resume where they left off: their queued messages are delivered, and unacknowledged ones are sent again. Sessions that expired while the broker was down are discarded, and their wills published.</p>
 <p>Changes are written in the background, in order for each client and in batches, so storage doesn't slow clients down. They reach the database within milliseconds: a broker that crashes loses only the changes of its last moments, and one that shuts down writes everything first. When storage falls behind, by 10,000 changes for one client, that client waits for it.</p>
+<p>The SQLite database runs in WAL mode: while the broker runs, it keeps <code>mercurio.db-wal</code> and <code>mercurio.db-shm</code> next to the database, and recent changes may be only in the <code>-wal</code> file. To back it up while the broker runs, use <code>sqlite3 mercurio.db ".backup copy.db"</code>; a plain copy of <code>mercurio.db</code> alone can miss those changes.</p>
 <p>PostgreSQL needs version 12 or later. Connect the broker to it directly: PgBouncer drops the connection settings the broker relies on, and in transaction mode the lock described below. The broker creates its tables, and updates them when a new version needs it; it refuses a database updated by a newer version.</p>
 
 <h3 id="standby">Standby brokers</h3>

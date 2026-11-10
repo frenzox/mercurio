@@ -6,6 +6,7 @@
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -40,32 +41,29 @@ impl SqliteStore {
     /// Create a new SQLite store with the given database path.
     ///
     /// Creates the database file and tables if they don't exist.
+    ///
+    /// The database is put in WAL mode, so the broker keeps `-wal` and
+    /// `-shm` files next to it while it runs.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path).map_err(StorageError::database)?;
-        let store = SqliteStore {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init_schema()?;
-        Ok(store)
+        Self::open(Connection::open(path))
     }
 
     /// Create an in-memory SQLite store (useful for testing).
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(StorageError::database)?;
-        let store = SqliteStore {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        store.init_schema()?;
-        Ok(store)
+        Self::open(Connection::open_in_memory())
     }
 
-    /// Initialize the database schema.
-    fn init_schema(&self) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        create_schema(&conn).map_err(StorageError::database)
+    fn open(conn: rusqlite::Result<Connection>) -> Result<Self> {
+        let conn = conn
+            .and_then(|conn| {
+                configure(&conn)?;
+                create_schema(&conn)?;
+                Ok(conn)
+            })
+            .map_err(StorageError::database)?;
+        Ok(SqliteStore {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Execute a blocking operation on the tokio runtime.
@@ -84,6 +82,16 @@ impl SqliteStore {
         .await
         .map_err(|e| StorageError::OperationFailed(e.to_string()))?
     }
+}
+
+/// WAL lets readers, such as an operator's `sqlite3` shell, work alongside
+/// the broker's writes. With WAL, NORMAL keeps the database consistent
+/// across a power loss and may lose only the last commits.
+fn configure(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    // In-memory databases report "memory" and stay that way
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
 }
 
 /// Creates the tables, and adds the columns databases from older versions
@@ -857,6 +865,7 @@ mod tests {
 
         let reopened = SqliteStore::new(&path).unwrap();
         assert_eq!(reopened.load_bans().await.unwrap(), vec![ban]);
+        drop(reopened);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -926,6 +935,7 @@ mod tests {
             .unwrap();
         // Sessions from before owners were kept count as anonymous ones
         assert_eq!(loaded.owner, SessionOwner::default());
+        drop(store);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -949,6 +959,7 @@ mod tests {
             .prepare("SELECT origin_client_id, origin_username FROM retained_messages")
             .is_ok());
         drop(conn);
+        drop(store);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1189,6 +1200,52 @@ mod tests {
 
         let retained = store.get_retained("#").await.unwrap();
         assert!(retained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_readers_do_not_block_writes() {
+        let path = std::env::temp_dir().join(format!("mercurio-wal-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::new(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            // 1 is NORMAL
+            let synchronous: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(synchronous, 1);
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        }
+
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT COUNT(*) FROM retained_messages", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        store
+            .store_retained("a", Some(create_test_message("a", "1")))
+            .await
+            .unwrap();
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_in_memory_store_keeps_its_journal_mode() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "memory");
     }
 
     #[tokio::test]

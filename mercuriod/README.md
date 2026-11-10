@@ -524,6 +524,12 @@ restart.
 Changes are written in the background within milliseconds, so a crash loses
 only the changes of its last moments; a shutdown writes everything first.
 
+The SQLite database runs in WAL mode: while the broker runs, it keeps
+`-wal` and `-shm` files next to the database, and recent changes may be
+only in the `-wal` file. To back it up while the broker runs, use
+`sqlite3 mercurio.db ".backup copy.db"`; a plain copy of the database file
+alone can miss those changes.
+
 Only one broker serves from a PostgreSQL database at a time. Another one
 started on it exits, or, with `standby = true`, waits without listening and
 takes over as soon as the serving broker's process stops, or about 11
