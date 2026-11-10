@@ -435,8 +435,15 @@ roles and access rules that change while the broker runs, as with
 mosquitto's dynamic security plugin. Create the file with an administrator:
 
 ```bash
-mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
+sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
 ```
+
+The file is created with mode 0600. Run as root in a directory owned by
+another user, as the service's state directory `/var/lib/mercurio` is, the
+command gives the file to that directory's owner and group, so the service
+can read it. systemd creates that directory when the service first starts:
+start it once before, with `systemctl start mercuriod`, if it has never
+run.
 
 The administrator manages it with `mercurioctl`, which names mosquitto's
 commands in kebab-case, as `mosquitto_ctrl` does:
@@ -457,12 +464,19 @@ Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
 `getDefaultACLAccess`, and for groups `createGroup`, `deleteGroup`,
 `addGroupRole`, `removeGroupRole`, `addGroupClient`, `removeGroupClient`,
 `getGroup`, `listGroups`, `setAnonymousGroup` and `getAnonymousGroup`. A
-client has its own roles and those of its groups; clients without a user
+client created with a `clientid` may connect only with that client id. A
+user name with no client, such as one from a client certificate, gets no
+access at all; create a client of that name, without a password, to give
+it roles. A client has its own roles and those of its groups; clients without a user
 name get those of the anonymous group. ACLs of type `publishClientSend`
 decide publishing, `publishClientReceive` receiving, and
-`subscribePattern` and `subscribeLiteral` subscribing. The highest
-`priority` wins. Without a matching ACL, only receiving is allowed, unless
+`subscribePattern` and `subscribeLiteral` subscribing. The ACL with the
+highest `priority` wins, whichever role holds it; roles and groups have no
+priority of their own, and commands giving them one fail. Without a matching ACL, only receiving is allowed, unless
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
+As in mosquitto, a change that can take access away disconnects the
+connected clients it concerns, with Administrative Action (0x98), so they
+log in again under their new access.
 
 `$CONTROL` topics are only open to clients when access control grants
 them, so a broker without `acl_file` or `dynamic_security` refuses them

@@ -4,17 +4,20 @@
 //! a JSON file, saved after every change.
 //!
 //! A client's roles are its own and those of its groups; clients without a
-//! user name get the roles of the anonymous group, when one is set.
+//! user name get the roles of the anonymous group, when one is set. A user
+//! name with no client gets no access.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, OnceLock, RwLock},
 };
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
+use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
@@ -22,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
 
+use crate::credentials::unknown_user_hash;
 use crate::reload::Reload;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -73,6 +77,9 @@ struct Client {
     /// Argon2 hash; a client without one can't log in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
+    /// The only client id it may connect with, when set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clientid: Option<String>,
     #[serde(default)]
     disabled: bool,
     #[serde(default)]
@@ -169,14 +176,13 @@ impl Data {
     }
 
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
-        // A client disabled while connected loses its access at once
+        // A client disabled or deleted while connected loses its access at
+        // once; a user name from elsewhere, such as a client certificate,
+        // needs a client of that name, as in mosquitto
         if let Some(username) = username {
-            if self
-                .clients
-                .iter()
-                .any(|c| c.username == username && c.disabled)
-            {
-                return false;
+            match self.clients.iter().find(|c| c.username == username) {
+                Some(client) if !client.disabled => {}
+                _ => return false,
             }
         }
         let decision = self
@@ -206,6 +212,53 @@ impl Data {
         }
     }
 
+    /// The clients whose access `command` may change, to disconnect once it
+    /// is applied, as mosquitto does: they log in again under the access
+    /// they now have, and their subscriptions are checked again.
+    fn affected_by(&self, command: &str, args: &Value) -> Affected {
+        let text = |name: &str| args.get(name).and_then(Value::as_str);
+        let mut affected = Affected::default();
+        match command {
+            "deleteClient" | "disableClient" | "setClientPassword" | "addClientRole"
+            | "removeClientRole" | "addGroupClient" | "removeGroupClient" => {
+                affected.users.extend(text("username").map(str::to_string));
+            }
+            "addGroupRole" | "removeGroupRole" | "deleteGroup" => {
+                if let Some(group) = text("groupname") {
+                    self.add_members(group, &mut affected);
+                }
+            }
+            "deleteRole" | "addRoleACL" | "removeRoleACL" => {
+                if let Some(role) = text("rolename") {
+                    let holders = self
+                        .clients
+                        .iter()
+                        .filter(|c| c.roles.iter().any(|r| r == role));
+                    affected.users.extend(holders.map(|c| c.username.clone()));
+                    for group in self
+                        .groups
+                        .iter()
+                        .filter(|g| g.roles.iter().any(|r| r == role))
+                    {
+                        self.add_members(&group.groupname, &mut affected);
+                    }
+                }
+            }
+            "setAnonymousGroup" => affected.anonymous = true,
+            _ => {}
+        }
+        affected
+    }
+
+    fn add_members(&self, group: &str, affected: &mut Affected) {
+        let members = self
+            .clients
+            .iter()
+            .filter(|c| c.groups.iter().any(|g| g == group));
+        affected.users.extend(members.map(|c| c.username.clone()));
+        affected.anonymous |= self.anonymous_group.as_deref() == Some(group);
+    }
+
     /// Applies one command. Returns its response data, if any, and whether
     /// it changed anything.
     fn apply(&mut self, command: &str, args: &Value) -> Result<(Option<Value>, bool), String> {
@@ -221,14 +274,21 @@ impl Data {
                 if self.clients.iter().any(|c| c.username == username) {
                     return Err("Client already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename");
+                let roles = names(args.get("roles"), "rolename")?;
                 if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
                     return Err(format!("Role {missing} not found"));
                 }
-                let groups = names(args.get("groups"), "groupname");
+                let groups = names(args.get("groups"), "groupname")?;
                 if let Some(missing) = groups.iter().find(|g| self.group(g).is_err()) {
                     return Err(format!("Group {missing} not found"));
                 }
+                // Empty, as mosquitto takes it, binds no client id
+                let clientid = match args.get("clientid") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(id)) if id.is_empty() => None,
+                    Some(Value::String(id)) => Some(id.clone()),
+                    Some(_) => return Err("Invalid clientid".to_string()),
+                };
                 let password = match args.get("password").and_then(Value::as_str) {
                     Some(password) => Some(hash_password(password)?),
                     None => None,
@@ -236,6 +296,7 @@ impl Data {
                 self.clients.push(Client {
                     username,
                     password,
+                    clientid,
                     disabled: false,
                     roles,
                     groups,
@@ -258,6 +319,7 @@ impl Data {
                 Ok((None, true))
             }
             "addClientRole" => {
+                no_priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let client = self.client(&text("username")?)?;
@@ -287,6 +349,7 @@ impl Data {
                     .collect();
                 let data = json!({ "client": {
                     "username": client.username,
+                    "clientid": client.clientid,
                     "disabled": client.disabled,
                     "roles": roles,
                     "groups": groups,
@@ -328,7 +391,7 @@ impl Data {
                 if self.groups.iter().any(|g| g.groupname == groupname) {
                     return Err("Group already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename");
+                let roles = names(args.get("roles"), "rolename")?;
                 if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
                     return Err(format!("Role {missing} not found"));
                 }
@@ -348,6 +411,7 @@ impl Data {
                 Ok((None, true))
             }
             "addGroupRole" => {
+                no_priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let group = self.group(&text("groupname")?)?;
@@ -364,6 +428,7 @@ impl Data {
                 Ok((None, true))
             }
             "addGroupClient" => {
+                no_priority(args)?;
                 let groupname = text("groupname")?;
                 self.group(&groupname)?;
                 let client = self.client(&text("username")?)?;
@@ -451,20 +516,20 @@ impl Data {
                     .get("acls")
                     .and_then(Value::as_array)
                     .ok_or("Invalid/missing acls")?;
+                // Applied to a copy, so an invalid entry leaves no half of
+                // the change behind for a later command of the batch to save
+                let mut access = self.default_acl_access;
                 for acl in acls {
                     let allow = acl.get("allow").and_then(Value::as_bool);
-                    let access = match acl.get("acltype").and_then(Value::as_str) {
-                        Some("publishClientSend") => {
-                            &mut self.default_acl_access.publish_client_send
-                        }
-                        Some("publishClientReceive") => {
-                            &mut self.default_acl_access.publish_client_receive
-                        }
-                        Some("subscribe") => &mut self.default_acl_access.subscribe,
+                    let field = match acl.get("acltype").and_then(Value::as_str) {
+                        Some("publishClientSend") => &mut access.publish_client_send,
+                        Some("publishClientReceive") => &mut access.publish_client_receive,
+                        Some("subscribe") => &mut access.subscribe,
                         _ => return Err("Invalid/missing acltype".to_string()),
                     };
-                    *access = allow.ok_or("Invalid/missing allow")?;
+                    *field = allow.ok_or("Invalid/missing allow")?;
                 }
+                self.default_acl_access = access;
                 Ok((None, true))
             }
             "getDefaultACLAccess" => {
@@ -483,13 +548,30 @@ impl Data {
 
 /// Names given as `[{"rolename": ...}]` or `[{"groupname": ...}]`, as
 /// mosquitto does.
-fn names(list: Option<&Value>, key: &str) -> Vec<String> {
-    list.and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.get(key).and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
+fn names(list: Option<&Value>, key: &str) -> Result<Vec<String>, String> {
+    let entries = list.and_then(Value::as_array).into_iter().flatten();
+    let mut names = Vec::new();
+    for entry in entries {
+        no_priority(entry)?;
+        if let Some(name) = entry.get(key).and_then(Value::as_str) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Refuses the `priority` mosquitto gives a client's roles and groups:
+/// here the matching ACL with the highest priority decides, whichever role
+/// it is in, so ordering roles would change nothing. Mosquitto's default,
+/// -1, is accepted.
+fn no_priority(args: &Value) -> Result<(), String> {
+    match args.get("priority") {
+        None | Some(Value::Null) => Ok(()),
+        Some(priority) if priority.as_i64() == Some(-1) => Ok(()),
+        Some(_) => {
+            Err("Role and group priorities are not supported; give the ACLs priorities".to_string())
+        }
+    }
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -500,6 +582,20 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to hash password: {e}"))
 }
 
+/// Connected clients a change of the state concerns.
+#[derive(Debug, Default)]
+struct Affected {
+    users: BTreeSet<String>,
+    /// Clients without a user name
+    anonymous: bool,
+}
+
+impl Affected {
+    fn is_empty(&self) -> bool {
+        self.users.is_empty() && !self.anonymous
+    }
+}
+
 /// The dynamic security state, checking passwords and topic access.
 pub struct DynamicSecurity {
     path: String,
@@ -508,6 +604,8 @@ pub struct DynamicSecurity {
     /// overwrite each other's changes or the temporary file, and a reload
     /// doesn't land between a batch's copy of the state and its save
     commands: Mutex<()>,
+    /// Disconnects the clients a change affects, once the broker runs
+    admin: OnceLock<Admin>,
 }
 
 impl DynamicSecurity {
@@ -516,12 +614,21 @@ impl DynamicSecurity {
             path: path.to_string(),
             data: RwLock::new(read(path)?),
             commands: Mutex::new(()),
+            admin: OnceLock::new(),
         })
+    }
+
+    /// Hands over the broker's `Admin`, which exists only once the broker
+    /// does.
+    pub fn set_admin(&self, admin: Admin) {
+        let _ = self.admin.set(admin);
     }
 
     /// Writes a new state file with an administrator client, `admin`, whose
     /// role may send every dynamic security and broker admin command and
-    /// read `$SYS`.
+    /// read `$SYS`. Created by root in another user's directory, such as the
+    /// service's state directory, the file is given to that directory's
+    /// owner and group, so the service can read it.
     pub fn init(path: &str, admin: &str, password: &str) -> Result<(), String> {
         if Path::new(path).exists() {
             return Err(format!("{path} already exists"));
@@ -536,6 +643,7 @@ impl DynamicSecurity {
             clients: vec![Client {
                 username: admin.to_string(),
                 password: Some(hash_password(password)?),
+                clientid: None,
                 disabled: false,
                 roles: vec!["admin".to_string()],
                 groups: Vec::new(),
@@ -555,16 +663,27 @@ impl DynamicSecurity {
             }],
             ..Default::default()
         };
-        write(path, &data)
+        write(path, &data)?;
+        #[cfg(unix)]
+        give_to_directory_owner(path)
+            .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
+        Ok(())
     }
 
     /// Runs a batch of commands, `{"commands": [...]}`, and returns the
-    /// response batch. The file is saved once if any command changed the
-    /// state; if saving fails, the changes are undone.
-    fn handle(&self, request: &[u8]) -> Value {
+    /// response batch with the clients the changes concern. The file is
+    /// saved once if any command changed the state; if saving fails, the
+    /// changes are undone.
+    fn handle(&self, request: &[u8]) -> (Value, Affected) {
         let request: Value = match serde_json::from_slice(request) {
             Ok(request) => request,
-            Err(e) => return json!({ "responses": [{ "error": format!("Invalid JSON: {e}") }] }),
+            Err(e) => {
+                let error = format!("Invalid JSON: {e}");
+                return (
+                    json!({ "responses": [{ "error": error }] }),
+                    Affected::default(),
+                );
+            }
         };
         let commands = request
             .get("commands")
@@ -578,13 +697,19 @@ impl DynamicSecurity {
         let _batch = self.commands.lock().unwrap_or_else(|e| e.into_inner());
         let mut data = self.data.read().unwrap().clone();
         let mut changed = false;
+        let mut affected = Affected::default();
         let mut responses = Vec::new();
         for args in &commands {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             let mut response = json!({ "command": command });
+            // Before applying it: a deleted role or group no longer names
+            // its holders
+            let concerned = data.affected_by(command, args);
             match data.apply(command, args) {
                 Ok((reply, change)) => {
                     changed |= change;
+                    affected.users.extend(concerned.users);
+                    affected.anonymous |= concerned.anonymous;
                     if let Some(reply) = reply {
                         response["data"] = reply;
                     }
@@ -602,10 +727,43 @@ impl DynamicSecurity {
                 Err(e) => {
                     error!("Dynamic security: {e}");
                     responses = vec![json!({ "error": "Failed to save the changes" })];
+                    affected = Affected::default();
                 }
             }
         }
-        json!({ "responses": responses })
+        (json!({ "responses": responses }), affected)
+    }
+}
+
+/// Disconnects the connected clients `affected` names, with Administrative
+/// Action and without their wills, as mosquitto does. Anonymous clients are
+/// those with a network address: in-process clients and those of Unix
+/// sockets, the trusted admin socket among them, are left alone.
+async fn disconnect(admin: Admin, affected: Affected) {
+    let mut query = ClientQuery::default();
+    query.connected = Some(true);
+    let mut targets = Vec::new();
+    loop {
+        query.paging = Paging::new(query.paging.offset, MAX_PAGE).expect("a page allowed");
+        let page = admin.clients(&query).await;
+        if page.items.is_empty() {
+            break;
+        }
+        query.paging.offset += page.items.len();
+        let concerned = page
+            .items
+            .into_iter()
+            .filter(|client| match &client.username {
+                Some(username) => affected.users.contains(username),
+                None => affected.anonymous && client.address.is_some(),
+            });
+        targets.extend(concerned.map(|client| client.client_id));
+    }
+    let mut options = DisconnectOptions::default();
+    options.send_will = false;
+    for client_id in targets {
+        // It may have left meanwhile
+        let _ = admin.disconnect(&client_id, options).await;
     }
 }
 
@@ -630,7 +788,10 @@ fn read(path: &str) -> Result<Data, String> {
     })
 }
 
-/// Replaces the file in one step, so a crash never leaves half of it.
+/// Replaces the file in one step, so a crash never leaves half of it. The
+/// new contents reach the disk before the rename, and the rename before
+/// returning: after a power loss the file is the old one or the new one,
+/// never empty, and it is the only copy.
 fn write(path: &str, data: &Data) -> Result<(), String> {
     let temporary = format!("{path}.new");
     let contents = serde_json::to_string_pretty(data).expect("serializable");
@@ -642,27 +803,92 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
     file.open(&temporary)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, contents.as_bytes())?;
+            file.sync_all()
+        })
         .and_then(|()| std::fs::rename(&temporary, path))
+        .and_then(|()| sync_directory(path))
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
+/// The directory holding `path`.
+#[cfg(unix)]
+fn directory_of(path: &str) -> &Path {
+    match Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Flushes the directory holding `path`, where a rename is recorded.
+#[cfg(unix)]
+fn sync_directory(path: &str) -> std::io::Result<()> {
+    std::fs::File::open(directory_of(path))?.sync_all()
+}
+
+/// Gives the file at `path` to the owner and group of its directory, when
+/// [`adopted_owner`] says so.
+#[cfg(unix)]
+fn give_to_directory_owner(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = std::fs::metadata(path)?;
+    let directory = std::fs::metadata(directory_of(path))?;
+    match adopted_owner(file.uid(), (directory.uid(), directory.gid())) {
+        Some((uid, gid)) => std::os::unix::fs::chown(path, Some(uid), Some(gid)),
+        None => Ok(()),
+    }
+}
+
+/// The owner and group a file created by `file_uid` takes from its
+/// directory's: those of the directory when root created the file in a
+/// directory of another user. The service's state directory belongs to its
+/// user, and systemd doesn't change the owner of files in a directory whose
+/// owner is already right, so a file root leaves there is unreadable to the
+/// service.
+#[cfg(unix)]
+fn adopted_owner(file_uid: u32, directory: (u32, u32)) -> Option<(u32, u32)> {
+    (file_uid == 0 && directory.0 != 0).then_some(directory)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl DynamicSecurity {
-    fn check_password(&self, username: &str, password: &[u8]) -> bool {
+    /// Whether `username` may log in with `password` as `client_id`; an
+    /// empty `client_id` is one the broker is to assign.
+    fn check_password(&self, username: &str, password: &[u8], client_id: &str) -> bool {
         // Copied out so Argon2, which is slow on purpose, runs without the lock
-        let hash = {
+        let (hash, bound) = {
             let data = self.data.read().unwrap();
             let client = data.clients.iter().find(|c| c.username == username);
-            match client
-                .filter(|c| !c.disabled)
-                .and_then(|c| c.password.clone())
-            {
-                Some(hash) => hash,
-                None => return false,
+            match client.filter(|c| !c.disabled) {
+                Some(Client {
+                    password: Some(hash),
+                    clientid,
+                    ..
+                }) => (Some(hash.clone()), clientid.clone()),
+                _ => (None, None),
             }
         };
-        PasswordHash::new(&hash)
-            .is_ok_and(|hash| Argon2::default().verify_password(password, &hash).is_ok())
+        match hash
+            .as_deref()
+            .and_then(|hash| PasswordHash::new(hash).ok())
+        {
+            Some(hash) => {
+                let valid = Argon2::default().verify_password(password, &hash).is_ok();
+                valid && bound.is_none_or(|bound| bound == client_id)
+            }
+            None => {
+                // As slow as a wrong password, so timing doesn't tell which
+                // users exist or can log in
+                let _ = Argon2::default().verify_password(password, &unknown_user_hash());
+                false
+            }
+        }
     }
 }
 
@@ -690,14 +916,19 @@ impl Plugin for DynamicSecurity {
         }
         Box::pin(async move {
             // Hashing passwords takes a while; keep it off the runtime
-            let response = tokio::task::block_in_place(|| self.handle(&payload));
+            let (response, affected) = tokio::task::block_in_place(|| self.handle(&payload));
+            // Apart, so a long list of sessions doesn't hold the answer up
+            let admin = self.admin.get().cloned();
+            if let Some(admin) = admin.filter(|_| !affected.is_empty()) {
+                tokio::spawn(disconnect(admin, affected));
+            }
             Some(Bytes::from(response.to_string()))
         })
     }
 
     fn authenticate<'a>(
         &'a self,
-        _: &'a ClientInfo,
+        client: &'a ClientInfo,
         credentials: &'a Credentials<'a>,
     ) -> BoxFuture<'a, Decision> {
         // Hashes take tens of milliseconds of CPU; keep them off the runtime
@@ -706,7 +937,9 @@ impl Plugin for DynamicSecurity {
             credentials.password.to_vec(),
         );
         Box::pin(async move {
-            let valid = tokio::task::block_in_place(|| self.check_password(&username, &password));
+            let valid = tokio::task::block_in_place(|| {
+                self.check_password(&username, &password, &client.client_id)
+            });
             if valid {
                 Decision::Allow
             } else {
@@ -835,7 +1068,7 @@ mod tests {
 
     fn run(security: &DynamicSecurity, commands: Value) -> Vec<Value> {
         let request = json!({ "commands": commands }).to_string();
-        let response = security.handle(request.as_bytes());
+        let (response, _) = security.handle(request.as_bytes());
         response["responses"].as_array().unwrap().clone()
     }
 
@@ -885,7 +1118,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
-        assert!(security.check_password("admin", b"secret"));
+        assert!(security.check_password("admin", b"secret", "c"));
         assert_eq!(
             security
                 .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
@@ -916,7 +1149,7 @@ mod tests {
         assert_eq!(responses[5]["data"]["clients"], json!(["admin", "s1"]));
 
         let s1 = identity("s1");
-        assert!(security.check_password("s1", b"pw"));
+        assert!(security.check_password("s1", b"pw", "c"));
         assert_eq!(
             security.authorize(&s1, "sensors/t1", Access::Write).await,
             Decision::Allow
@@ -1001,11 +1234,11 @@ mod tests {
             &security,
             json!([{ "command": "disableClient", "username": "s1" }]),
         );
-        assert!(!security.check_password("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw", "c"));
 
         // Saved, so a reload or a restart keeps the changes
         security.reload().unwrap();
-        assert!(!security.check_password("s1", b"pw"));
+        assert!(!security.check_password("s1", b"pw", "c"));
         run(
             &security,
             json!([{ "command": "enableClient", "username": "s1" }]),
@@ -1136,6 +1369,419 @@ mod tests {
                 "{filter}"
             );
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_client_id_binds_the_client() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-bound-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "s1", "password": "pw",
+                  "clientid": "dev1" },
+                { "command": "getClient", "username": "s1" },
+            ]),
+        );
+        assert!(responses[0].get("error").is_none(), "{responses:?}");
+        assert_eq!(responses[1]["data"]["client"]["clientid"], "dev1");
+
+        let credentials = Credentials::new("s1", b"pw");
+        // An empty client id is one the broker is to assign
+        for (client_id, decision) in [
+            ("dev1", Decision::Allow),
+            ("dev2", Decision::Deny),
+            ("", Decision::Deny),
+        ] {
+            let client = ClientInfo::new(client_id, Some("s1".to_string()));
+            assert_eq!(
+                security.authenticate(&client, &credentials).await,
+                decision,
+                "{client_id:?}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Connects `username`, password `pw`, as client `username`.
+    async fn connect(port: u16, username: &str) -> mercurio_client::MqttClient {
+        let options = mercurio_client::ConnectOptions::new("127.0.0.1", port)
+            .client_id(username)
+            .username(username)
+            .password("pw");
+        mercurio_client::MqttClient::connect(options)
+            .await
+            .unwrap_or_else(|e| panic!("{username} failed to connect: {e}"))
+    }
+
+    /// Whether the broker disconnected `client` for an administrative
+    /// action within a while.
+    async fn kicked(client: &mercurio_client::MqttClient) -> bool {
+        use mercurio_client::{DisconnectReason, Event};
+        use mercurio_core::reason::ReasonCode;
+
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(500), client.recv()).await;
+            match event {
+                Err(_) => return false,
+                Ok(Some(Event::Disconnected {
+                    reason: DisconnectReason::ServerInitiated { reason, .. },
+                })) => return reason == ReasonCode::AdministrativeAction,
+                Ok(Some(Event::Disconnected { reason })) => panic!("{reason:?}"),
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("ended without a disconnect event"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_changes_disconnect_the_clients_they_affect() {
+        use mercurio_server::server::{Server, ServerConfig};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-kick-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = std::sync::Arc::new(DynamicSecurity::load(path).unwrap());
+        let mut config = ServerConfig::default();
+        config.plugins = vec![security.clone()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = Server::new(
+            listener,
+            config,
+            std::sync::Arc::new(mercurio_storage::memory::MemoryStore::new()),
+        )
+        .await
+        .unwrap();
+        security.set_admin(server.admin());
+        tokio::spawn(server.run(std::future::pending::<()>()));
+
+        let admin = ClientInfo::new("admin", Some("admin".to_string()));
+        let command = |commands: Value| {
+            let security = security.clone();
+            let admin = admin.clone();
+            async move {
+                let request = json!({ "commands": commands }).to_string();
+                let answer = security
+                    .on_control(&admin, "v1", Bytes::from(request))
+                    .await
+                    .unwrap();
+                let answer: Value = serde_json::from_slice(&answer).unwrap();
+                for response in answer["responses"].as_array().unwrap() {
+                    assert!(response.get("error").is_none(), "{answer}");
+                }
+            }
+        };
+
+        // Each case: setup, then the command that must disconnect `user`
+        // and no one else
+        let cases = [
+            (
+                json!([]),
+                json!({ "command": "deleteClient", "username": "user" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "disableClient", "username": "user" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "setClientPassword", "username": "user", "password": "x" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "removeClientRole", "username": "user", "rolename": "r" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "addClientRole", "username": "user", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "removeGroupClient", "username": "user", "groupname": "g" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "addGroupClient", "username": "user", "groupname": "g" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "removeGroupRole", "groupname": "g", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" },
+                       { "command": "removeGroupRole", "groupname": "g", "rolename": "r" }]),
+                json!({ "command": "addGroupRole", "groupname": "g", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "deleteGroup", "groupname": "g" }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "deleteRole", "rolename": "r" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "removeRoleACL", "rolename": "r",
+                        "acltype": "subscribePattern", "topic": "a/#" }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "addRoleACL", "rolename": "r",
+                        "acltype": "subscribePattern", "topic": "b/#", "allow": true }),
+            ),
+        ];
+        for (n, (setup, change)) in cases.into_iter().enumerate() {
+            let user = format!("user{n}");
+            let bystander = format!("bystander{n}");
+            let rename = |value: Value| {
+                serde_json::from_str::<Value>(
+                    &value.to_string().replace("\"user\"", &format!("{user:?}")),
+                )
+                .unwrap()
+            };
+            command(json!([
+                { "command": "createRole", "rolename": "r", "acls": [
+                    { "acltype": "subscribePattern", "topic": "a/#", "allow": true },
+                ]},
+                { "command": "createGroup", "groupname": "g", "roles": [{ "rolename": "r" }] },
+                { "command": "createClient", "username": user, "password": "pw" },
+                { "command": "createClient", "username": bystander, "password": "pw" },
+            ]))
+            .await;
+            command(rename(setup)).await;
+            let affected = connect(port, &user).await;
+            let other = connect(port, &bystander).await;
+
+            command(json!([rename(change.clone())])).await;
+            assert!(kicked(&affected).await, "{change}");
+            assert!(!kicked(&other).await, "{change}");
+
+            let _ = other.disconnect().await;
+            let cleanup = [
+                json!({ "command": "deleteClient", "username": user }),
+                json!({ "command": "deleteClient", "username": bystander }),
+                json!({ "command": "deleteGroup", "groupname": "g" }),
+                json!({ "command": "deleteRole", "rolename": "r" }),
+            ];
+            let request = json!({ "commands": cleanup }).to_string();
+            security.handle(request.as_bytes());
+        }
+
+        // Anonymous clients have the anonymous group's roles
+        command(json!([
+            { "command": "createGroup", "groupname": "guests" },
+            { "command": "createClient", "username": "named", "password": "pw" },
+        ]))
+        .await;
+        let options = mercurio_client::ConnectOptions::new("127.0.0.1", port).client_id("anon");
+        let anonymous = mercurio_client::MqttClient::connect(options).await.unwrap();
+        let named = connect(port, "named").await;
+        command(json!([{ "command": "setAnonymousGroup", "groupname": "guests" }])).await;
+        assert!(kicked(&anonymous).await);
+        assert!(!kicked(&named).await);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_users_it_does_not_know_get_no_access() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-gone-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        run(
+            &security,
+            json!([
+                { "command": "setDefaultACLAccess", "acls": [
+                    { "acltype": "publishClientSend", "allow": true },
+                    { "acltype": "subscribe", "allow": true },
+                ]},
+                { "command": "createClient", "username": "s1", "password": "pw" },
+                // A user name from a client certificate, with no password
+                { "command": "createClient", "username": "device-7" },
+            ]),
+        );
+        let all = [Access::Write, Access::Read, Access::Subscribe];
+        for username in ["s1", "device-7"] {
+            for access in all {
+                assert_eq!(
+                    security
+                        .authorize(&identity(username), "anything", access)
+                        .await,
+                    Decision::Allow,
+                    "{username} {access:?}"
+                );
+            }
+        }
+
+        // Deleted while connected, or never created, as a user name from a
+        // certificate or another plugin may be
+        run(
+            &security,
+            json!([{ "command": "deleteClient", "username": "s1" }]),
+        );
+        for username in ["s1", "stranger"] {
+            for access in all {
+                assert_eq!(
+                    security
+                        .authorize(&identity(username), "anything", access)
+                        .await,
+                    Decision::Deny,
+                    "{username} {access:?}"
+                );
+            }
+        }
+        // Anonymous clients keep the default access
+        let anonymous = ClientInfo::new("a", None);
+        for access in all {
+            assert_eq!(
+                security.authorize(&anonymous, "anything", access).await,
+                Decision::Allow,
+                "{access:?}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_gives_the_new_file_to_the_owner_of_its_directory() {
+        // Root creating it in the service's state directory
+        assert_eq!(adopted_owner(0, (998, 997)), Some((998, 997)));
+        // Root's own directory, or a user creating it: kept as created
+        assert_eq!(adopted_owner(0, (0, 0)), None);
+        assert_eq!(adopted_owner(1000, (998, 997)), None);
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-owner-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let directory = std::fs::metadata(std::env::temp_dir()).unwrap();
+        let expected = adopted_owner(metadata.uid(), (directory.uid(), directory.gid()));
+        assert!(expected.is_none_or(|owner| owner == (metadata.uid(), metadata.gid())));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_unknown_users_cost_a_password_check() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-timing-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "off", "password": "pw" },
+                { "command": "disableClient", "username": "off" },
+                { "command": "createClient", "username": "nopassword" },
+            ]),
+        );
+        let time = |username: &str| {
+            let started = std::time::Instant::now();
+            assert!(!security.check_password(username, b"wrong", "c"));
+            started.elapsed()
+        };
+        let wrong = time("admin");
+        for username in ["nobody", "off", "nopassword"] {
+            let elapsed = time(username);
+            assert!(
+                elapsed * 4 > wrong,
+                "{username}: {elapsed:?}, a wrong password {wrong:?}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_role_priorities_are_refused() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-priority-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "r" },
+                { "command": "createGroup", "groupname": "g" },
+                { "command": "createClient", "username": "s1" },
+                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": 5 },
+                { "command": "addGroupRole", "groupname": "g", "rolename": "r", "priority": 5 },
+                { "command": "addGroupClient", "groupname": "g", "username": "s1", "priority": 5 },
+                { "command": "createClient", "username": "s2",
+                  "roles": [{ "rolename": "r", "priority": 5 }] },
+                { "command": "createGroup", "groupname": "g2",
+                  "roles": [{ "rolename": "r", "priority": 5 }] },
+                // Mosquitto's default, as tools may send it
+                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": -1 },
+                { "command": "getClient", "username": "s1" },
+                { "command": "getGroup", "groupname": "g" },
+            ]),
+        );
+        assert!(
+            responses[..3].iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+        for response in &responses[3..8] {
+            assert!(response.get("error").is_some(), "{response}");
+        }
+        assert!(responses[8].get("error").is_none(), "{responses:?}");
+        assert_eq!(
+            responses[9]["data"]["client"]["groups"],
+            json!([]),
+            "{responses:?}"
+        );
+        assert_eq!(responses[10]["data"]["group"]["roles"], json!([]));
+        let listed = run(&security, json!([{ "command": "listClients" }]));
+        assert_eq!(listed[0]["data"]["clients"], json!(["admin", "s1"]));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_invalid_default_access_changes_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-default-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "setDefaultACLAccess", "acls": [
+                    { "acltype": "publishClientSend", "allow": true },
+                    { "acltype": "bogus", "allow": true },
+                ]},
+                { "command": "createClient", "username": "s1", "password": "pw" },
+            ]),
+        );
+        assert!(responses[0].get("error").is_some(), "{responses:?}");
+        assert!(responses[1].get("error").is_none(), "{responses:?}");
+
+        security.reload().unwrap();
+        let access = run(&security, json!([{ "command": "getDefaultACLAccess" }]));
+        assert_eq!(
+            access[0]["data"]["acls"][0],
+            json!({ "acltype": "publishClientSend", "allow": false })
+        );
         std::fs::remove_file(path).unwrap();
     }
 

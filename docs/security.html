@@ -133,7 +133,8 @@ pattern read devices/%u/commands</pre>
 <h2 id="dynamic-security">Dynamic security</h2>
 <p>Dynamic security manages clients, roles and access while the broker runs, with the JSON commands of mosquitto's dynamic security plugin. It replaces <code>password_file</code> and <code>acl_file</code>.</p>
 <pre><span class="comment"># Create the state file with an administrator (prompts for the password)</span>
-mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
+sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
+<p>The file is created with mode 0600. Run as root in a directory owned by another user, as the service's state directory <code>/var/lib/mercurio</code> is, <code>dynsec-init</code> gives the file to that directory's owner and group, so the service can read it. systemd creates that directory when the service first starts: start it once before, with <code>systemctl start mercuriod</code>, if it has never run.</p>
 <pre>[auth]
 enabled = true
 allow_anonymous = false
@@ -152,7 +153,7 @@ mercurioctl -H broker.example.com -u admin dynsec list-clients</pre>
 
 <h3>Model</h3>
 <ul>
-<li><strong>Clients</strong> log in with a user name and password, and can be disabled.</li>
+<li><strong>Clients</strong> log in with a user name and password, and can be disabled. A client created with a <code>clientid</code> may connect only with that client id, not with one the broker assigns. A user name dynamic security has no client for, such as one taken from a certificate with <code>identity_as_username</code>, gets no access at all: create a client of that name, without a password, to give it roles. A client deleted while connected loses its access at once.</li>
 <li><strong>Roles</strong> hold ACLs. A client has its own roles and those of its groups.</li>
 <li><strong>Groups</strong> give their roles to their members. The anonymous group's roles apply to clients without a user name.</li>
 <li><strong>ACLs</strong> have a type, a topic filter, an optional <code>priority</code> and <code>allow</code>. The matching ACL with the highest priority decides.</li>
@@ -174,7 +175,7 @@ mercurioctl -H broker.example.com -u admin dynsec list-clients</pre>
 <tr><td>Groups</td><td><code>createGroup</code>, <code>deleteGroup</code>, <code>addGroupRole</code>, <code>removeGroupRole</code>, <code>addGroupClient</code>, <code>removeGroupClient</code>, <code>getGroup</code>, <code>listGroups</code>, <code>setAnonymousGroup</code>, <code>getAnonymousGroup</code></td></tr>
 <tr><td>Defaults</td><td><code>setDefaultACLAccess</code>, <code>getDefaultACLAccess</code></td></tr>
 </table>
-<p>Changes take effect at once and are saved to the file after each message. The file is replaced in one step, so a crash never leaves it half written.</p>
+<p>Changes take effect at once and are saved to the file after each message. As in mosquitto, a change that can take access away disconnects the connected clients it concerns, with reason code Administrative Action (0x98) and without their wills, so they log in again under their new access: deleting or disabling a client or setting its password, adding or removing a client's roles or groups, adding or removing a group's roles, deleting a group or a role, and adding or removing a role's ACLs. Changes to the anonymous group disconnect anonymous clients that came over the network; in-process clients and those of Unix sockets stay connected. The file is replaced in one step, so a crash never leaves it half written.</p>
 
 <h2 id="http">HTTP authentication</h2>
 <p>Delegates checks to an HTTP service, with the requests of mosquitto-go-auth's HTTP backend, so services written for it answer Mercurio too.</p>
