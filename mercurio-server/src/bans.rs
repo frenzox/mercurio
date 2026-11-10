@@ -183,6 +183,17 @@ impl Bans {
             .any(|ban| !ban.expired(now) && ban.matches(client))
     }
 
+    /// Whether an address ban in force matches `ip`, for refusing a
+    /// connection before anything else is known of it.
+    pub(crate) fn refuses_address(&self, ip: IpAddr) -> bool {
+        let now = unix_secs();
+        self.active
+            .read()
+            .unwrap()
+            .iter()
+            .any(|ban| !ban.expired(now) && ban.range.is_some_and(|range| range.contains(ip)))
+    }
+
     /// The bans in force, by type, then value, then prefix.
     pub(crate) fn list(&self) -> Vec<Ban> {
         let now = unix_secs();

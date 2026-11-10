@@ -550,6 +550,12 @@ pub struct ServerConfig {
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
 
+    /// Seconds writing one packet to a client may take before its connection
+    /// is dropped as stalled; also how long a connection taking over a client
+    /// id waits for the previous one
+    #[serde(default = "default_write_timeout")]
+    pub write_timeout: u64,
+
     /// Highest topic alias MQTT 5 clients may use; 0 disables aliases
     #[serde(default = "default_max_topic_alias")]
     pub max_topic_alias: u16,
@@ -637,6 +643,7 @@ impl Default for ServerConfig {
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
             connect_timeout: default_connect_timeout(),
+            write_timeout: default_write_timeout(),
             max_topic_alias: default_max_topic_alias(),
             receive_maximum: default_receive_maximum(),
             max_inflight: default_max_inflight(),
@@ -800,6 +807,10 @@ fn default_connect_timeout() -> u64 {
     Limits::default().connect_timeout.as_secs()
 }
 
+fn default_write_timeout() -> u64 {
+    Limits::default().write_timeout.as_secs()
+}
+
 fn default_max_topic_alias() -> u16 {
     Limits::default().topic_alias_maximum
 }
@@ -821,8 +832,12 @@ impl ServerConfig {
         if self.max_inflight == 0 {
             return Err("max_inflight must be at least 1".to_string());
         }
+        if self.write_timeout == 0 {
+            return Err("write_timeout must be at least 1 second".into());
+        }
         let mut limits = Limits::default();
         limits.connect_timeout = Duration::from_secs(self.connect_timeout);
+        limits.write_timeout = Duration::from_secs(self.write_timeout);
         limits.max_packet_size = self.max_packet_size;
         limits.queue.max_qos0 = self.max_queued_qos0_messages;
         limits.queue.max_messages = self.max_queued_messages;
