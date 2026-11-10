@@ -129,7 +129,7 @@ mount_point = "tenant1/"</pre>
 <h2 id="logging">[logging]</h2>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>level</code></td><td><code>"info"</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, or per module, as in <code>"info,mercurio_server::session=warn"</code>. An empty or invalid level means <code>info</code>. <a href="admin.html#broker"><code>setLogLevel</code></a> changes it until the broker restarts.</td></tr>
+<tr><td><code>level</code></td><td><code>"info"</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, or per module, as in <code>"info,mercurio_server::session=warn"</code>. An empty or invalid level means <code>info</code>, with a warning in the log. <a href="admin.html#broker"><code>setLogLevel</code></a> changes it until the broker restarts.</td></tr>
 <tr><td><code>file</code></td><td></td><td>Append logs to this file instead of standard output.</td></tr>
 <tr><td><code>syslog</code></td><td><code>false</code></td><td>Send logs to the local syslog daemon through <code>/dev/log</code>.</td></tr>
 <tr><td><code>connection_messages</code></td><td><code>true</code></td><td>Log clients connecting and disconnecting. With <code>false</code>, a <code>level</code> naming their target, <code>mercurio::connections</code>, still turns them on.</td></tr>
