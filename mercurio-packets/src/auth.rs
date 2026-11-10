@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
     pub auth_method: Option<AuthenticationMethod>,
@@ -89,26 +91,21 @@ impl Encoder for AuthPacket {
 
 impl Decoder for AuthPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reserved = buffer.get_u8() & 0xF;
+        crate::decode_packet(buffer, PacketType::Auth, |_, buffer| {
+            // Both reason and properties may be omitted [MQTT-3.15.2-1]
+            let reason = if buffer.has_remaining() {
+                ReasonCode::decode(buffer)?
+            } else {
+                ReasonCode::Success
+            };
+            let properties = if buffer.has_remaining() {
+                AuthProperties::decode(buffer)?
+            } else {
+                AuthProperties::default()
+            };
 
-        if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let remaining_len = VariableByteInteger::decode(buffer)?;
-        // Both reason and properties may be omitted [MQTT-3.15.2-1]
-        let reason = if remaining_len.0 > 0 {
-            ReasonCode::decode(buffer)?
-        } else {
-            ReasonCode::Success
-        };
-        let properties = if remaining_len.0 > 1 {
-            AuthProperties::decode(buffer)?
-        } else {
-            AuthProperties::default()
-        };
-
-        Ok(AuthPacket { reason, properties })
+            Ok(AuthPacket { reason, properties })
+        })
     }
 }
 

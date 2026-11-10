@@ -17,6 +17,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 /// The Connect Flags byte (section 3.1.2.3). The flags decide which
 /// optional fields of the payload are encoded and decoded.
@@ -433,9 +435,14 @@ impl Encoder for ConnectPacket {
 
 impl Decoder for ConnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::Connect, |_, body| {
+            Self::decode_body(body)
+        })
+    }
+}
 
+impl ConnectPacket {
+    fn decode_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // Parse protocol name and level to determine version
         let protocol_name = String::decode(buffer)?;
         let protocol_level = u8::decode(buffer)?;

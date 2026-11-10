@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
     pub user_property: Option<Vec<UserProperty>>,
@@ -135,10 +137,12 @@ impl UnsubscribePacket {
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::Unsubscribe, |_, body| {
+            Self::decode_body(body, with_properties)
+        })
+    }
 
+    fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         let packet_id = u16::decode(buffer)?;
         let properties = if with_properties {
             crate::present(UnsubscribeProperties::decode(buffer)?)
@@ -150,10 +154,9 @@ impl UnsubscribePacket {
             return Err(ReasonCode::ProtocolError.into());
         }
 
-        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.remaining() > next_packet {
+        while buffer.has_remaining() {
             payload.push(UnsubscribePayload::decode(buffer)?);
         }
 

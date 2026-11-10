@@ -15,6 +15,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct SubscribeProperties {
@@ -256,10 +258,12 @@ impl SubscribePacket {
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::Subscribe, |_, body| {
+            Self::decode_body(body, with_properties)
+        })
+    }
 
+    fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         let packet_id = u16::decode(buffer)?;
         let properties = if with_properties {
             crate::present(SubscribeProperties::decode(buffer)?)
@@ -271,10 +275,9 @@ impl SubscribePacket {
             return Err(ReasonCode::ProtocolError.into());
         }
 
-        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.remaining() > next_packet {
+        while buffer.has_remaining() {
             let sub = SubscribePayload::decode(buffer)?;
 
             // MQTT 3.x only defines the QoS bits; the rest are reserved [MQTT-3.8.3-4]

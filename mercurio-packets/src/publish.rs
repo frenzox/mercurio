@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 /// MQTT 5 only.
 pub struct PublishProperties {
@@ -169,12 +171,19 @@ impl PublishPacket {
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        // Fixed header
-        let fixed_header = buffer.get_u8();
-        let dup = (fixed_header & 0b0000_1000) != 0;
-        let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 1);
-        let retain = (fixed_header & 0b0000_0001) != 0;
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+        crate::decode_packet(buffer, PacketType::Publish, |flags, body| {
+            Self::decode_body(flags, body, with_properties)
+        })
+    }
+
+    fn decode_body<T: Buf>(
+        flags: u8,
+        buffer: &mut T,
+        with_properties: bool,
+    ) -> crate::Result<Self> {
+        let dup = (flags & 0b0000_1000) != 0;
+        let qos_level = QoS::from((flags & 0b0000_0110) >> 1);
+        let retain = (flags & 0b0000_0001) != 0;
 
         // Variable header
         let topic_name = String::decode(buffer)?;
@@ -188,26 +197,14 @@ impl PublishPacket {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let mut header_len = topic_name.encoded_size() + packet_id.encoded_size();
         let properties = if with_properties {
-            let properties = PublishProperties::decode(buffer)?;
-            header_len += properties.encoded_size()
-                + VariableByteInteger(properties.encoded_size() as u32).encoded_size();
-            Some(properties)
+            Some(PublishProperties::decode(buffer)?)
         } else {
             None
         };
 
-        // Payload
-        let payload_len = remaining_len
-            .checked_sub(header_len)
-            .ok_or(ReasonCode::MalformedPacket)?;
-
-        if buffer.remaining() < payload_len {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let payload = Some(buffer.copy_to_bytes(payload_len));
+        // The payload is the rest of the packet
+        let payload = Some(buffer.copy_to_bytes(buffer.remaining()));
 
         Ok(PublishPacket {
             dup,

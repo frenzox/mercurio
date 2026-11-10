@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct PubRelProperties {
     pub reason_string: Option<ReasonString>,
@@ -100,31 +102,26 @@ impl Encoder for PubRelPacket {
 
 impl Decoder for PubRelPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1);
+        crate::decode_packet(buffer, PacketType::PubRel, |_, buffer| {
+            let packet_id = u16::decode(buffer)?;
 
-        let remaining_len = VariableByteInteger::decode(buffer)?;
-        let packet_id = u16::decode(buffer)?;
+            // Reason and properties may be left out (section 3.4.2.1)
+            let reason = if buffer.has_remaining() {
+                ReasonCode::decode(buffer)?
+            } else {
+                ReasonCode::Success
+            };
+            let properties = if buffer.has_remaining() {
+                crate::present(PubRelProperties::decode(buffer)?)
+            } else {
+                None
+            };
 
-        if remaining_len.0 == 2 {
-            return Ok(PubRelPacket {
+            Ok(PubRelPacket {
                 packet_id,
-                reason: ReasonCode::Success,
-                properties: None,
-            });
-        }
-
-        let reason = ReasonCode::decode(buffer)?;
-        // The property length is omitted when there are none [MQTT-3.4.2.2]
-        let properties = if remaining_len.0 > 3 {
-            crate::present(PubRelProperties::decode(buffer)?)
-        } else {
-            None
-        };
-
-        Ok(PubRelPacket {
-            packet_id,
-            reason,
-            properties,
+                reason,
+                properties,
+            })
         })
     }
 }

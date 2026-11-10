@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct UnsubAckProperties {
     pub reason_string: Option<ReasonString>,
@@ -132,29 +134,25 @@ impl Encoder for UnsubAckPacket {
 impl Decoder for UnsubAckPacket {
     /// Decodes an UNSUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; // Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
+            let packet_id = u16::decode(buffer)?;
+            let properties = crate::present(UnsubAckProperties::decode(buffer)?);
 
-        let packet_id = u16::decode(buffer)?;
-        let properties = crate::present(UnsubAckProperties::decode(buffer)?);
+            if !buffer.has_remaining() {
+                return Err(ReasonCode::ProtocolError.into());
+            }
 
-        if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+            let mut payload = Vec::new();
+            while buffer.has_remaining() {
+                payload.push(UnsubAckPayload::decode(buffer)?);
+            }
 
-        let next_packet = buffer_len - remaining_len;
-        let mut payload = Vec::new();
-
-        while buffer.remaining() > next_packet {
-            payload.push(UnsubAckPayload::decode(buffer)?);
-        }
-
-        Ok(UnsubAckPacket {
-            protocol_version: ProtocolVersion::V5,
-            packet_id,
-            properties,
-            payload,
+            Ok(UnsubAckPacket {
+                protocol_version: ProtocolVersion::V5,
+                packet_id,
+                properties,
+                payload,
+            })
         })
     }
 }
@@ -163,17 +161,15 @@ impl UnsubAckPacket {
     /// Decodes an UNSUBACK packet in MQTT 3.x format.
     /// MQTT 3.x UNSUBACK: just packet_id (no properties, no payload)
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length (should be 2)
+        crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
+            let packet_id = u16::decode(buffer)?;
 
-        let packet_id = u16::decode(buffer)?;
-
-        // MQTT 3.x UNSUBACK has no properties and no payload
-        Ok(UnsubAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1,
-            packet_id,
-            properties: None,
-            payload: Vec::new(),
+            Ok(UnsubAckPacket {
+                protocol_version: ProtocolVersion::V3_1_1,
+                packet_id,
+                properties: None,
+                payload: Vec::new(),
+            })
         })
     }
 }

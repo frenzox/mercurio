@@ -4,6 +4,8 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
 
+use crate::PacketType;
+
 #[derive(PartialEq, Eq, Debug)]
 pub struct PingRespPacket {}
 
@@ -20,9 +22,7 @@ impl Encoder for PingRespPacket {
 
 impl Decoder for PingRespPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1);
-        VariableByteInteger::decode(buffer)?;
-        Ok(Self {})
+        crate::decode_packet(buffer, PacketType::PingResp, |_, _| Ok(Self {}))
     }
 }
 

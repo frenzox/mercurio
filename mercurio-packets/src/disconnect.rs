@@ -12,6 +12,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
     /// Replaces the session expiry from CONNECT. Sent by the client only
@@ -106,32 +108,26 @@ impl DisconnectPacket {
 
 impl Decoder for DisconnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reserved = buffer.get_u8() & 0xF;
+        crate::decode_packet(buffer, PacketType::Disconnect, |_, buffer| {
+            // 0x00 is "Normal disconnection" in DISCONNECT, whether it is
+            // sent or left out
+            let reason = if buffer.has_remaining() {
+                match ReasonCode::decode(buffer)? {
+                    ReasonCode::Success => ReasonCode::NormalDisconnection,
+                    reason => reason,
+                }
+            } else {
+                ReasonCode::NormalDisconnection
+            };
 
-        if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
+            let properties = if buffer.has_remaining() {
+                crate::present(DisconnectProperties::decode(buffer)?)
+            } else {
+                None
+            };
 
-        let min_len_reason = 1;
-        let min_len_properties = 2;
-
-        let remaining_len = VariableByteInteger::decode(buffer)?; //Remaining length
-                                                                  // 0x00 is "Normal disconnection" in DISCONNECT, whether it is sent
-                                                                  // or left out
-        let reason = match remaining_len.0.cmp(&min_len_reason) {
-            core::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
-            _ => match ReasonCode::decode(buffer)? {
-                ReasonCode::Success => ReasonCode::NormalDisconnection,
-                reason => reason,
-            },
-        };
-
-        let properties = match remaining_len.0.cmp(&min_len_properties) {
-            core::cmp::Ordering::Less => None,
-            _ => crate::present(DisconnectProperties::decode(buffer)?),
-        };
-
-        Ok(DisconnectPacket { reason, properties })
+            Ok(DisconnectPacket { reason, properties })
+        })
     }
 }
 

@@ -14,6 +14,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
     /// Whether the server resumed a session it already held for this client.
@@ -277,18 +279,17 @@ impl Decoder for ConnAckPacket {
     /// Decodes a CONNACK packet assuming MQTT 5.0 format.
     /// For MQTT 3.x decoding, use `decode_v3` instead.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
+            let flags = ConnAckFlags::decode(buffer)?;
+            let reason_code = ReasonCode::decode(buffer)?;
+            let properties = crate::present(ConnAckProperties::decode(buffer)?);
 
-        let flags = ConnAckFlags::decode(buffer)?;
-        let reason_code = ReasonCode::decode(buffer)?;
-        let properties = crate::present(ConnAckProperties::decode(buffer)?);
-
-        Ok(ConnAckPacket {
-            protocol_version: ProtocolVersion::V5,
-            flags,
-            reason_code,
-            properties,
+            Ok(ConnAckPacket {
+                protocol_version: ProtocolVersion::V5,
+                flags,
+                reason_code,
+                properties,
+            })
         })
     }
 }
@@ -296,9 +297,12 @@ impl Decoder for ConnAckPacket {
 impl ConnAckPacket {
     /// Decodes a CONNACK packet in MQTT 3.x format.
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
+            Self::decode_v3_body(buffer)
+        })
+    }
 
+    fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let flags = ConnAckFlags::decode(buffer)?;
         let return_code = u8::decode(buffer)?;
 

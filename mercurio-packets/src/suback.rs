@@ -13,6 +13,8 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
+use crate::PacketType;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
     pub reason_string: Option<ReasonString>,
@@ -151,29 +153,25 @@ impl Encoder for SubAckPacket {
 impl Decoder for SubAckPacket {
     /// Decodes a SUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; // Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
+            let packet_id = u16::decode(buffer)?;
+            let properties = crate::present(SubAckProperties::decode(buffer)?);
 
-        let packet_id = u16::decode(buffer)?;
-        let properties = crate::present(SubAckProperties::decode(buffer)?);
+            if !buffer.has_remaining() {
+                return Err(ReasonCode::ProtocolError.into());
+            }
 
-        if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+            let mut payload = Vec::new();
+            while buffer.has_remaining() {
+                payload.push(SubAckPayload::decode(buffer)?);
+            }
 
-        let next_packet = buffer_len - remaining_len;
-        let mut payload = Vec::new();
-
-        while buffer.remaining() > next_packet {
-            payload.push(SubAckPayload::decode(buffer)?);
-        }
-
-        Ok(SubAckPacket {
-            protocol_version: ProtocolVersion::V5,
-            packet_id,
-            properties,
-            payload,
+            Ok(SubAckPacket {
+                protocol_version: ProtocolVersion::V5,
+                packet_id,
+                properties,
+                payload,
+            })
         })
     }
 }
@@ -182,18 +180,19 @@ impl SubAckPacket {
     /// Decodes a SUBACK packet in MQTT 3.x format.
     /// MQTT 3.x SUBACK: packet_id + return codes (no properties)
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
+            Self::decode_v3_body(buffer)
+        })
+    }
 
+    fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let packet_id = u16::decode(buffer)?;
 
         // No properties in MQTT 3.x
         // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure
-        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.remaining() > next_packet {
+        while buffer.has_remaining() {
             let return_code = u8::decode(buffer)?;
             let reason_code = match return_code {
                 0x00 => ReasonCode::GrantedQoS0,
