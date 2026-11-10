@@ -12,7 +12,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -20,6 +20,7 @@ use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 use serde_json::json;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::warn;
 
 use crate::config::redacted_http_url;
@@ -27,11 +28,21 @@ use crate::config::redacted_http_url;
 /// Most ACL answers kept; the oldest goes first once full.
 const CACHE_LIMIT: usize = 10_000;
 
+/// Most requests to the backends at once. Each takes a thread of the
+/// blocking pool, which storage and DNS lookups share, for up to
+/// `timeout_seconds`.
+const MAX_REQUESTS: usize = 32;
+
 /// Shortest time between two warnings about failed requests, so a backend
 /// that is down does not flood the log.
 const WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 type CacheKey = (Option<String>, String, String, u8);
+
+/// A URL and the body sent to it.
+type RequestKey = (String, String);
+
+type Answer = Arc<OnceCell<Option<bool>>>;
 
 pub struct HttpAuth {
     agent: ureq::Agent,
@@ -39,6 +50,8 @@ pub struct HttpAuth {
     acl_url: Option<String>,
     cache: Mutex<Cache>,
     failures: Mutex<Throttle>,
+    requests: Arc<Semaphore>,
+    in_flight: Mutex<HashMap<RequestKey, Answer>>,
 }
 
 impl HttpAuth {
@@ -58,18 +71,34 @@ impl HttpAuth {
             acl_url,
             cache: Mutex::new(Cache::new(CACHE_LIMIT, cache_for)),
             failures: Mutex::default(),
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            in_flight: Mutex::default(),
         }
     }
 
     /// Whether `url` allows `body`: Some(true) on a 2xx status, Some(false)
-    /// on a 4xx one, and None when the backend gave no answer.
+    /// on a 4xx one, and None when the backend gave no answer. Identical
+    /// checks made meanwhile wait for the same request.
     async fn allows(&self, url: &str, body: serde_json::Value) -> Option<bool> {
+        let waiter = Waiter::join(&self.in_flight, (url.to_string(), body.to_string()));
+        *waiter
+            .answer
+            .get_or_init(|| self.request(url, waiter.key.1.clone()))
+            .await
+    }
+
+    async fn request(&self, url: &str, body: String) -> Option<bool> {
+        // The semaphore is never closed
+        let permit = Arc::clone(&self.requests).acquire_owned().await.ok()?;
         let (agent, target) = (self.agent.clone(), url.to_string());
+        // The permit goes with the request, which runs on after a check
+        // that gave up waiting for it
         let send = move || {
+            let _permit = permit;
             agent
                 .post(&target)
                 .header("Content-Type", "application/json")
-                .send(body.to_string())
+                .send(body)
                 .map(|_| ())
         };
         let failure = match tokio::task::spawn_blocking(send).await {
@@ -94,6 +123,43 @@ impl HttpAuth {
             );
         }
         None
+    }
+}
+
+/// One check waiting on a request that identical checks share.
+struct Waiter<'a> {
+    in_flight: &'a Mutex<HashMap<RequestKey, Answer>>,
+    key: RequestKey,
+    answer: Answer,
+}
+
+impl<'a> Waiter<'a> {
+    fn join(in_flight: &'a Mutex<HashMap<RequestKey, Answer>>, key: RequestKey) -> Self {
+        let answer = Arc::clone(in_flight.lock().unwrap().entry(key.clone()).or_default());
+        Self {
+            in_flight,
+            key,
+            answer,
+        }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    /// Takes the request out of the map once it is answered, so later checks
+    /// ask again, or once its last waiter gives up. Waiters are only added
+    /// under the lock, so the count read under it is exact.
+    fn drop(&mut self) {
+        let Ok(mut in_flight) = self.in_flight.lock() else {
+            return;
+        };
+        let ours = in_flight
+            .get(&self.key)
+            .is_some_and(|answer| Arc::ptr_eq(answer, &self.answer));
+        // One count for the map, one for this waiter
+        let last = Arc::strong_count(&self.answer) == 2;
+        if ours && (self.answer.initialized() || last) {
+            in_flight.remove(&self.key);
+        }
     }
 }
 
@@ -247,12 +313,11 @@ impl Plugin for HttpAuth {
 mod tests {
     use super::*;
     use std::{
+        future::Future,
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Poll,
     };
 
     struct Backend {
@@ -428,6 +493,72 @@ mod tests {
             auth.authorize(&alice, "t", Access::Write).await,
             Decision::Allow
         );
+    }
+
+    /// Runs every future concurrently on this task.
+    async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+        let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
+        let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+        std::future::poll_fn(|cx| {
+            let mut pending = false;
+            for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+                if output.is_none() {
+                    match future.as_mut().poll(cx) {
+                        Poll::Ready(value) => *output = Some(value),
+                        Poll::Pending => pending = true,
+                    }
+                }
+            }
+            if pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+        outputs.into_iter().map(Option::unwrap).collect()
+    }
+
+    #[tokio::test]
+    async fn test_identical_checks_share_one_request() {
+        let backend = backend(Duration::from_millis(200), |_, _| "200 OK");
+        let auth = acl_auth(backend.url);
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let checks = (0..10).map(|_| auth.authorize(&alice, "t", Access::Write));
+        for decision in join_all(checks).await {
+            assert_eq!(decision, Decision::Allow);
+        }
+        assert_eq!(backend.requests.load(Ordering::SeqCst), 1);
+        assert!(auth.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_abandoned_checks_leave_nothing_in_flight() {
+        let backend = backend(Duration::from_millis(200), |_, _| "200 OK");
+        let auth = acl_auth(backend.url);
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let check = auth.authorize(&alice, "t", Access::Write);
+        assert!(tokio::time::timeout(Duration::from_millis(50), check)
+            .await
+            .is_err());
+        assert!(auth.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_requests_in_flight_are_bounded() {
+        let backend = backend(Duration::from_millis(50), |_, _| "200 OK");
+        let auth = acl_auth(backend.url);
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let topics: Vec<String> = (0..MAX_REQUESTS * 3).map(|i| format!("t/{i}")).collect();
+        let checks = topics
+            .iter()
+            .map(|topic| auth.authorize(&alice, topic, Access::Write));
+        for decision in join_all(checks).await {
+            assert_eq!(decision, Decision::Allow);
+        }
+        assert_eq!(backend.requests.load(Ordering::SeqCst), MAX_REQUESTS * 3);
+        let most = backend.most_at_once.load(Ordering::SeqCst);
+        assert!(most <= MAX_REQUESTS, "{most} requests at once");
     }
 
     fn key(topic: &str) -> CacheKey {
