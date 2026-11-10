@@ -273,8 +273,9 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     /// Handles a message published to `$CONTROL/<name>/<path>`, once the
-    /// client may publish there. A response is published to
-    /// `$CONTROL/<name>/<path>/response`. Such messages aren't sent on to
+    /// client may publish there. A response goes only to that client: on
+    /// the request's Response Topic with its Correlation Data, or else on
+    /// `$CONTROL/<name>/<path>/response`. Requests aren't sent on to
     /// subscribers, even when the plugin named `<name>` doesn't implement
     /// this hook.
     ///

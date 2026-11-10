@@ -781,7 +781,15 @@ impl Session {
             let payload = packet.payload.clone().unwrap_or_default();
             if let Some(answer) = chain.control(&identity, &packet.topic_name, payload).await {
                 if let Some(answer) = answer {
-                    let topic: Arc<str> = format!("{}/response", packet.topic_name).into();
+                    let request = hooked_properties
+                        .take()
+                        .unwrap_or_else(|| message_properties(packet.properties.as_ref()));
+                    // MQTT 5 request/response, with a fixed topic for
+                    // clients that name none, such as MQTT 3.1.1 ones
+                    let topic: Arc<str> = match request.response_topic {
+                        Some(topic) => topic.value.into(),
+                        None => format!("{}/response", packet.topic_name).into(),
+                    };
                     let reply = Message {
                         packet_id: None,
                         topic: Arc::clone(&topic),
@@ -789,12 +797,15 @@ impl Session {
                         qos: QoS::AtLeastOnce,
                         retain: false,
                         payload: Some(answer),
-                        properties: MessageProperties::default(),
+                        properties: MessageProperties {
+                            correlation_data: request.correlation_data,
+                            ..Default::default()
+                        },
                         expires_at: None,
                         subscription_identifiers: Vec::new(),
                         origin: None,
                     };
-                    broker.publish_from(&topic, reply, None).await?;
+                    broker.publish_to(&topic, reply, self.shared.subscriber_id);
                 }
                 return response;
             }
