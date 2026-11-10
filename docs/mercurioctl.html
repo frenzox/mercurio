@@ -146,6 +146,11 @@ monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0  
 <li>A table cell holds one line, so <code>retained show</code> prints a payload's line breaks as spaces. <code>--json</code> keeps them: <code>mercurioctl retained show status/door --json | jq -r .payload</code>.</li>
 </ul>
 
+<h2 id="completions">Shell completions</h2>
+<p><code>mercurioctl completions &lt;shell&gt;</code> prints a completion script for <code>bash</code>, <code>zsh</code>, <code>fish</code>, <code>elvish</code> or <code>powershell</code>:</p>
+<pre>mercurioctl completions bash &gt; ~/.local/share/bash-completion/completions/mercurioctl
+mercurioctl completions zsh &gt; "${fpath[1]}/_mercurioctl"</pre>
+
 <h2 id="exit-status">Exit status</h2>
 <table>
 <tr><th>Status</th><th>Means</th></tr>

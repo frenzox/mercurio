@@ -51,6 +51,11 @@ pub fn request(
         Command::Listener(ListCommand::List) => named("listListeners", json!({})),
         Command::Bridge(ListCommand::List) => named("listBridges", json!({})),
         Command::Plugin(ListCommand::List) => named("listPlugins", json!({})),
+        Command::Completions { .. } => {
+            return Err(Failure::Usage(
+                "completions aren't a broker command".to_string(),
+            ))
+        }
     };
     Ok(Request {
         topic: BROKER_TOPIC,

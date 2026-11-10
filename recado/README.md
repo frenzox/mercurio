@@ -80,6 +80,10 @@ message, 2 when it couldn't be reached, refused the login or closed the
 connection, 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
 go to standard error.
 
+`recado completions <shell>` prints a completion script for bash, zsh,
+fish, elvish or PowerShell, such as
+`recado completions bash > ~/.local/share/bash-completion/completions/recado`.
+
 Run `recado pub --help` or `recado sub --help` for every option, or see
 the [CLI guide](https://frenzox.github.io/mercurio/cli.html).
 

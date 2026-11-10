@@ -1,6 +1,7 @@
 //! The command line.
 
 use clap::{builder::BoolishValueParser, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use mercurio_client::cli::ConnectArgs;
 
 use crate::dynsec::Dynsec;
@@ -106,6 +107,14 @@ pub enum Command {
     /// Dynamic security: clients, groups, roles and their ACLs
     #[command(subcommand)]
     Dynsec(Dynsec),
+    /// Print a completion script for a shell, as for
+    /// `mercurioctl completions bash > /etc/bash_completion.d/mercurioctl`
+    Completions { shell: Shell },
+}
+
+/// Writes the completion script for `shell` to `out`.
+pub fn completions(shell: Shell, out: &mut dyn std::io::Write) {
+    clap_complete::generate(shell, &mut command(), "mercurioctl", out);
 }
 
 #[derive(Subcommand, Debug)]
@@ -285,7 +294,7 @@ fn parse_reason_code(value: &str) -> Result<u8, String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{command, parse_reason_code, Cli};
+    use super::{command, completions, parse_reason_code, Cli, Command};
 
     #[test]
     fn connection_options_name_their_variables() {
@@ -312,6 +321,28 @@ mod tests {
     #[test]
     fn arguments_are_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_cover_the_commands() {
+        for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+            let cli = Cli::try_parse_from(["mercurioctl", "completions", shell]).unwrap();
+            let Command::Completions { shell } = cli.command else {
+                panic!("expected completions");
+            };
+            let mut script = Vec::new();
+            completions(shell, &mut script);
+            let script = String::from_utf8(script).unwrap();
+            for word in [
+                "mercurioctl",
+                "dynsec",
+                "create-client",
+                "retained",
+                "timeout",
+            ] {
+                assert!(script.contains(word), "{word} missing for {shell}");
+            }
+        }
     }
 
     #[test]

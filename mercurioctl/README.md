@@ -75,6 +75,10 @@ Exit status: 0 on success, 1 when the broker refused the command, 2 when
 it couldn't be reached, refused the login or didn't answer in time, 3 on
 wrong usage.
 
+`mercurioctl completions <shell>` prints a completion script for bash,
+zsh, fish, elvish or PowerShell, such as
+`mercurioctl completions bash > ~/.local/share/bash-completion/completions/mercurioctl`.
+
 Run `mercurioctl --help`, or `--help` after any command, for the rest, or
 see the [mercurioctl guide](https://frenzox.github.io/mercurio/mercurioctl.html)
 and the [administration guide](https://frenzox.github.io/mercurio/admin.html).

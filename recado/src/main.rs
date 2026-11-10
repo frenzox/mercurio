@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap_complete::Shell;
 use mercurio_client::cli::ConnectArgs;
 
 mod common;
@@ -33,6 +34,9 @@ enum Commands {
     Pub(publish::PubArgs),
     /// Subscribe to topics and print messages
     Sub(subscribe::SubArgs),
+    /// Print a completion script for a shell, as for
+    /// `recado completions bash > /etc/bash_completion.d/recado`
+    Completions { shell: Shell },
 }
 
 #[tokio::main]
@@ -75,7 +79,15 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             init_logging(args.connection.verbose);
             subscribe::run(args).await
         }
+        Commands::Completions { shell } => {
+            completions(shell, &mut std::io::stdout());
+            Ok(())
+        }
     }
+}
+
+fn completions(shell: Shell, out: &mut dyn std::io::Write) {
+    clap_complete::generate(shell, &mut command(), "recado", out);
 }
 
 #[cfg(test)]
@@ -87,6 +99,23 @@ mod tests {
     #[test]
     fn arguments_are_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_cover_both_commands_and_their_options() {
+        for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+            let cli = Cli::try_parse_from(["recado", "completions", shell]).unwrap();
+            let Commands::Completions { shell } = cli.command else {
+                panic!("expected completions");
+            };
+            let mut script = Vec::new();
+            super::completions(shell, &mut script);
+            let script = String::from_utf8(script).unwrap();
+            for word in ["recado", "pub", "sub", "will-topic", "format"] {
+                assert!(script.contains(word), "{word} missing for {shell}");
+            }
+        }
+        assert!(Cli::try_parse_from(["recado", "completions", "cmd"]).is_err());
     }
 
     #[test]
@@ -147,6 +176,7 @@ mod tests {
             let connection = match cli.command {
                 Commands::Pub(args) => args.connection,
                 Commands::Sub(args) => args.connection,
+                Commands::Completions { .. } => unreachable!(),
             };
             assert_eq!(
                 connection.connect.unix.as_deref(),

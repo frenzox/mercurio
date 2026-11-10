@@ -41,6 +41,10 @@ fn parse() -> Result<Cli, clap::Error> {
 }
 
 async fn run(cli: Cli) -> Result<(), Failure> {
+    if let cli::Command::Completions { shell } = cli.command {
+        cli::completions(shell, &mut std::io::stdout());
+        return Ok(());
+    }
     let request = commands::request(cli.command, new_password)?;
     let mut connect = client::resolve(cli.connect, Path::new(client::ADMIN_SOCKET));
     connect
