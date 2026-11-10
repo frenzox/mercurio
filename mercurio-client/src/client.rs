@@ -192,6 +192,16 @@ impl MqttClient {
                         None => ClientError::ConnectionRefused(ack.reason_code),
                     });
                 }
+                // A clean start leaves no session to resume [MQTT-3.2.2-4]
+                if ack.flags.session_present && options.clean_start {
+                    let _ = connection
+                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                            reason: ReasonCode::ProtocolError,
+                            properties: None,
+                        }))
+                        .await;
+                    return Err(ClientError::BrokerViolation(ReasonCode::ProtocolError));
+                }
                 let assigned_id = ack
                     .properties
                     .as_ref()

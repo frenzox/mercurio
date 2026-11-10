@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use mercurio_client::{ClientError, ConnectOptions, MqttClient, QoS};
+use mercurio_core::reason::ReasonCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -78,6 +79,38 @@ async fn publishes_wait_for_the_receive_maximum_window() {
     b.unwrap();
     client.disconnect().await.unwrap();
     broker.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_present_after_clean_start_is_refused() {
+    let (port, listener) = limited_broker().await;
+    let broker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket
+            .write_all(&[0x20, 0x03, 0x01, 0x00, 0x00])
+            .await
+            .unwrap();
+        let mut sent = Vec::new();
+        socket.read_to_end(&mut sent).await.unwrap();
+        sent
+    });
+
+    let connected = MqttClient::connect(ConnectOptions::new("127.0.0.1", port).clean_start(true))
+        .await;
+    assert!(
+        matches!(
+            connected,
+            Err(ClientError::BrokerViolation(ReasonCode::ProtocolError))
+        ),
+        "{:?}",
+        connected.err()
+    );
+    let sent = timeout(Duration::from_secs(2), broker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sent[..3], [0xe0, 0x01, 0x82], "sent {sent:02x?}");
 }
 
 #[tokio::test]

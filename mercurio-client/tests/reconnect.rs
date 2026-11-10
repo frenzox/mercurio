@@ -71,6 +71,7 @@ async fn publish_across_reconnect(session_present: bool) -> (Vec<Vec<u8>>, Vec<E
     let client = MqttClient::connect(
         ConnectOptions::new("127.0.0.1", port)
             .client_id("c")
+            .clean_start(false)
             .keep_alive(0)
             .reconnect(Duration::from_millis(50)),
     )
@@ -196,6 +197,7 @@ async fn resent_messages_respect_a_lowered_receive_maximum() {
     let client = MqttClient::connect(
         ConnectOptions::new("127.0.0.1", port)
             .client_id("c")
+            .clean_start(false)
             .keep_alive(0)
             .reconnect(Duration::from_millis(50)),
     )
@@ -345,6 +347,7 @@ async fn a_resent_message_now_too_large_fails_and_frees_its_slot() {
     let client = MqttClient::connect(
         ConnectOptions::new("127.0.0.1", port)
             .client_id("c")
+            .clean_start(false)
             .keep_alive(0)
             .reconnect(Duration::from_millis(50)),
     )
