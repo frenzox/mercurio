@@ -12,6 +12,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -61,6 +62,15 @@ impl HttpAuth {
         timeout: Duration,
         cache_for: Duration,
     ) -> Self {
+        if let Some(url) = user_url
+            .as_deref()
+            .filter(|url| is_plaintext_to_remote(url))
+        {
+            warn!(
+                "[auth.http] user_url {} is plain HTTP to another host, so passwords cross the network unencrypted; use https://",
+                redacted_http_url(url)
+            );
+        }
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .build()
@@ -124,6 +134,26 @@ impl HttpAuth {
         }
         None
     }
+}
+
+/// Whether `url` is plain HTTP to a host other than this machine's loopback.
+fn is_plaintext_to_remote(url: &str) -> bool {
+    let Some(rest) = url
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .map(|_| &url[7..])
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    !loopback
 }
 
 /// One check waiting on a request that identical checks share.
@@ -610,6 +640,29 @@ mod tests {
         assert_eq!(throttle.allow(start + Duration::from_secs(2)), None);
         assert_eq!(throttle.allow(start + WARN_INTERVAL), Some(2));
         assert_eq!(throttle.allow(start + WARN_INTERVAL), None);
+    }
+
+    #[test]
+    fn test_plain_http_to_another_host_is_flagged() {
+        for url in [
+            "http://auth.example.com/user",
+            "HTTP://10.0.0.1:8080/user",
+            "http://u:p@auth.example.com/user",
+            "http://[2001:db8::1]/user",
+            "http://localhost.example.com/user",
+        ] {
+            assert!(is_plaintext_to_remote(url), "{url}");
+        }
+        for url in [
+            "https://auth.example.com/user",
+            "http://localhost:8080/user",
+            "http://LOCALHOST/user",
+            "http://127.0.0.1/user",
+            "http://127.1.2.3:80/user?x=@y",
+            "http://[::1]:8080/user",
+        ] {
+            assert!(!is_plaintext_to_remote(url), "{url}");
+        }
     }
 
     #[test]
