@@ -31,8 +31,9 @@ use crate::{
     encoding::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
-    BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
+    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage,
+    WillStore, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -154,6 +155,20 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE sessions ADD COLUMN owner_username TEXT;
     ALTER TABLE sessions ADD COLUMN owner_mount_point TEXT;
+",
+    "
+    CREATE TABLE bans (
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        prefix BOOLEAN NOT NULL,
+        reason TEXT,
+        created_at BIGINT NOT NULL,
+        expires_at BIGINT,
+        PRIMARY KEY (kind, value, prefix)
+    );
+
+    CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON bans
+        FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
 ",
 ];
 
@@ -681,6 +696,10 @@ impl BatchStore for PostgresStore {
         "postgres"
     }
 
+    fn ban_store(self: Arc<Self>) -> Option<Arc<dyn BanStore>> {
+        Some(self)
+    }
+
     /// Applies the batch in one transaction, its statements pipelined, so
     /// it costs about one round trip.
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
@@ -968,6 +987,70 @@ impl RetainedMessageStore for PostgresStore {
 }
 
 #[async_trait]
+impl BanStore for PostgresStore {
+    async fn load_bans(&self) -> Result<Vec<StoredBan>> {
+        self.query(
+            "SELECT kind, value, prefix, reason, created_at, expires_at FROM bans",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(StoredBan {
+                kind: row.try_get(0).db()?,
+                value: row.try_get(1).db()?,
+                prefix: row.try_get(2).db()?,
+                reason: row.try_get(3).db()?,
+                created_at: row.try_get::<_, i64>(4).db()? as u64,
+                expires_at: row.try_get::<_, Option<i64>>(5).db()?.map(|t| t as u64),
+            })
+        })
+        .collect()
+    }
+
+    async fn store_ban(&self, ban: &StoredBan) -> Result<()> {
+        let client = self.client().await?;
+        let statement = client
+            .prepare_cached(
+                "INSERT INTO bans (kind, value, prefix, reason, created_at, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (kind, value, prefix) DO UPDATE SET reason = EXCLUDED.reason,
+                     created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at",
+            )
+            .await
+            .db()?;
+        client
+            .execute(
+                &statement,
+                &[
+                    &ban.kind,
+                    &ban.value,
+                    &ban.prefix,
+                    &ban.reason,
+                    &(ban.created_at as i64),
+                    &ban.expires_at.map(|t| t as i64),
+                ],
+            )
+            .await
+            .db()?;
+        Ok(())
+    }
+
+    async fn delete_ban(&self, kind: &str, value: &str, prefix: bool) -> Result<()> {
+        let client = self.client().await?;
+        let statement = client
+            .prepare_cached("DELETE FROM bans WHERE kind = $1 AND value = $2 AND prefix = $3")
+            .await
+            .db()?;
+        client
+            .execute(&statement, &[&kind, &value, &prefix])
+            .await
+            .db()?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl WillStore for PostgresStore {
     async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()> {
         self.apply(client_id, &[Write::StoreWill(will.clone())])
@@ -1126,7 +1209,7 @@ mod tests {
             .unwrap()
             .batch_execute(
                 "TRUNCATE sessions, retained_messages, will_messages, inflight_messages,
-                 queued_messages",
+                 queued_messages, bans",
             )
             .await
             .unwrap();
@@ -1435,14 +1518,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bans() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        crate::testing::bans_round_trip(&store).await;
+        assert!(Arc::new(store).ban_store().is_some());
+    }
+
+    #[tokio::test]
     async fn test_one_broker_holds_the_database() {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
 
         let (active, lock) = PostgresStore::connect_exclusive(&url, None, false)
             .await
             .unwrap()
             .unwrap();
+        let ban = crate::testing::ban("address", "10.0.0.0/8", false);
+        active.store_ban(&ban).await.unwrap();
         assert!(PostgresStore::connect_exclusive(&url, None, false)
             .await
             .unwrap()
@@ -1458,8 +1553,7 @@ mod tests {
         assert!(!waiting.is_finished());
 
         // The server ends the holder's connection, as on a failover
-        empty_store(&url)
-            .await
+        database
             .client()
             .await
             .unwrap()
@@ -1489,6 +1583,18 @@ mod tests {
             .contains("another broker took over"));
         assert!(active.store_retained("t", None).await.is_err());
         standby.apply("c", &[Write::ClearQueue]).await.unwrap();
+
+        // The standby finds the bans as it starts serving; the old holder
+        // can't change them any more
+        assert_eq!(standby.load_bans().await.unwrap(), vec![ban]);
+        assert!(active
+            .delete_ban("address", "10.0.0.0/8", false)
+            .await
+            .is_err());
+        standby
+            .delete_ban("address", "10.0.0.0/8", false)
+            .await
+            .unwrap();
 
         drop(standby_lock);
         let (_, lock) = PostgresStore::connect_exclusive(&url, None, false)
