@@ -49,8 +49,9 @@ the defaults below. A missing file at a path given with `-c` is an error.
 
 ## Configuration
 
-Mercuriod reads a TOML file. Every setting is optional; this is the full
-list with the defaults, also available as
+Mercuriod reads a TOML file. Every setting is optional, and a key it does
+not know stops it from starting, with an error naming the key. This is the
+full list with the defaults, also available as
 [`contrib/config.toml`](contrib/config.toml):
 
 ```toml

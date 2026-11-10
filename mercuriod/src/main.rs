@@ -339,7 +339,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(reload_on_sighup(reloadable));
 
     let result = match config.storage {
-        StorageConfig::Memory => {
+        StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
             serve(listener, server_config, storage, &commands, shutdown).await
         }

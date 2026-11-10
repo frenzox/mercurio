@@ -39,7 +39,7 @@
 <main>
 <h1>Administration</h1>
 <p class="lead">Look at and change a running broker: its clients and sessions, bans, retained messages and subscriptions, its log level and files, without restarting it.</p>
-<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <a href="mercurioctl.html">mercurioctl</a> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.3 or earlier.</p>
+<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <a href="mercurioctl.html">mercurioctl</a> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups <a href="#upgrading-0.4.4">upgrading from earlier versions</a>.</p>
 
 <h2 id="socket">The admin socket</h2>
 <pre>[admin]
@@ -174,6 +174,11 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <li>Adding a ban with the type, value and prefix of an existing one replaces its duration and reason.</li>
 <li>A ban leaves stored sessions alone. A will already waiting for a client that disconnected before the ban, delayed by its Will Delay Interval or restored after a restart, is still published; delete the session with <code>deleteSession</code> to drop it.</li>
 <li>With SQLite or PostgreSQL storage, bans survive restarts, and a standby broker loads them when it takes over. In memory, they last until the broker stops.</li>
+</ul>
+
+<h2 id="upgrading-0.4.4">Upgrading from mercuriod 0.4.4 or earlier</h2>
+<ul>
+<li><strong>A configuration with a key the broker does not know no longer starts.</strong> Earlier versions ignored such keys, so a misspelling such as <code>enable = true</code> under <code>[auth]</code> or <code>[server.tls]</code> left authentication or TLS off without a word. The error names the key; fix or remove it. This applies to every table, the files of <code>include_dir</code> included, and to the keys of a <code>[storage]</code> backend other than the one chosen, such as <code>path</code> with <code>backend = "memory"</code>.</li>
 </ul>
 
 <h2 id="upgrading">Upgrading from mercuriod 0.4.3 or earlier</h2>

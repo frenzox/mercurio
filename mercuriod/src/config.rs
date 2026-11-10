@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 /// Main configuration structure.
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct Config {
     #[serde(default)]
@@ -53,6 +54,7 @@ pub struct Config {
 
 /// A connection to another broker, as an MQTT 5 client.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
     /// Names the bridge in logs and in its default client id
     pub name: String,
@@ -91,6 +93,7 @@ pub struct BridgeConfig {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeTlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -120,6 +123,7 @@ fn default_true() -> bool {
 /// `pattern` is matched below `local_prefix` on this broker and below
 /// `remote_prefix` on the remote one.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeTopic {
     pub pattern: String,
 
@@ -149,6 +153,7 @@ pub enum Direction {
 
 /// An extra listener, with its own protocol and TLS settings.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -359,12 +364,12 @@ impl From<Protocol> for Transport {
 
 /// Where the broker keeps sessions, retained messages, wills and in-flight
 /// messages.
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(tag = "backend", rename_all = "lowercase")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StorageConfig {
-    /// Lost on restart
-    #[default]
-    Memory,
+    /// Lost on restart. A struct variant, as serde lets a unit variant of an
+    /// internally tagged enum ignore unknown keys
+    Memory {},
     /// Kept in a SQLite database file
     Sqlite { path: String },
     /// Kept in a PostgreSQL database, such as
@@ -379,6 +384,12 @@ pub enum StorageConfig {
         #[serde(default)]
         standby: bool,
     },
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self::Memory {}
+    }
 }
 
 impl Config {
@@ -470,6 +481,7 @@ fn merge(into: &mut toml::Table, from: toml::Table) {
 
 /// Server configuration.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct ServerConfig {
     /// Host address to bind to
@@ -638,6 +650,7 @@ impl Default for ServerConfig {
 
 /// TLS configuration for the server.
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct TlsServerConfig {
     /// Enable TLS
@@ -715,6 +728,7 @@ impl TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedirectConfig {
     /// The server clients should use, such as `broker2.example.com:1883`
     pub server_reference: String,
@@ -817,6 +831,7 @@ impl ServerConfig {
 
 /// Logging configuration.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
@@ -873,6 +888,7 @@ impl Default for AdminConfig {
 
 /// Authentication configuration.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct AuthConfig {
     /// Enable authentication
@@ -899,6 +915,7 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpAuthConfig {
     /// Checks user names and passwords, in place of `password_file`
     #[serde(serialize_with = "redact_some_url")]
@@ -945,7 +962,9 @@ fn default_allow_anonymous() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{redacted_http_url, redacted_url, AdminConfig, Config, Protocol};
+    use serde::Deserialize;
+
+    use super::{redacted_http_url, redacted_url, AdminConfig, Config, Protocol, StorageConfig};
 
     #[test]
     fn test_tls_acceptor_builds_with_every_dependency_linked() {
@@ -1150,6 +1169,132 @@ mod tests {
         let admin = config.admin.expect("the shipped config has [admin]");
         assert_eq!(admin.socket, "/run/mercurio/admin.sock");
         assert_eq!(admin.group, "mercurio");
+    }
+
+    #[test]
+    fn test_unknown_keys_are_refused_in_every_table() {
+        for (toml, key) in [
+            ("includedir = \"/x\"\n", "includedir"),
+            ("[listener]\nport = 1884\n", "listener"),
+            ("[server]\nprot = 1\n", "prot"),
+            ("[server.tls]\nenable = true\n", "enable"),
+            (
+                "[server.redirect]\nserver_reference = \"h\"\npermanent_ = true\n",
+                "permanent_",
+            ),
+            ("[logging]\nlvl = \"debug\"\n", "lvl"),
+            ("[auth]\nenable = true\n", "enable"),
+            ("[auth.http]\nuser_ur = \"http://h\"\n", "user_ur"),
+            ("[admin]\nsockets = \"/x\"\n", "sockets"),
+            ("[storage]\nbackend = \"memory\"\npath = \"x\"\n", "path"),
+            (
+                "[storage]\nbackend = \"sqlite\"\npath = \"x\"\nstandby = true\n",
+                "standby",
+            ),
+            (
+                "[storage]\nbackend = \"postgres\"\nurl = \"postgres://h/db\"\nca_file = \"ca.pem\"\n",
+                "ca_file",
+            ),
+            (
+                "[[listeners]]\nport = 1884\nproxy_form = [\"10.0.0.0/8\"]\n",
+                "proxy_form",
+            ),
+            (
+                "[[listeners]]\nport = 8883\n[listeners.tls]\nenabled = true\nca_file = \"ca.pem\"\n",
+                "ca_file",
+            ),
+            (
+                "[[listeners]]\nport = 1885\n[listeners.auth]\nenabled = true\npasswd_file = \"p\"\n",
+                "passwd_file",
+            ),
+            (
+                "[[bridges]]\nname = \"b\"\nhost = \"h\"\nusername_ = \"u\"\n[[bridges.topics]]\npattern = \"#\"\n",
+                "username_",
+            ),
+            (
+                "[[bridges]]\nname = \"b\"\nhost = \"h\"\n[bridges.tls]\nca_file = \"ca.pem\"\n[[bridges.topics]]\npattern = \"#\"\n",
+                "ca_file",
+            ),
+            (
+                "[[bridges]]\nname = \"b\"\nhost = \"h\"\n[[bridges.topics]]\npattern = \"#\"\ndirecton = \"in\"\n",
+                "directon",
+            ),
+            ("[[plugins]]\npath = \"a.wasm\"\nmemory = 1\n", "memory"),
+        ] {
+            let error = toml::from_str::<Config>(toml).unwrap_err().to_string();
+            assert!(error.contains(&format!("`{key}`")), "{toml}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_unknown_keys_in_included_files_are_refused() {
+        let dir = std::env::temp_dir().join(format!("mercuriod-unknown-{}", std::process::id()));
+        let conf_d = dir.join("conf.d");
+        std::fs::create_dir_all(&conf_d).unwrap();
+        let main = dir.join("main.toml");
+        std::fs::write(&main, format!("include_dir = \"{}\"\n", conf_d.display())).unwrap();
+        std::fs::write(conf_d.join("auth.toml"), "[auth]\nenable = true\n").unwrap();
+        let error = Config::from_file(&main).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(error.contains("`enable`"), "{error}");
+    }
+
+    /// `sample` with every commented-out `key = value` line and table header
+    /// turned on.
+    fn uncommented(sample: &str) -> toml::Table {
+        let setting = |line: &str| {
+            line.starts_with('[')
+                || line
+                    .split_once(" = ")
+                    .is_some_and(|(key, _)| key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        };
+        let text: String = sample
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest) if setting(rest) => rest,
+                _ => line,
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn test_every_key_of_the_shipped_sample_and_readme_parses() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let sample = std::fs::read_to_string(format!("{dir}/contrib/config.toml")).unwrap();
+        let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
+        let (_, readme) = readme.split_once("```toml\n").unwrap();
+        let (readme, _) = readme.split_once("```").unwrap();
+        check_every_key_parses(uncommented(&sample));
+        check_every_key_parses(uncommented(readme));
+    }
+
+    fn check_every_key_parses(mut table: toml::Table) {
+        // The storage keys belong to different backends
+        let storage = table.remove("storage").unwrap();
+        let config = Config::deserialize(table).unwrap();
+        assert!(config.include_dir.is_some());
+        assert!(config.server.redirect.is_some());
+        assert!(config.auth.http.is_some());
+        assert!(config.listeners.iter().any(|l| l.auth.is_some()));
+        assert!(config.bridges.iter().any(|b| !b.topics.is_empty()));
+
+        let storage = storage.as_table().unwrap();
+        for (backend, keys) in [
+            ("memory", &[][..]),
+            ("sqlite", &["path"][..]),
+            ("postgres", &["url", "ca_path", "standby"][..]),
+        ] {
+            let mut table = toml::Table::new();
+            table.insert("backend".into(), backend.into());
+            for key in keys {
+                table.insert(key.to_string(), storage[*key].clone());
+            }
+            StorageConfig::deserialize(table).unwrap();
+        }
+        let covered = ["backend", "path", "url", "ca_path", "standby"];
+        assert!(storage.keys().all(|k| covered.contains(&k.as_str())));
     }
 
     #[test]
