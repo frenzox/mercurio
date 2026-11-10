@@ -120,7 +120,10 @@ async fn stall(ping_first: bool) {
         .unwrap()
         .unwrap();
     let event = timeout(Duration::from_secs(2), client.recv()).await;
-    assert!(event.is_err(), "connection ended after the stall: {event:?}");
+    assert!(
+        event.is_err(),
+        "connection ended after the stall: {event:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,7 +163,9 @@ async fn a_stalled_write_ends_the_connection_and_reconnects() {
     .await
     .expect("the write never gave up");
     assert!(published.is_err());
-    let event = timeout(Duration::from_secs(5), client.recv()).await.unwrap();
+    let event = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .unwrap();
     assert!(
         matches!(
             event,
@@ -170,8 +175,13 @@ async fn a_stalled_write_ends_the_connection_and_reconnects() {
         ),
         "{event:?}"
     );
-    let event = timeout(Duration::from_secs(5), client.recv()).await.unwrap();
-    assert!(matches!(event, Some(Event::Reconnected { .. })), "{event:?}");
+    let event = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .unwrap();
+    assert!(
+        matches!(event, Some(Event::Reconnected { .. })),
+        "{event:?}"
+    );
     let _sockets = broker.await.unwrap();
 }
 

@@ -302,7 +302,10 @@ async fn a_permanent_refusal_stops_the_client_with_its_reason() {
     .unwrap();
 
     let events = events_until_none(&client).await;
-    assert!(matches!(events[0], Event::Disconnected { .. }), "{events:?}");
+    assert!(
+        matches!(events[0], Event::Disconnected { .. }),
+        "{events:?}"
+    );
     let Event::Stopped { error } = &events[1] else {
         panic!("no final event: {events:?}");
     };
@@ -359,7 +362,10 @@ async fn a_resent_message_now_too_large_fails_and_frees_its_slot() {
     )
     .await
     .expect("the oversized resend never failed");
-    assert!(matches!(large, Err(ClientError::PacketTooLarge)), "{large:?}");
+    assert!(
+        matches!(large, Err(ClientError::PacketTooLarge)),
+        "{large:?}"
+    );
     timeout(
         Duration::from_secs(3),
         client.publish("a", "small", QoS::AtLeastOnce),
@@ -409,7 +415,10 @@ async fn publishes_queued_while_disconnected_follow_the_new_limits() {
     })
     .await
     .expect("the queued publishes never completed");
-    assert!(matches!(qos2, Err(ClientError::NotSupported(_))), "{qos2:?}");
+    assert!(
+        matches!(qos2, Err(ClientError::NotSupported(_))),
+        "{qos2:?}"
+    );
     assert!(
         matches!(retained, Err(ClientError::NotSupported(_))),
         "{retained:?}"

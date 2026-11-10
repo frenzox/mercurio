@@ -96,8 +96,8 @@ async fn a_session_present_after_clean_start_is_refused() {
         sent
     });
 
-    let connected = MqttClient::connect(ConnectOptions::new("127.0.0.1", port).clean_start(true))
-        .await;
+    let connected =
+        MqttClient::connect(ConnectOptions::new("127.0.0.1", port).clean_start(true)).await;
     assert!(
         matches!(
             connected,
@@ -185,8 +185,8 @@ async fn announce_oversized_packet(
     let client = MqttClient::connect(options(
         ConnectOptions::new("127.0.0.1", port).keep_alive(0),
     ))
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let event = timeout(Duration::from_secs(2), client.recv())
         .await
         .unwrap_or_default();
@@ -210,8 +210,7 @@ fn refused_as_too_large(answer: &[u8], event: Option<Event>) {
 #[tokio::test]
 async fn packets_over_the_default_limit_are_refused_from_their_header() {
     // 2 MiB, over the 1 MiB default
-    let (connect, answer, event) =
-        announce_oversized_packet(|o| o, [0x80, 0x80, 0x80, 0x01]).await;
+    let (connect, answer, event) = announce_oversized_packet(|o| o, [0x80, 0x80, 0x80, 0x01]).await;
     // Maximum Packet Size of 1 MiB, announced in CONNECT
     assert!(
         connect
@@ -225,10 +224,7 @@ async fn packets_over_the_default_limit_are_refused_from_their_header() {
 #[tokio::test]
 async fn packets_over_the_set_limit_are_refused_from_their_header() {
     // 1,000 bytes, over the 500 set
-    let (_, answer, event) = announce_oversized_packet(
-        |o| o.maximum_packet_size(500),
-        [0xe8, 0x07, 0x00, 0x00],
-    )
-    .await;
+    let (_, answer, event) =
+        announce_oversized_packet(|o| o.maximum_packet_size(500), [0xe8, 0x07, 0x00, 0x00]).await;
     refused_as_too_large(&answer, event);
 }
