@@ -228,12 +228,9 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
                 0
             }
         };
-        let pending = MIGRATIONS.get(version as usize..).ok_or_else(|| {
-            StorageError::OperationFailed(format!(
-                "the database has schema version {version}, newer than this broker's {}",
-                MIGRATIONS.len()
-            ))
-        })?;
+        let pending = MIGRATIONS
+            .get(version as usize..)
+            .ok_or_else(|| newer_schema(version))?;
         for migration in pending {
             client.batch_execute(migration).await.db()?;
         }
@@ -252,6 +249,38 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
         .await
         .db()?;
     result
+}
+
+fn newer_schema(version: i32) -> StorageError {
+    StorageError::OperationFailed(format!(
+        "the database has schema version {version}, newer than this broker's {}",
+        MIGRATIONS.len()
+    ))
+}
+
+/// Fails if the database's schema is newer than this broker knows, without
+/// changing it.
+async fn check_schema(client: &tokio_postgres::Client) -> Result<()> {
+    let exists: bool = client
+        .query_one("SELECT to_regclass('mercurio_schema') IS NOT NULL", &[])
+        .await
+        .db()?
+        .try_get(0)
+        .db()?;
+    if !exists {
+        return Ok(());
+    }
+    if let Some(row) = client
+        .query_opt("SELECT version FROM mercurio_schema", &[])
+        .await
+        .db()?
+    {
+        let version: i32 = row.try_get(0).db()?;
+        if version as usize > MIGRATIONS.len() {
+            return Err(newer_schema(version));
+        }
+    }
+    Ok(())
 }
 
 /// Turns tokio-postgres errors into the crate's, keeping its types out of
@@ -429,7 +458,19 @@ impl PostgresStore {
             )
             .await
             .db()?;
-        migrate(&client).await?;
+        // A role's timeouts, common on managed PostgreSQL, would cancel a
+        // standby's wait for the lock or end its idle connection
+        client
+            .execute(
+                "SELECT set_config(name, '0', false) FROM pg_settings
+                 WHERE name IN ('statement_timeout', 'lock_timeout', 'idle_session_timeout')",
+                &[],
+            )
+            .await
+            .db()?;
+        // The schema changes only under the lock, as the broker holding it
+        // may not know a newer one
+        check_schema(&client).await?;
 
         let sql = if wait {
             "SELECT true FROM pg_advisory_lock($1)"
@@ -445,6 +486,7 @@ impl PostgresStore {
         {
             return Ok(None);
         }
+        migrate(&client).await?;
         // Waits for writes of the previous holder already past their check
         let epoch: i64 = client
             .query_one(
@@ -1706,6 +1748,140 @@ mod tests {
         let store = empty_store(&url).await;
         crate::testing::bans_round_trip(&store).await;
         assert!(Arc::new(store).ban_store().is_some());
+    }
+
+    /// `url` with `user` and `password` in place of its credentials.
+    fn url_as(url: &str, user: &str, password: &str) -> String {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let host = rest.split_once('@').map_or(rest, |(_, host)| host);
+        format!("{scheme}://{user}:{password}@{host}")
+    }
+
+    /// Managed PostgreSQL often gives roles a statement or lock timeout,
+    /// which would cancel a standby's wait for the lock.
+    #[tokio::test]
+    async fn test_a_standby_waits_despite_its_roles_timeouts() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        admin
+            .batch_execute(
+                "DROP ROLE IF EXISTS mercurio_hurried;
+                 CREATE ROLE mercurio_hurried LOGIN SUPERUSER PASSWORD 'hurried';
+                 ALTER ROLE mercurio_hurried SET statement_timeout = '200ms';
+                 ALTER ROLE mercurio_hurried SET lock_timeout = '200ms';",
+            )
+            .await
+            .unwrap();
+        let (_active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+        let hurried = url_as(&url, "mercurio_hurried", "hurried");
+        let waiting = tokio::spawn(async move {
+            PostgresStore::connect_exclusive(&hurried, &ConnectOptions::default(), true).await
+        });
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!waiting.is_finished(), "{:?}", waiting.await.unwrap().err());
+
+        drop(lock);
+        let (_, standby_lock) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the standby takes over")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(standby_lock);
+        let _ = admin.batch_execute("DROP ROLE mercurio_hurried").await;
+    }
+
+    /// A newer standby leaves the schema alone until it holds the
+    /// database, as the broker serving from it may not know the new one.
+    #[tokio::test]
+    async fn test_a_standby_migrates_once_it_holds_the_database() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        let version = || async {
+            let version: i32 = admin
+                .query_one("SELECT version FROM mercurio_schema", &[])
+                .await
+                .unwrap()
+                .get(0);
+            version as usize
+        };
+        let (_active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        // As if the serving broker were the version before the last change
+        admin
+            .execute(
+                "UPDATE mercurio_schema SET version = $1",
+                &[&(MIGRATIONS.len() as i32 - 1)],
+            )
+            .await
+            .unwrap();
+
+        let url_standby = url.clone();
+        let waiting = tokio::spawn(async move {
+            PostgresStore::connect_exclusive(&url_standby, &ConnectOptions::default(), true).await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished());
+        assert_eq!(version().await, MIGRATIONS.len() - 1);
+
+        drop(lock);
+        let (_, standby_lock) = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the standby takes over")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(version().await, MIGRATIONS.len());
+        drop(standby_lock);
+    }
+
+    /// A standby older than the database's schema fails at once, rather
+    /// than wait for a database it can't serve from.
+    #[tokio::test]
+    async fn test_an_older_standby_refuses_a_newer_schema() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let admin = database.client().await.unwrap();
+        let (_active, _lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        let set_version = |version: usize| {
+            let admin = &admin;
+            async move {
+                admin
+                    .execute(
+                        "UPDATE mercurio_schema SET version = $1",
+                        &[&(version as i32)],
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        set_version(MIGRATIONS.len() + 1).await;
+        let standby = tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), true),
+        )
+        .await
+        .expect("an older standby doesn't wait");
+        set_version(MIGRATIONS.len()).await;
+        let error = standby.err().unwrap();
+        assert!(error.to_string().contains("newer"), "{error}");
     }
 
     #[tokio::test]

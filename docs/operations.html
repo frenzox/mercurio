@@ -67,6 +67,7 @@ backend = "postgres"
 url = "postgres://mercurio:password@db.example.com/mercurio?sslmode=require"
 standby = true</pre>
 <p>A standby waits without listening on its ports. It takes over as soon as the serving broker's process stops, or about 11 seconds after the database last heard from the serving broker's host, and serves every session from the database. Point clients at both brokers, through a load balancer or a list of addresses, so they reconnect to whichever serves.</p>
+<p>A standby updates the tables only once it takes over, so one running a newer version can wait next to an older serving broker; a standby older than the tables exits at once. Its wait is not cut short by a <code>statement_timeout</code>, <code>lock_timeout</code> or <code>idle_session_timeout</code> set on the database role, as managed PostgreSQL services often do.</p>
 <p>A broker that can't reach the database for about 7 seconds stops serving and exits with an error, because a standby may take over. With <code>standby = true</code> and the provided systemd unit, it restarts as the standby. Each takeover is recorded in the database, which refuses writes from brokers that served before it, even those delayed in the network, so a replaced broker can't overwrite the new one's sessions. A broker that has a write refused this way stops at once, as when it loses the database.</p>
 
 <h2 id="queues">Queues and slow clients</h2>
