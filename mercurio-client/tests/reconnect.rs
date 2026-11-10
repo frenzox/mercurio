@@ -315,6 +315,59 @@ async fn a_permanent_refusal_stops_the_client_with_its_reason() {
 }
 
 #[tokio::test]
+async fn a_resent_message_now_too_large_fails_and_frees_its_slot() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        let mut socket = accept(&listener, false).await;
+        assert_eq!(read_packet(&mut socket).await[0], 0x32);
+        drop(socket);
+
+        // Session kept, but now Maximum Packet Size 50 and Receive
+        // Maximum 1
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await;
+        socket
+            .write_all(&[
+                0x20, 0x0b, 0x01, 0x00, 0x08, 0x27, 0x00, 0x00, 0x00, 0x32, 0x21, 0x00, 0x01,
+            ])
+            .await
+            .unwrap();
+        let small = read_packet(&mut socket).await;
+        assert_eq!(small[0], 0x32, "{small:02x?}");
+        socket
+            .write_all(&[0x40, 0x02, small[5], small[6]])
+            .await
+            .unwrap();
+        socket
+    });
+
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .client_id("c")
+            .keep_alive(0)
+            .reconnect(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    let large = timeout(
+        Duration::from_secs(3),
+        client.publish("a", vec![0u8; 100], QoS::AtLeastOnce),
+    )
+    .await
+    .expect("the oversized resend never failed");
+    assert!(matches!(large, Err(ClientError::PacketTooLarge)), "{large:?}");
+    timeout(
+        Duration::from_secs(3),
+        client.publish("a", "small", QoS::AtLeastOnce),
+    )
+    .await
+    .expect("the slot of the oversized message stayed taken")
+    .unwrap();
+    let _socket = broker.await.unwrap();
+}
+
+#[tokio::test]
 async fn reconnection_backs_off() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

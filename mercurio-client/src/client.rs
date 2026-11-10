@@ -1131,11 +1131,19 @@ impl EventLoop {
                 .iter_mut()
                 .filter(|(_, o)| !o.sent)
                 .min_by_key(|(_, o)| o.seq);
-            if let Some((_, outgoing)) = resumed {
+            if let Some((&packet_id, outgoing)) = resumed {
                 outgoing.sent = true;
                 let packet = ControlPacket::Publish(outgoing.packet.clone());
-                if self.connection.write_packet(packet).await.is_err() {
-                    return;
+                match self.connection.write_packet(packet).await {
+                    Ok(()) => {}
+                    // The broker lowered its Maximum Packet Size since the
+                    // message was first sent
+                    Err(ClientError::PacketTooLarge) => {
+                        if let Some(outgoing) = self.outgoing.remove(&packet_id) {
+                            let _ = outgoing.response.send(Err(ClientError::PacketTooLarge));
+                        }
+                    }
+                    Err(_) => return,
                 }
                 continue;
             }
