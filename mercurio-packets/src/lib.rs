@@ -150,6 +150,16 @@ impl ControlPacket {
 
         let packet_type: u8 = src[0] >> 4;
 
+        // MQTT 3.1 sets DUP when it resends a PUBREL, SUBSCRIBE or
+        // UNSUBSCRIBE (3.1 section 2.1); 3.1.1 reserved that bit. None of the
+        // three keeps the flag, so drop it before the decoders check it.
+        if version == ProtocolVersion::V3_1
+            && matches!(packet_type, 0x06 | 0x08 | 0x0a)
+            && src[0] & 0x0f == 0b1010
+        {
+            src[0] &= !0b1000;
+        }
+
         // In MQTT 3.x acknowledgements carry only a packet id, DISCONNECT and
         // the pings nothing, and AUTH doesn't exist; MQTT 5 extended them
         if !version.supports_properties() {
@@ -475,6 +485,29 @@ mod tests {
         let mut encoded = BytesMut::new();
         packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
         assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn test_dup_on_pubrel_subscribe_unsubscribe_only_in_mqtt_3_1() {
+        // PUBREL, SUBSCRIBE "a" at QoS 0 and UNSUBSCRIBE "a", DUP set
+        let resent: [&[u8]; 3] = [
+            &[0x6a, 0x02, 0x00, 0x01],
+            &[0x8a, 0x06, 0x00, 0x01, 0x00, 0x01, b'a', 0x00],
+            &[0xaa, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'],
+        ];
+        for bytes in resent {
+            let parse = |version| {
+                ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version)
+            };
+            assert!(parse(ProtocolVersion::V3_1).is_ok(), "{bytes:02x?}");
+            assert!(
+                matches!(
+                    parse(ProtocolVersion::V3_1_1),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{bytes:02x?}"
+            );
+        }
     }
 
     #[test]
