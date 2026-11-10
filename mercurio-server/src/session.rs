@@ -273,12 +273,14 @@ struct Shared {
     queue: Arc<MessageQueue>,
     /// Identifies this session's subscriptions in the topic tree
     subscriber_id: u64,
+    /// Generation of the latest connection to use this session. Changed
+    /// with `state` locked, so checks made under that lock see it settled;
+    /// readable without the lock by the session manager.
+    generation: AtomicU64,
 }
 
 struct State {
     pub connect_packet: ConnectPacket,
-    /// Generation of the latest connection to use this session
-    generation: u64,
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     /// Topic filters subscribed to, with their granted QoS
@@ -400,7 +402,6 @@ impl Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     connect_packet,
-                    generation: 0,
                     client_id,
                     subscriptions: HashMap::new(),
                     topics: None,
@@ -430,6 +431,7 @@ impl Session {
                 }),
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
+                generation: AtomicU64::new(0),
             }),
         }
     }
@@ -454,15 +456,15 @@ impl Session {
         session.will_message.take()
     }
 
-    pub(crate) async fn generation(&self) -> u64 {
-        self.shared.state.lock().await.generation
+    pub(crate) fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
     }
 
     /// Hands the session to `generation`, dropping the will an earlier
     /// connection left waiting for its delay.
     pub(crate) async fn set_generation(&self, generation: u64) {
         let mut state = self.shared.state.lock().await;
-        state.generation = generation;
+        self.shared.generation.store(generation, Ordering::Release);
         if let Some(will) = state.pending_will.take() {
             will.abort();
         }
@@ -473,7 +475,7 @@ impl Session {
     /// already taken over.
     pub(crate) async fn set_pending_will(&self, generation: u64, will: AbortHandle) {
         let mut state = self.shared.state.lock().await;
-        if state.generation == generation {
+        if self.generation() == generation {
             state.pending_will = Some(will);
         } else {
             will.abort();
@@ -485,7 +487,7 @@ impl Session {
     /// will is never cut off half published.
     pub(crate) async fn claim_pending_will(&self, generation: u64) -> bool {
         let mut state = self.shared.state.lock().await;
-        if state.generation != generation {
+        if self.generation() != generation {
             return false;
         }
         state.pending_will = None;
@@ -1046,7 +1048,7 @@ impl Session {
     /// outliving it by `expiry`, unless a newer connection took over.
     pub(crate) async fn detach(&self, generation: u64, expiry: Option<Duration>) {
         let mut state = self.shared.state.lock().await;
-        if state.generation != generation {
+        if self.generation() != generation {
             return;
         }
         let now = unix_millis();
