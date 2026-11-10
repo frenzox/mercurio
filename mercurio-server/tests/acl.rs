@@ -203,16 +203,12 @@ async fn will_topic_needs_write_access() {
 }
 
 #[tokio::test]
-async fn unverified_user_names_get_anonymous_rights() {
-    // Without authentication anyone can claim to be alice
+async fn credentials_are_verified_without_required_authentication() {
     let addr = start_broker(false).await;
-    let (mut impostor, accepted) =
-        Client::connect(addr, "i", Some(("alice", "anything")), None).await;
-    assert_eq!(accepted, ReasonCode::Success);
+    let (_, refused) = Client::connect(addr, "i", Some(("alice", "anything")), None).await;
+    assert_eq!(refused, ReasonCode::BadUserNameOrPassword);
 
-    assert_eq!(
-        impostor.subscribe("alice/#").await,
-        ReasonCode::NotAuthorized
-    );
-    assert_eq!(impostor.subscribe("public/#").await.get_code(), 0x00);
+    let (mut alice, accepted) = Client::connect(addr, "a", Some(("alice", "secret")), None).await;
+    assert_eq!(accepted, ReasonCode::Success);
+    assert_eq!(alice.subscribe("alice/#").await.get_code(), 0x00);
 }

@@ -491,7 +491,8 @@ fn build_auth(
 
     let http = config.http.as_ref().map(|http| {
         let auth = Arc::new(HttpAuth::new(
-            http.user_url.clone(),
+            // The broker checks credentials whenever they're sent
+            http.user_url.clone().filter(|_| config.enabled),
             http.acl_url.clone(),
             Duration::from_secs(http.timeout_seconds),
             Duration::from_secs(http.cache_seconds),
@@ -707,7 +708,7 @@ fn write_password_file(
 
 #[cfg(test)]
 mod tests {
-    use super::address;
+    use super::{address, build_auth, config};
 
     #[test]
     fn test_ipv6_hosts_are_bracketed() {
@@ -715,5 +716,23 @@ mod tests {
         assert_eq!(address("[::1]", 1883), "[::1]:1883");
         assert_eq!(address("0.0.0.0", 1883), "0.0.0.0:1883");
         assert_eq!(address("localhost", 1883), "localhost:1883");
+    }
+
+    #[test]
+    fn test_http_auth_without_authentication_only_controls_access() {
+        // The broker checks any credentials sent, so the user URL must not
+        // be asked when authentication is off
+        let config: config::AuthConfig = toml::from_str(
+            r#"
+            [http]
+            user_url = "http://127.0.0.1:1/user"
+            acl_url = "http://127.0.0.1:1/acl"
+            "#,
+        )
+        .unwrap();
+        let (auth, plugins) = build_auth(&config, &mut Vec::new(), true).unwrap();
+        assert!(!auth.require_auth);
+        let hooks: Vec<String> = plugins.iter().flat_map(|p| p.status().hooks).collect();
+        assert_eq!(hooks, ["authorize"]);
     }
 }

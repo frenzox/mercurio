@@ -76,7 +76,10 @@ use crate::{
 #[derive(Default)]
 #[non_exhaustive]
 pub struct AuthConfig {
-    /// Whether authentication is required.
+    /// Whether authentication is required. Credentials a client sends are
+    /// checked by the plugins either way, and refused on
+    /// [`Decision::Deny`]; without it, clients whose credentials no plugin
+    /// decides on, or that send none, are let in as anonymous.
     pub require_auth: bool,
     /// With authentication required, still accept clients that send no
     /// user name. Credentials that are sent are always checked.
@@ -862,16 +865,16 @@ async fn validate_credentials(
     chain: &Chain,
     client: &ClientInfo,
     credentials: &Credentials<'_>,
-) -> bool {
+) -> Decision {
     static CHECKS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let checks = CHECKS.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         Arc::new(tokio::sync::Semaphore::new(cores))
     });
     let Ok(_permit) = checks.acquire().await else {
-        return false;
+        return Decision::Deny;
     };
-    chain.authenticate(client, credentials).await == Decision::Allow
+    chain.authenticate(client, credentials).await
 }
 
 /// Run the MQTT broker with plain TCP connections.
@@ -1428,7 +1431,11 @@ where
                 Some(username) => verified_user = username,
                 None => return Ok(()),
             }
-        } else if self.auth_config.require_auth {
+        } else {
+            let require_auth = self.auth_config.require_auth;
+            // Credentials that are sent are checked even when authentication
+            // isn't required, so a plugin that refuses them is never skipped;
+            // only those no plugin decides on are then let in, unverified
             let authenticated = match (
                 &connect_packet.payload.user_name,
                 &connect_packet.payload.password,
@@ -1440,12 +1447,19 @@ where
                         peer: self.peer,
                     };
                     let credentials = Credentials::new(username, password);
-                    let valid = validate_credentials(&self.chain, &client, &credentials).await;
-                    if !valid {
-                        warn!("Authentication failed for user `{}`", username);
+                    match validate_credentials(&self.chain, &client, &credentials).await {
+                        Decision::Allow => {
+                            verified_user = Some(username.clone());
+                            true
+                        }
+                        Decision::Defer if !require_auth => true,
+                        _ => {
+                            warn!("Authentication failed for user `{}`", username);
+                            false
+                        }
                     }
-                    valid
                 }
+                _ if !require_auth => true,
                 (None, None) if self.auth_config.allow_anonymous => true,
                 _ => {
                     warn!("Authentication required but no credentials provided");
@@ -1458,7 +1472,6 @@ where
                     .reject_connect(&connect_packet, ReasonCode::BadUserNameOrPassword)
                     .await;
             }
-            verified_user = connect_packet.payload.user_name.clone();
         }
 
         if let Some(reason) = self.refused_will(&connect_packet) {

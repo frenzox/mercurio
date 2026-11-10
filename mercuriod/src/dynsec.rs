@@ -14,7 +14,7 @@ use std::{
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
-use mercurio_core::topic::topic_matches_filter;
+use mercurio_core::topic::{filter_covers, topic_matches_filter};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
@@ -40,7 +40,8 @@ struct Data {
 }
 
 /// Access of clients no ACL decides for, anonymous ones included; by
-/// default, as in mosquitto, only receiving is allowed.
+/// default, as in mosquitto, only receiving is allowed. It never applies to
+/// `$CONTROL` topics, which stay closed unless an ACL opens them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct DefaultAccess {
@@ -109,10 +110,10 @@ impl Acl {
     fn applies(&self, topic: &str, access: Access) -> bool {
         match (self.acltype, access) {
             (AclType::PublishClientSend, Access::Write)
-            | (AclType::PublishClientReceive, Access::Read)
-            | (AclType::SubscribePattern, Access::Subscribe) => {
+            | (AclType::PublishClientReceive, Access::Read) => {
                 topic_matches_filter(topic, &self.topic)
             }
+            (AclType::SubscribePattern, Access::Subscribe) => filter_covers(&self.topic, topic),
             (AclType::SubscribeLiteral, Access::Subscribe) => topic == self.topic,
             _ => false,
         }
@@ -189,8 +190,12 @@ impl Data {
                 Some(best) if best.priority >= acl.priority => Some(best),
                 _ => Some(acl),
             });
+        // $CONTROL administers the broker: only an ACL opens it, never the
+        // default access, which may be permissive for ordinary topics
+        let control = topic == "$CONTROL" || topic.starts_with("$CONTROL/");
         match decision {
             Some(acl) => acl.allow,
+            None if control => false,
             None => match access {
                 Access::Write => self.default_acl_access.publish_client_send,
                 Access::Read => self.default_acl_access.publish_client_receive,
@@ -1030,6 +1035,107 @@ mod tests {
                 "on_control"
             ])
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_permissive_defaults_never_open_control() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-open-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "setDefaultACLAccess", "acls": [
+                    { "acltype": "publishClientSend", "allow": true },
+                    { "acltype": "publishClientReceive", "allow": true },
+                    { "acltype": "subscribe", "allow": true },
+                ]},
+                { "command": "createClient", "username": "s1", "password": "pw" },
+            ]),
+        );
+        assert!(
+            responses.iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+
+        let anonymous = ClientInfo::new("a", None);
+        for client in [&identity("s1"), &anonymous] {
+            for topic in [
+                "$CONTROL",
+                COMMAND_TOPIC,
+                "$CONTROL/broker/v1",
+                "$CONTROL/dynamic-security/v1/response",
+            ] {
+                for access in [Access::Write, Access::Read, Access::Subscribe] {
+                    assert_eq!(
+                        security.authorize(client, topic, access).await,
+                        Decision::Deny,
+                        "{:?} {topic} {access:?}",
+                        client.username
+                    );
+                }
+            }
+            assert_eq!(
+                security.authorize(client, "anything", Access::Write).await,
+                Decision::Allow
+            );
+            assert_eq!(
+                security
+                    .authorize(client, "$CONTROLLER", Access::Write)
+                    .await,
+                Decision::Allow
+            );
+        }
+        assert_eq!(
+            security
+                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .await,
+            Decision::Allow
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_patterns_cover_only_narrower_filters() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-pattern-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "tenant" },
+                { "command": "addRoleACL", "rolename": "tenant", "acltype": "subscribePattern",
+                  "topic": "tenants/acme/+", "allow": true },
+                { "command": "createClient", "username": "acme", "password": "pw",
+                  "roles": [{ "rolename": "tenant" }] },
+            ]),
+        );
+        assert!(
+            responses.iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+
+        let acme = identity("acme");
+        for (filter, decision) in [
+            ("tenants/acme/a", Decision::Allow),
+            ("tenants/acme/+", Decision::Allow),
+            ("tenants/acme/#", Decision::Deny),
+            ("tenants/acme/a/#", Decision::Deny),
+            ("tenants/+/a", Decision::Deny),
+        ] {
+            assert_eq!(
+                security.authorize(&acme, filter, Access::Subscribe).await,
+                decision,
+                "{filter}"
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 
