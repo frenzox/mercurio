@@ -8,6 +8,8 @@ pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use mercurio_core::{
@@ -122,6 +124,37 @@ pub struct StoredWillMessage {
     /// Seconds to wait after the connection ends before publishing
     pub delay_secs: u32,
     pub properties: MessageProperties,
+}
+
+/// A ban the broker keeps across restarts. The broker gives `kind` and
+/// `value` their meaning; stores only keep them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBan {
+    /// What the ban matches clients by: `clientid`, `username` or `address`
+    pub kind: String,
+    /// The client id or user name, or the address or CIDR block
+    pub value: String,
+    /// `value` is matched as a prefix
+    pub prefix: bool,
+    pub reason: Option<String>,
+    /// Unix seconds
+    pub created_at: u64,
+    /// Unix seconds; None for a ban that never expires
+    pub expires_at: Option<u64>,
+}
+
+/// Where the broker keeps its bans. A ban is named by its kind, value and
+/// prefix flag.
+#[async_trait]
+pub trait BanStore: Send + Sync {
+    /// Every stored ban, expired ones included.
+    async fn load_bans(&self) -> Result<Vec<StoredBan>>;
+
+    /// Stores `ban`, replacing the one with the same kind, value and prefix.
+    async fn store_ban(&self, ban: &StoredBan) -> Result<()>;
+
+    /// Removes the ban with this kind, value and prefix, if there is one.
+    async fn delete_ban(&self, kind: &str, value: &str, prefix: bool) -> Result<()>;
 }
 
 /// Inflight message for QoS 1/2 tracking.
@@ -291,6 +324,12 @@ pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
         "custom"
     }
 
+    /// Where the broker keeps its bans. Without one, the broker keeps them
+    /// in memory, and they last until it stops.
+    fn ban_store(self: Arc<Self>) -> Option<Arc<dyn BanStore>> {
+        None
+    }
+
     /// Apply `writes` for `client_id` in order. Each write may be applied
     /// again after a failure, so applying one twice must be harmless.
     /// Stores that can should apply the batch atomically.
@@ -372,3 +411,54 @@ pub trait MqttStore: BatchStore + RetainedMessageStore {}
 
 /// Blanket implementation for any type implementing all storage traits.
 impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{BanStore, StoredBan};
+
+    pub(crate) fn ban(kind: &str, value: &str, prefix: bool) -> StoredBan {
+        StoredBan {
+            kind: kind.into(),
+            value: value.into(),
+            prefix,
+            reason: None,
+            created_at: 1_800_000_000,
+            expires_at: None,
+        }
+    }
+
+    /// What every `BanStore` does: a ban is named by its kind, value and
+    /// prefix flag, and storing one again replaces it.
+    pub(crate) async fn bans_round_trip(store: &dyn BanStore) {
+        let sorted = |mut bans: Vec<StoredBan>| {
+            bans.sort_by(|a, b| (&a.kind, &a.value, a.prefix).cmp(&(&b.kind, &b.value, b.prefix)));
+            bans
+        };
+        assert!(store.load_bans().await.unwrap().is_empty());
+
+        let mut exact = ban("clientid", "c", false);
+        exact.reason = Some("spam".into());
+        exact.expires_at = Some(1_800_003_600);
+        let prefixed = ban("clientid", "c", true);
+        let address = ban("address", "10.0.0.0/8", false);
+        for stored in [&exact, &prefixed, &address] {
+            store.store_ban(stored).await.unwrap();
+        }
+        assert_eq!(
+            sorted(store.load_bans().await.unwrap()),
+            vec![address.clone(), exact.clone(), prefixed.clone()]
+        );
+
+        exact.reason = None;
+        exact.expires_at = None;
+        exact.created_at = 1_800_000_100;
+        store.store_ban(&exact).await.unwrap();
+        store.delete_ban("clientid", "c", true).await.unwrap();
+        // Deleting what isn't stored is no error
+        store.delete_ban("username", "c", false).await.unwrap();
+        assert_eq!(
+            sorted(store.load_bans().await.unwrap()),
+            vec![address, exact]
+        );
+    }
+}

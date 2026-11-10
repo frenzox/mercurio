@@ -22,8 +22,9 @@ use crate::{
     encoding::{
         decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
     },
-    BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredWillMessage, WillStore, Write,
+    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage,
+    WillStore, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -146,6 +147,16 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
                 expires_at INTEGER,
                 subscription_identifiers TEXT,
                 PRIMARY KEY (client_id, sequence)
+            );
+
+            CREATE TABLE IF NOT EXISTS bans (
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                prefix INTEGER NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                PRIMARY KEY (kind, value, prefix)
             );
 
             CREATE INDEX IF NOT EXISTS idx_inflight_client
@@ -358,6 +369,10 @@ impl BatchStore for SqliteStore {
         "sqlite"
     }
 
+    fn ban_store(self: Arc<Self>) -> Option<Arc<dyn BanStore>> {
+        Some(self)
+    }
+
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
         let client_id = client_id.to_string();
         let writes = writes.to_vec();
@@ -372,6 +387,61 @@ impl BatchStore for SqliteStore {
                 "ROLLBACK"
             })?;
             applied
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl BanStore for SqliteStore {
+    async fn load_bans(&self) -> Result<Vec<StoredBan>> {
+        self.blocking(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT kind, value, prefix, reason, created_at, expires_at FROM bans")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(StoredBan {
+                    kind: row.get(0)?,
+                    value: row.get(1)?,
+                    prefix: row.get(2)?,
+                    reason: row.get(3)?,
+                    created_at: row.get::<_, i64>(4)? as u64,
+                    expires_at: row.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                })
+            })?;
+            let bans = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(bans)
+        })
+        .await
+    }
+
+    async fn store_ban(&self, ban: &StoredBan) -> Result<()> {
+        let ban = ban.clone();
+        self.blocking(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO bans (kind, value, prefix, reason, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    ban.kind,
+                    ban.value,
+                    ban.prefix,
+                    ban.reason,
+                    ban.created_at as i64,
+                    ban.expires_at.map(|t| t as i64)
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_ban(&self, kind: &str, value: &str, prefix: bool) -> Result<()> {
+        let (kind, value) = (kind.to_string(), value.to_string());
+        self.blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM bans WHERE kind = ?1 AND value = ?2 AND prefix = ?3",
+                params![kind, value, prefix],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -769,6 +839,30 @@ mod tests {
 
     use super::*;
     use crate::StoredSubscription;
+
+    #[tokio::test]
+    async fn test_bans() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        crate::testing::bans_round_trip(store.as_ref()).await;
+        assert!(store.ban_store().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bans_survive_reopening() {
+        let path =
+            std::env::temp_dir().join(format!("mercurio-store-bans-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let ban = crate::testing::ban("username", "guest", true);
+        SqliteStore::new(&path)
+            .unwrap()
+            .store_ban(&ban)
+            .await
+            .unwrap();
+
+        let reopened = SqliteStore::new(&path).unwrap();
+        assert_eq!(reopened.load_bans().await.unwrap(), vec![ban]);
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn test_backend_is_named() {

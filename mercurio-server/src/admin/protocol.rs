@@ -6,7 +6,10 @@ use mercurio_core::{codec::Decoder, reason::ReasonCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{Admin, AdminError, ClientQuery, DisconnectOptions, ErrorCode, Page, Paging};
+use super::{
+    Admin, AdminError, BanKey, BanKind, ClientQuery, DisconnectOptions, ErrorCode, NewBan, Page,
+    Paging,
+};
 use crate::{
     plugin::{Access, Chain, ClientInfo, Decision},
     server::AddressRange,
@@ -134,6 +137,30 @@ struct ClientArgs {
     clientid: String,
 }
 
+#[derive(Deserialize)]
+struct BanKeyArgs {
+    #[serde(rename = "type")]
+    kind: BanKind,
+    value: String,
+    prefix: Option<bool>,
+}
+
+impl BanKeyArgs {
+    fn key(self) -> BanKey {
+        let mut key = BanKey::new(self.kind, self.value);
+        key.prefix = self.prefix.unwrap_or(false);
+        key
+    }
+}
+
+#[derive(Deserialize)]
+struct AddBanArgs {
+    #[serde(flatten)]
+    key: BanKeyArgs,
+    duration: Option<u32>,
+    reason: Option<String>,
+}
+
 /// Runs the commands `client` sent in `payload`, in order, and returns the
 /// response payload.
 pub(crate) async fn handle(
@@ -255,6 +282,24 @@ async fn run(
                 .delete_session(&a.clientid, a.disconnect.unwrap_or(false))
                 .await?;
             Value::Null
+        }
+        "addBan" => {
+            let a: AddBanArgs = arguments(args)?;
+            let mut ban = NewBan::new(a.key.key());
+            ban.duration = a.duration;
+            ban.reason = a.reason;
+            admin.add_ban(ban).await?;
+            Value::Null
+        }
+        "removeBan" => {
+            admin
+                .remove_ban(&arguments::<BanKeyArgs>(args)?.key())
+                .await?;
+            Value::Null
+        }
+        "listBans" => {
+            let paging = arguments::<PageArgs>(args)?.paging()?;
+            listing("bans", admin.bans(paging).await)
         }
         "listRetained" => {
             let a: ListRetainedArgs = arguments(args)?;

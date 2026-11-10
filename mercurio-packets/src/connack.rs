@@ -232,6 +232,7 @@ impl From<ReasonCode> for ConnAckReturnCode {
             ReasonCode::ServerUnavailable => ConnAckReturnCode::ServerUnavailable,
             ReasonCode::BadUserNameOrPassword => ConnAckReturnCode::BadUsernameOrPassword,
             ReasonCode::NotAuthorized => ConnAckReturnCode::NotAuthorized,
+            ReasonCode::Banned => ConnAckReturnCode::NotAuthorized,
             _ => ConnAckReturnCode::ServerUnavailable, // Default fallback for unmapped codes
         }
     }
@@ -415,6 +416,14 @@ mod tests {
         packet.encode(&mut encoded);
 
         assert_eq!(encoded.to_vec(), expected);
+    }
+
+    #[test]
+    fn test_banned_is_not_authorized_in_mqtt_3() {
+        assert_eq!(
+            ConnAckReturnCode::from(ReasonCode::Banned),
+            ConnAckReturnCode::NotAuthorized
+        );
     }
 
     #[test]

@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
-    BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionState, SessionStore, StorageError, StoredWillMessage, WillStore,
+    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
+    SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage, WillStore,
 };
+
+/// A ban's kind, value and prefix flag.
+type BanKey = (String, String, bool);
 
 /// In-memory storage backend implementing all storage traits.
 ///
@@ -26,6 +29,7 @@ pub struct MemoryStore {
     retained: Arc<RwLock<HashMap<String, Message>>>,
     wills: Arc<RwLock<HashMap<String, StoredWillMessage>>>,
     inflight: Arc<RwLock<HashMap<String, HashMap<u16, InflightMessage>>>>,
+    bans: Arc<RwLock<HashMap<BanKey, StoredBan>>>,
 }
 
 impl MemoryStore {
@@ -38,6 +42,42 @@ impl MemoryStore {
 impl BatchStore for MemoryStore {
     fn backend_name(&self) -> &'static str {
         "memory"
+    }
+
+    fn ban_store(self: Arc<Self>) -> Option<Arc<dyn BanStore>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl BanStore for MemoryStore {
+    async fn load_bans(&self) -> Result<Vec<StoredBan>> {
+        let bans = self
+            .bans
+            .read()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        Ok(bans.values().cloned().collect())
+    }
+
+    async fn store_ban(&self, ban: &StoredBan) -> Result<()> {
+        let mut bans = self
+            .bans
+            .write()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        bans.insert(
+            (ban.kind.clone(), ban.value.clone(), ban.prefix),
+            ban.clone(),
+        );
+        Ok(())
+    }
+
+    async fn delete_ban(&self, kind: &str, value: &str, prefix: bool) -> Result<()> {
+        let mut bans = self
+            .bans
+            .write()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        bans.remove(&(kind.to_string(), value.to_string(), prefix));
+        Ok(())
     }
 }
 
@@ -267,6 +307,13 @@ impl QueueStore for MemoryStore {
 mod tests {
     use super::*;
     use crate::StoredSubscription;
+
+    #[tokio::test]
+    async fn test_bans() {
+        let store = Arc::new(MemoryStore::new());
+        crate::testing::bans_round_trip(store.as_ref()).await;
+        assert!(store.ban_store().is_some());
+    }
     use bytes::Bytes;
     use mercurio_core::qos::QoS;
     use std::sync::Arc;

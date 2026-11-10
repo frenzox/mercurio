@@ -83,6 +83,7 @@ impl State {
             client_id: client_id.to_string(),
             session: guard.session(),
             connected: self.connections.contains_key(client_id),
+            generation: self.connections.get(client_id).map(|slot| slot.generation),
             restored_will: self.restored_wills.contains(client_id),
         }
     }
@@ -96,6 +97,21 @@ pub(crate) enum Close {
     /// The admin API closes it with `reason`; without `send_will` the will
     /// is dropped
     Admin { reason: ReasonCode, send_will: bool },
+}
+
+/// Records `reason` as the pending close. An administrator's pending close
+/// isn't undone by a takeover, and one that drops the will always wins.
+fn merge_close(pending: &mut Option<Close>, reason: Close) {
+    let drops_will = matches!(
+        reason,
+        Close::Admin {
+            send_will: false,
+            ..
+        }
+    );
+    if drops_will || !matches!(pending, Some(Close::Admin { .. })) {
+        *pending = Some(reason);
+    }
 }
 
 /// Why `delete_session` refused.
@@ -120,6 +136,8 @@ pub(crate) struct ClientEntry {
     pub client_id: String,
     pub session: Session,
     pub connected: bool,
+    /// Identifies the connection `connected` speaks of
+    pub generation: Option<u64>,
     /// A will from before a restart waits for its delay
     pub restored_will: bool,
 }
@@ -408,20 +426,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     close: watch::channel(None).0,
                     generation,
                 });
-            // A takeover doesn't undo an administrator's pending close, which
-            // may say to drop the will, while one that drops it always wins
-            let drops_will = matches!(
-                reason,
-                Close::Admin {
-                    send_will: false,
-                    ..
-                }
-            );
-            slot.close.send_modify(|pending| {
-                if drops_will || !matches!(pending, Some(Close::Admin { .. })) {
-                    *pending = Some(reason);
-                }
-            });
+            slot.close
+                .send_modify(|pending| merge_close(pending, reason));
             slot.close = close_tx;
             slot.generation = generation;
             (Arc::clone(&slot.lease), generation, held)
@@ -496,8 +502,37 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let Some(slot) = manager.connections.get(client_id) else {
             return false;
         };
-        slot.close.send_replace(Some(close));
+        slot.close
+            .send_modify(|pending| merge_close(pending, close));
         true
+    }
+
+    /// Like `close_connection`, but only if the connection using
+    /// `client_id` is still the one of `generation`.
+    pub(crate) async fn close_generation(
+        &self,
+        client_id: &str,
+        generation: u64,
+        close: Close,
+    ) -> bool {
+        let manager = self.shared.state.lock().await;
+        let Some(slot) = manager
+            .connections
+            .get(client_id)
+            .filter(|slot| slot.generation == generation)
+        else {
+            return false;
+        };
+        slot.close
+            .send_modify(|pending| merge_close(pending, close));
+        true
+    }
+
+    /// Asks the connection holding `lease` to close, unless a newer one took
+    /// its client id since.
+    pub(crate) async fn close_own(&self, lease: &ConnectionLease, close: Close) {
+        self.close_generation(&lease.client_id, lease.generation, close)
+            .await;
     }
 
     /// Removes the session of `client_id` with everything stored for it,
@@ -1427,6 +1462,31 @@ mod tests {
             username: Some(username.to_string()),
             mount_point: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_later_close_with_the_will_keeps_the_will_dropped() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let banned = Close::Admin {
+            reason: ReasonCode::Banned,
+            send_will: false,
+        };
+        let disconnect = Close::Admin {
+            reason: ReasonCode::AdministrativeAction,
+            send_will: true,
+        };
+        assert!(manager.close_connection("c", banned).await);
+        assert!(manager.close_connection("c", disconnect).await);
+        assert_eq!(*started.lease.close.borrow(), Some(banned));
+
+        // A close aimed at an older connection leaves this one alone
+        let stale = started.lease.generation + 1;
+        assert!(!manager.close_generation("c", stale, disconnect).await);
+        manager.end_connection(started.lease, None).await;
     }
 
     #[tokio::test]

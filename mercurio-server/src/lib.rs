@@ -2,6 +2,7 @@
 pub mod acl;
 pub mod admin;
 pub mod auth;
+mod bans;
 mod broker;
 mod connection;
 pub mod error;

@@ -56,6 +56,7 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 use crate::{
     acl::Access,
     admin::{Admin, AdminExtension, AdminParts, ListenerInfo},
+    bans::{Bans, Candidate},
     broker::Broker,
     connection::Connection,
     http,
@@ -457,6 +458,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     address_slots: Arc<AddressSlots>,
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
+    bans: Arc<Bans>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -633,6 +635,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             local: self.local,
             connect_deadline: self.connect_deadline,
             listener: self.listener,
+            bans: self.bans,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -701,6 +704,7 @@ struct Listener<St: MqttStore + 'static> {
     /// Connections per client address, for `max_connections_per_ip`
     address_slots: Arc<AddressSlots>,
     connection_slots: Option<Arc<Semaphore>>,
+    bans: Arc<Bans>,
 }
 
 struct Handler<St, S>
@@ -725,6 +729,7 @@ where
     connect_deadline: Instant,
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
+    bans: Arc<Bans>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -879,6 +884,9 @@ impl<St: MqttStore + 'static> Server<St> {
         let session_manager_holder =
             SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue);
         let session_manager = session_manager_holder.session_manager();
+        // A PostgreSQL standby gets here once it took the database over, so
+        // it serves with the bans in force then
+        let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
 
         let admin = Admin::new(AdminParts {
             directory: Arc::new(session_manager.clone()),
@@ -889,6 +897,7 @@ impl<St: MqttStore + 'static> Server<St> {
             storage: storage.backend_name(),
             extension: admin_extension,
             plugins: all_plugins.clone(),
+            bans: Arc::clone(&bans),
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
@@ -917,6 +926,7 @@ impl<St: MqttStore + 'static> Server<St> {
             policy,
             limits,
             stats,
+            bans,
         };
 
         session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
@@ -982,6 +992,19 @@ impl<St: MqttStore + 'static> Server<St> {
                 interval,
             );
         }
+        // Its own timer: the $SYS publisher may be off, or slower
+        let bans = Arc::clone(&server.bans);
+        let mut stop = server.notify_shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.recv() => break,
+                }
+                bans.sweep().await;
+            }
+        });
         for (client_id, will, due) in restored_wills {
             let broker = server.broker.clone();
             let session_manager = session_manager.clone();
@@ -1087,6 +1110,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
                 listener: Arc::from("local"),
+                bans: Arc::clone(&self.bans),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1367,6 +1391,17 @@ where
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                 .await;
         }
+        // After authentication, since user name bans match the verified
+        // user, and once the client id is final
+        if self.banned(&connect_packet.payload.client_id, verified_user.as_deref()) {
+            warn!(
+                "Client `{}` is banned, refusing",
+                connect_packet.payload.client_id
+            );
+            return self
+                .reject_connect(&connect_packet, ReasonCode::Banned)
+                .await;
+        }
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
         if let Some(will_topic) = &connect_packet.payload.will_topic {
@@ -1425,8 +1460,27 @@ where
             self.session_manager.hold_locally(client_id);
         }
 
-        session.set_verified_user(verified_user).await;
+        session.set_verified_user(verified_user.clone()).await;
         session.set_peer(self.peer).await;
+        // A ban added after the check above, while this client had yet to
+        // claim its id, also missed it in addBan's walk of the connected
+        // clients. Checked again now that the id is held and the session
+        // shows who the client is, either this check or that walk sees the
+        // other; the connection then closes with Banned once it is up.
+        {
+            let client_id = session.get_client_id().await;
+            if self.banned(&client_id, verified_user.as_deref()) {
+                warn!(
+                    "Client `{}` was banned while connecting, closing",
+                    client_id
+                );
+                let close = Close::Admin {
+                    reason: ReasonCode::Banned,
+                    send_will: false,
+                };
+                self.session_manager.close_own(&lease, close).await;
+            }
+        }
         let counters = session
             .attach(Arc::clone(&self.listener), keepalive, expiry)
             .await;
@@ -1505,6 +1559,20 @@ where
         }
 
         session.detach(lease.generation, expiry).await;
+
+        // A close that drops the will can lose the race against a read error,
+        // an EOF or a DISCONNECT with a will
+        if matches!(
+            *lease.close.borrow(),
+            Some(Close::Admin {
+                send_will: false,
+                ..
+            })
+        ) {
+            session.clear_will().await;
+            self.session_manager
+                .delete_will(&session.get_client_id().await);
+        }
 
         // Publish will message on abnormal disconnect
         // (clean disconnect clears the will, so take_will returns None)
@@ -1668,6 +1736,16 @@ where
                 .write_packet(ControlPacket::ConnAck(connack))
                 .await;
             Ok(())
+        })
+    }
+
+    /// Whether a ban refuses this client, connecting with `client_id` as
+    /// the verified `username`.
+    fn banned(&self, client_id: &str, username: Option<&str>) -> bool {
+        self.bans.refuses(&Candidate {
+            client_id,
+            username,
+            ip: self.peer.map(|peer| peer.ip()),
         })
     }
 
@@ -2003,6 +2081,25 @@ where
                     }
                 }
 
+                // A re-authentication may land on a banned user name; the
+                // ban is in force before addBan walks the connected clients,
+                // so checking after the user is set covers both orders
+                if matches!(&maybe_res, Some(ControlPacket::Auth(a)) if a.reason == ReasonCode::Success)
+                {
+                    let identity = session.identity().await;
+                    if self.banned(&identity.client_id, identity.username.as_deref()) {
+                        warn!(
+                            "Client `{}` re-authenticated as a banned user, closing",
+                            identity.client_id
+                        );
+                        let close = Close::Admin {
+                            reason: ReasonCode::Banned,
+                            send_will: false,
+                        };
+                        return self.close_for(&session, protocol_version, close).await;
+                    }
+                }
+
                 if let Some(res) = maybe_res {
                     debug!(
                         "Sending {} to client {:?}",
@@ -2024,43 +2121,52 @@ where
                 // An abnormal disconnect: the will is published
                 Err(ReasonCode::KeepAliveTimeout.into())
             }
-            Wake::Closed(close) => {
-                let client_id = session.get_client_id().await;
-                let reason = match close {
-                    Close::TakenOver => {
-                        info!("Client `{}` was taken over by a new connection", client_id);
-                        ReasonCode::SessionTakenOver
-                    }
-                    Close::Admin { reason, send_will } => {
-                        info!(
-                            "Closing the connection of client `{}`: {}",
-                            client_id, reason
-                        );
-                        if !send_will {
-                            session.clear_will().await;
-                            self.session_manager.delete_will(&client_id);
-                        }
-                        reason
-                    }
-                };
-                if protocol_version.supports_reason_codes() {
-                    let _ = self
-                        .connection
-                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
-                            reason,
-                            properties: Some(DisconnectProperties {
-                                reason_string: reason_string(
-                                    reason,
-                                    session.client_maximum_packet_size().await,
-                                ),
-                                ..Default::default()
-                            }),
-                        }))
-                        .await;
-                }
-                Ok(Flow::Close)
-            }
+            Wake::Closed(close) => self.close_for(&session, protocol_version, close).await,
         }
+    }
+
+    /// Tells the client why its connection closes, dropping its will if
+    /// the close says so.
+    async fn close_for(
+        &mut self,
+        session: &Session,
+        protocol_version: ProtocolVersion,
+        close: Close,
+    ) -> Result<Flow> {
+        let client_id = session.get_client_id().await;
+        let reason = match close {
+            Close::TakenOver => {
+                info!("Client `{}` was taken over by a new connection", client_id);
+                ReasonCode::SessionTakenOver
+            }
+            Close::Admin { reason, send_will } => {
+                info!(
+                    "Closing the connection of client `{}`: {}",
+                    client_id, reason
+                );
+                if !send_will {
+                    session.clear_will().await;
+                    self.session_manager.delete_will(&client_id);
+                }
+                reason
+            }
+        };
+        if protocol_version.supports_reason_codes() {
+            let _ = self
+                .connection
+                .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                    reason,
+                    properties: Some(DisconnectProperties {
+                        reason_string: reason_string(
+                            reason,
+                            session.client_maximum_packet_size().await,
+                        ),
+                        ..Default::default()
+                    }),
+                }))
+                .await;
+        }
+        Ok(Flow::Close)
     }
 }
 
@@ -2152,7 +2258,48 @@ impl std::str::FromStr for AddressRange {
                 .filter(|p| *p <= bits)
                 .ok_or_else(invalid)?,
         };
+        // `contains` sees IPv4 clients as IPv4, so a mapped range has to be
+        // one too to match anyone
+        if let IpAddr::V6(v6) = network {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if prefix < 96 {
+                    return Err(format!(
+                        "`{text}` is an IPv4-mapped block shorter than /96; write it as IPv4"
+                    ));
+                }
+                return Ok(AddressRange {
+                    network: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Ok(AddressRange { network, prefix })
+    }
+}
+
+impl std::fmt::Display for AddressRange {
+    /// The range's first address, then its length unless it holds one
+    /// address: `10.0.0.0/8`, `192.0.2.7`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (first, bits) = match self.network {
+            IpAddr::V4(ip) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                (IpAddr::V4((u32::from(ip) & mask).into()), 32)
+            }
+            IpAddr::V6(ip) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                (IpAddr::V6((u128::from(ip) & mask).into()), 128)
+            }
+        };
+        if self.prefix == bits {
+            write!(f, "{first}")
+        } else {
+            write!(f, "{first}/{}", self.prefix)
+        }
     }
 }
 
@@ -2265,6 +2412,27 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_address_ranges_print_their_first_address() {
+        let print = |text: &str| text.parse::<AddressRange>().unwrap().to_string();
+        assert_eq!(print("10.1.2.3/8"), "10.0.0.0/8");
+        assert_eq!(print("192.0.2.7"), "192.0.2.7");
+        assert_eq!(print("192.0.2.7/32"), "192.0.2.7");
+        assert_eq!(print("2001:db8::1/32"), "2001:db8::/32");
+        assert_eq!(print("0.0.0.0/0"), "0.0.0.0/0");
+    }
+
+    #[test]
+    fn test_mapped_ranges_are_ipv4_ranges() {
+        let parse = |text: &str| text.parse::<AddressRange>();
+        assert_eq!(parse("::ffff:192.0.2.7").unwrap().to_string(), "192.0.2.7");
+        assert_eq!(
+            parse("::ffff:192.0.2.0/120").unwrap().to_string(),
+            "192.0.2.0/24"
+        );
+        assert!(parse("::ffff:192.0.2.7/95").is_err());
+    }
 
     #[test]
     fn test_address_ranges() {
