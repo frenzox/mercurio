@@ -192,8 +192,8 @@ allow_anonymous = false
 # Or delegate checks to an HTTP service: a 2xx answer allows. acl_url alone,
 # without authentication, only checks topic access
 # [auth.http]
-# user_url = "http://auth.internal/mqtt/user"
-# acl_url = "http://auth.internal/mqtt/acl"
+# user_url = "https://auth.internal/mqtt/user"
+# acl_url = "https://auth.internal/mqtt/acl"
 # timeout_seconds = 5
 # cache_seconds = 30
 
