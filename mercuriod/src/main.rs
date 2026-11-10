@@ -473,6 +473,26 @@ fn build_auth(
     reloadable: &mut Vec<Arc<dyn Reload>>,
     main: bool,
 ) -> Result<(ServerAuthConfig, Vec<Arc<dyn Plugin>>), String> {
+    let table = if main { "[auth]" } else { "[listeners.auth]" };
+    // Without authentication these would be ignored, letting everyone in
+    let authenticating = [
+        ("password_file", config.password_file.is_some()),
+        ("dynamic_security", config.dynamic_security.is_some()),
+        (
+            "user_url",
+            config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
+        ),
+    ];
+    if let Some((key, _)) = authenticating
+        .iter()
+        .find(|(_, set)| *set && !config.enabled)
+    {
+        return Err(format!(
+            "`{key}` is set in {table} but `enabled` is false, so no client would be \
+             authenticated; set `enabled = true` or remove `{key}`"
+        ));
+    }
+
     if let Some(path) = &config.dynamic_security {
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
@@ -507,13 +527,11 @@ fn build_auth(
     }
 
     let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-    if config.enabled {
-        if let Some(path) = &config.password_file {
-            let validator = Arc::new(Reloadable::load(path, load_credentials)?);
-            info!("Loaded credentials from {}", path);
-            reloadable.push(validator.clone());
-            plugins.push(validator);
-        }
+    if let Some(path) = &config.password_file {
+        let validator = Arc::new(Reloadable::load(path, load_credentials)?);
+        info!("Loaded credentials from {}", path);
+        reloadable.push(validator.clone());
+        plugins.push(validator);
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
@@ -707,7 +725,58 @@ fn write_password_file(
 
 #[cfg(test)]
 mod tests {
-    use super::address;
+    use super::{address, build_auth, config};
+
+    fn auth(toml: &str) -> config::AuthConfig {
+        toml::from_str(toml).unwrap()
+    }
+
+    #[test]
+    fn test_authentication_settings_need_authentication_enabled() {
+        for (toml, key) in [
+            ("password_file = \"/nonexistent/passwd\"\n", "password_file"),
+            (
+                "dynamic_security = \"/nonexistent/dynsec.json\"\n",
+                "dynamic_security",
+            ),
+            ("[http]\nuser_url = \"http://h/user\"\n", "user_url"),
+        ] {
+            for main in [true, false] {
+                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
+                    panic!("{toml}: accepted");
+                };
+                assert!(
+                    error.contains(&format!("`{key}`")) && error.contains("`enabled`"),
+                    "{toml}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_access_control_works_without_authentication() {
+        let (value, plugins) = build_auth(
+            &auth("[http]\nacl_url = \"http://h/acl\"\n"),
+            &mut Vec::new(),
+            true,
+        )
+        .map_err(|e| panic!("{e}"))
+        .unwrap();
+        assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+
+        let acl = std::env::temp_dir().join(format!("mercuriod-acl-{}", std::process::id()));
+        std::fs::write(&acl, "topic read public/#\n").unwrap();
+        let result = build_auth(
+            &auth(&format!("acl_file = \"{}\"\n", acl.display())),
+            &mut Vec::new(),
+            true,
+        );
+        std::fs::remove_file(&acl).unwrap();
+        let (value, plugins) = result.map_err(|e| panic!("{e}")).unwrap();
+        assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+    }
 
     #[test]
     fn test_ipv6_hosts_are_bracketed() {
