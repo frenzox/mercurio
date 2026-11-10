@@ -10,7 +10,7 @@ implementations:
 - `sqlite::SqliteStore`: a SQLite database, behind the `sqlite` feature.
 - `postgres::PostgresStore`: a PostgreSQL database, behind the `postgres`
   feature, over TLS when the server supports it. A broker serving from it
-  opens it with `PostgresStore::connect_exclusive(url, ca_path, wait)`,
+  opens it with `PostgresStore::connect_exclusive(url, &options, wait)`,
   which keeps any other broker from writing to the database meanwhile.
 
 ```rust,ignore

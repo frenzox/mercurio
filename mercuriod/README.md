@@ -220,6 +220,12 @@ backend = "memory"
 # One broker serves from a PostgreSQL database at a time. When another is,
 # exit (false), or wait and take over once it stops (true)
 # standby = false
+# Connections each broker keeps to PostgreSQL, plus one that holds the
+# database: the server's max_connections must allow pool_size + 1 for each
+# broker, standbys included
+# pool_size = 16
+# Seconds a write waits for a free connection before it is tried again
+# pool_timeout = 5
 
 [auth]
 # Require clients to authenticate. password_file, dynamic_security and

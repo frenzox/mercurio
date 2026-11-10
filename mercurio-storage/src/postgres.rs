@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -296,6 +296,33 @@ fn classify(error: tokio_postgres::Error) -> StorageError {
     }
 }
 
+/// How [`PostgresStore`] connects, besides the URL.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ConnectOptions {
+    /// PEM file of the certificate authority that signed the server's
+    /// certificate; the Mozilla root certificates otherwise.
+    pub ca_path: Option<PathBuf>,
+    /// Most connections the store keeps open. A store from
+    /// [`PostgresStore::connect_exclusive`] opens one more, which holds the
+    /// database. 16 by default.
+    pub pool_size: usize,
+    /// Longest wait for a free connection once all are in use, after which
+    /// the operation fails with [`StorageError::Transient`]. 5 seconds by
+    /// default.
+    pub pool_timeout: Duration,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        ConnectOptions {
+            ca_path: None,
+            pool_size: 16,
+            pool_timeout: TIMEOUT,
+        }
+    }
+}
+
 /// PostgreSQL storage backend implementing all storage traits, over a pool
 /// of connections that are reopened when the server drops them.
 #[derive(Clone)]
@@ -341,15 +368,15 @@ impl PostgresStore {
     ///
     /// The connection is encrypted when the server supports it, or always
     /// with `?sslmode=require` in the URL, and never with `sslmode=disable`.
-    /// The server's certificate is verified against `ca_path`, a PEM file,
-    /// or else the Mozilla root certificates.
+    /// The server's certificate is verified against `options.ca_path`, a
+    /// PEM file, or else the Mozilla root certificates.
     ///
     /// Nothing stops another broker from using the database meanwhile; a
     /// broker serving clients should use [`Self::connect_exclusive`].
-    pub async fn connect(url: &str, ca_path: Option<&Path>) -> Result<Self> {
+    pub async fn connect(url: &str, options: &ConnectOptions) -> Result<Self> {
         let config = base_config(url)?;
-        let tls = tls(ca_path)?;
-        let store = Self::with_pool(config, tls, None, None)?;
+        let tls = tls(options.ca_path.as_deref())?;
+        let store = Self::with_pool(config, tls, options, None, None)?;
         let client = store.client().await?;
         migrate(&client).await?;
         Ok(store)
@@ -364,11 +391,11 @@ impl PostgresStore {
     /// fail, even those already on their way.
     pub async fn connect_exclusive(
         url: &str,
-        ca_path: Option<&Path>,
+        options: &ConnectOptions,
         wait: bool,
     ) -> Result<Option<(Self, DatabaseLock)>> {
         let config = base_config(url)?;
-        let tls = tls(ca_path)?;
+        let tls = tls(options.ca_path.as_deref())?;
 
         // The lock belongs to a connection of its own, outside the pool, so
         // it lasts as long as that connection
@@ -430,28 +457,30 @@ impl PostgresStore {
                 }
             }
         });
-        let store = Self::with_pool(config, tls, Some(epoch), Some(fenced))?;
+        let store = Self::with_pool(config, tls, options, Some(epoch), Some(fenced))?;
         Ok(Some((store, DatabaseLock { heartbeat, lost })))
     }
 
     fn with_pool(
         mut config: tokio_postgres::Config,
         tls: MakeRustlsConnect,
+        options: &ConnectOptions,
         epoch: Option<i64>,
         lost: Option<watch::Sender<bool>>,
     ) -> Result<Self> {
-        let mut options = format!(
+        let mut settings = format!(
             "{} -c statement_timeout={}",
             config.get_options().unwrap_or_default(),
             TIMEOUT.as_millis()
         );
         if let Some(epoch) = epoch {
-            options.push_str(&format!(" -c mercurio.epoch={epoch}"));
+            settings.push_str(&format!(" -c mercurio.epoch={epoch}"));
         }
-        config.options(options.trim());
+        config.options(settings.trim());
         let pool = Pool::builder(Manager::new(config, tls))
             .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(TIMEOUT))
+            .max_size(options.pool_size)
+            .wait_timeout(Some(options.pool_timeout))
             .create_timeout(Some(TIMEOUT))
             .recycle_timeout(Some(TIMEOUT))
             .build()
@@ -1291,7 +1320,9 @@ mod tests {
     }
 
     async fn empty_store(url: &str) -> PostgresStore {
-        let store = PostgresStore::connect(url, None).await.unwrap();
+        let store = PostgresStore::connect(url, &ConnectOptions::default())
+            .await
+            .unwrap();
         store
             .client()
             .await
@@ -1349,7 +1380,9 @@ mod tests {
     async fn test_migrates_a_version_1_database() {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
-        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
         let client = store.client().await.unwrap();
         client
             .batch_execute(&format!(
@@ -1366,7 +1399,9 @@ mod tests {
             .unwrap();
         drop(client);
 
-        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
         let version: i32 = store
             .client()
             .await
@@ -1621,19 +1656,22 @@ mod tests {
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
 
-        let (active, lock) = PostgresStore::connect_exclusive(&url, None, false)
-            .await
-            .unwrap()
-            .unwrap();
+        let (active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
         let ban = crate::testing::ban("address", "10.0.0.0/8", false);
         active.store_ban(&ban).await.unwrap();
-        assert!(PostgresStore::connect_exclusive(&url, None, false)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let url_standby = url.clone();
         let waiting = tokio::spawn(async move {
-            PostgresStore::connect_exclusive(&url_standby, None, true)
+            PostgresStore::connect_exclusive(&url_standby, &ConnectOptions::default(), true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1684,7 +1722,7 @@ mod tests {
             .unwrap();
 
         drop(standby_lock);
-        let (_, lock) = PostgresStore::connect_exclusive(&url, None, false)
+        let (_, lock) = PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
             .await
             .unwrap()
             .expect("dropping the lock frees the database");
@@ -1698,10 +1736,11 @@ mod tests {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
-        let (active, lock) = PostgresStore::connect_exclusive(&url, None, false)
-            .await
-            .unwrap()
-            .unwrap();
+        let (active, lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
         active.apply("c", &[Write::ClearQueue]).await.unwrap();
         assert!(!lock.is_lost());
 
@@ -1723,7 +1762,9 @@ mod tests {
     async fn test_errors_worth_retrying_are_transient() {
         let Some(url) = database_url() else { return };
         let _database = DATABASE.lock().await;
-        let store = PostgresStore::connect(&url, None).await.unwrap();
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
         let client = store.client().await.unwrap();
         let raise = |code: &str| {
             format!("DO $$ BEGIN RAISE EXCEPTION 'test' USING ERRCODE = '{code}'; END $$")
@@ -1760,12 +1801,41 @@ mod tests {
         assert!(matches!(error, StorageError::Transient(_)), "{error}");
     }
 
+    /// A broker waiting for a free connection retries, rather than give
+    /// its changes up.
+    #[tokio::test]
+    async fn test_the_pool_is_sized_and_its_wait_is_transient() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let options = ConnectOptions {
+            pool_size: 1,
+            pool_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let store = PostgresStore::connect(&url, &options).await.unwrap();
+        assert_eq!(store.pool.status().max_size, 1);
+        let _held = store.client().await.unwrap();
+        let error = store.client().await.err().unwrap();
+        assert!(matches!(error, StorageError::Transient(_)), "{error}");
+    }
+
+    #[test]
+    fn test_default_options() {
+        let options = ConnectOptions::default();
+        assert_eq!(options.pool_size, 16);
+        assert_eq!(options.pool_timeout, Duration::from_secs(5));
+        assert_eq!(options.ca_path, None);
+    }
+
     #[tokio::test]
     async fn test_an_unreachable_database_is_transient() {
-        let error = PostgresStore::connect("postgres://mercurio@127.0.0.1:1/mercurio", None)
-            .await
-            .err()
-            .unwrap();
+        let error = PostgresStore::connect(
+            "postgres://mercurio@127.0.0.1:1/mercurio",
+            &ConnectOptions::default(),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(matches!(error, StorageError::Transient(_)), "{error}");
     }
 }
