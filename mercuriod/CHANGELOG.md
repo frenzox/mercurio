@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.3...mercuriod-v0.4.4) - 2026-11-10
+
+### Added
+
+- *(mercuriod)* recommend mercurioctl in its packages
+- *(mercuriod)* list bridges with their link state and queue
+- *(mercuriod)* show the configuration in use with its secrets redacted
+- *(mercuriod)* reload files on request and report how each went
+- *(mercuriod)* change the log level of a running broker
+- *(mercuriod)* let the dynsec-init administrator run broker admin commands
+- *(mercuriod)* report WASM plugin hooks, copies and failures
+- *(mercuriod)* report the daemon's own plugins as built-in in listPlugins
+- *(mercuriod)* serve an admin socket for administrators on the host
+
+### Other
+
+- point the READMEs at mercurioctl and the admin guide
+
 ## [0.4.3](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.2...mercuriod-v0.4.3) - 2026-11-09
 
 ### Other

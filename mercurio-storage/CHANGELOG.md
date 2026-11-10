@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.3.2...mercurio-storage-v0.3.3) - 2026-11-10
+
+### Added
+
+- *(storage)* keep broker bans in PostgreSQL
+- *(storage)* keep broker bans in the memory and SQLite stores
+- *(server)* split starting the broker from running it, with an Admin handle
+
 ## [0.3.2](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.3.1...mercurio-storage-v0.3.2) - 2026-11-09
 
 ### Other
