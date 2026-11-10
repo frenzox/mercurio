@@ -27,10 +27,15 @@ async fn main() -> ExitCode {
             return ExitCode::from(if e.use_stderr() { USAGE } else { 0 });
         }
     };
+    let json = cli.json;
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            eprintln!("mercurioctl: {failure}");
+            if json {
+                eprintln!("{}", failure.to_json());
+            } else {
+                eprintln!("mercurioctl: {failure}");
+            }
             ExitCode::from(failure.exit_code())
         }
     }

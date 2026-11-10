@@ -221,6 +221,44 @@ async fn destructive_commands_need_yes_off_a_terminal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failures_with_json_are_json_on_standard_error() {
+    let broker = start("json-errors").await;
+    let missing = broker.ctl(&["client", "show", "nobody", "--json"]).await;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty(), "{}", stdout(&missing));
+    let error: Value = serde_json::from_slice(&missing.stderr)
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr(&missing)));
+    assert_eq!(error["code"], "notFound", "{error}");
+    assert!(
+        error["error"].as_str().unwrap().contains("nobody"),
+        "{error}"
+    );
+
+    let unreachable = mercurioctl(
+        &[
+            "--unix",
+            "/nonexistent/mercurio.sock",
+            "--json",
+            "broker",
+            "info",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(unreachable.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&unreachable.stderr)
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr(&unreachable)));
+    assert_eq!(error["code"], Value::Null, "{error}");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("/nonexistent/mercurio.sock"),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_exit_status_tells_failures_apart() {
     let broker = start("status").await;
 

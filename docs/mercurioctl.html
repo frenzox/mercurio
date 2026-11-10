@@ -144,6 +144,7 @@ monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0  
 <li>A list longer than what was shown ends with a line such as <code>1-100 of 250; --offset 100 shows the next ones</code>.</li>
 <li><code>--json</code> prints the answer's <code>data</code> as the broker sends it, with the field names and Unix times of the <a href="admin.html#commands">command reference</a>, and nothing for commands without data.</li>
 <li><code>broker config</code> always prints JSON.</li>
+<li>With <code>--json</code>, a failure prints as one JSON object on standard error, <code>{"error": "no client `x`", "code": "notFound"}</code>, with the broker's error code, or <code>null</code> when there is none. The exit status stays the same. Mistakes on the command line itself, which clap reports before <code>--json</code> is read, stay plain text.</li>
 <li>A table cell holds one line, so <code>retained show</code> prints a payload's line breaks as spaces. <code>--json</code> keeps them: <code>mercurioctl retained show status/door --json | jq -r .payload</code>.</li>
 </ul>
 
