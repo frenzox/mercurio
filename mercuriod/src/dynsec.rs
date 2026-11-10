@@ -630,7 +630,10 @@ fn read(path: &str) -> Result<Data, String> {
     })
 }
 
-/// Replaces the file in one step, so a crash never leaves half of it.
+/// Replaces the file in one step, so a crash never leaves half of it. The
+/// new contents reach the disk before the rename, and the rename before
+/// returning: after a power loss the file is the old one or the new one,
+/// never empty, and it is the only copy.
 fn write(path: &str, data: &Data) -> Result<(), String> {
     let temporary = format!("{path}.new");
     let contents = serde_json::to_string_pretty(data).expect("serializable");
@@ -642,9 +645,28 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
     file.open(&temporary)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+        .and_then(|mut file| {
+            std::io::Write::write_all(&mut file, contents.as_bytes())?;
+            file.sync_all()
+        })
         .and_then(|()| std::fs::rename(&temporary, path))
+        .and_then(|()| sync_directory(path))
         .map_err(|e| format!("Failed to write {path}: {e}"))
+}
+
+/// Flushes the directory holding `path`, where a rename is recorded.
+#[cfg(unix)]
+fn sync_directory(path: &str) -> std::io::Result<()> {
+    let directory = match Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &str) -> std::io::Result<()> {
+    Ok(())
 }
 
 impl DynamicSecurity {
