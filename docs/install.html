@@ -105,7 +105,7 @@ mercuriod -v</pre>
 <p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
 
 <h2 id="systemd">Running as a systemd service</h2>
-<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
+<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code>, which suits the SQLite database, and <code>/var/log/mercurio</code>, for a log <code>file</code>, as its only writable directories, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. Files the broker creates are readable by its user only, and it may keep 65536 files open, as each client connection takes one. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
 <pre><span class="comment"># Binary, configuration and unit</span>
 sudo cp target/release/mercuriod /usr/bin/
 sudo mkdir -p /etc/mercurio

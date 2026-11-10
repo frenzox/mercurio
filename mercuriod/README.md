@@ -594,8 +594,10 @@ five seconds for their connections to close before exiting.
 ### Systemd service
 
 A systemd unit is provided in [`contrib/mercuriod.service`](contrib/mercuriod.service).
-It runs the broker sandboxed, with `/var/lib/mercurio` as its only
-writable directory, which suits the SQLite database.
+It runs the broker sandboxed, with `/var/lib/mercurio` (for the SQLite
+database) and `/var/log/mercurio` (for a log `file`) as its only writable
+directories. Files the broker creates are readable by its user only, and
+it may keep 65536 files open, as each client connection takes one.
 
 ```bash
 # Copy service file
