@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.4...mercuriod-v0.4.5) - 2026-11-10
+
+### Fixed
+
+- *(mercuriod)* warn when the configured log level is replaced by info
+
+### Other
+
+- *(mercuriod)* wrap the admin socket comment in the sample config
+
 ## [0.4.4](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.3...mercuriod-v0.4.4) - 2026-11-10
 
 ### Added
