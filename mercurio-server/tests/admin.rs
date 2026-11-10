@@ -15,11 +15,12 @@ use mercurio_packets::{
 };
 use mercurio_server::{
     acl::AclFile,
-    admin::{Admin, AdminError, AdminExtension, ErrorCode},
-    plugin::{ready, Access, BoxFuture, ClientInfo, Decision, Plugin},
+    admin::{Admin, AdminError, AdminExtension, BanKey, BanKind, ErrorCode, NewBan, Paging},
+    plugin::{ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin},
     server::{ListenerConfig, LocalConnector, Server, ServerConfig, Transport},
 };
-use mercurio_storage::memory::MemoryStore;
+use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore};
+
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -58,6 +59,14 @@ impl Plugin for AllowAll {
         _: &'a ClientInfo,
         _: &'a str,
         _: Access,
+    ) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a Credentials<'a>,
     ) -> BoxFuture<'a, Decision> {
         ready(Decision::Allow)
     }
@@ -244,6 +253,30 @@ async fn wait_for(admin: &mut Client, client_id: &str, done: impl Fn(&Value) -> 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("`{client_id}` never got there");
+}
+
+/// The reason code of the CONNACK `packet` gets on a new connection, sent
+/// after `header`, such as a PROXY header.
+async fn connack_reason(addr: SocketAddr, header: &[u8], packet: ConnectPacket) -> ReasonCode {
+    let version = packet.protocol_version;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = BytesMut::from(header);
+    ControlPacket::Connect(packet).encode_with_version(&mut bytes, version);
+    stream.write_all(&bytes).await.unwrap();
+    let mut buffer = BytesMut::new();
+    loop {
+        if let Ok(packet) = ControlPacket::parse_with_version(&mut buffer, version) {
+            let ControlPacket::ConnAck(connack) = packet else {
+                panic!("Expected CONNACK, got {packet:?}");
+            };
+            return connack.reason_code;
+        }
+        let read = timeout(Duration::from_secs(2), stream.read_buf(&mut buffer)).await;
+        assert!(
+            matches!(read, Ok(Ok(n)) if n > 0),
+            "closed without a CONNACK"
+        );
+    }
 }
 
 #[tokio::test]
@@ -988,5 +1021,287 @@ async fn plugins_are_listed_in_chain_order() {
             {"name": "acl-file", "kind": "builtin", "hooks": ["authorize"]},
             {"name": "custom", "kind": "rust", "hooks": []},
         ])
+    );
+}
+
+#[tokio::test]
+async fn bans_are_added_listed_and_removed() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let ok = |response: Value| assert!(response.get("error").is_none(), "{response}");
+    ok(admin
+        .run(json!({
+            "command": "addBan", "type": "clientid", "value": "spammer",
+            "duration": 3600, "reason": "spam",
+        }))
+        .await);
+    ok(admin
+        .run(json!({"command": "addBan", "type": "username", "value": "guest", "prefix": true}))
+        .await);
+    ok(admin
+        .run(json!({"command": "addBan", "type": "address", "value": "10.1.2.3/8"}))
+        .await);
+
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 3);
+    let bans = listed["data"]["bans"].as_array().unwrap();
+    assert_eq!(bans[0]["type"], "clientid");
+    assert_eq!(bans[0]["value"], "spammer");
+    assert_eq!(bans[0]["prefix"], false);
+    assert_eq!(bans[0]["reason"], "spam");
+    let created = bans[0]["createdAt"].as_u64().unwrap();
+    assert!(created > 1_700_000_000);
+    assert_eq!(bans[0]["expiresAt"].as_u64(), Some(created + 3600));
+    assert_eq!(bans[1]["type"], "username");
+    assert_eq!(bans[1]["prefix"], true);
+    assert_eq!(bans[1]["reason"], Value::Null);
+    assert_eq!(bans[1]["expiresAt"], Value::Null);
+    // An address ban is kept as the block it names
+    assert_eq!(bans[2]["type"], "address");
+    assert_eq!(bans[2]["value"], "10.0.0.0/8");
+
+    // The same type, value and prefix replace the ban, created when it first was
+    ok(admin
+        .run(json!({"command": "addBan", "type": "clientid", "value": "spammer"}))
+        .await);
+    let listed = admin.run(json!({"command": "listBans", "count": 1})).await;
+    assert_eq!(listed["data"]["totalCount"], 3);
+    let spammer = &listed["data"]["bans"][0];
+    assert_eq!(spammer["reason"], Value::Null);
+    assert_eq!(spammer["expiresAt"], Value::Null);
+    assert_eq!(spammer["createdAt"].as_u64(), Some(created));
+
+    // The prefix flag is part of what names a ban
+    let missing = admin
+        .run(json!({"command": "removeBan", "type": "username", "value": "guest"}))
+        .await;
+    assert_eq!(missing["code"], "notFound");
+    ok(admin
+        .run(json!({"command": "removeBan", "type": "username", "value": "guest", "prefix": true}))
+        .await);
+    ok(admin
+        .run(json!({"command": "removeBan", "type": "address", "value": "10.9.9.9/8"}))
+        .await);
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 1);
+    assert_eq!(listed["data"]["bans"][0]["value"], "spammer");
+}
+
+#[tokio::test]
+async fn malformed_bans_are_invalid_arguments() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    for request in [
+        json!({"command": "addBan", "type": "address", "value": "10.0.0.0/8", "prefix": true}),
+        json!({"command": "addBan", "type": "address", "value": "example.com"}),
+        json!({"command": "addBan", "type": "ip", "value": "10.0.0.1"}),
+        json!({"command": "addBan", "type": "clientid", "value": ""}),
+        json!({"command": "addBan", "type": "clientid", "value": "c", "duration": 0}),
+        json!({"command": "addBan", "type": "clientid", "value": "c", "duration": -1}),
+        json!({"command": "addBan", "type": "clientid", "value": "c", "duration": 4_294_967_296u64}),
+        json!({"command": "addBan", "type": "clientid"}),
+        json!({"command": "removeBan", "type": "address", "value": "nope"}),
+        json!({"command": "listBans", "count": 1001}),
+    ] {
+        let response = admin.run(request.clone()).await;
+        assert_eq!(response["code"], "invalidArgument", "{request}");
+    }
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 0);
+}
+
+#[tokio::test]
+async fn banned_clients_are_refused_at_connect() {
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll)])).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(BanKind::ClientId, "bad")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("bad")).await,
+        ReasonCode::Banned
+    );
+    // MQTT 3.1.1 has no Banned: Not Authorized, 0x05
+    let mut old = connect_packet("bad");
+    old.protocol_version = ProtocolVersion::V3_1_1;
+    old.properties = None;
+    assert_eq!(
+        connack_reason(addr, b"", old).await,
+        ReasonCode::NotAuthorized
+    );
+    // An exact ban matches nothing longer
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("bad2")).await,
+        ReasonCode::Success
+    );
+
+    let mut key = BanKey::new(BanKind::ClientId, "bad");
+    key.prefix = true;
+    admin.add_ban(NewBan::new(key)).await.unwrap();
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("bad2")).await,
+        ReasonCode::Banned
+    );
+}
+
+#[tokio::test]
+async fn user_name_bans_match_the_verified_user() {
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    config.auth.require_auth = true;
+    config.auth.allow_anonymous = true;
+    let (addr, admin) = start(config).await;
+    let mut key = BanKey::new(BanKind::Username, "guest");
+    key.prefix = true;
+    admin.add_ban(NewBan::new(key)).await.unwrap();
+
+    let as_user = |client_id: &str, user: &str| {
+        let mut packet = connect_packet(client_id);
+        packet.flags.user_name = true;
+        packet.flags.password = true;
+        packet.payload.user_name = Some(user.into());
+        packet.payload.password = Some(Bytes::from_static(b"secret"));
+        packet
+    };
+    assert_eq!(
+        connack_reason(addr, b"", as_user("a", "guest-7")).await,
+        ReasonCode::Banned
+    );
+    assert_eq!(
+        connack_reason(addr, b"", as_user("b", "alice")).await,
+        ReasonCode::Success
+    );
+    // An anonymous client has no user name to match
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("guest-7")).await,
+        ReasonCode::Success
+    );
+}
+
+#[tokio::test]
+async fn address_bans_match_the_address_a_proxy_reports() {
+    let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied_addr = proxied.local_addr().unwrap();
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    config.listeners = vec![{
+        let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
+        listener.proxy_protocol = true;
+        listener
+    }];
+    let (_, admin) = start(config).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(BanKind::Address, "192.0.2.0/24")))
+        .await
+        .unwrap();
+
+    let from = |ip: &str| format!("PROXY TCP4 {ip} 127.0.0.1 56324 1883\r\n");
+    assert_eq!(
+        connack_reason(
+            proxied_addr,
+            from("192.0.2.9").as_bytes(),
+            connect_packet("a")
+        )
+        .await,
+        ReasonCode::Banned
+    );
+    assert_eq!(
+        connack_reason(
+            proxied_addr,
+            from("198.51.100.1").as_bytes(),
+            connect_packet("b")
+        )
+        .await,
+        ReasonCode::Success
+    );
+}
+
+#[tokio::test]
+async fn bans_survive_a_restart_on_sqlite() {
+    let db = std::env::temp_dir().join(format!("mercurio-server-bans-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let open = || Arc::new(SqliteStore::new(&db).unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server::new(listener, config(Vec::new()), open())
+        .await
+        .unwrap();
+    let mut key = BanKey::new(BanKind::ClientId, "bad");
+    key.prefix = true;
+    let mut ban = NewBan::new(key);
+    ban.reason = Some("spam".into());
+    server.admin().add_ban(ban).await.unwrap();
+    drop(server);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Server::new(listener, config(Vec::new()), open())
+        .await
+        .unwrap();
+    let bans = server.admin().bans(Paging::default()).await;
+    tokio::spawn(server.run(std::future::pending::<()>()));
+    assert_eq!(bans.total_count, 1);
+    assert_eq!(bans.items[0].value, "bad");
+    assert!(bans.items[0].prefix);
+    assert_eq!(bans.items[0].reason.as_deref(), Some("spam"));
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("bad-1")).await,
+        ReasonCode::Banned
+    );
+    std::fs::remove_file(&db).unwrap();
+}
+
+#[tokio::test]
+async fn banned_clients_publish_no_will_and_start_no_session() {
+    let (addr, admin) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut watcher = Client::connect(addr, "watcher").await;
+    watcher.subscribe("wills/#").await;
+    let mut checker = admin_client(addr).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(BanKind::ClientId, "device")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connack_reason(addr, b"", with_will("device")).await,
+        ReasonCode::Banned
+    );
+    assert!(watcher.receive().await.is_none());
+    let details = checker
+        .run(json!({"command": "getClient", "clientid": "device"}))
+        .await;
+    assert_eq!(details["code"], "notFound");
+}
+
+#[tokio::test]
+async fn address_bans_on_mapped_blocks_apply_to_ipv4_clients() {
+    let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxied_addr = proxied.local_addr().unwrap();
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    config.listeners = vec![{
+        let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
+        listener.proxy_protocol = true;
+        listener
+    }];
+    let (_, admin) = start(config).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(
+            BanKind::Address,
+            "::ffff:192.0.2.0/120",
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        admin.bans(Paging::default()).await.items[0].value,
+        "192.0.2.0/24"
+    );
+    assert_eq!(
+        connack_reason(
+            proxied_addr,
+            b"PROXY TCP4 192.0.2.9 127.0.0.1 56324 1883\r\n",
+            connect_packet("a")
+        )
+        .await,
+        ReasonCode::Banned
     );
 }

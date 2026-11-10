@@ -10,8 +10,8 @@ mod types;
 
 pub(crate) use protocol::handle as handle_request;
 pub use types::{
-    BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo, RetainedMessage,
-    RetainedProperties, RetainedSummary, SubscriberInfo, SubscriptionSummary,
+    Ban, BanKind, BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo,
+    RetainedMessage, RetainedProperties, RetainedSummary, SubscriberInfo, SubscriptionSummary,
 };
 
 use std::{
@@ -32,6 +32,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::{
+    bans::Bans,
     plugin::{BoxFuture, Plugin, PluginStatus},
     queue::Subscriber,
     server::{AddressRange, ListenerState},
@@ -60,6 +61,7 @@ struct Inner {
     started: Instant,
     extension: Option<Arc<dyn AdminExtension>>,
     plugins: Vec<Arc<dyn Plugin>>,
+    bans: Arc<Bans>,
 }
 
 /// Why a command failed: a stable [`ErrorCode`] for scripts, and a message
@@ -184,6 +186,51 @@ pub struct ClientQuery {
     pub paging: Paging,
 }
 
+/// Which ban: `removeBan`'s arguments, and what `addBan` adds or replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BanKey {
+    pub kind: BanKind,
+    /// A client id or user name, or an IP address or CIDR block
+    pub value: String,
+    /// Match client ids or user names starting with `value`; not for
+    /// addresses
+    pub prefix: bool,
+}
+
+impl BanKey {
+    /// A ban on exactly `value`.
+    pub fn new(kind: BanKind, value: impl Into<String>) -> Self {
+        BanKey {
+            kind,
+            value: value.into(),
+            prefix: false,
+        }
+    }
+}
+
+/// A ban to add: `addBan`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NewBan {
+    pub key: BanKey,
+    /// Seconds until the ban expires, counted from now; it never does when
+    /// None
+    pub duration: Option<u32>,
+    pub reason: Option<String>,
+}
+
+impl NewBan {
+    /// A ban that never expires, without a reason.
+    pub fn new(key: BanKey) -> Self {
+        NewBan {
+            key,
+            duration: None,
+            reason: None,
+        }
+    }
+}
+
 /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know, such
 /// as the ones `mercuriod` adds. Set in `ServerConfig::admin_extension`.
 pub trait AdminExtension: Send + Sync + 'static {
@@ -209,6 +256,7 @@ pub(crate) struct AdminParts {
     pub storage: &'static str,
     pub extension: Option<Arc<dyn AdminExtension>>,
     pub plugins: Vec<Arc<dyn Plugin>>,
+    pub bans: Arc<Bans>,
 }
 
 /// The sessions as the admin API reaches them, whatever the storage the
@@ -297,6 +345,7 @@ impl Admin {
                 started: Instant::now(),
                 extension: parts.extension,
                 plugins: parts.plugins,
+                bans: parts.bans,
             }),
         }
     }
@@ -443,6 +492,34 @@ impl Admin {
                 format!("client `{client_id}` is connected; set `disconnect` to close it first"),
             ),
         })
+    }
+
+    /// Refuses clients matching `ban` from now on: `addBan`. A ban with the
+    /// same type, value and prefix is replaced, keeping when it was created.
+    pub async fn add_ban(&self, ban: NewBan) -> Result<(), AdminError> {
+        let ban = self.inner.bans.add(ban).await?;
+        info!(
+            "Banned the {} `{}` for the admin API",
+            ban.ban.kind.as_str(),
+            ban.ban.value
+        );
+        Ok(())
+    }
+
+    /// Lifts the ban `key` names: `removeBan`.
+    pub async fn remove_ban(&self, key: &BanKey) -> Result<(), AdminError> {
+        self.inner.bans.remove(key).await?;
+        info!(
+            "Lifted the ban on the {} `{}` for the admin API",
+            key.kind.as_str(),
+            key.value
+        );
+        Ok(())
+    }
+
+    /// The bans in force, by type, then value, then prefix: `listBans`.
+    pub async fn bans(&self, paging: Paging) -> Page<Ban> {
+        Page::of(self.inner.bans.list(), paging)
     }
 
     /// One session in detail: `getClient`.
@@ -686,7 +763,7 @@ fn retained_filter(filter: &str) -> Result<(), AdminError> {
     Ok(())
 }
 
-fn storage_failed(e: StorageError) -> AdminError {
+pub(crate) fn storage_failed(e: StorageError) -> AdminError {
     AdminError::new(ErrorCode::Unavailable, format!("storage failed: {e}"))
 }
 

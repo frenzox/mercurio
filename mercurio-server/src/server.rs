@@ -56,6 +56,7 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 use crate::{
     acl::Access,
     admin::{Admin, AdminExtension, AdminParts, ListenerInfo},
+    bans::{Bans, Candidate},
     broker::Broker,
     connection::Connection,
     http,
@@ -457,6 +458,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     address_slots: Arc<AddressSlots>,
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
+    bans: Arc<Bans>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -633,6 +635,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             local: self.local,
             connect_deadline: self.connect_deadline,
             listener: self.listener,
+            bans: self.bans,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -701,6 +704,7 @@ struct Listener<St: MqttStore + 'static> {
     /// Connections per client address, for `max_connections_per_ip`
     address_slots: Arc<AddressSlots>,
     connection_slots: Option<Arc<Semaphore>>,
+    bans: Arc<Bans>,
 }
 
 struct Handler<St, S>
@@ -725,6 +729,7 @@ where
     connect_deadline: Instant,
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
+    bans: Arc<Bans>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -879,6 +884,9 @@ impl<St: MqttStore + 'static> Server<St> {
         let session_manager_holder =
             SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue);
         let session_manager = session_manager_holder.session_manager();
+        // A PostgreSQL standby gets here once it took the database over, so
+        // it serves with the bans in force then
+        let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
 
         let admin = Admin::new(AdminParts {
             directory: Arc::new(session_manager.clone()),
@@ -889,6 +897,7 @@ impl<St: MqttStore + 'static> Server<St> {
             storage: storage.backend_name(),
             extension: admin_extension,
             plugins: all_plugins.clone(),
+            bans: Arc::clone(&bans),
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
@@ -917,6 +926,7 @@ impl<St: MqttStore + 'static> Server<St> {
             policy,
             limits,
             stats,
+            bans,
         };
 
         session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
@@ -1087,6 +1097,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
                 listener: Arc::from("local"),
+                bans: Arc::clone(&self.bans),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1365,6 +1376,17 @@ where
             );
             return self
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                .await;
+        }
+        // After authentication, since user name bans match the verified
+        // user, and once the client id is final
+        if self.banned(&connect_packet.payload.client_id, verified_user.as_deref()) {
+            warn!(
+                "Client `{}` is banned, refusing",
+                connect_packet.payload.client_id
+            );
+            return self
+                .reject_connect(&connect_packet, ReasonCode::Banned)
                 .await;
         }
         // A will is published on the client's behalf, so it needs the same
@@ -1668,6 +1690,16 @@ where
                 .write_packet(ControlPacket::ConnAck(connack))
                 .await;
             Ok(())
+        })
+    }
+
+    /// Whether a ban refuses this client, connecting with `client_id` as
+    /// the verified `username`.
+    fn banned(&self, client_id: &str, username: Option<&str>) -> bool {
+        self.bans.refuses(&Candidate {
+            client_id,
+            username,
+            ip: self.peer.map(|peer| peer.ip()),
         })
     }
 
@@ -2152,7 +2184,48 @@ impl std::str::FromStr for AddressRange {
                 .filter(|p| *p <= bits)
                 .ok_or_else(invalid)?,
         };
+        // `contains` sees IPv4 clients as IPv4, so a mapped range has to be
+        // one too to match anyone
+        if let IpAddr::V6(v6) = network {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                if prefix < 96 {
+                    return Err(format!(
+                        "`{text}` is an IPv4-mapped block shorter than /96; write it as IPv4"
+                    ));
+                }
+                return Ok(AddressRange {
+                    network: IpAddr::V4(v4),
+                    prefix: prefix - 96,
+                });
+            }
+        }
         Ok(AddressRange { network, prefix })
+    }
+}
+
+impl std::fmt::Display for AddressRange {
+    /// The range's first address, then its length unless it holds one
+    /// address: `10.0.0.0/8`, `192.0.2.7`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (first, bits) = match self.network {
+            IpAddr::V4(ip) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                (IpAddr::V4((u32::from(ip) & mask).into()), 32)
+            }
+            IpAddr::V6(ip) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                (IpAddr::V6((u128::from(ip) & mask).into()), 128)
+            }
+        };
+        if self.prefix == bits {
+            write!(f, "{first}")
+        } else {
+            write!(f, "{first}/{}", self.prefix)
+        }
     }
 }
 
@@ -2265,6 +2338,27 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_address_ranges_print_their_first_address() {
+        let print = |text: &str| text.parse::<AddressRange>().unwrap().to_string();
+        assert_eq!(print("10.1.2.3/8"), "10.0.0.0/8");
+        assert_eq!(print("192.0.2.7"), "192.0.2.7");
+        assert_eq!(print("192.0.2.7/32"), "192.0.2.7");
+        assert_eq!(print("2001:db8::1/32"), "2001:db8::/32");
+        assert_eq!(print("0.0.0.0/0"), "0.0.0.0/0");
+    }
+
+    #[test]
+    fn test_mapped_ranges_are_ipv4_ranges() {
+        let parse = |text: &str| text.parse::<AddressRange>();
+        assert_eq!(parse("::ffff:192.0.2.7").unwrap().to_string(), "192.0.2.7");
+        assert_eq!(
+            parse("::ffff:192.0.2.0/120").unwrap().to_string(),
+            "192.0.2.0/24"
+        );
+        assert!(parse("::ffff:192.0.2.7/95").is_err());
+    }
 
     #[test]
     fn test_address_ranges() {

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// `getBrokerInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -185,4 +185,53 @@ pub struct SubscriberInfo {
     pub retain_as_published: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_identifier: Option<u32>,
+}
+
+/// What a ban matches clients by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum BanKind {
+    /// The client id, once the broker assigned one
+    ClientId,
+    /// The user the broker verified the client as; anonymous clients have
+    /// none
+    Username,
+    /// The client's IP address, from the PROXY header when there is one
+    Address,
+}
+
+impl BanKind {
+    /// Its name in the protocol and in storage.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BanKind::ClientId => "clientid",
+            BanKind::Username => "username",
+            BanKind::Address => "address",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<BanKind> {
+        [BanKind::ClientId, BanKind::Username, BanKind::Address]
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+    }
+}
+
+/// One entry of `listBans`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Ban {
+    #[serde(rename = "type")]
+    pub kind: BanKind,
+    /// An address range as its first address and length: `10.0.0.0/8`,
+    /// `192.0.2.7`
+    pub value: String,
+    pub prefix: bool,
+    pub reason: Option<String>,
+    /// Unix seconds, when the ban was first added
+    pub created_at: u64,
+    /// Unix seconds; null for a ban that never expires
+    pub expires_at: Option<u64>,
 }
