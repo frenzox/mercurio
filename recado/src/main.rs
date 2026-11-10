@@ -393,7 +393,7 @@ fn qos_level(value: &str) -> Result<QoS, String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Commands};
+    use super::{common, Cli, Commands};
 
     #[test]
     fn arguments_are_well_formed() {
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(connection.keep_alive, 30);
         assert!(connection.no_clean_start && connection.verbose);
         assert_eq!(connection.session_expiry, 60);
-        assert_eq!(connection.protocol_version, "311");
+        assert_eq!(connection.protocol_version, common::Protocol::V311);
     }
 
     #[cfg(unix)]

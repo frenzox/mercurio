@@ -55,7 +55,7 @@ Connection options, for both commands:
 | `--unix` | Unix socket, instead of host and port | |
 | `-i, --client-id` | Client id | generated |
 | `-u, --username`, `-P, --password` | Credentials | |
-| `-V, --protocol-version` | `5`, `311` or `31` | `5` |
+| `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a

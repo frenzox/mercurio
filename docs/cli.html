@@ -106,7 +106,7 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
 <tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
-<tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code></td><td><code>5</code></td></tr>
+<tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code>; also <code>3.1.1</code>, <code>3.1</code> and mosquitto's <code>mqttv5</code>, <code>mqttv311</code>, <code>mqttv31</code>. Anything else is an error</td><td><code>5</code></td></tr>
 <tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
 <tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with; implies <code>--tls</code></td><td>system roots</td></tr>
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
