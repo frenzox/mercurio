@@ -14,7 +14,7 @@ use std::{
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
-use mercurio_core::topic::topic_matches_filter;
+use mercurio_core::topic::{filter_covers, topic_matches_filter};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
@@ -110,10 +110,10 @@ impl Acl {
     fn applies(&self, topic: &str, access: Access) -> bool {
         match (self.acltype, access) {
             (AclType::PublishClientSend, Access::Write)
-            | (AclType::PublishClientReceive, Access::Read)
-            | (AclType::SubscribePattern, Access::Subscribe) => {
+            | (AclType::PublishClientReceive, Access::Read) => {
                 topic_matches_filter(topic, &self.topic)
             }
+            (AclType::SubscribePattern, Access::Subscribe) => filter_covers(&self.topic, topic),
             (AclType::SubscribeLiteral, Access::Subscribe) => topic == self.topic,
             _ => false,
         }
@@ -1096,6 +1096,46 @@ mod tests {
                 .await,
             Decision::Allow
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_patterns_cover_only_narrower_filters() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-pattern-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        let responses = run(
+            &security,
+            json!([
+                { "command": "createRole", "rolename": "tenant" },
+                { "command": "addRoleACL", "rolename": "tenant", "acltype": "subscribePattern",
+                  "topic": "tenants/acme/+", "allow": true },
+                { "command": "createClient", "username": "acme", "password": "pw",
+                  "roles": [{ "rolename": "tenant" }] },
+            ]),
+        );
+        assert!(
+            responses.iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+
+        let acme = identity("acme");
+        for (filter, decision) in [
+            ("tenants/acme/a", Decision::Allow),
+            ("tenants/acme/+", Decision::Allow),
+            ("tenants/acme/#", Decision::Deny),
+            ("tenants/acme/a/#", Decision::Deny),
+            ("tenants/+/a", Decision::Deny),
+        ] {
+            assert_eq!(
+                security.authorize(&acme, filter, Access::Subscribe).await,
+                decision,
+                "{filter}"
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 

@@ -234,6 +234,39 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
     topic_levels.next().is_none()
 }
 
+/// Whether `filter` matches every topic the subscription filter `subset`
+/// can match, so that a grant on `filter` may allow subscribing to `subset`.
+/// A shared subscription, `$share/{share name}/{topic filter}`, is decided
+/// on its topic filter.
+///
+/// [`topic_matches_filter`] can't answer this with `subset` as the topic:
+/// `+` there matches a literal `#` level, so `x/+` would cover `x/#`.
+pub fn filter_covers(filter: &str, subset: &str) -> bool {
+    let subset = parse_shared_subscription(subset).map_or(subset, |(_, filter)| filter);
+
+    // A first-level wildcard never matches `$` topics [MQTT-4.7.2-1], so it
+    // covers a subset only if the subset can't match them either
+    if subset.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+
+    let mut subset_levels = subset.split('/');
+    for filter_level in filter.split('/') {
+        if filter_level == "#" {
+            return true;
+        }
+        match subset_levels.next() {
+            // `#` in the subset matches any number of levels, which only a
+            // `#` in the filter matches too
+            Some("#") | None => return false,
+            Some("+") if filter_level != "+" => return false,
+            Some(level) if filter_level == "+" || filter_level == level => {}
+            Some(_) => return false,
+        }
+    }
+    subset_levels.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +303,52 @@ mod tests {
         assert!(!topic_matches_filter("$SYS/load", "#"));
         assert!(!topic_matches_filter("$SYS/load", "+/load"));
         assert!(topic_matches_filter("$SYS/load", "$SYS/#"));
+    }
+
+    #[test]
+    fn test_filter_covers() {
+        assert!(filter_covers("x/+", "x/a"));
+        assert!(filter_covers("x/+", "x/+"));
+        assert!(!filter_covers("x/+", "x/#"));
+        assert!(!filter_covers("x/+", "x/a/b"));
+        assert!(!filter_covers("x/+", "x"));
+
+        assert!(filter_covers("x/#", "x/+"));
+        assert!(filter_covers("x/#", "x/a/b"));
+        assert!(filter_covers("x/#", "x/#"));
+        assert!(filter_covers("x/#", "x"));
+        assert!(filter_covers("x/#", "x/+/#"));
+        assert!(!filter_covers("x/#", "y/a"));
+        assert!(!filter_covers("x/#", "+/a"));
+        assert!(!filter_covers("x/#", "#"));
+
+        assert!(!filter_covers("+/+", "#"));
+        assert!(!filter_covers("+/+", "a/#"));
+        assert!(filter_covers("+/+", "+/a"));
+        assert!(!filter_covers("+/+", "+"));
+
+        assert!(filter_covers("#", "#"));
+        assert!(filter_covers("#", "+/a/#"));
+        assert!(filter_covers("#", "a/b"));
+        assert!(filter_covers("+", "+"));
+        assert!(!filter_covers("#", "$SYS/load"));
+        assert!(!filter_covers("#", "$SYS/#"));
+        assert!(!filter_covers("+/load", "$SYS/load"));
+
+        assert!(filter_covers("a/b/c", "a/b/c"));
+        assert!(!filter_covers("a/b/c", "a/b"));
+        assert!(!filter_covers("a/b/c", "a/b/c/d"));
+        assert!(!filter_covers("a/b/c", "a/+/c"));
+        assert!(filter_covers("a/+", "a/"));
+
+        assert!(filter_covers("$SYS/#", "$SYS/load"));
+        assert!(filter_covers("$SYS/#", "$SYS/+"));
+        assert!(!filter_covers("$SYS/#", "+/load"));
+        assert!(!filter_covers("$SYS/#", "#"));
+
+        assert!(filter_covers("jobs/#", "$share/workers/jobs/+"));
+        assert!(!filter_covers("jobs/+", "$share/workers/jobs/#"));
+        assert!(!filter_covers("jobs/#", "$share/jobs/x"));
     }
 
     #[test]

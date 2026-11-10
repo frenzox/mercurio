@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use mercurio_core::topic::{topic_matches_filter, validate_subscribe_filter};
+use mercurio_core::topic::{filter_covers, topic_matches_filter, validate_subscribe_filter};
 
 use crate::plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin, PluginKind, PluginStatus};
 
@@ -175,11 +175,10 @@ impl AclFile {
     /// when subscribing.
     pub fn allows(&self, client: &ClientInfo, topic: &str, access: Access) -> bool {
         let rules = self.rules_for(client);
-        // A subscription filter is checked like a topic, so its wildcards
-        // only pass where a rule's own wildcards cover them
-        let matching = rules
-            .iter()
-            .filter(|rule| topic_matches_filter(topic, &rule.filter));
+        let matching = rules.iter().filter(|rule| match access {
+            Access::Subscribe => filter_covers(&rule.filter, topic),
+            _ => topic_matches_filter(topic, &rule.filter),
+        });
 
         let mut allowed = false;
         for rule in matching {
@@ -228,6 +227,7 @@ mod tests {
         topic readwrite alice/#
         topic deny alice/secret
         topic sensors/+/temperature
+        topic read feeds/+
 
         pattern write devices/%c/status
         pattern read users/%u/inbox
@@ -299,6 +299,11 @@ mod tests {
         // Would also match topics no rule grants
         assert!(!acl.allows(&alice, "#", Access::Subscribe));
         assert!(!acl.allows(&alice, "sensors/#", Access::Subscribe));
+        assert!(acl.allows(&alice, "feeds/+", Access::Subscribe));
+        assert!(acl.allows(&alice, "feeds/news", Access::Subscribe));
+        // `+` in the rule covers one level, `#` in the filter many
+        assert!(!acl.allows(&alice, "feeds/#", Access::Subscribe));
+        assert!(!acl.allows(&alice, "feeds/news/#", Access::Subscribe));
     }
 
     #[test]
