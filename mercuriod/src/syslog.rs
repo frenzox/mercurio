@@ -1,23 +1,52 @@
 //! Logging to the local syslog daemon, through its `/dev/log` socket.
 
-use std::{io, os::unix::net::UnixDatagram, sync::Arc};
+use std::{
+    io,
+    os::unix::net::UnixDatagram,
+    sync::{Arc, Mutex},
+};
 
 use tracing::{Level, Metadata};
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Makes one writer per log line, sent as one datagram when dropped.
 pub struct Syslog {
-    socket: Arc<UnixDatagram>,
+    socket: Arc<Socket>,
     /// `mercuriod[<pid>]: `, the tag syslog daemons expect
     tag: String,
 }
 
-impl Syslog {
-    pub fn connect(path: &str) -> io::Result<Self> {
+/// A datagram socket connected to the syslog daemon's, connected again when
+/// the daemon restarts and binds a new one.
+struct Socket {
+    path: String,
+    connected: Mutex<UnixDatagram>,
+}
+
+impl Socket {
+    fn connect(path: &str) -> io::Result<UnixDatagram> {
         let socket = UnixDatagram::unbound()?;
         socket.connect(path)?;
+        Ok(socket)
+    }
+
+    fn send(&self, datagram: &[u8]) -> io::Result<()> {
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        if connected.send(datagram).is_ok() {
+            return Ok(());
+        }
+        *connected = Self::connect(&self.path)?;
+        connected.send(datagram).map(|_| ())
+    }
+}
+
+impl Syslog {
+    pub fn connect(path: &str) -> io::Result<Self> {
         Ok(Self {
-            socket: Arc::new(socket),
+            socket: Arc::new(Socket {
+                path: path.to_string(),
+                connected: Mutex::new(Socket::connect(path)?),
+            }),
             tag: format!("mercuriod[{}]: ", std::process::id()),
         })
     }
@@ -41,7 +70,7 @@ impl Syslog {
 }
 
 pub struct Line {
-    socket: Arc<UnixDatagram>,
+    socket: Arc<Socket>,
     buffer: Vec<u8>,
     /// Where the message starts, after the priority and tag
     start: usize,
@@ -108,6 +137,33 @@ mod tests {
             std::process::id()
         );
         assert_eq!(std::str::from_utf8(&buffer[..len]).unwrap(), expected);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_logging_resumes_after_the_daemon_restarts() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-syslog-restart-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let syslog = Syslog::connect(path.to_str().unwrap()).unwrap();
+        writeln!(syslog.line(Level::INFO), "before").unwrap();
+        let mut buffer = [0u8; 256];
+        receiver.recv(&mut buffer).unwrap();
+
+        // The daemon restarts, binding a new socket at the same path
+        drop(receiver);
+        std::fs::remove_file(&path).unwrap();
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        writeln!(syslog.line(Level::INFO), "after").unwrap();
+        let len = receiver.recv(&mut buffer).expect("the line was lost");
+        assert!(std::str::from_utf8(&buffer[..len])
+            .unwrap()
+            .ends_with("after"));
         std::fs::remove_file(&path).unwrap();
     }
 }
