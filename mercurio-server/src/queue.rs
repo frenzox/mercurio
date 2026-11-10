@@ -9,7 +9,10 @@ use std::{
 use tokio::sync::Notify;
 use tracing::warn;
 
-use mercurio_core::{message::Message, qos::QoS};
+use mercurio_core::{
+    message::{unix_millis, Message},
+    qos::QoS,
+};
 use mercurio_storage::Write;
 
 use crate::writer::Writer;
@@ -110,11 +113,17 @@ impl MessageQueue {
             self.limits.max_messages
         };
         let size = payload_size(&message);
-        let too_big = self
-            .limits
-            .max_bytes
-            .is_some_and(|max| state.bytes + size > max);
-        if state.messages.len() >= limit || too_big {
+        let full = |state: &QueueState| {
+            state.messages.len() >= limit
+                || self
+                    .limits
+                    .max_bytes
+                    .is_some_and(|max| state.bytes + size > max)
+        };
+        if full(&state) {
+            state.evict_expired();
+        }
+        if full(&state) {
             if state.dropped == 0 {
                 warn!(
                     "Message queue full, dropping messages, starting with a QoS {} one on `{}`",
@@ -153,11 +162,7 @@ impl MessageQueue {
     /// those already queued. Used while the client is disconnected.
     pub(crate) fn start_journal(&self, journal: Writer) {
         let mut state = self.state.lock().unwrap();
-        for (sequence, message) in &state.messages {
-            if message.qos != QoS::AtMostOnce {
-                journal.write(Write::Enqueue(*sequence, message.clone()));
-            }
-        }
+        state.record(&journal);
         state.journal = Some(journal);
     }
 
@@ -205,6 +210,41 @@ impl MessageQueue {
                 }
             }
             self.notify.notified().await;
+        }
+    }
+}
+
+impl QueueState {
+    /// Records the queued QoS 1 and 2 messages in `journal`.
+    fn record(&self, journal: &Writer) {
+        for (sequence, message) in &self.messages {
+            if message.qos != QoS::AtMostOnce {
+                journal.write(Write::Enqueue(*sequence, message.clone()));
+            }
+        }
+    }
+
+    /// Drops the messages past their expiry, which are never sent
+    /// [MQTT-3.3.2-5]. The journal can't drop single messages, so it is
+    /// rewritten with those left.
+    fn evict_expired(&mut self) {
+        let now = unix_millis();
+        let before = self.messages.len();
+        let mut freed = 0;
+        self.messages.retain(|(_, message)| {
+            let live = message.expires_at.is_none_or(|deadline| deadline > now);
+            if !live {
+                freed += payload_size(message);
+            }
+            live
+        });
+        if self.messages.len() == before {
+            return;
+        }
+        self.bytes -= freed;
+        if let Some(journal) = &self.journal {
+            journal.write(Write::ClearQueue);
+            self.record(journal);
         }
     }
 }
@@ -411,6 +451,61 @@ mod tests {
         }
         // The queued QoS 1 message, then the new QoS 2 one; QoS 0 is skipped
         assert_eq!(recorded, ["0:1", "2:2", "clear"]);
+    }
+
+    fn expiring(qos: QoS, expires_at: u64) -> Message {
+        Message {
+            expires_at: Some(expires_at),
+            ..message(qos)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_queue_evicts_expired_messages() {
+        let queue = MessageQueue::new(QueueLimits {
+            max_messages: 3,
+            ..Default::default()
+        });
+        let now = unix_millis();
+        queue.push(expiring(QoS::AtLeastOnce, now - 1));
+        queue.push(expiring(QoS::AtLeastOnce, now + 60_000));
+        queue.push(expiring(QoS::AtLeastOnce, now - 1));
+
+        assert!(queue.push(message(QoS::ExactlyOnce)));
+        let state = queue.state.lock().unwrap();
+        let sequences: Vec<u64> = state.messages.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sequences, [1, 3]);
+        assert_eq!(state.bytes, 14);
+        assert_eq!(state.dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn test_evicting_expired_messages_rewrites_the_journal() {
+        let queue = MessageQueue::new(QueueLimits {
+            max_messages: 2,
+            ..Default::default()
+        });
+        let now = unix_millis();
+        queue.push(expiring(QoS::AtLeastOnce, now - 1));
+        queue.push(message(QoS::AtLeastOnce));
+
+        let (journal, mut events) = Writer::channel();
+        queue.start_journal(journal);
+        queue.push(message(QoS::ExactlyOnce));
+
+        let mut recorded = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            let Op::Write(write, _) = event else {
+                continue;
+            };
+            recorded.push(match *write {
+                Write::Enqueue(sequence, _) => sequence.to_string(),
+                Write::ClearQueue => "clear".to_string(),
+                _ => "other".to_string(),
+            });
+        }
+        // Both journaled, then the expired one dropped from the record
+        assert_eq!(recorded, ["0", "1", "clear", "1", "2"]);
     }
 
     #[tokio::test]
