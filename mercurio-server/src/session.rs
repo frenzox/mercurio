@@ -1030,6 +1030,7 @@ impl Session {
         expiry: Option<Duration>,
     ) -> Arc<ClientCounters> {
         let counters = Arc::new(ClientCounters::default());
+        self.shared.queue.set_connected(true);
         self.shared.state.lock().await.presence = Presence {
             listener: Some(listener),
             connected_at: Some(unix_millis() / 1000),
@@ -1049,6 +1050,7 @@ impl Session {
         if state.generation != generation {
             return;
         }
+        self.shared.queue.set_connected(false);
         let now = unix_millis();
         state.presence.disconnected_at = Some(now / 1000);
         state.presence.session_expiry = expiry;

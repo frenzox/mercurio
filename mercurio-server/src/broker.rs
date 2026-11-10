@@ -114,9 +114,25 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        let matches = self.subscriptions.matching(topic);
-        // A session with overlapping subscriptions gets one copy; shared
-        // subscriptions are delivered on their own
+        // Each share group's message goes to the next connected member whose
+        // queue takes it, and only to a disconnected one, whose queue waits
+        // for its client to return, when no connected member can
+        let matches = self.subscriptions.matching_with(topic, |members, turn| {
+            let order = (0..members.len()).map(|i| (turn + i) % members.len());
+            let offer = |want_connected: bool| {
+                order.clone().find(|&i| {
+                    let member = &members[i].1;
+                    member.queue.is_connected() == want_connected
+                        && Subscriber::deliver(
+                            std::slice::from_ref(member),
+                            message.clone(),
+                            origin,
+                        )
+                })
+            };
+            offer(true).or_else(|| offer(false))
+        });
+        // A session with overlapping subscriptions gets one copy
         let mut by_session: HashMap<u64, Vec<Subscriber>> = HashMap::new();
         for subscriber in &matches.regular {
             by_session
@@ -126,9 +142,6 @@ impl<S: RetainedMessageStore> Broker<S> {
         }
         for subscriptions in by_session.values() {
             Subscriber::deliver(subscriptions, message.clone(), origin);
-        }
-        for subscriber in &matches.shared {
-            Subscriber::deliver(std::slice::from_ref(subscriber), message.clone(), origin);
         }
         Ok(matches.len())
     }
@@ -146,6 +159,7 @@ impl<S: RetainedMessageStore> Broker<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::{MessageQueue, QueueLimits};
     use bytes::Bytes;
     use mercurio_core::qos::QoS;
     use mercurio_storage::memory::MemoryStore;
@@ -164,6 +178,93 @@ mod tests {
             subscription_identifiers: Vec::new(),
             origin: None,
         }
+    }
+
+    fn share_member(id: u64, limits: QueueLimits, connected: bool) -> Subscriber {
+        let queue = Arc::new(MessageQueue::new(limits));
+        queue.set_connected(connected);
+        Subscriber {
+            queue,
+            session_id: id,
+            granted_qos: QoS::AtLeastOnce,
+            no_local: false,
+            retain_as_published: false,
+            subscription_identifier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_subscriptions_prefer_connected_members() {
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
+        let online = share_member(1, QueueLimits::default(), true);
+        let offline = share_member(2, QueueLimits::default(), false);
+        broker.subscribe("$share/g/jobs", 1, online.clone());
+        broker.subscribe("$share/g/jobs", 2, offline.clone());
+
+        for _ in 0..4 {
+            let matched = broker
+                .publish_from("jobs", create_test_message("jobs", "x", false), None)
+                .await
+                .unwrap();
+            assert_eq!(matched, 1);
+        }
+        assert_eq!(online.queue.len(), 4);
+        assert_eq!(offline.queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shared_subscriptions_skip_full_members() {
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
+        let small = QueueLimits {
+            max_qos0: 1,
+            ..Default::default()
+        };
+        let full = share_member(1, small, true);
+        let roomy = share_member(2, QueueLimits::default(), true);
+        let offline = share_member(3, QueueLimits::default(), false);
+        broker.subscribe("$share/g/jobs", 1, full.clone());
+        broker.subscribe("$share/g/jobs", 2, roomy.clone());
+        broker.subscribe("$share/g/jobs", 3, offline.clone());
+
+        for _ in 0..4 {
+            broker
+                .publish("jobs", create_test_message("jobs", "x", false))
+                .await
+                .unwrap();
+        }
+        // The first went to the small queue, the rest past it to the roomy one
+        assert_eq!(full.queue.len(), 1);
+        assert_eq!(roomy.queue.len(), 3);
+        assert_eq!(offline.queue.len(), 0);
+
+        // With no connected member able to take it, an offline one does
+        roomy.queue.set_connected(false);
+        broker
+            .publish("jobs", create_test_message("jobs", "x", false))
+            .await
+            .unwrap();
+        assert_eq!(full.queue.len(), 1);
+        assert_eq!(roomy.queue.len() + offline.queue.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_shared_subscriptions_take_turns_among_eligible_members() {
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
+        let members: Vec<Subscriber> = (1..=3)
+            .map(|id| share_member(id, QueueLimits::default(), id != 2))
+            .collect();
+        for member in &members {
+            broker.subscribe("$share/g/jobs", member.session_id, member.clone());
+        }
+
+        for _ in 0..6 {
+            broker
+                .publish("jobs", create_test_message("jobs", "x", false))
+                .await
+                .unwrap();
+        }
+        let counts: Vec<usize> = members.iter().map(|m| m.queue.len()).collect();
+        assert_eq!(counts, [3, 0, 3]);
     }
 
     #[tokio::test]

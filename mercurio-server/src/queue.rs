@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use tokio::sync::Notify;
@@ -51,6 +54,8 @@ pub(crate) struct MessageQueue {
     state: Mutex<QueueState>,
     notify: Notify,
     limits: QueueLimits,
+    /// Whether a client is connected to take the messages
+    connected: AtomicBool,
 }
 
 #[derive(Default)]
@@ -79,7 +84,16 @@ impl MessageQueue {
             state: Mutex::default(),
             notify: Notify::new(),
             limits,
+            connected: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_connected(&self, connected: bool) {
+        self.connected.store(connected, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
     }
 
     /// How many messages wait to be sent.
@@ -87,7 +101,8 @@ impl MessageQueue {
         self.state.lock().unwrap().messages.len()
     }
 
-    pub(crate) fn push(&self, message: Message) {
+    /// Queues `message` unless the queue is full. Returns whether it did.
+    pub(crate) fn push(&self, message: Message) -> bool {
         let mut state = self.state.lock().unwrap();
         let limit = if message.qos == QoS::AtMostOnce {
             self.limits.max_qos0
@@ -107,7 +122,7 @@ impl MessageQueue {
                 );
             }
             state.dropped += 1;
-            return;
+            return false;
         }
         if state.dropped > 0 {
             warn!(
@@ -131,6 +146,7 @@ impl MessageQueue {
         state.messages.push_back((sequence, message));
         drop(state);
         self.notify.notify_one();
+        true
     }
 
     /// Starts recording QoS 1 and 2 messages in `journal`, beginning with
@@ -214,15 +230,19 @@ impl Subscriber {
     /// all of them one session's and matching the message, `origin` being
     /// the session that published it. The copy has the highest QoS granted
     /// [MQTT-3.3.4-2] and the identifiers of every subscription
-    /// [MQTT-3.3.4-4].
-    pub(crate) fn deliver(subscriptions: &[Subscriber], mut message: Message, origin: Option<u64>) {
+    /// [MQTT-3.3.4-4]. Returns whether the session's queue took it.
+    pub(crate) fn deliver(
+        subscriptions: &[Subscriber],
+        mut message: Message,
+        origin: Option<u64>,
+    ) -> bool {
         // [MQTT-3.8.3-3]
         let matching: Vec<&Subscriber> = subscriptions
             .iter()
             .filter(|s| !(s.no_local && origin == Some(s.session_id)))
             .collect();
         let Some(first) = matching.first() else {
-            return;
+            return false;
         };
         // Forwarded messages carry RETAIN only when asked to keep it as
         // published [MQTT-3.3.1-12]
@@ -240,17 +260,18 @@ impl Subscriber {
             .collect();
         identifiers.sort_unstable();
         identifiers.dedup();
-        first.queue_message(message, granted_qos, identifiers);
+        first.queue_message(message, granted_qos, identifiers)
     }
 
     /// Queues a retained message sent because of a new subscription.
-    pub(crate) fn deliver_retained(&self, message: Message) {
+    /// Returns whether the queue took it.
+    pub(crate) fn deliver_retained(&self, message: Message) -> bool {
         let identifiers = self.subscription_identifier.into_iter().collect();
-        self.queue_message(message, self.granted_qos, identifiers);
+        self.queue_message(message, self.granted_qos, identifiers)
     }
 
     /// Queues a message, downgraded to the QoS granted [MQTT-3.8.4-8].
-    fn queue_message(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) {
+    fn queue_message(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> bool {
         message.subscription_identifiers = identifiers;
         if self.queue.limits.upgrade_qos {
             message.qos = granted_qos;
@@ -260,7 +281,7 @@ impl Subscriber {
                 message.packet_id = None;
             }
         }
-        self.queue.push(message);
+        self.queue.push(message)
     }
 }
 
