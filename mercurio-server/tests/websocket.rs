@@ -197,6 +197,70 @@ async fn websocket_listeners_serve_files_and_mqtt() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The status a WebSocket upgrade with `headers` is refused with, if any.
+async fn upgrade_status(addr: SocketAddr, headers: &[(&'static str, &'static str)]) -> Option<u16> {
+    let mut request = format!("ws://{addr}/mqtt").into_client_request().unwrap();
+    for (name, value) in headers {
+        request
+            .headers_mut()
+            .insert(*name, HeaderValue::from_static(value));
+    }
+    let stream = TcpStream::connect(addr).await.unwrap();
+    match client_async(request, stream).await {
+        Ok(_) => None,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Some(response.status().as_u16())
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Without the subprotocol the client isn't speaking MQTT [MQTT-6.0.0-3],
+/// and a browser page couldn't tell the broker apart from another server.
+#[tokio::test]
+async fn upgrades_without_the_mqtt_subprotocol_are_refused() {
+    let (_, websocket_addr) = start_broker().await;
+    assert_eq!(upgrade_status(websocket_addr, &[]).await, Some(400));
+    let other = [("Sec-WebSocket-Protocol", "chat")];
+    assert_eq!(upgrade_status(websocket_addr, &other).await, Some(400));
+    let both = [("Sec-WebSocket-Protocol", "chat, mqtt")];
+    assert_eq!(upgrade_status(websocket_addr, &both).await, None);
+}
+
+/// A page from another site can open a WebSocket to an intranet broker;
+/// its browser says where the page came from.
+#[tokio::test]
+async fn only_allowed_origins_may_upgrade() {
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = websocket_listener.local_addr().unwrap();
+    let mut listener = ListenerConfig::new(websocket_listener, Transport::WebSocket);
+    listener.allowed_origins = Some(vec!["https://app.example".into()]);
+    let mut config = ServerConfig::default();
+    config.listeners = vec![listener];
+    tokio::spawn(mercurio_server::server::run_with_config(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let mqtt = ("Sec-WebSocket-Protocol", "mqtt");
+    let from = |origin| [mqtt, ("Origin", origin)];
+    assert_eq!(
+        upgrade_status(addr, &from("https://evil.example")).await,
+        Some(403)
+    );
+    assert_eq!(
+        upgrade_status(addr, &from("https://app.example")).await,
+        None
+    );
+    assert_eq!(
+        upgrade_status(addr, &from("HTTPS://APP.example")).await,
+        None
+    );
+    // Clients other than browsers send no Origin
+    assert_eq!(upgrade_status(addr, &[mqtt]).await, None);
+}
+
 /// Frames are reassembled before the MQTT packet size is known, so a
 /// message growing past the largest packet is refused as it arrives,
 /// before the rest of it is sent.

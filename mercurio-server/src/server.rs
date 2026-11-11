@@ -301,6 +301,14 @@ pub struct ListenerConfig {
     /// connect timeout, and a listener sends 32 at once at most; requests
     /// beyond that get Service Unavailable.
     pub http_dir: Option<PathBuf>,
+    /// On WebSocket listeners, the origins of the web pages that may
+    /// connect, such as `https://app.example.com`. Browsers say which page
+    /// opens a WebSocket in its `Origin` header; an upgrade from any other
+    /// is refused with 403 Forbidden, so a page from another site can't
+    /// reach the broker through its visitors' browsers. Clients other than
+    /// browsers send no `Origin` and are not affected. Any origin may
+    /// connect when unset.
+    pub allowed_origins: Option<Vec<String>>,
     /// Its clients skip authentication and access control, `$CONTROL` and
     /// every admin command included, as in-process connections do. They also
     /// skip the connection limits, the redirect and the client id prefixes,
@@ -332,6 +340,7 @@ impl ListenerConfig {
             plugins: None,
             max_connections: None,
             http_dir: None,
+            allowed_origins: None,
             trusted: false,
             #[cfg(unix)]
             peer_filter: None,
@@ -434,6 +443,7 @@ struct EndpointSettings {
     auth: Option<Arc<AuthConfig>>,
     chain: Option<Chain>,
     http_files: Option<Arc<http::Files>>,
+    allowed_origins: Option<Arc<[String]>>,
 }
 
 impl Endpoint {
@@ -525,6 +535,7 @@ impl Endpoint {
                 },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
                 http_files: config.http_dir.map(|dir| Arc::new(http::Files::new(dir))),
+                allowed_origins: config.allowed_origins.map(Into::into),
             },
         })
     }
@@ -579,6 +590,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     cert_identity: Option<String>,
     mount_point: Option<String>,
     http_files: Option<Arc<http::Files>>,
+    allowed_origins: Option<Arc<[String]>>,
     /// An in-process connection, from the local listener
     local: bool,
     /// When the PROXY header, the TLS and WebSocket handshakes and CONNECT
@@ -679,6 +691,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
         self.mount_point = settings.mount_point;
         self.http_files = settings.http_files;
+        self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
@@ -698,7 +711,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         .and_then(|c| c.first())
                         .and_then(|cert| certificate_name(cert, part));
                     if self.cert_identity.is_none() {
-                        warn!(target: CONNECTIONS, "No Common Name in the certificate of {:?}", peer_addr);
+                        warn!(
+                            target: CONNECTIONS,
+                            "No Common Name in the certificate of {:?}", peer_addr
+                        );
                         return None;
                     }
                 }
@@ -715,6 +731,46 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
     }
 
+    /// Reads the HTTP request on a WebSocket listener with files to serve.
+    /// A WebSocket upgrade is returned to complete; any other request is
+    /// answered from `files`, under its own deadline as sending a file may
+    /// take longer than connecting does, and None returned.
+    async fn serve_http<S>(
+        &mut self,
+        stream: S,
+        files: &http::Files,
+        peer_addr: Option<SocketAddr>,
+    ) -> Option<http::Rewind<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let request = Box::pin(http::read_request(stream));
+        let (stream, head) =
+            match connect_step(&mut self.shutdown, self.connect_deadline, request).await? {
+                Ok(Ok(http::Request::Upgrade(upgrade))) => return Some(upgrade),
+                Ok(Ok(http::Request::Files(stream, head))) => (stream, head),
+                Ok(Err(e)) => {
+                    debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e);
+                    return None;
+                }
+                Err(_) => {
+                    debug!(target: CONNECTIONS, "HTTP request from {:?} timed out", peer_addr);
+                    return None;
+                }
+            };
+        let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
+        let response = Box::pin(http::respond(stream, &head, files));
+        match connect_step(&mut self.shutdown, deadline, response).await? {
+            Ok(Err(e)) => debug!(
+                target: CONNECTIONS,
+                "HTTP response to {:?} failed: {}", peer_addr, e
+            ),
+            Err(_) => debug!(target: CONNECTIONS, "HTTP response to {:?} timed out", peer_addr),
+            Ok(Ok(())) => {}
+        }
+        None
+    }
+
     /// Serves one client on `stream`, after the WebSocket handshake if it
     /// came in on the WebSocket listener.
     async fn serve<S>(mut self, stream: S, transport: Transport, peer_addr: Option<SocketAddr>)
@@ -725,44 +781,20 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
                 let stream = match self.http_files.clone() {
-                    Some(files) => {
-                        let request = Box::pin(http::read_request(stream));
-                        let request =
-                            connect_step(&mut self.shutdown, self.connect_deadline, request);
-                        let Some(request) = request.await else {
-                            return;
-                        };
-                        match request {
-                            Ok(Ok(http::Request::Upgrade(upgrade))) => upgrade,
-                            Ok(Ok(http::Request::Files(stream, head))) => {
-                                // Its own time: sending a file may take
-                                // longer than connecting does
-                                let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
-                                let response = Box::pin(http::respond(stream, &head, &files));
-                                let response = connect_step(&mut self.shutdown, deadline, response);
-                                return match response.await {
-                                    Some(Ok(Err(e))) => {
-                                        debug!(target: CONNECTIONS, "HTTP response to {:?} failed: {}", peer_addr, e)
-                                    }
-                                    Some(Err(_)) => {
-                                        debug!(target: CONNECTIONS, "HTTP response to {:?} timed out", peer_addr)
-                                    }
-                                    _ => {}
-                                };
-                            }
-                            Ok(Err(e)) => {
-                                return debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e)
-                            }
-                            Err(_) => {
-                                return debug!(target: CONNECTIONS, "HTTP request from {:?} timed out", peer_addr)
-                            }
-                        }
-                    }
+                    Some(files) => match Box::pin(self.serve_http(stream, &files, peer_addr)).await
+                    {
+                        Some(upgrade) => upgrade,
+                        None => return,
+                    },
                     None => http::Rewind::new(stream, Vec::new()),
                 };
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
-                let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
+                let handshake = Box::pin(websocket::accept(
+                    stream,
+                    self.limits.max_packet_size,
+                    self.allowed_origins.as_deref(),
+                ));
                 let handshake = connect_step(&mut self.shutdown, self.connect_deadline, handshake);
                 let Some(handshake) = handshake.await else {
                     return;
@@ -771,12 +803,14 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     Ok(Ok(websocket)) => {
                         Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
                     }
-                    Ok(Err(e)) => {
-                        debug!(target: CONNECTIONS, "WebSocket handshake failed for {:?}: {}", peer_addr, e)
-                    }
-                    Err(_) => {
-                        debug!(target: CONNECTIONS, "WebSocket handshake timed out for {:?}", peer_addr)
-                    }
+                    Ok(Err(e)) => debug!(
+                        target: CONNECTIONS,
+                        "WebSocket handshake failed for {:?}: {}", peer_addr, e
+                    ),
+                    Err(_) => debug!(
+                        target: CONNECTIONS,
+                        "WebSocket handshake timed out for {:?}", peer_addr
+                    ),
                 }
             }
         }
@@ -1333,6 +1367,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 cert_identity: None,
                 mount_point: None,
                 http_files: None,
+                allowed_origins: None,
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),

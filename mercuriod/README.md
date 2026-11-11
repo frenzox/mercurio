@@ -291,6 +291,9 @@ group = "mercurio"
 # [[listeners]]
 # port = 8080
 # protocol = "websocket"
+# Web pages from other origins are refused (browsers send the page's origin;
+# other clients send none and are not affected); any origin when unset
+# allowed_origins = ["https://app.example.com"]
 #
 # Unix domain socket, for clients on the same machine
 # [[listeners]]

@@ -205,6 +205,10 @@ pub struct ListenerConfig {
     /// plain HTTP requests
     pub http_dir: Option<String>,
 
+    /// With `protocol = "websocket"`, the origins of the web pages that
+    /// may connect, such as `https://app.example.com`; any when unset
+    pub allowed_origins: Option<Vec<String>>,
+
     /// Only accept connections arriving on this network interface (Linux)
     pub bind_interface: Option<String>,
 

@@ -280,6 +280,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             value.mount_point = extra.mount_point.clone();
             value.max_connections = extra.max_connections;
             value.http_dir = extra.http_dir.clone().map(Into::into);
+            value.allowed_origins = extra.allowed_origins.clone();
             let names = extra.plugins.as_deref();
             if let Some(auth) = &extra.auth {
                 let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;

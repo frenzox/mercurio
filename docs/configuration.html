@@ -185,6 +185,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>path</code></td><td></td><td>Unix domain socket. Either this or <code>port</code>.</td></tr>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
+<tr><td><code>allowed_origins</code></td><td>any</td><td>With <code>"websocket"</code>, the origins of the web pages that may connect, such as <code>["https://app.example.com"]</code>. An upgrade with another <code>Origin</code> is refused with 403. Clients other than browsers send no <code>Origin</code> and are not affected.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
 <tr><td><code>proxy_from</code></td><td>any</td><td>With <code>proxy_protocol</code>, the addresses or CIDR blocks of the proxies allowed to send the header, such as <code>["10.0.0.0/8"]</code>. Connections from elsewhere are closed, as their header could claim any address.</td></tr>
 <tr><td><code>mount_point</code></td><td></td><td>Prefixed to every topic the listener's clients use. Must end with <code>/</code>.</td></tr>

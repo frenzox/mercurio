@@ -14,7 +14,7 @@ use tokio_tungstenite::{
     tungstenite::{
         self,
         handshake::server::{ErrorResponse, Request, Response},
-        http::HeaderValue,
+        http::{HeaderValue, StatusCode},
         protocol::WebSocketConfig,
         Message,
     },
@@ -24,11 +24,14 @@ use tokio_tungstenite::{
 const SUBPROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 /// Completes the WebSocket handshake on `stream`, selecting the `mqtt`
-/// subprotocol when the client offers it [MQTT-6.0.0-4]. Messages larger
-/// than `max_message_size` are refused before they are buffered whole.
+/// subprotocol [MQTT-6.0.0-4]. A client that doesn't offer it is refused
+/// with 400 Bad Request, and one whose `Origin` isn't among
+/// `allowed_origins`, when given, with 403 Forbidden. Messages larger than
+/// `max_message_size` are refused before they are buffered whole.
 pub(crate) async fn accept<S>(
     stream: S,
     max_message_size: usize,
+    allowed_origins: Option<&[String]>,
 ) -> Result<WebSocketTransport<S>, tungstenite::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -36,6 +39,14 @@ where
     // The error type is set by tungstenite's handshake callback
     #[allow(clippy::result_large_err)]
     let select_mqtt = |request: &Request, mut response: Response| {
+        if let (Some(allowed), Some(origin)) = (allowed_origins, request.headers().get("Origin")) {
+            let allowed = origin
+                .to_str()
+                .is_ok_and(|origin| allowed.iter().any(|a| a.eq_ignore_ascii_case(origin)));
+            if !allowed {
+                return Err(refusal(StatusCode::FORBIDDEN, "origin not allowed"));
+            }
+        }
         let offers_mqtt = request
             .headers()
             .get_all(SUBPROTOCOL_HEADER)
@@ -43,12 +54,16 @@ where
             .filter_map(|value| value.to_str().ok())
             .flat_map(|value| value.split(','))
             .any(|protocol| protocol.trim() == "mqtt");
-        if offers_mqtt {
-            response
-                .headers_mut()
-                .insert(SUBPROTOCOL_HEADER, HeaderValue::from_static("mqtt"));
+        if !offers_mqtt {
+            return Err(refusal(
+                StatusCode::BAD_REQUEST,
+                "the mqtt subprotocol is required",
+            ));
         }
-        Ok::<_, ErrorResponse>(response)
+        response
+            .headers_mut()
+            .insert(SUBPROTOCOL_HEADER, HeaderValue::from_static("mqtt"));
+        Ok(response)
     };
 
     let config = WebSocketConfig::default()
@@ -60,6 +75,12 @@ where
         websocket,
         pending: Bytes::new(),
     })
+}
+
+fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
+    let mut response = ErrorResponse::new(Some(reason.to_string()));
+    *response.status_mut() = status;
+    response
 }
 
 /// Presents a WebSocket as the plain byte stream MQTT expects.

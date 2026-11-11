@@ -77,6 +77,12 @@ protocol = "websocket"</pre>
 <pre>const client = mqtt.connect("ws://broker.example.com:8080/mqtt");
 client.on("connect", () =&gt; client.subscribe("sensors/#"));
 client.on("message", (topic, payload) =&gt; console.log(topic, payload.toString()));</pre>
+<p>Clients must offer the <code>mqtt</code> subprotocol, as MQTT.js does; an upgrade without it is refused with 400 Bad Request. A page on any site can open a WebSocket to the broker through its visitor's browser, which matters for a broker on an internal network that allows anonymous clients. <code>allowed_origins</code> lists the pages that may:</p>
+<pre>[[listeners]]
+port = 8080
+protocol = "websocket"
+allowed_origins = ["https://dashboard.example.com"]</pre>
+<p>An upgrade whose <code>Origin</code> header names another site is refused with 403 Forbidden. Clients other than browsers send no <code>Origin</code> and are not affected.</p>
 
 <h3 id="http-dir">Serving a web page</h3>
 <p>A WebSocket listener can also serve static files, so a dashboard or test page needs no separate web server:</p>
