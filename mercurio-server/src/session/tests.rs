@@ -1,3 +1,4 @@
+use super::retained::RETAINED_PAGE;
 use super::*;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::{
