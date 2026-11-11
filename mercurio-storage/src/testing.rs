@@ -14,8 +14,8 @@ use mercurio_core::{
 };
 
 use crate::{
-    BanStore, InflightMessage, MqttStore, SessionOwner, SessionState, StoredBan,
-    StoredSubscription, StoredWillMessage, Write,
+    BanStore, InflightMessage, LoadedClient, MqttStore, SessionOwner, SessionState, StoredBan,
+    StoredClient, StoredSubscription, StoredWillMessage, Write,
 };
 
 /// Runs every check of the suite against `store`, which starts empty.
@@ -30,6 +30,7 @@ pub async fn conformance(store: &impl MqttStore) {
     }
     batches(store).await;
     delete_cascades(store).await;
+    bulk_load(store).await;
     retained(store).await;
     retained_pages(store).await;
 }
@@ -613,6 +614,91 @@ async fn delete_cascades(store: &impl MqttStore) {
     }
     store.delete_session("kept").await.unwrap();
     assert!(store.list_sessions().await.unwrap().is_empty());
+}
+
+/// What a stored client holds, comparable.
+fn summary(mut client: StoredClient) -> String {
+    client
+        .session
+        .subscriptions
+        .sort_by(|a, b| a.topic_filter.cmp(&b.topic_filter));
+    client.inflight.sort_by_key(|m| m.packet_id);
+    client.incoming_qos2.sort_unstable();
+    format!(
+        "{:?} {:?} {:?} {:?} {:?}",
+        client.session,
+        client.will,
+        payloads(client.queue),
+        client.inflight,
+        client.incoming_qos2
+    )
+}
+
+/// Sessions load a page at a time, each with everything stored with it,
+/// as `load_client` loads it, and stored rows without a session are left
+/// out.
+async fn bulk_load(store: &impl MqttStore) {
+    let mut expected = Vec::new();
+    for i in 0..10 {
+        let client_id = format!("client/{i}");
+        let mut writes = vec![Write::SaveSession(session(&client_id))];
+        if i % 2 == 0 {
+            writes.extend([
+                Write::StoreWill(StoredWillMessage {
+                    topic: format!("will/{i}"),
+                    payload: Bytes::from_static(b"bye"),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    delay_secs: i,
+                    properties: properties(),
+                }),
+                Write::Enqueue(1, message("q", &format!("{i}.1"))),
+                Write::Enqueue(2, message("q", &format!("{i}.2"))),
+                Write::StoreInflight(inflight_message(i as u16 + 1)),
+                Write::StoreInflight(inflight_message(100)),
+                Write::StoreIncomingQos2(i as u16),
+            ]);
+        }
+        apply(store, &client_id, &writes).await;
+        expected.push(client_id);
+    }
+    // Rows of clients without a session
+    apply(
+        store,
+        "orphan",
+        &[
+            Write::StoreInflight(inflight_message(1)),
+            Write::StoreIncomingQos2(1),
+        ],
+    )
+    .await;
+
+    let mut found = Vec::new();
+    loop {
+        let after = found.last().map(|c: &LoadedClient| c.client_id.clone());
+        let page = store.load_clients(after.as_deref(), 3).await.unwrap();
+        assert!(page.len() <= 3);
+        let last = page.len() < 3;
+        found.extend(page);
+        if last {
+            break;
+        }
+    }
+    let mut ids: Vec<String> = found.iter().map(|c| c.client_id.clone()).collect();
+    ids.sort();
+    assert_eq!(ids, expected);
+    for client in found {
+        let alone = store.load_client(&client.client_id).await.unwrap().unwrap();
+        let loaded = client.stored.unwrap();
+        assert_eq!(loaded.session.client_id, client.client_id);
+        assert_eq!(summary(loaded), summary(alone), "{}", client.client_id);
+    }
+    assert!(store.load_client("orphan").await.unwrap().is_none());
+
+    for client_id in expected.iter().map(String::as_str).chain(["orphan"]) {
+        store.delete_session(client_id).await.unwrap();
+    }
+    assert!(store.load_clients(None, 3).await.unwrap().is_empty());
 }
 
 async fn topics(store: &impl MqttStore, filter: &str) -> Vec<String> {

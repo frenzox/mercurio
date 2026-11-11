@@ -4,6 +4,7 @@
 //! Suitable for single-node deployments requiring persistence across restarts.
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions, TryLockError},
     path::Path,
     sync::{Arc, Mutex},
@@ -23,9 +24,9 @@ use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionOwner,
-    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, TopicRange,
-    Write,
+    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore,
+    SessionOwner, SessionState, StorageError, StoredBan, StoredClient, StoredSubscription,
+    StoredWillMessage, TopicRange, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -431,9 +432,80 @@ impl FromSql for Identifiers {
     }
 }
 
-/// Selects the columns `inflight_from_row` reads.
-const INFLIGHT_COLUMNS: &str = "SELECT packet_id, topic, payload, qos, dup, sequence, released,
-    properties, subscription_identifiers, retain, expires_at FROM inflight_messages";
+/// The columns `session_from_row` reads.
+const SESSION_COLUMNS: &str =
+    "expiry_interval, expires_at, owner_username, owner_mount_point, subscriptions";
+
+/// A session, without its subscriptions, which have a table of their own.
+fn session_from_row(row: &rusqlite::Row, client_id: &str) -> rusqlite::Result<SessionState> {
+    unmoved_subscriptions(row.get(4)?)?;
+    Ok(SessionState {
+        client_id: client_id.to_string(),
+        subscriptions: Vec::new(),
+        expiry_interval: row.get(0)?,
+        expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
+        owner: SessionOwner {
+            username: row.get(2)?,
+            mount_point: row.get(3)?,
+        },
+    })
+}
+
+/// The columns `subscription_from_row` reads.
+const SUBSCRIPTION_COLUMNS: &str =
+    "topic_filter, qos, no_local, retain_as_published, subscription_identifier";
+
+fn subscription_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredSubscription> {
+    Ok(StoredSubscription {
+        topic_filter: row.get(0)?,
+        qos: row.get::<_, Qos>(1)?.0,
+        no_local: row.get(2)?,
+        retain_as_published: row.get(3)?,
+        subscription_identifier: row.get(4)?,
+    })
+}
+
+/// The columns `will_from_row` reads.
+const WILL_COLUMNS: &str = "topic, payload, qos, retain, delay_secs, properties";
+
+fn will_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredWillMessage> {
+    let payload: Vec<u8> = row.get(1)?;
+    Ok(StoredWillMessage {
+        topic: row.get(0)?,
+        payload: Bytes::from(payload),
+        qos: row.get::<_, Qos>(2)?.0,
+        retain: row.get(3)?,
+        delay_secs: row.get(4)?,
+        properties: decode_properties(row.get(5)?)?,
+    })
+}
+
+/// The columns `queued_from_row` reads.
+const QUEUED_COLUMNS: &str =
+    "sequence, topic, payload, qos, retain, properties, expires_at, subscription_identifiers";
+
+fn queued_from_row(row: &rusqlite::Row) -> rusqlite::Result<(u64, Message)> {
+    let topic: String = row.get(1)?;
+    let payload: Option<Vec<u8>> = row.get(2)?;
+    let message = Message {
+        packet_id: None,
+        topic: Arc::from(topic.as_str()),
+        dup: false,
+        qos: row.get::<_, Qos>(3)?.0,
+        retain: row.get(4)?,
+        payload: payload.map(Bytes::from),
+        properties: decode_properties(row.get(5)?)?,
+        expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+        subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
+        origin: None,
+    };
+    // SQLite integers are signed; the bit pattern round-trips
+    Ok((row.get::<_, i64>(0)? as u64, message))
+}
+
+/// The columns `inflight_from_row` reads.
+const INFLIGHT_COLUMNS: &str = "packet_id, topic, payload, qos, dup, sequence, released,
+    properties, subscription_identifiers, retain, expires_at";
 
 fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
     let payload: Option<Vec<u8>> = row.get(2)?;
@@ -739,46 +811,22 @@ impl BatchStore for SqliteStore {
 
     async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
         let client_id = client_id.to_string();
-
         self.blocking(move |conn| {
             let Some(mut session) = conn
                 .query_row(
-                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point,
-                            subscriptions
-                     FROM sessions WHERE client_id = ?1",
+                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE client_id = ?1"),
                     params![client_id],
-                    |row| {
-                        unmoved_subscriptions(row.get(4)?)?;
-                        Ok(SessionState {
-                            client_id: client_id.clone(),
-                            subscriptions: Vec::new(),
-                            expiry_interval: row.get(0)?,
-                            expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
-                            owner: SessionOwner {
-                                username: row.get(2)?,
-                                mount_point: row.get(3)?,
-                            },
-                        })
-                    },
+                    |row| session_from_row(row, &client_id),
                 )
                 .optional()?
             else {
                 return Ok(None);
             };
-            let mut stmt = conn.prepare(
-                "SELECT topic_filter, qos, no_local, retain_as_published, subscription_identifier
-                 FROM subscriptions WHERE client_id = ?1",
-            )?;
-            session.subscriptions = stmt
-                .query_map(params![client_id], |row| {
-                    Ok(StoredSubscription {
-                        topic_filter: row.get(0)?,
-                        qos: row.get::<_, Qos>(1)?.0,
-                        no_local: row.get(2)?,
-                        retain_as_published: row.get(3)?,
-                        subscription_identifier: row.get(4)?,
-                    })
-                })?
+            session.subscriptions = conn
+                .prepare_cached(&format!(
+                    "SELECT {SUBSCRIPTION_COLUMNS} FROM subscriptions WHERE client_id = ?1"
+                ))?
+                .query_map(params![client_id], subscription_from_row)?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(Some(session))
         })
@@ -796,24 +844,11 @@ impl BatchStore for SqliteStore {
 
     async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
         let client_id = client_id.to_string();
-
         self.blocking(move |conn| {
             conn.query_row(
-                "SELECT topic, payload, qos, retain, delay_secs, properties
-                 FROM will_messages WHERE client_id = ?1",
+                &format!("SELECT {WILL_COLUMNS} FROM will_messages WHERE client_id = ?1"),
                 params![client_id],
-                |row| {
-                    let payload: Vec<u8> = row.get(1)?;
-                    let properties: Vec<u8> = row.get(5)?;
-                    Ok(StoredWillMessage {
-                        topic: row.get(0)?,
-                        payload: Bytes::from(payload),
-                        qos: row.get::<_, Qos>(2)?.0,
-                        retain: row.get(3)?,
-                        delay_secs: row.get(4)?,
-                        properties: decode_properties(properties)?,
-                    })
-                },
+                will_from_row,
             )
             .optional()
         })
@@ -822,11 +857,12 @@ impl BatchStore for SqliteStore {
 
     async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
         let client_id = client_id.to_string();
-
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare(&format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1"))?;
-            let rows = stmt.query_map(params![client_id], inflight_from_row)?;
-            rows.collect()
+            conn.prepare_cached(&format!(
+                "SELECT {INFLIGHT_COLUMNS} FROM inflight_messages WHERE client_id = ?1"
+            ))?
+            .query_map(params![client_id], inflight_from_row)?
+            .collect()
         })
         .await
     }
@@ -834,44 +870,155 @@ impl BatchStore for SqliteStore {
     async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
         let client_id = client_id.to_string();
         self.blocking(move |conn| {
-            let mut stmt =
-                conn.prepare("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?;
-            let rows = stmt.query_map(params![client_id], |row| row.get(0))?;
-            rows.collect()
+            conn.prepare_cached("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?
+                .query_map(params![client_id], |row| row.get(0))?
+                .collect()
         })
         .await
     }
 
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
         let client_id = client_id.to_string();
-
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT sequence, topic, payload, qos, retain, properties, expires_at,
-                        subscription_identifiers
-                 FROM queued_messages WHERE client_id = ?1 ORDER BY sequence",
-            )?;
-            let rows = stmt.query_map(params![client_id], |row| {
-                let topic: String = row.get(1)?;
-                let payload: Option<Vec<u8>> = row.get(2)?;
-                let message = Message {
-                    packet_id: None,
-                    topic: Arc::from(topic.as_str()),
-                    dup: false,
-                    qos: row.get::<_, Qos>(3)?.0,
-                    retain: row.get(4)?,
-                    payload: payload.map(Bytes::from),
-                    properties: decode_properties(row.get(5)?)?,
-                    expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
-                    subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
-                    origin: None,
-                };
-                Ok((row.get::<_, i64>(0)? as u64, message))
-            })?;
-            rows.collect()
+            conn.prepare_cached(&format!(
+                "SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE client_id = ?1
+                 ORDER BY sequence"
+            ))?
+            .query_map(params![client_id], queued_from_row)?
+            .collect()
         })
         .await
     }
+
+    /// One query per table for the whole page: its sessions, then the rows
+    /// of every other table in the range of client ids the page covers.
+    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+        let after = after.map(str::to_string);
+        let clients = self
+            .blocking(move |conn| Ok(load_clients(conn, after, limit)))
+            .await?;
+        clients
+    }
+}
+
+/// What `load_clients` gathers for each client of the page.
+type Gathered = BTreeMap<String, Result<StoredClient>>;
+
+/// Reads, for each row of `sql` over the page's range of client ids, its
+/// client id, the last column, and passes `read` the row for that client's
+/// entry. A row that can't be decoded fails its client's entry only.
+fn gather<T>(
+    conn: &Connection,
+    sql: &str,
+    (after, last): (&Option<String>, &str),
+    clients: &mut Gathered,
+    read: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    mut put: impl FnMut(&mut StoredClient, T),
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(sql).map_err(StorageError::database)?;
+    let mut rows = stmt
+        .query(params![after, last])
+        .map_err(StorageError::database)?;
+    while let Some(row) = rows.next().map_err(StorageError::database)? {
+        let client_id: String = row
+            .get(row.as_ref().column_count() - 1)
+            .map_err(StorageError::database)?;
+        // Rows of a client without a session are left out
+        let Some(Ok(client)) = clients.get_mut(&client_id) else {
+            continue;
+        };
+        match read(row).map_err(StorageError::database) {
+            Ok(value) => put(client, value),
+            Err(e @ StorageError::SerializationError(_)) => {
+                clients.insert(client_id, Err(e));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn load_clients(
+    conn: &Connection,
+    after: Option<String>,
+    limit: usize,
+) -> Result<Vec<LoadedClient>> {
+    let mut clients = Gathered::new();
+    {
+        let mut stmt = conn
+            .prepare_cached(&format!(
+                "SELECT {SESSION_COLUMNS}, client_id FROM sessions
+                 WHERE ?1 IS NULL OR client_id > ?1 ORDER BY client_id LIMIT ?2"
+            ))
+            .map_err(StorageError::database)?;
+        let mut rows = stmt
+            .query(params![after, limit as i64])
+            .map_err(StorageError::database)?;
+        while let Some(row) = rows.next().map_err(StorageError::database)? {
+            let client_id: String = row.get(5).map_err(StorageError::database)?;
+            let stored = match session_from_row(row, &client_id).map_err(StorageError::database) {
+                Ok(session) => Ok(StoredClient {
+                    session,
+                    will: None,
+                    queue: Vec::new(),
+                    inflight: Vec::new(),
+                    incoming_qos2: Vec::new(),
+                }),
+                Err(e @ StorageError::SerializationError(_)) => Err(e),
+                Err(e) => return Err(e),
+            };
+            clients.insert(client_id, stored);
+        }
+    }
+    let Some(last) = clients.keys().next_back().cloned() else {
+        return Ok(Vec::new());
+    };
+    let range = (&after, last.as_str());
+    let within = "WHERE (?1 IS NULL OR client_id > ?1) AND client_id <= ?2 ORDER BY client_id";
+    gather(
+        conn,
+        &format!("SELECT {SUBSCRIPTION_COLUMNS}, client_id FROM subscriptions {within}"),
+        range,
+        &mut clients,
+        subscription_from_row,
+        |client, subscription| client.session.subscriptions.push(subscription),
+    )?;
+    gather(
+        conn,
+        &format!("SELECT {WILL_COLUMNS}, client_id FROM will_messages {within}"),
+        range,
+        &mut clients,
+        will_from_row,
+        |client, will| client.will = Some(will),
+    )?;
+    gather(
+        conn,
+        &format!("SELECT {QUEUED_COLUMNS}, client_id FROM queued_messages {within}, sequence"),
+        range,
+        &mut clients,
+        queued_from_row,
+        |client, queued| client.queue.push(queued),
+    )?;
+    gather(
+        conn,
+        &format!("SELECT {INFLIGHT_COLUMNS}, client_id FROM inflight_messages {within}"),
+        range,
+        &mut clients,
+        inflight_from_row,
+        |client, message| client.inflight.push(message),
+    )?;
+    gather(
+        conn,
+        &format!("SELECT packet_id, client_id FROM incoming_qos2 {within}"),
+        range,
+        &mut clients,
+        |row| row.get::<_, u16>(0),
+        |client, packet_id| client.incoming_qos2.push(packet_id),
+    )?;
+    Ok(clients
+        .into_iter()
+        .map(|(client_id, stored)| LoadedClient { client_id, stored })
+        .collect())
 }
 
 #[async_trait]
@@ -1438,6 +1585,14 @@ mod tests {
         assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
         assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
         assert!(store.load_will("good").await.unwrap().is_some());
+        let loaded = store.load_clients(None, 10).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(
+            loaded[0].stored,
+            Err(StorageError::SerializationError(_))
+        ));
+        assert_eq!(loaded[0].client_id, "bad");
+        assert!(loaded[1].stored.is_ok());
 
         // Deleting the session removes the rows that can't be read too
         store.delete_session("bad").await.unwrap();

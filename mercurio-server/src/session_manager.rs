@@ -21,8 +21,8 @@ use mercurio_core::{
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
-    BatchStore, InflightMessage, RetainedMessageStore, SessionOwner, SessionState, StorageError,
-    StoredSubscription, StoredWillMessage, Write,
+    BatchStore, InflightMessage, LoadedClient, RetainedMessageStore, SessionOwner, SessionState,
+    StoredClient, StoredSubscription, StoredWillMessage, Write,
 };
 use tracing::{error, warn};
 
@@ -441,15 +441,8 @@ type StoredSession = (
     Vec<u16>,
 );
 
-/// A session a previous run stored, as restore reads it: its state, will,
-/// queue, in-flight messages and incoming QoS 2 packet ids.
-type RestoredSession = (
-    SessionState,
-    Option<StoredWillMessage>,
-    Vec<(u64, Message)>,
-    Vec<InflightMessage>,
-    Vec<u16>,
-);
+/// How many stored sessions restore reads at a time.
+const RESTORE_PAGE: usize = 1000;
 
 /// Result of starting a session, includes subscriptions, will, and inflight to restore if resuming.
 pub(crate) struct SessionStartResult {
@@ -1171,74 +1164,81 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         &self,
         broker: &Broker<B>,
     ) -> mercurio_storage::Result<Vec<(String, WillMessage, Duration)>> {
-        let client_ids = self.storage.list_sessions().await?;
         let now = unix_millis();
         let mut wills = Vec::new();
-
-        for client_id in client_ids {
-            let stored = match self.read_stored(&client_id).await {
-                Ok(Some(stored)) => stored,
-                Ok(None) => continue,
-                Err(StorageError::SerializationError(e)) => {
-                    self.set_aside(&client_id, &e).await;
-                    continue;
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .storage
+                .load_clients(after.as_deref(), RESTORE_PAGE)
+                .await?;
+            let last_page = page.len() < RESTORE_PAGE;
+            after = page.last().map(|loaded| loaded.client_id.clone());
+            for LoadedClient { client_id, stored } in page {
+                match stored {
+                    Ok(stored) => {
+                        wills.extend(self.restore_client(client_id, stored, now, broker).await)
+                    }
+                    Err(e) => self.set_aside(&client_id, &e.to_string()).await,
                 }
-                Err(e) => return Err(e),
-            };
-            let (state, will, queue, inflight, incoming_qos2) = stored;
-            // Sessions connected when the broker stopped count as
-            // disconnected from now on
-            let deadline = state
-                .expires_at
-                .or_else(|| state.expiry_interval.map(|i| now + u64::from(i) * 1000));
-            let until_expiry = deadline.map(|d| Duration::from_millis(d.saturating_sub(now)));
-
-            // Live sessions go back in memory, subscribed, so messages keep
-            // being queued for their clients until they reconnect
-            if deadline.is_none_or(|d| d > now) {
-                self.restore_session(&client_id, state, (queue, inflight, incoming_qos2), broker)
-                    .await;
             }
-
-            // The clients were disconnected by the shutdown, so their wills
-            // are due after their delay, or when the session ends if sooner
-            if let Some(stored) = will {
-                let will = WillMessage::from(stored.clone());
-                let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
-                self.shared
-                    .state
-                    .lock()
-                    .await
-                    .restored_wills
-                    .insert(client_id.clone(), stored);
-                wills.push((client_id.clone(), will, due));
-            }
-
-            if let Some(delay) = until_expiry {
-                // Generation 0 predates every connection of this run
-                self.schedule_end(client_id, 0, delay).await;
+            if last_page {
+                return Ok(wills);
             }
         }
-
-        Ok(wills)
     }
 
-    /// Everything stored for `client_id`, read before any of it is
-    /// restored, so a session that can't be read whole is set aside whole.
-    async fn read_stored(
+    /// Restores a session a previous run stored, if it hasn't expired, and
+    /// schedules its end. Returns its will, with when it is due.
+    async fn restore_client<B: RetainedMessageStore>(
         &self,
-        client_id: &str,
-    ) -> mercurio_storage::Result<Option<RestoredSession>> {
-        let Some(state) = self.storage.load_session(client_id).await? else {
-            return Ok(None);
-        };
-        Ok(Some((
-            state,
-            self.storage.load_will(client_id).await?,
-            self.storage.load_queue(client_id).await?,
-            self.storage.load_inflight(client_id).await?,
-            self.storage.load_incoming_qos2(client_id).await?,
-        )))
+        client_id: String,
+        stored: StoredClient,
+        now: u64,
+        broker: &Broker<B>,
+    ) -> Option<(String, WillMessage, Duration)> {
+        let StoredClient {
+            session: state,
+            will,
+            queue,
+            inflight,
+            incoming_qos2,
+        } = stored;
+        // Sessions connected when the broker stopped count as disconnected
+        // from now on
+        let deadline = state
+            .expires_at
+            .or_else(|| state.expiry_interval.map(|i| now + u64::from(i) * 1000));
+        let until_expiry = deadline.map(|d| Duration::from_millis(d.saturating_sub(now)));
+
+        // Live sessions go back in memory, subscribed, so messages keep
+        // being queued for their clients until they reconnect
+        if deadline.is_none_or(|d| d > now) {
+            self.restore_session(&client_id, state, (queue, inflight, incoming_qos2), broker)
+                .await;
+        }
+
+        // The clients were disconnected by the shutdown, so their wills are
+        // due after their delay, or when the session ends if sooner
+        let due_will = will.map(|stored| {
+            let will = WillMessage::from(stored.clone());
+            let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
+            (stored, will, due)
+        });
+        if let Some((stored, ..)) = &due_will {
+            self.shared
+                .state
+                .lock()
+                .await
+                .restored_wills
+                .insert(client_id.clone(), stored.clone());
+        }
+
+        if let Some(delay) = until_expiry {
+            // Generation 0 predates every connection of this run
+            self.schedule_end(client_id.clone(), 0, delay).await;
+        }
+        due_will.map(|(_, will, due)| (client_id, will, due))
     }
 
     /// Leaves the stored session of `client_id` as it is, unrestored, and

@@ -405,6 +405,73 @@ pub trait BatchStore: Send + Sync {
     async fn delete_session(&self, client_id: &str) -> Result<()> {
         self.apply(client_id, &[Write::DeleteSession]).await
     }
+
+    /// The client's stored session with everything stored with it.
+    async fn load_client(&self, client_id: &str) -> Result<Option<StoredClient>> {
+        let Some(session) = self.load_session(client_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(StoredClient {
+            session,
+            will: self.load_will(client_id).await?,
+            queue: self.load_queue(client_id).await?,
+            inflight: self.load_inflight(client_id).await?,
+            incoming_qos2: self.load_incoming_qos2(client_id).await?,
+        }))
+    }
+
+    /// At most `limit` stored sessions, each with everything stored with
+    /// it, ordered by client id in an order of the store's choosing, from
+    /// the first after the client id `after` on. Fewer than `limit` means
+    /// there are no more. The broker restores its sessions with this as it
+    /// starts, a page at a time.
+    ///
+    /// A client whose rows can't be decoded has its entry fail with
+    /// `StorageError::SerializationError`; others fail the whole call.
+    ///
+    /// The default reads each client on its own; stores should read each
+    /// kind of row for the whole page at once.
+    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+        let mut client_ids = self.list_sessions().await?;
+        client_ids.retain(|id| after.is_none_or(|after| id.as_str() > after));
+        client_ids.sort_unstable();
+        client_ids.truncate(limit);
+        let mut clients = Vec::with_capacity(client_ids.len());
+        for client_id in client_ids {
+            let stored = match self.load_client(&client_id).await {
+                Ok(Some(stored)) => Ok(stored),
+                // Deleted since it was listed
+                Ok(None) => continue,
+                Err(e @ StorageError::SerializationError(_)) => Err(e),
+                Err(e) => return Err(e),
+            };
+            clients.push(LoadedClient { client_id, stored });
+        }
+        Ok(clients)
+    }
+}
+
+/// A client's stored session with everything stored with it.
+#[derive(Debug, Clone)]
+pub struct StoredClient {
+    pub session: SessionState,
+    pub will: Option<StoredWillMessage>,
+    /// Its queued messages, each with its position in the queue, in that
+    /// order
+    pub queue: Vec<(u64, Message)>,
+    /// In no particular order
+    pub inflight: Vec<InflightMessage>,
+    /// The packet ids of its QoS 2 messages awaiting PUBREL
+    pub incoming_qos2: Vec<u16>,
+}
+
+/// A client as `BatchStore::load_clients` returns it.
+#[derive(Debug)]
+pub struct LoadedClient {
+    pub client_id: String,
+    /// What is stored for it, or `StorageError::SerializationError` when
+    /// some of it can't be decoded
+    pub stored: Result<StoredClient>,
 }
 
 /// Combined trait for full MQTT storage functionality.

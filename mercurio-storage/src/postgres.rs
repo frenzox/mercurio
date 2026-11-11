@@ -36,9 +36,9 @@ use tracing::{info, warn};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionOwner,
-    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, TopicRange,
-    Write,
+    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore,
+    SessionOwner, SessionState, StorageError, StoredBan, StoredClient, StoredSubscription,
+    StoredWillMessage, TopicRange, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -1119,61 +1119,30 @@ impl BatchStore for PostgresStore {
         // One row per subscription, or one without any
         let rows = self
             .query(
-                "SELECT s.expiry_interval, s.expires_at, s.owner_username, s.owner_mount_point,
-                        length(s.subscriptions) > 0 AS unmoved,
-                        f.topic_filter, f.qos, f.no_local, f.retain_as_published,
-                        f.subscription_identifier
-                 FROM sessions s
-                 LEFT JOIN subscriptions f ON f.client_id = s.client_id
-                 WHERE s.client_id = $1
-                 ORDER BY f.topic_filter",
+                &format!(
+                    "SELECT {SESSION_COLUMNS}, f.topic_filter, f.qos, f.no_local,
+                            f.retain_as_published, f.subscription_identifier
+                     FROM sessions s
+                     LEFT JOIN subscriptions f ON f.client_id = s.client_id
+                     WHERE s.client_id = $1"
+                ),
                 &[&client_id],
             )
             .await?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        // Subscriptions an older version kept in the session's row that the
-        // move to their table couldn't read
-        if row.try_get("unmoved").col()? {
-            return Err(StorageError::SerializationError(
-                "subscriptions left in the session's row can't be read".into(),
-            ));
-        }
-        let mut subscriptions = Vec::with_capacity(rows.len());
+        let mut session = session_from_row(row, client_id)?;
         for row in &rows {
-            let Some(topic_filter) = row.try_get::<_, Option<String>>("topic_filter").col()? else {
-                continue;
-            };
-            subscriptions.push(StoredSubscription {
-                topic_filter,
-                qos: int_to_qos(row.try_get("qos").col()?)?,
-                no_local: row.try_get("no_local").col()?,
-                retain_as_published: row.try_get("retain_as_published").col()?,
-                subscription_identifier: row
-                    .try_get::<_, Option<i64>>("subscription_identifier")
-                    .col()?
-                    .map(|id| narrow(id, "subscription identifier"))
-                    .transpose()?,
-            });
+            if row
+                .try_get::<_, Option<&str>>("topic_filter")
+                .col()?
+                .is_some()
+            {
+                session.subscriptions.push(subscription_from_row(row)?);
+            }
         }
-        Ok(Some(SessionState {
-            client_id: client_id.to_string(),
-            subscriptions,
-            expiry_interval: row
-                .try_get::<_, Option<i64>>("expiry_interval")
-                .col()?
-                .map(|i| narrow(i, "session expiry interval"))
-                .transpose()?,
-            expires_at: row
-                .try_get::<_, Option<i64>>("expires_at")
-                .col()?
-                .map(|t| t as u64),
-            owner: SessionOwner {
-                username: row.try_get("owner_username").col()?,
-                mount_point: row.try_get("owner_mount_point").col()?,
-            },
-        }))
+        Ok(Some(session))
     }
 
     async fn list_sessions(&self) -> Result<Vec<String>> {
@@ -1185,24 +1154,14 @@ impl BatchStore for PostgresStore {
     }
 
     async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        let rows = self
-            .query(
-                "SELECT topic, payload, qos, retain, delay_secs, properties
-                 FROM will_messages WHERE client_id = $1",
-                &[&client_id],
-            )
-            .await?;
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        Ok(Some(StoredWillMessage {
-            topic: row.try_get("topic").col()?,
-            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").col()?),
-            qos: int_to_qos(row.try_get("qos").col()?)?,
-            retain: row.try_get("retain").col()?,
-            delay_secs: narrow(row.try_get::<_, i64>("delay_secs").col()?, "will delay")?,
-            properties: decode_properties(row.try_get("properties").col()?)?,
-        }))
+        self.query(
+            "SELECT * FROM will_messages WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await?
+        .first()
+        .map(will_from_row)
+        .transpose()
     }
 
     async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
@@ -1223,7 +1182,7 @@ impl BatchStore for PostgresStore {
         )
         .await?
         .iter()
-        .map(|row| narrow(row.try_get::<_, i32>(0).col()?, "packet id"))
+        .map(incoming_from_row)
         .collect()
     }
 
@@ -1234,32 +1193,195 @@ impl BatchStore for PostgresStore {
         )
         .await?
         .iter()
-        .map(|row| {
-            let topic: String = row.try_get("topic").col()?;
-            let message = Message {
-                packet_id: None,
-                topic: Arc::from(topic.as_str()),
-                dup: false,
-                qos: int_to_qos(row.try_get("qos").col()?)?,
-                retain: row.try_get("retain").col()?,
-                payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")
-                    .col()?
-                    .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").col()?)?,
-                expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")
-                    .col()?
-                    .map(|t| t as u64),
-                subscription_identifiers: decode_identifiers(
-                    row.try_get("subscription_identifiers").col()?,
-                )?,
-                origin: None,
-            };
-            Ok((row.try_get::<_, i64>("sequence").col()? as u64, message))
-        })
+        .map(queued_from_row)
         .collect()
     }
+
+    /// One query per table for the whole page, those after the sessions
+    /// pipelined: its sessions, then the rows of every other table in the
+    /// range of client ids the page covers.
+    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+        let after_clause = match after {
+            Some(_) => "client_id > $1",
+            None => "$1::TEXT IS NULL",
+        };
+        let sessions = self
+            .query(
+                &format!(
+                    "SELECT s.client_id, {SESSION_COLUMNS} FROM sessions s
+                     WHERE {after_clause} ORDER BY s.client_id LIMIT $2"
+                ),
+                &[&after, &(limit as i64)],
+            )
+            .await?;
+        let mut clients: BTreeMap<String, Result<StoredClient>> = BTreeMap::new();
+        let mut order = Vec::with_capacity(sessions.len());
+        for row in &sessions {
+            let client_id: String = row.try_get("client_id").col()?;
+            let stored = session_from_row(row, &client_id).map(|session| StoredClient {
+                session,
+                will: None,
+                queue: Vec::new(),
+                inflight: Vec::new(),
+                incoming_qos2: Vec::new(),
+            });
+            order.push(client_id.clone());
+            clients.insert(client_id, stored);
+        }
+        let Some(last) = order.last().cloned() else {
+            return Ok(Vec::new());
+        };
+
+        let within = format!("WHERE {after_clause} AND client_id <= $2 ORDER BY client_id");
+        let sql = [
+            format!("SELECT * FROM subscriptions {within}"),
+            format!("SELECT * FROM will_messages {within}"),
+            format!("SELECT * FROM queued_messages {within}, sequence"),
+            format!("SELECT * FROM inflight_messages {within}"),
+            format!("SELECT client_id, packet_id FROM incoming_qos2 {within}"),
+        ];
+        let client = self.client().await?;
+        let mut statements = Vec::with_capacity(sql.len());
+        for sql in &sql {
+            statements.push(client.prepare_cached(sql).await.db()?);
+        }
+        let params: [&(dyn ToSql + Sync); 2] = [&after, &last];
+        let results = join_all(statements.iter().map(|s| client.query(s, &params))).await;
+        let mut results = results.into_iter();
+        let mut next = || results.next().expect("one result per statement").db();
+
+        type Put = fn(&mut StoredClient, &Row) -> Result<()>;
+        let puts: [Put; 5] = [
+            |client, row| {
+                client
+                    .session
+                    .subscriptions
+                    .push(subscription_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.will = Some(will_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.queue.push(queued_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.inflight.push(inflight_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.incoming_qos2.push(incoming_from_row(row)?);
+                Ok(())
+            },
+        ];
+        for put in puts {
+            for row in next()? {
+                let client_id: String = row.try_get("client_id").col()?;
+                // Rows of a client without a session are left out
+                let Some(Ok(stored)) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if let Err(e) = put(stored, &row) {
+                    clients.insert(client_id, Err(e));
+                }
+            }
+        }
+        Ok(order
+            .into_iter()
+            .map(|client_id| LoadedClient {
+                stored: clients.remove(&client_id).expect("each client is gathered"),
+                client_id,
+            })
+            .collect())
+    }
+}
+
+/// The columns of a session `session_from_row` reads.
+const SESSION_COLUMNS: &str = "s.expiry_interval, s.expires_at, s.owner_username,
+    s.owner_mount_point, length(s.subscriptions) > 0 AS unmoved";
+
+/// A session, without its subscriptions, which have a table of their own.
+fn session_from_row(row: &Row, client_id: &str) -> Result<SessionState> {
+    // Subscriptions an older version kept in the session's row that the
+    // move to their table couldn't read
+    if row.try_get("unmoved").col()? {
+        return Err(StorageError::SerializationError(
+            "subscriptions left in the session's row can't be read".into(),
+        ));
+    }
+    Ok(SessionState {
+        client_id: client_id.to_string(),
+        subscriptions: Vec::new(),
+        expiry_interval: row
+            .try_get::<_, Option<i64>>("expiry_interval")
+            .col()?
+            .map(|i| narrow(i, "session expiry interval"))
+            .transpose()?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        owner: SessionOwner {
+            username: row.try_get("owner_username").col()?,
+            mount_point: row.try_get("owner_mount_point").col()?,
+        },
+    })
+}
+
+fn subscription_from_row(row: &Row) -> Result<StoredSubscription> {
+    Ok(StoredSubscription {
+        topic_filter: row.try_get("topic_filter").col()?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        no_local: row.try_get("no_local").col()?,
+        retain_as_published: row.try_get("retain_as_published").col()?,
+        subscription_identifier: row
+            .try_get::<_, Option<i64>>("subscription_identifier")
+            .col()?
+            .map(|id| narrow(id, "subscription identifier"))
+            .transpose()?,
+    })
+}
+
+fn will_from_row(row: &Row) -> Result<StoredWillMessage> {
+    Ok(StoredWillMessage {
+        topic: row.try_get("topic").col()?,
+        payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").col()?),
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: row.try_get("retain").col()?,
+        delay_secs: narrow(row.try_get::<_, i64>("delay_secs").col()?, "will delay")?,
+        properties: decode_properties(row.try_get("properties").col()?)?,
+    })
+}
+
+fn queued_from_row(row: &Row) -> Result<(u64, Message)> {
+    let topic: String = row.try_get("topic").col()?;
+    let message = Message {
+        packet_id: None,
+        topic: Arc::from(topic.as_str()),
+        dup: false,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: row.try_get("retain").col()?,
+        payload: row
+            .try_get::<_, Option<Vec<u8>>>("payload")
+            .col()?
+            .map(Bytes::from),
+        properties: decode_properties(row.try_get("properties").col()?)?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        subscription_identifiers: decode_identifiers(
+            row.try_get("subscription_identifiers").col()?,
+        )?,
+        origin: None,
+    };
+    Ok((row.try_get::<_, i64>("sequence").col()? as u64, message))
+}
+
+fn incoming_from_row(row: &Row) -> Result<u16> {
+    narrow(row.try_get::<_, i32>("packet_id").col()?, "packet id")
 }
 
 impl PostgresStore {
@@ -1892,6 +2014,21 @@ mod tests {
         assert!(store.load_session("good").await.unwrap().is_some());
         assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
         assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
+        let loaded = store.load_clients(None, 10).await.unwrap();
+        let stored = |client_id: &str| {
+            &loaded
+                .iter()
+                .find(|c| c.client_id == client_id)
+                .unwrap()
+                .stored
+        };
+        assert!(undecodable(stored("bad").as_ref().map(|_| ()).map_err(
+            |e| {
+                assert!(matches!(e, StorageError::SerializationError(_)), "{e}");
+                StorageError::SerializationError(e.to_string())
+            }
+        )));
+        assert!(stored("good").is_ok());
 
         store.delete_session("bad").await.unwrap();
         assert!(store.load_session("bad").await.unwrap().is_none());
