@@ -5,10 +5,44 @@ use std::sync::Arc;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::ClientConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::timeout;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tracing::info;
 
 use crate::error::ClientError;
-use crate::options::TlsOptions;
+use crate::options::{ConnectOptions, TlsOptions};
+
+/// Runs the TLS handshake with the broker over `stream`, within the
+/// connect timeout.
+pub(crate) async fn handshake<S>(
+    options: &ConnectOptions,
+    stream: S,
+) -> Result<TlsStream<S>, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    info!("Establishing TLS connection");
+    let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
+    timeout(
+        options.connect_timeout,
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| ClientError::Timeout)?
+    .map_err(handshake_error)
+}
+
+/// A TLS handshake that failed over the certificate or the TLS settings,
+/// which rustls reports as invalid data, or over the connection itself.
+fn handshake_error(error: std::io::Error) -> ClientError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        ClientError::tls("TLS handshake failed", Some(error.into()))
+    } else {
+        ClientError::ConnectionFailed(error)
+    }
+}
 
 /// Build a TLS connector from the given options.
 pub fn build_tls_connector(

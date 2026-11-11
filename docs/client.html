@@ -44,6 +44,7 @@
 <pre>[dependencies]
 mercurio-client = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }</pre>
+<p>Features: <code>tls</code>, on by default, adds TLS through rustls and its aws-lc-rs provider; plain TCP and Unix socket users can turn it off with <code>default-features = false</code> to skip building rustls and aws-lc, and then connecting with any TLS setting fails with <code>ClientError::Tls</code>. <code>clap</code>, off by default, adds the command-line arguments described below.</p>
 
 <h2>Connecting, publishing, subscribing</h2>
 <pre>use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};

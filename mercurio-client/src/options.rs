@@ -417,6 +417,13 @@ impl ConnectOptions {
                 None,
             ));
         }
+        #[cfg(not(feature = "tls"))]
+        if self.tls.enabled {
+            return Err(ClientError::tls(
+                "TLS needs the client built with its `tls` feature",
+                None,
+            ));
+        }
         if let Some(client_id) = &self.client_id {
             check_length("client id", client_id)?;
         }
@@ -764,6 +771,25 @@ mod tests {
         // The last call wins
         assert!(!options().ca_path("ca.pem").tls(false).tls.enabled);
         assert!(options().tls(false).ca_path("ca.pem").tls.enabled);
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn test_tls_needs_the_tls_feature() {
+        let options = || ConnectOptions::new("broker", 8883);
+        for options in [
+            options().tls(true),
+            options().ca_path("ca.pem"),
+            options().client_cert("c.pem", "k.pem"),
+            options().danger_skip_tls_verify(true),
+        ] {
+            let Err(error @ ClientError::Tls { .. }) = options.check() else {
+                panic!("TLS accepted without the tls feature");
+            };
+            assert!(error.to_string().contains("`tls` feature"), "{error}");
+            assert!(!error.is_transient());
+        }
+        assert!(options().check().is_ok());
     }
 
     #[cfg(unix)]

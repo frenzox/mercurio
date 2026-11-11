@@ -36,13 +36,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
-use crate::connection::Connection;
+use crate::connection::{Connection, Stream};
 use crate::error::{transient_refusal, ClientError, Result};
 use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
 use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
 };
-use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
 enum Command {
@@ -104,11 +103,15 @@ impl MqttClient {
 
     /// Opens the transport and performs the CONNECT handshake.
     async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
+        let mut connection = Connection::new(Self::open_stream(options).await?, options);
+        let session = Self::perform_connect(&mut connection, options).await?;
+        Ok((connection, session))
+    }
+
+    /// Opens the byte stream to the broker, TLS handshake included.
+    async fn open_stream(options: &ConnectOptions) -> Result<Box<dyn Stream>> {
         if let Some(connector) = &options.connector {
-            let stream = (connector.0)().map_err(ClientError::ConnectionFailed)?;
-            let mut connection = Connection::new(stream, options);
-            let session = Self::perform_connect(&mut connection, options).await?;
-            return Ok((connection, session));
+            return (connector.0)().map_err(ClientError::ConnectionFailed);
         }
 
         let connect_timeout = options.connect_timeout;
@@ -119,9 +122,7 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(ClientError::ConnectionFailed)?;
-            let mut connection = Connection::new(stream, options);
-            let session = Self::perform_connect(&mut connection, options).await?;
-            return Ok((connection, session));
+            return Ok(Box::new(stream));
         }
 
         let addr = format!("{}:{}", options.host, options.port);
@@ -132,20 +133,11 @@ impl MqttClient {
             .map_err(|_| ClientError::Timeout)?
             .map_err(ClientError::ConnectionFailed)?;
 
-        let mut connection = if options.tls.enabled {
-            info!("Establishing TLS connection");
-            let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
-            let tls_stream = timeout(connect_timeout, connector.connect(server_name, stream))
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(handshake_error)?;
-            Connection::new(tls_stream, options)
-        } else {
-            Connection::new(stream, options)
-        };
-
-        let session = Self::perform_connect(&mut connection, options).await?;
-        Ok((connection, session))
+        #[cfg(feature = "tls")]
+        if options.tls.enabled {
+            return Ok(Box::new(crate::tls::handshake(options, stream).await?));
+        }
+        Ok(Box::new(stream))
     }
 
     /// Perform the MQTT CONNECT handshake.
@@ -691,16 +683,6 @@ fn refused_for_good(error: &ClientError) -> bool {
         ClientError::Redirected { .. } => true,
         ClientError::ConnectionRefused(reason) => !transient_refusal(*reason),
         _ => false,
-    }
-}
-
-/// A TLS handshake that failed over the certificate or the TLS settings,
-/// which rustls reports as invalid data, or over the connection itself.
-fn handshake_error(error: std::io::Error) -> ClientError {
-    if error.kind() == std::io::ErrorKind::InvalidData {
-        ClientError::tls("TLS handshake failed", Some(error.into()))
-    } else {
-        ClientError::ConnectionFailed(error)
     }
 }
 

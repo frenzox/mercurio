@@ -32,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   aliases, and enhanced authentication.
 - TLS with the system's roots or your own CA, and client certificates.
 - Unix sockets, with `ConnectOptions::unix`.
+- TLS sits behind the default `tls` feature; turn it off for plain TCP
+  and Unix sockets without rustls and aws-lc.
 - An optional `clap` feature with the connection options of recado and
   mercurioctl, `cli::ConnectArgs`, for your own command-line tools.
 - Follows the limits the broker announces, such as Receive Maximum and
