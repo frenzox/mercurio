@@ -17,6 +17,41 @@ use tracing::warn;
 
 use crate::{broker::Broker, session_manager::SessionManager};
 
+/// Storage batches the writers attempted again after a failure, for every
+/// broker of the process: the writers' retry loop has no broker to count in.
+pub(crate) static BATCHES_RETRIED: AtomicU64 = AtomicU64::new(0);
+
+/// Storage batches the writers gave up on, their changes lost.
+pub(crate) static BATCHES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Why the broker lost a message it had accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropCause {
+    /// A QoS 0 message found the session's queue at its QoS 0 limit
+    QueueFullQos0,
+    /// A QoS 1 or 2 message found the session's queue full
+    QueueFull,
+    /// Its Message Expiry Interval passed while it waited in a queue
+    Expired,
+    /// Larger than the client's Maximum Packet Size
+    TooLarge,
+    /// The subscriber may not read its topic
+    NotAuthorized,
+    /// No member of a shared subscription's group could take it
+    NoShareMember,
+}
+
+/// The `$SYS/broker/` names of the messages dropped by cause, in
+/// `DropCause` order.
+const DROPPED_BY_CAUSE: [&str; 6] = [
+    "publish/messages/dropped/queue_full_qos0",
+    "publish/messages/dropped/queue_full",
+    "publish/messages/dropped/expired",
+    "publish/messages/dropped/too_large",
+    "publish/messages/dropped/not_authorized",
+    "publish/messages/dropped/no_share_member",
+];
+
 /// Counters the connection handlers update.
 #[derive(Default)]
 pub(crate) struct Stats {
@@ -28,6 +63,8 @@ pub(crate) struct Stats {
     pub messages_sent: AtomicU64,
     pub bytes_received: AtomicU64,
     pub bytes_sent: AtomicU64,
+    /// By `DropCause`, in its order
+    dropped: [AtomicU64; DROPPED_BY_CAUSE.len()],
 }
 
 impl Stats {
@@ -38,6 +75,15 @@ impl Stats {
     pub(crate) fn add_n(counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Counts `n` messages lost for `cause`, and against `client` when one
+    /// client lost them.
+    pub(crate) fn dropped(&self, cause: DropCause, n: u64, client: Option<&ClientCounters>) {
+        Self::add_n(&self.dropped[cause as usize], n);
+        if let Some(client) = client {
+            Self::add_n(&client.dropped, n);
+        }
+    }
 }
 
 /// Traffic of one connection since it connected, for the admin API.
@@ -47,6 +93,9 @@ pub(crate) struct ClientCounters {
     pub messages_out: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// Messages for the client the broker lost, those lost while it was
+    /// away after this connection included
+    pub dropped: AtomicU64,
 }
 
 /// Rates per minute averaged over 1, 5 and 15 minutes, as mosquitto's
@@ -122,7 +171,8 @@ pub(crate) fn counters(
     let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     let connected = get(&stats.connected);
     let sessions = sessions as u64;
-    vec![
+    let dropped: Vec<u64> = stats.dropped.iter().map(get).collect();
+    let mut counters = vec![
         ("clients/connected", connected),
         ("clients/total", sessions),
         ("clients/disconnected", sessions.saturating_sub(connected)),
@@ -134,7 +184,12 @@ pub(crate) fn counters(
         ("bytes/sent", get(&stats.bytes_sent)),
         ("retained messages/count", retained as u64),
         ("subscriptions/count", subscriptions as u64),
-    ]
+        ("publish/messages/dropped", dropped.iter().sum()),
+    ];
+    counters.extend(DROPPED_BY_CAUSE.into_iter().zip(dropped));
+    counters.push(("store/batches/retried", get(&BATCHES_RETRIED)));
+    counters.push(("store/batches/dropped", get(&BATCHES_DROPPED)));
+    counters
 }
 
 /// Publishes the statistics every `interval` until the process ends.

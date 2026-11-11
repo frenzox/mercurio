@@ -679,6 +679,75 @@ async fn client_details_show_the_will_and_the_messages_sent() {
 }
 
 #[tokio::test]
+async fn messages_lost_to_a_full_queue_are_counted_for_the_client() {
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    config.limits.queue.max_messages = 2;
+    let (addr, server_admin) = start(config).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect_with(addr, persistent("device")).await;
+    device.subscribe("jobs").await;
+    drop(device);
+    wait_for(&mut admin, "device", |d| d["connected"] == false).await;
+
+    let mut publisher = Client::connect(addr, "publisher").await;
+    for _ in 0..5 {
+        publisher.publish("jobs", b"job", false).await;
+    }
+
+    let details = wait_for(&mut admin, "device", |d| d["dropped"] == 3).await;
+    assert_eq!(details["queued"], 2);
+    let all = admin.run(json!({"command": "listClients"})).await;
+    let entry = &all["data"]["clients"][1];
+    assert_eq!(entry["clientid"], "device");
+    assert_eq!(entry["dropped"], 3);
+    let stats = server_admin.info().await.stats;
+    assert_eq!(stats["publish/messages/dropped"], 3);
+    assert_eq!(stats["publish/messages/dropped/queue_full"], 3);
+    assert_eq!(stats["publish/messages/dropped/queue_full_qos0"], 0);
+}
+
+/// Allows everything but reading `a/secret`.
+struct HideSecret;
+
+impl Plugin for HideSecret {
+    fn name(&self) -> &str {
+        "hide-secret"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        topic: &'a str,
+        access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        ready(match (topic, access) {
+            ("a/secret", Access::Read) => Decision::Deny,
+            _ => Decision::Allow,
+        })
+    }
+}
+
+#[tokio::test]
+async fn messages_the_subscriber_may_not_read_are_counted() {
+    let (addr, server_admin) = start(config(vec![Arc::new(HideSecret)])).await;
+    let mut admin = admin_client(addr).await;
+    let mut device = Client::connect(addr, "device").await;
+    device.subscribe("a/#").await;
+    let mut publisher = Client::connect(addr, "publisher").await;
+    publisher.publish("a/secret", b"hidden", false).await;
+    publisher.publish("a/public", b"shown", false).await;
+    let Some(ControlPacket::Publish(shown)) = device.receive().await else {
+        panic!("Expected the readable message");
+    };
+    assert_eq!(shown.topic_name, "a/public");
+
+    let details = wait_for(&mut admin, "device", |d| d["dropped"] == 1).await;
+    assert_eq!(details["messagesOut"], 1);
+    let stats = server_admin.info().await.stats;
+    assert_eq!(stats["publish/messages/dropped/not_authorized"], 1);
+}
+
+#[tokio::test]
 async fn disconnect_client_sends_administrative_action_and_the_will() {
     let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
     let mut admin = admin_client(addr).await;

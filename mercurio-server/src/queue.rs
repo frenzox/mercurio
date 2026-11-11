@@ -15,7 +15,10 @@ use mercurio_core::{
 };
 use mercurio_storage::Write;
 
-use crate::writer::Writer;
+use crate::{
+    sys::{ClientCounters, DropCause, Stats},
+    writer::Writer,
+};
 
 /// How many messages one session may have waiting to be sent.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +62,10 @@ pub(crate) struct MessageQueue {
     limits: QueueLimits,
     /// Whether a client is connected to take the messages
     connected: AtomicBool,
+    /// Where the messages lost are counted: the broker's statistics, and
+    /// those of the session's current or last connection
+    stats: Arc<Stats>,
+    counters: Mutex<Arc<ClientCounters>>,
 }
 
 #[derive(Default)]
@@ -88,7 +95,26 @@ impl MessageQueue {
             notify: Notify::new(),
             limits,
             connected: AtomicBool::new(false),
+            stats: Default::default(),
+            counters: Default::default(),
         }
+    }
+
+    /// Counts the messages lost in `stats`.
+    pub(crate) fn counted_in(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// Counts the messages lost from now on against `counters` too.
+    pub(crate) fn set_counters(&self, counters: Arc<ClientCounters>) {
+        *self.counters.lock().unwrap() = counters;
+    }
+
+    /// Counts `n` messages for the session's client lost for `cause`.
+    pub(crate) fn count_drop(&self, cause: DropCause, n: u64) {
+        let counters = self.counters.lock().unwrap();
+        self.stats.dropped(cause, n, Some(&counters));
     }
 
     pub(crate) fn set_connected(&self, connected: bool) {
@@ -106,6 +132,7 @@ impl MessageQueue {
 
     /// Queues `message` unless the queue is full, in which case the message
     /// is lost. Returns whether it was queued.
+    #[cfg(test)]
     pub(crate) fn push(&self, message: Message) -> bool {
         self.insert(message, true)
     }
@@ -132,12 +159,21 @@ impl MessageQueue {
                     .is_some_and(|max| state.bytes + size > max)
         };
         if full(&state) {
+            let before = state.messages.len();
             state.evict_expired();
+            self.count_drop(DropCause::Expired, (before - state.messages.len()) as u64);
         }
         if full(&state) {
             if !lost_if_full {
                 return false;
             }
+            self.count_drop(
+                match message.qos {
+                    QoS::AtMostOnce => DropCause::QueueFullQos0,
+                    _ => DropCause::QueueFull,
+                },
+                1,
+            );
             if state.dropped == 0 {
                 warn!(
                     "Message queue full, dropping messages, starting with a QoS {} one on `{}`",
@@ -287,8 +323,27 @@ impl Subscriber {
     /// [MQTT-3.3.4-4]. Returns whether the session's queue took it.
     pub(crate) fn deliver(
         subscriptions: &[Subscriber],
+        message: Message,
+        origin: Option<u64>,
+    ) -> bool {
+        Self::queue(subscriptions, message, origin, true)
+    }
+
+    /// As `deliver`, for a shared subscription's member: a full queue
+    /// refuses the message without losing it, as another member may take it.
+    pub(crate) fn offer(
+        subscriptions: &[Subscriber],
+        message: Message,
+        origin: Option<u64>,
+    ) -> bool {
+        Self::queue(subscriptions, message, origin, false)
+    }
+
+    fn queue(
+        subscriptions: &[Subscriber],
         mut message: Message,
         origin: Option<u64>,
+        lost_if_full: bool,
     ) -> bool {
         // [MQTT-3.8.3-3]
         let matching: Vec<&Subscriber> = subscriptions
@@ -314,7 +369,8 @@ impl Subscriber {
             .collect();
         identifiers.sort_unstable();
         identifiers.dedup();
-        first.queue_message(message, granted_qos, identifiers)
+        let message = first.prepare(message, granted_qos, identifiers);
+        first.queue.insert(message, lost_if_full)
     }
 
     /// Queues a retained message sent because of a new subscription.
@@ -324,11 +380,6 @@ impl Subscriber {
         let identifiers = self.subscription_identifier.into_iter().collect();
         let message = self.prepare(message, self.granted_qos, identifiers);
         self.queue.try_push(message)
-    }
-
-    fn queue_message(&self, message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> bool {
-        let message = self.prepare(message, granted_qos, identifiers);
-        self.queue.push(message)
     }
 
     /// The copy of `message` to queue, downgraded to the QoS granted
@@ -394,6 +445,42 @@ mod tests {
         assert_eq!(qos, [QoS::AtMostOnce, QoS::AtMostOnce, QoS::AtLeastOnce]);
         // The QoS 1 message fitting ended the first episode of drops
         assert_eq!(state.dropped, 1);
+    }
+
+    /// The `$SYS` value `name` of `stats`.
+    fn stat(stats: &Stats, name: &str) -> u64 {
+        crate::sys::counters(stats, 0, 0, 0, 0)
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap()
+            .1
+    }
+
+    #[tokio::test]
+    async fn test_messages_lost_are_counted_by_cause_and_for_the_client() {
+        let stats = Arc::new(Stats::default());
+        let queue = MessageQueue::new(QueueLimits {
+            max_qos0: 1,
+            max_messages: 2,
+            ..Default::default()
+        })
+        .counted_in(Arc::clone(&stats));
+        let counters = Arc::new(ClientCounters::default());
+        queue.set_counters(Arc::clone(&counters));
+
+        queue.push(message(QoS::AtMostOnce));
+        queue.push(message(QoS::AtMostOnce));
+        queue.push(expiring(QoS::AtLeastOnce, unix_millis() - 1));
+        queue.push(message(QoS::AtLeastOnce));
+        queue.push(message(QoS::ExactlyOnce));
+        // Refused for the caller to retry, not lost
+        assert!(!queue.try_push(message(QoS::AtLeastOnce)));
+
+        assert_eq!(stat(&stats, "publish/messages/dropped/queue_full_qos0"), 1);
+        assert_eq!(stat(&stats, "publish/messages/dropped/expired"), 1);
+        assert_eq!(stat(&stats, "publish/messages/dropped/queue_full"), 1);
+        assert_eq!(stat(&stats, "publish/messages/dropped"), 3);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

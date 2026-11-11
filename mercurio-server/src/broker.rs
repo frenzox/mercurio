@@ -1,6 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{queue::Subscriber, topic_tree::TopicTree};
+use crate::{
+    queue::Subscriber,
+    sys::{DropCause, Stats},
+    topic_tree::TopicTree,
+};
 use mercurio_core::{message::Message, Result};
 use mercurio_storage::RetainedMessageStore;
 
@@ -13,6 +17,7 @@ pub(crate) struct Broker<S: RetainedMessageStore> {
     subscriptions: TopicTree<Subscriber>,
     /// Storage backend for retained messages
     storage: Arc<S>,
+    stats: Arc<Stats>,
 }
 
 impl<S: RetainedMessageStore> Clone for Broker<S> {
@@ -20,6 +25,7 @@ impl<S: RetainedMessageStore> Clone for Broker<S> {
         Broker {
             subscriptions: self.subscriptions.clone(),
             storage: Arc::clone(&self.storage),
+            stats: Arc::clone(&self.stats),
         }
     }
 }
@@ -29,7 +35,14 @@ impl<S: RetainedMessageStore> Broker<S> {
         Broker {
             subscriptions: TopicTree::new(),
             storage,
+            stats: Default::default(),
         }
+    }
+
+    /// Counts the messages it loses in `stats`.
+    pub(crate) fn counted_in(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Adds or replaces the subscription of `id` to a topic filter.
@@ -123,14 +136,14 @@ impl<S: RetainedMessageStore> Broker<S> {
                 order.clone().find(|&i| {
                     let member = &members[i].1;
                     member.queue.is_connected() == want_connected
-                        && Subscriber::deliver(
-                            std::slice::from_ref(member),
-                            message.clone(),
-                            origin,
-                        )
+                        && Subscriber::offer(std::slice::from_ref(member), message.clone(), origin)
                 })
             };
-            offer(true).or_else(|| offer(false))
+            let chosen = offer(true).or_else(|| offer(false));
+            if chosen.is_none() {
+                self.stats.dropped(DropCause::NoShareMember, 1, None);
+            }
+            chosen
         });
         // A session with overlapping subscriptions gets one copy
         let mut by_session: HashMap<u64, Vec<Subscriber>> = HashMap::new();
@@ -245,6 +258,33 @@ mod tests {
             .unwrap();
         assert_eq!(full.queue.len(), 1);
         assert_eq!(roomy.queue.len() + offline.queue.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_message_no_share_member_takes_is_counted_once() {
+        let stats = Arc::new(Stats::default());
+        let broker = Broker::new(Arc::new(MemoryStore::new())).counted_in(Arc::clone(&stats));
+        let small = QueueLimits {
+            max_qos0: 1,
+            ..Default::default()
+        };
+        for id in 1..=2 {
+            let mut member = share_member(id, small, true);
+            member.queue = Arc::new(MessageQueue::new(small).counted_in(Arc::clone(&stats)));
+            member.queue.set_connected(true);
+            broker.subscribe("$share/g/jobs", id, member);
+        }
+        for _ in 0..3 {
+            broker
+                .publish("jobs", create_test_message("jobs", "x", false))
+                .await
+                .unwrap();
+        }
+
+        let counters = crate::sys::counters(&stats, 0, 0, 0, 0);
+        let stat = |name: &str| counters.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(stat("publish/messages/dropped/no_share_member"), 1);
+        assert_eq!(stat("publish/messages/dropped"), 1);
     }
 
     #[tokio::test]

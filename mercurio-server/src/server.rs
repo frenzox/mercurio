@@ -70,7 +70,7 @@ use crate::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
     shutdown::Shutdown,
-    sys::{self, ConnectedGuard, Stats},
+    sys::{self, ConnectedGuard, DropCause, Stats},
     tls::{certificate_name, CertificateName, TlsConfig},
     websocket,
 };
@@ -1143,9 +1143,13 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-        let broker = Broker::new(Arc::clone(&storage));
-        let session_manager_holder =
-            SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue, limits.write_timeout);
+        let broker = Broker::new(Arc::clone(&storage)).counted_in(Arc::clone(&stats));
+        let session_manager_holder = SessionManagerDropGuard::new(
+            Arc::clone(&storage),
+            limits.queue,
+            limits.write_timeout,
+            Arc::clone(&stats),
+        );
         let session_manager = session_manager_holder.session_manager();
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
@@ -2409,6 +2413,7 @@ where
                 .may(&identity, &message.topic, Access::Read)
                 .await
             {
+                session.count_drop(DropCause::NotAuthorized);
                 return Ok(Flow::Continue);
             }
         }

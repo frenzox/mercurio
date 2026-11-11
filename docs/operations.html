@@ -112,6 +112,14 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>bytes/received</code>, <code>bytes/sent</code></td><td>Bytes since start</td></tr>
 <tr><td><code>retained messages/count</code></td><td>Retained messages stored</td></tr>
 <tr><td><code>subscriptions/count</code></td><td>Subscriptions</td></tr>
+<tr><td><code>publish/messages/dropped</code></td><td>Messages accepted from a publisher and lost before reaching a subscriber, since start</td></tr>
+<tr><td><code>publish/messages/dropped/queue_full_qos0</code></td><td>QoS 0 messages that found a session's queue at <code>max_queued_qos0_messages</code></td></tr>
+<tr><td><code>publish/messages/dropped/queue_full</code></td><td>QoS 1 and 2 messages that found a session's queue at <code>max_queued_messages</code> or <code>max_queued_bytes</code></td></tr>
+<tr><td><code>publish/messages/dropped/expired</code></td><td>Messages whose expiry interval passed while they waited in a queue</td></tr>
+<tr><td><code>publish/messages/dropped/too_large</code></td><td>Messages larger than the subscriber's Maximum Packet Size</td></tr>
+<tr><td><code>publish/messages/dropped/not_authorized</code></td><td>Messages on a topic the subscriber may not read, although its subscription matched</td></tr>
+<tr><td><code>publish/messages/dropped/no_share_member</code></td><td>Messages no member of a shared subscription's group could take</td></tr>
+<tr><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td><td>Batches of session changes written again after a storage error, and given up on, their changes lost on the next restart</td></tr>
 <tr><td><code>load/messages/received/1min</code>, <code>5min</code>, <code>15min</code></td><td>Messages received per minute, averaged over 1, 5 and 15 minutes</td></tr>
 <tr><td><code>load/messages/sent/…</code>, <code>load/bytes/received/…</code>, <code>load/bytes/sent/…</code>, <code>load/connections/…</code></td><td>The same for messages sent, bytes and new connections</td></tr>
 <tr><td><code>connection/&lt;client id&gt;/state</code></td><td><code>1</code> or <code>0</code> for each <a href="bridges.html">bridge</a></td></tr>

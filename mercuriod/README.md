@@ -666,9 +666,15 @@ Every `sys_interval` seconds the broker publishes retained statistics under
 `clients/connected`, `clients/disconnected`, `clients/total`,
 `clients/maximum`, `clients/expired`, `messages/received`,
 `messages/sent`, `bytes/received`, `bytes/sent`,
-`retained messages/count` and `subscriptions/count`, and the 1, 5 and 15
-minute averages per minute of messages, bytes and connections under
-`load/`, such as `load/messages/received/1min`. Clients
+`retained messages/count`, `subscriptions/count` and
+`publish/messages/dropped`, the messages lost before reaching a subscriber.
+Mercurio adds the dropped messages by cause under
+`publish/messages/dropped/` (`queue_full_qos0`, `queue_full`, `expired`,
+`too_large`, `not_authorized`, `no_share_member`) and the storage batches
+retried and given up on as `store/batches/retried` and
+`store/batches/dropped`. Under `load/` come the 1, 5 and 15
+minute averages per minute of messages, bytes and connections, such as
+`load/messages/received/1min`. Clients
 may subscribe to them, but not publish to `$SYS` topics.
 
 ## Running

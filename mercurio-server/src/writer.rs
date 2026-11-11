@@ -296,6 +296,7 @@ async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) {
         };
         match retry.after(&e) {
             Some(delay) => {
+                crate::sys::Stats::add(&crate::sys::BATCHES_RETRIED);
                 warn!(
                     "Failed to store changes for `{}`, retrying: {}",
                     client_id, e
@@ -303,6 +304,7 @@ async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) {
                 tokio::time::sleep(delay).await;
             }
             None => {
+                crate::sys::Stats::add(&crate::sys::BATCHES_DROPPED);
                 error!(
                     "Gave up storing {} changes for `{}`, a restart will lose them: {}",
                     batch.len(),

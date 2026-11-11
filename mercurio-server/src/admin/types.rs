@@ -64,6 +64,9 @@ pub struct ClientSummary {
     pub subscriptions: usize,
     pub queued: usize,
     pub inflight: usize,
+    /// Messages for the client the broker lost since it last connected,
+    /// while it was away included
+    pub dropped: u64,
 }
 
 /// `getClient`: the `listClients` entry with the subscriptions themselves,
@@ -98,6 +101,7 @@ pub struct ClientDetails {
     pub messages_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    pub dropped: u64,
 }
 
 /// A subscription in `getClient`.

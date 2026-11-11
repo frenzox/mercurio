@@ -17,6 +17,7 @@ const CLIENTS: &[Column] = &[
     ("SUBS", &["subscriptions"]),
     ("QUEUED", &["queued"]),
     ("INFLIGHT", &["inflight"]),
+    ("DROPPED", &["dropped"]),
 ];
 const BANS: &[Column] = &[
     ("TYPE", &["type"]),
@@ -310,12 +311,12 @@ mod tests {
                     "clientid": "sensor-1", "username": "alice", "connected": true,
                     "address": "10.0.0.7:51234", "listener": "0.0.0.0:1883",
                     "protocolVersion": 5, "connectedSince": 1794340800, "subscriptions": 2,
-                    "queued": 0, "inflight": 0,
+                    "queued": 0, "inflight": 0, "dropped": 0,
                 },
                 {
                     "clientid": "s2", "username": null, "connected": false, "address": null,
                     "listener": null, "protocolVersion": 4, "disconnectedSince": 1794344400,
-                    "subscriptions": 0, "queued": 12, "inflight": 0,
+                    "subscriptions": 0, "queued": 12, "inflight": 0, "dropped": 7,
                 },
             ],
             "totalCount": 2,
@@ -323,9 +324,9 @@ mod tests {
         assert_eq!(
             shown(json!({"command": "listClients"}), data),
             "\
-CLIENT ID  USERNAME  CONNECTED  ADDRESS         SINCE                 SUBS  QUEUED  INFLIGHT
-sensor-1   alice     true       10.0.0.7:51234  2026-11-10 20:00:00Z  2     0       0
-s2         -         false      -               2026-11-10 21:00:00Z  0     12      0
+CLIENT ID  USERNAME  CONNECTED  ADDRESS         SINCE                 SUBS  QUEUED  INFLIGHT  DROPPED
+sensor-1   alice     true       10.0.0.7:51234  2026-11-10 20:00:00Z  2     0       0         0
+s2         -         false      -               2026-11-10 21:00:00Z  0     12      0         7
 "
         );
     }

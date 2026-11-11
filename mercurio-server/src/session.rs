@@ -59,7 +59,7 @@ use crate::{
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
-    sys::ClientCounters,
+    sys::{ClientCounters, DropCause, Stats},
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
@@ -398,9 +398,13 @@ impl From<Session> for SessionDropGuard {
 }
 
 impl SessionDropGuard {
-    pub fn new(connect_packet: ConnectPacket, queue_limits: QueueLimits) -> Self {
+    pub(crate) fn new(
+        connect_packet: ConnectPacket,
+        queue_limits: QueueLimits,
+        stats: Arc<Stats>,
+    ) -> Self {
         SessionDropGuard {
-            session: Session::with_queue_limits(connect_packet, queue_limits),
+            session: Session::with_queue_limits(connect_packet, queue_limits, stats),
         }
     }
 
@@ -412,12 +416,21 @@ impl SessionDropGuard {
 impl Session {
     #[cfg(test)]
     pub fn new(connect_packet: ConnectPacket) -> Self {
-        Self::with_queue_limits(connect_packet, QueueLimits::default())
+        Self::with_queue_limits(connect_packet, QueueLimits::default(), Default::default())
     }
 
-    pub fn with_queue_limits(connect_packet: ConnectPacket, queue_limits: QueueLimits) -> Self {
+    /// A session whose queue holds up to `queue_limits` and counts the
+    /// messages it loses in `stats`.
+    pub(crate) fn with_queue_limits(
+        connect_packet: ConnectPacket,
+        queue_limits: QueueLimits,
+        stats: Arc<Stats>,
+    ) -> Self {
         let client_id = connect_packet.payload.client_id.clone();
         let will_message = WillMessage::from_connect_packet(&connect_packet);
+        let presence = Presence::default();
+        let queue = MessageQueue::new(queue_limits).counted_in(stats);
+        queue.set_counters(Arc::clone(&presence.counters));
         Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -449,9 +462,9 @@ impl Session {
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
                     max_retained_messages: None,
-                    presence: Presence::default(),
+                    presence,
                 }),
-                queue: Arc::new(MessageQueue::new(queue_limits)),
+                queue: Arc::new(queue),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
                 generation: AtomicU64::new(0),
                 owes_retained: AtomicBool::new(false),
@@ -1055,6 +1068,7 @@ impl Session {
         expiry: Option<Duration>,
     ) -> Arc<ClientCounters> {
         let counters = Arc::new(ClientCounters::default());
+        self.shared.queue.set_counters(Arc::clone(&counters));
         self.shared.queue.set_connected(true);
         self.shared.state.lock().await.presence = Presence {
             listener: Some(listener),
@@ -1113,6 +1127,11 @@ impl Session {
             will_pending: state.will_message.is_some() || state.pending_will.is_some(),
             counters: Arc::clone(&presence.counters),
         }
+    }
+
+    /// Counts a message for the client lost for `cause`.
+    pub(crate) fn count_drop(&self, cause: DropCause) {
+        self.shared.queue.count_drop(cause, 1);
     }
 
     /// Starts keeping the queue on disk while the client is away.
@@ -1605,6 +1624,10 @@ impl Session {
                 if !delivery.subscriber.deliver_retained(message.clone()) {
                     // An empty queue that refuses it never takes it
                     if queue.len() == 0 {
+                        self.count_drop(match message.qos {
+                            QoS::AtMostOnce => DropCause::QueueFullQos0,
+                            _ => DropCause::QueueFull,
+                        });
                         warn!(
                             "Retained message on `{}` doesn't fit the message queue, dropping it",
                             message.topic
@@ -1669,6 +1692,7 @@ impl Session {
         if let Some(deadline) = message.expires_at {
             let now = unix_millis();
             if now >= deadline {
+                self.count_drop(DropCause::Expired);
                 return None;
             }
             let remaining_secs = (deadline - now).div_ceil(1000);
@@ -1712,6 +1736,7 @@ impl Session {
             // Packets the client can't take are discarded as if delivered
             // [MQTT-3.1.2-25]
             let Some(sent) = session.apply_topic_alias(publish.clone()) else {
+                self.count_drop(DropCause::TooLarge);
                 warn!(
                     "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
                     publish.topic_name, session.client_id
@@ -1811,6 +1836,7 @@ impl Session {
                 continue;
             };
             if session.too_big(publish) {
+                self.count_drop(DropCause::TooLarge);
                 warn!(
                     "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
                     publish.topic_name, session.client_id
@@ -2545,6 +2571,8 @@ mod tests {
         let mut expired = message("t", QoS::AtMostOnce, None, false);
         expired.expires_at = Some(unix_millis() - 1);
         assert!(session.prepare_publish(expired).await.is_none());
+        let counters = session.snapshot().await.counters;
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
 
         let mut fresh = message("t", QoS::AtMostOnce, None, false);
         fresh.expires_at = Some(unix_millis() + 5000);
@@ -2847,6 +2875,8 @@ mod tests {
         let mut large = message("t", QoS::AtLeastOnce, None, false);
         large.payload = Some(Bytes::from(vec![0u8; 64]));
         assert!(session.prepare_publish(large).await.is_none());
+        let counters = session.snapshot().await.counters;
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
         // Nothing is left awaiting an acknowledgement that will never come
         assert_eq!(
             session
@@ -3160,7 +3190,11 @@ mod tests {
             max_qos0: 2,
             ..Default::default()
         };
-        let mut session = Session::with_queue_limits(create_connect_packet_without_will(), limits);
+        let mut session = Session::with_queue_limits(
+            create_connect_packet_without_will(),
+            limits,
+            Default::default(),
+        );
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
         for i in 0..5 {
             let topic = format!("r/{i}");
