@@ -58,6 +58,22 @@ const FIXTURES: &str = concat!(
 );
 
 #[test]
+fn requiring_scram_channel_binding_passes() {
+    let dir = TempDir::new("scram-binding");
+    let (_held, port) = taken_port();
+    let passwd = dir.write("passwd", "alice:$6$pZufTypp2a6RmJv0$0E3Uw01KVS5L6/s+8dWtsoMjdF9mnjUcloZJLTWqsIQbvp1b3crPcunceFO+VmiVpj+Wde8NRnyJs4ZAFgaQUA==\n");
+    let config = dir.write(
+        "config.toml",
+        &format!(
+            "[server]\nport = {port}\n[auth]\nenabled = true\npassword_file = \"{}\"\nscram_require_channel_binding = true\n[admin]\nsocket = \"\"\n",
+            passwd.display()
+        ),
+    );
+    let output = mercuriod(&config, true);
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[test]
 fn a_valid_configuration_passes_without_binding_or_storage() {
     let dir = TempDir::new("valid");
     let (_held, port) = taken_port();

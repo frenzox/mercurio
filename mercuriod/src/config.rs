@@ -1511,6 +1511,11 @@ pub struct AuthConfig {
     /// restarts and don't tell which users exist
     pub scram_secret_file: Option<String>,
 
+    /// Refuses SCRAM-SHA-256 without channel binding on connections that
+    /// could bind (TLS 1.3), so clients must use SCRAM-SHA-256-PLUS there
+    #[serde(default)]
+    pub scram_require_channel_binding: bool,
+
     /// Checks delegated to HTTP endpoints
     pub http: Option<HttpAuthConfig>,
 }
@@ -1566,6 +1571,7 @@ impl Default for AuthConfig {
             acl_file: None,
             dynamic_security: None,
             scram_secret_file: None,
+            scram_require_channel_binding: false,
             http: None,
         }
     }

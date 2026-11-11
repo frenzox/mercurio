@@ -681,7 +681,7 @@ fn scram_auth<S: ScramCredentialStore + ?Sized>(
     config: &config::AuthConfig,
     create_files: bool,
 ) -> Result<ScramAuth<S>, String> {
-    let auth = ScramAuth::new(store);
+    let auth = ScramAuth::new(store).require_channel_binding(config.scram_require_channel_binding);
     Ok(match &config.scram_secret_file {
         Some(path) => match load_scram_secret(path, create_files)? {
             Some(secret) => auth.decoy_secret(secret),
