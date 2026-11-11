@@ -136,6 +136,7 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>--unix PATH</code></td><td>Connect through this Unix socket instead of TCP; not with <code>-H</code>, <code>-p</code> or the TLS options</td><td></td></tr>
 <tr><td><code>-i, --client-id</code></td><td>Client id. Left out, it is empty and the broker assigns one; MQTT 3.1 takes no empty id, so there recado sends a random <code>recado-</code> id</td><td>assigned by the broker</td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials. The password can also come from <code>RECADO_PASSWORD</code>, which other users can't see in <code>ps</code>; <code>-u</code> alone asks for it when standard error is a terminal</td><td></td></tr>
+<tr><td><code>--auth-method scram-sha-256</code></td><td>Log in with <a href="security.html#scram">SCRAM-SHA-256</a> instead of sending the user name and password in CONNECT: the password, from the same sources, never reaches the broker, and the broker must prove it knows it. Needs <code>-u</code> and MQTT 5</td><td></td></tr>
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
 <tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting. Needs <code>-i</code>, as with mosquitto: a session kept under an id nobody knows could never be resumed</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
@@ -152,6 +153,9 @@ recado sub -H broker.example.com -p 8883 --cafile ca.crt -u alice -t '#'
 
 <span class="comment"># In a script, with the password out of ps</span>
 RECADO_PASSWORD="$(cat ~/.mqtt-password)" recado pub -u alice -t status -m up
+
+<span class="comment"># Without the password crossing the network</span>
+recado pub --auth-method scram-sha-256 -u alice -t status -m up
 
 <span class="comment"># MQTT 3.1.1</span>
 recado pub -V 311 -t test -m hello

@@ -71,6 +71,7 @@ Connection options, for both commands:
 | `--unix` | Unix socket, instead of host and port | |
 | `-i, --client-id` | Client id; for MQTT 3.1, which takes no empty id, recado makes up a `recado-` id. `-c` needs it | assigned by the broker |
 | `-u, --username`, `-P, --password` | Credentials; the password also comes from `RECADO_PASSWORD`, and `-u` alone asks for it on a terminal | |
+| `--auth-method scram-sha-256` | Log in with SCRAM-SHA-256, so the password never reaches the broker; needs `-u` and MQTT 5 | |
 | `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |

@@ -63,6 +63,10 @@ mercuriod passwd -f /etc/mercurio/passwd -u alice
 mercuriod passwd -f /etc/mercurio/passwd -u alice -d</pre>
 <p><code>mercuriod passwd</code> replaces the file in one step, so a reload never sees half of it. The file keeps its owner, group and mode, at most <code>0640</code>; a new file gets <code>0600</code>, so let the broker read it with <code>chgrp mercurio</code> and <code>chmod 640</code>. A file it cannot read in full, such as one with a malformed line, is left unchanged with an error.</p>
 <p>Files written by <code>mosquitto_passwd</code> work unchanged: their <code>$7$</code> (PBKDF2-SHA512, mosquitto 2.0's default) and <code>$6$</code> (SHA-512, older versions) hashes are recognised. Any other hash field, such as a plain-text password or an empty one, stops the file from loading, with an error naming its line.</p>
+<p>Next to the Argon2 hash, <code>mercuriod passwd</code> stores the user's <a href="#scram">SCRAM-SHA-256</a> keys, on a line of their own after the user's:</p>
+<pre>alice:$argon2id$v=19$m=19456,t=2,p=1$...
+#scram-sha-256:alice:&lt;digest of the hash&gt;:SCRAM-SHA-256$600000:&lt;salt&gt;$&lt;StoredKey&gt;:&lt;ServerKey&gt;</pre>
+<p>The line starts with <code>#</code>, so <code>mosquitto_passwd</code> and earlier <code>mercuriod</code> releases read it as a comment, and the file stays readable by both. The digest ties the keys to the hash they were set with: when another tool, such as <code>mosquitto_passwd</code>, changes the password, the keys no longer match and are not used, so the old password does not keep working over SCRAM. A malformed <code>#scram-sha-256:</code> line stops the file from loading, as a malformed hash does.</p>
 
 <h2 id="acl">Access control lists</h2>
 <pre>[auth]
@@ -144,6 +148,7 @@ sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</
 <p>Coming from mosquitto, create it from mosquitto's file instead:</p>
 <pre>sudo mercuriod dynsec-import /var/lib/mosquitto/dynamic-security.json /var/lib/mercurio/dynamic-security.json</pre>
 <p><code>dynsec-import</code> carries over clients, groups, roles, ACLs, priorities, the default access and the anonymous group, and gives the file to the directory's owner as <code>dynsec-init</code> does. It never overwrites an existing file. Clients keep their passwords: mosquitto's PBKDF2-SHA512 hashes are checked as they are, and a password set again with <code>setClientPassword</code> or <code>modifyClient</code> is stored as Argon2. A PBKDF2 check is faster than an Argon2 one, so until then the time a login takes can tell an imported client from an unknown user name; set those passwords again to close that. What can't be carried over is listed and left out: <code>unsubscribeLiteral</code> and <code>unsubscribePattern</code> ACLs and a default that denies unsubscribing (Mercurio lets every client unsubscribe), passwords in another form (those clients can't log in until they get one), and names a client, group or role refers to that the file does not define.</p>
+<p>Setting a password with <code>dynsec-init</code>, <code>createClient</code>, <code>setClientPassword</code> or <code>modifyClient</code> also stores the client's <a href="#scram">SCRAM-SHA-256</a> keys, in the client's <code>scram</code> field, tied to its hash as in the password file. Earlier releases ignore the field. <code>getClient</code> never shows it. A client that is disabled, or bound to another client id, cannot log in with SCRAM either.</p>
 <pre>[auth]
 enabled = true
 allow_anonymous = false
@@ -230,7 +235,17 @@ class Auth(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 
 <h2 id="enhanced">MQTT 5 enhanced authentication</h2>
-<p>MQTT 5 clients can authenticate with a method such as SCRAM through the AUTH packet, and re-authenticate during a connection. The daemon has no method configured; applications embedding the broker register methods through the server library. See <a href="embedding.html#auth">Embedding</a>.</p>
+<p>MQTT 5 clients can authenticate with a method through the AUTH packet, and re-authenticate during a connection. The daemon offers <a href="#scram">SCRAM-SHA-256</a> with a password file or dynamic security. Applications embedding the broker register other methods through the server library. See <a href="embedding.html#auth">Embedding</a>.</p>
+
+<h3 id="scram">SCRAM-SHA-256</h3>
+<p>With SCRAM-SHA-256 (RFC 5802 and RFC 7677, method name <code>SCRAM-SHA-256</code>), the client proves it knows the password without sending it, and the broker proves it knows the user's keys: its signature goes in the CONNACK, or in the AUTH that ends a re-authentication, and the Mercurio client refuses a broker without it. Nothing needs configuring: with <code>password_file</code> or <code>dynamic_security</code> set, the broker offers the method, and every user whose password was set by this release or later can use it. Plain user name and password logins keep working for the same users.</p>
+<ul>
+<li>Users whose password was set before, or by <code>mosquitto_passwd</code>, or imported from mosquitto, have no SCRAM keys: their plain logins work, and SCRAM fails for them as a wrong password does, until the password is set again.</li>
+<li>New keys use 600,000 PBKDF2-HMAC-SHA256 iterations. The broker computes them once, when the password is set; a login costs it a few hashes whatever the count. The client derives them on its first login, about 0.15 s on a desktop CPU, and the Mercurio client keeps the result for reconnections. Small devices that cannot afford that should log in with a user name and password over TLS.</li>
+<li>Channel binding is not supported: a client that requires it is refused with Bad Authentication Method. A wrong password or an unknown user gives Bad User Name or Password, and counts as a failed login like any other.</li>
+<li>For an unknown user, the broker answers with a salt derived from the user name and a secret, and the usual iteration count, so its first message does not show whether the user exists. The secret is new on every start, so comparing answers across restarts can still tell.</li>
+</ul>
+<p>Connect with SCRAM from the command line with <code>--auth-method scram-sha-256</code>, see <a href="cli.html">recado</a>, or from Rust with <code>ScramSha256</code>, see <a href="client.html#enhanced">the client library</a>.</p>
 
 <h2 id="client-ids">Client id ownership</h2>
 <p>A client id belongs to the owner of its session for as long as that session exists, connected or not. The owner is the user the client authenticated as, or anonymous, together with the mount point of its listener. A client of the same owner takes over the id as usual: the connection that held it closes with Session Taken Over. A client of another owner is refused with Not Authorized (return code 5 in MQTT 3.1.1), Clean Start or not, and the connection, session, queued messages and will of the owner stay as they were. The broker logs each refusal at warn level with the client id and both owners.</p>
