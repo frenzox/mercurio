@@ -21,6 +21,8 @@
 <li><a href="listeners.html">Listeners &amp; transports</a></li>
 <li><a href="bridges.html">Bridges</a></li>
 <li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html">Administration</a></li>
+<li><a href="mercurioctl.html">mercurioctl</a></li>
 </ul>
 <h2>Clients &amp; libraries</h2>
 <ul>
@@ -43,6 +45,7 @@
 <tr><th>Component</th><th>What it is</th></tr>
 <tr><td><code>mercuriod</code></td><td>The broker daemon. Configured with a TOML file, runs as a systemd service.</td></tr>
 <tr><td><code>recado</code></td><td>Command-line client: <code>recado pub</code> and <code>recado sub</code>.</td></tr>
+<tr><td><code>mercurioctl</code></td><td>Administers a running broker: clients, bans, retained messages, subscriptions, the log level, reloads and dynamic security.</td></tr>
 <tr><td><code>mercurio-client</code></td><td>Async Rust client library.</td></tr>
 <tr><td><code>mercurio-server</code></td><td>The broker as a library, to embed in your own program or extend with custom authentication.</td></tr>
 <tr><td><code>mercurio-storage</code></td><td>Storage for sessions, retained messages, wills and queued messages, in memory, SQLite or PostgreSQL.</td></tr>
@@ -82,6 +85,7 @@
 <li>State in memory, SQLite or PostgreSQL, so persistent sessions survive restarts.</li>
 <li><code>$SYS</code> statistics with mosquitto's names, logging to file or syslog.</li>
 <li>Configuration reloads on <code>SIGHUP</code>, graceful shutdown on <code>SIGTERM</code>.</li>
+<li>An <a href="admin.html">administration API</a> on <code>$CONTROL/broker/v1</code> and <a href="mercurioctl.html">mercurioctl</a>: list, disconnect and ban clients, delete sessions and retained messages, change the log level and reload files while the broker runs.</li>
 </ul>
 
 <h2>Where to go next</h2>
@@ -92,6 +96,7 @@
 <a href="listeners.html"><strong>Listeners</strong>TLS, WebSocket, Unix sockets, mount points.</a>
 <a href="bridges.html"><strong>Bridges</strong>Forward topics to and from other brokers.</a>
 <a href="operations.html"><strong>Operations</strong>Persistence, limits, statistics, logs.</a>
+<a href="admin.html"><strong>Administration</strong>Clients, bans and reloads at runtime, with mercurioctl.</a>
 <a href="client.html"><strong>Rust client library</strong>Connect, publish and subscribe from Rust.</a>
 <a href="plugins.html"><strong>WebAssembly plugins</strong>Extend the broker with sandboxed components.</a>
 <a href="migrating.html"><strong>Migrating from mosquitto</strong>Option by option.</a>

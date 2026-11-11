@@ -29,11 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - MQTT 5 properties, subscription options and identifiers, topic
   aliases, and enhanced authentication.
 - TLS with the system's roots or your own CA, and client certificates.
+- Unix sockets, with `ConnectOptions::unix`.
+- An optional `clap` feature with the connection options of recado and
+  mercurioctl, `cli::ConnectArgs`, for your own command-line tools.
 - Follows the limits the broker announces, such as Receive Maximum and
   Maximum Packet Size.
 
-For a command-line client built on this library, see
-[`recado`](https://crates.io/crates/recado). The
+For command-line tools built on this library, see
+[`recado`](https://crates.io/crates/recado) and
+[`mercurioctl`](https://crates.io/crates/mercurioctl). The
 [client guide](https://frenzox.github.io/mercurio/client.html)
 covers every option.
 

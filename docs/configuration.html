@@ -21,6 +21,8 @@
 <li><a href="listeners.html">Listeners &amp; transports</a></li>
 <li><a href="bridges.html">Bridges</a></li>
 <li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html">Administration</a></li>
+<li><a href="mercurioctl.html">mercurioctl</a></li>
 </ul>
 <h2>Clients &amp; libraries</h2>
 <ul>
@@ -127,10 +129,10 @@ mount_point = "tenant1/"</pre>
 <h2 id="logging">[logging]</h2>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>level</code></td><td><code>"info"</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, or per module, as in <code>"info,mercurio_server::session=warn"</code>.</td></tr>
+<tr><td><code>level</code></td><td><code>"info"</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, or per module, as in <code>"info,mercurio_server::session=warn"</code>. An empty or invalid level means <code>info</code>. <a href="admin.html#broker"><code>setLogLevel</code></a> changes it until the broker restarts.</td></tr>
 <tr><td><code>file</code></td><td></td><td>Append logs to this file instead of standard output.</td></tr>
 <tr><td><code>syslog</code></td><td><code>false</code></td><td>Send logs to the local syslog daemon through <code>/dev/log</code>.</td></tr>
-<tr><td><code>connection_messages</code></td><td><code>true</code></td><td>Log clients connecting and disconnecting.</td></tr>
+<tr><td><code>connection_messages</code></td><td><code>true</code></td><td>Log clients connecting and disconnecting. With <code>false</code>, a <code>level</code> naming their target, <code>mercurio::connections</code>, still turns them on.</td></tr>
 </table>
 
 <h2 id="storage">[storage]</h2>
@@ -160,6 +162,14 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>acl_url</code></td><td></td><td>Endpoint checking topic access; replaces <code>acl_file</code>.</td></tr>
 <tr><td><code>timeout_seconds</code></td><td><code>5</code></td><td>Longest wait for an answer; a timeout denies.</td></tr>
 <tr><td><code>cache_seconds</code></td><td><code>30</code></td><td>How long topic answers are reused.</td></tr>
+</table>
+
+<h2 id="admin">[admin]</h2>
+<p>The admin socket, through which local administrators run every command without credentials. See <a href="admin.html#socket">Administration</a>. Changes need a restart.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>socket</code></td><td><code>"/run/mercurio/admin.sock"</code></td><td>Path of the Unix socket; <code>""</code> turns it off. Every directory on the path must be writable only by root or the broker's user. Linux only; elsewhere the section is ignored.</td></tr>
+<tr><td><code>group</code></td><td><code>"mercurio"</code></td><td>Group whose members may use the socket, besides root and the broker's user, as its members were when the broker started. <code>""</code> for nobody else.</td></tr>
 </table>
 
 <h2 id="listeners">[[listeners]]</h2>

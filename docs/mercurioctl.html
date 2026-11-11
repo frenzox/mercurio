@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mercurioctl · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html">Administration</a></li>
+<li><a href="mercurioctl.html" aria-current="page">mercurioctl</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="plugins.html">WebAssembly plugins</a></li>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>mercurioctl</h1>
+<p class="lead">Administers a running broker from the command line: clients and sessions, bans, retained messages, subscriptions, listeners, bridges and plugins, the log level, reloads and dynamic security.</p>
+<p>It sends the commands of the <a href="admin.html">admin API</a> over MQTT 5, and prints the answers as tables, or as JSON for scripts.</p>
+
+<h2 id="install">Installing</h2>
+<p>Each <a href="https://github.com/frenzox/mercurio/releases">release</a> has <code>.deb</code> and <code>.rpm</code> packages and a <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. The <code>mercuriod</code> packages recommend it; from downloaded files, install both at once:</p>
+<pre><span class="comment"># Debian, Ubuntu, Raspberry Pi OS</span>
+sudo apt install ./mercuriod_*.deb ./mercurioctl_*.deb
+
+<span class="comment"># Fedora, RHEL, openSUSE</span>
+sudo dnf install ./mercuriod-*.rpm ./mercurioctl-*.rpm</pre>
+<p>Or with cargo: <code>cargo install mercurioctl</code>.</p>
+
+<h2 id="connecting">Connecting</h2>
+<p>Without connection options, mercurioctl connects through the broker's <a href="admin.html#socket">admin socket</a>, <code>/run/mercurio/admin.sock</code>, when that file exists. There, as root or a member of the <code>mercurio</code> group, every command works without credentials. Without the socket, it connects to <code>localhost:1883</code>.</p>
+<pre><span class="comment"># On the broker's host</span>
+mercurioctl client list
+
+<span class="comment"># Another broker, over TLS; asks for the password</span>
+mercurioctl -H broker.example.com -p 8883 --tls -u ops client list
+
+<span class="comment"># An admin socket somewhere else</span>
+mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
+<p>Connection options go before the command. Each can also be set with an environment variable, which the option overrides:</p>
+<table>
+<tr><th>Option</th><th>Variable</th><th>Meaning</th><th>Default</th></tr>
+<tr><td><code>-H, --host</code>, <code>-p, --port</code></td><td><code>MERCURIOCTL_HOST</code>, <code>MERCURIOCTL_PORT</code></td><td>Broker over TCP</td><td>admin socket, else <code>localhost:1883</code></td></tr>
+<tr><td><code>--unix PATH</code></td><td><code>MERCURIOCTL_UNIX</code></td><td>Broker over a Unix socket</td><td></td></tr>
+<tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td><code>MERCURIOCTL_USERNAME</code>, <code>MERCURIOCTL_PASSWORD</code></td><td>Credentials</td><td></td></tr>
+<tr><td><code>--tls</code>, <code>--cafile</code>, <code>--insecure</code></td><td><code>MERCURIOCTL_TLS</code>, <code>MERCURIOCTL_CAFILE</code>, <code>MERCURIOCTL_INSECURE</code></td><td>TLS, its CA, or no verification</td><td></td></tr>
+<tr><td><code>-i, --client-id</code></td><td><code>MERCURIOCTL_CLIENT_ID</code></td><td>Client id</td><td>assigned by the broker</td></tr>
+<tr><td><code>--timeout SECONDS</code></td><td><code>MERCURIOCTL_TIMEOUT</code></td><td>Longest wait for the answer, connecting included</td><td><code>10</code></td></tr>
+<tr><td><code>--json</code></td><td></td><td>Print the answer's data as JSON</td><td>tables</td></tr>
+</table>
+<p><code>MERCURIOCTL_TLS</code> and <code>MERCURIOCTL_INSECURE</code> take <code>1</code>/<code>0</code>, <code>yes</code>/<code>no</code>, <code>on</code>/<code>off</code> or <code>true</code>/<code>false</code>. An empty variable counts as unset.</p>
+<ul>
+<li>Any connection option but <code>-i</code> turns the admin socket default off: <code>-u ops</code> alone connects to <code>localhost:1883</code>.</li>
+<li><code>-u</code> without <code>-P</code> asks for the password. A <code>-P</code> on the command line is visible to other users in <code>ps</code>.</li>
+<li><code>--json</code> and <code>--timeout</code> can go anywhere on the line.</li>
+<li>Through the admin socket, a user who may not use it gets Permission denied: run mercurioctl with <code>sudo</code>, or join the group.</li>
+<li>Over the network, the user needs permission for each command and for its answers: see <a href="admin.html#remote">Over the network</a>.</li>
+</ul>
+
+<h2 id="commands">Commands</h2>
+<p>Commands are <code>mercurioctl &lt;group&gt; &lt;verb&gt;</code>. What each one does and returns is in the <a href="admin.html#commands">command reference</a>; <code>--help</code> after any of them lists its options.</p>
+<table>
+<tr><th>Command</th><th>Runs</th></tr>
+<tr><td><code>client list</code> <code>[--connected | --offline]</code> <code>[--prefix P]</code> <code>[--user U]</code> <code>[--address A]</code></td><td><code>listClients</code></td></tr>
+<tr><td><code>client show &lt;clientid&gt;</code></td><td><code>getClient</code></td></tr>
+<tr><td><code>client disconnect &lt;clientid&gt; [--no-will] [--reason-code C]</code></td><td><code>disconnectClient</code>; <code>C</code> in decimal or <code>0x..</code></td></tr>
+<tr><td><code>client delete-session &lt;clientid&gt; [--disconnect]</code></td><td><code>deleteSession</code></td></tr>
+<tr><td><code>ban add</code> <code>&lt;clientid|username|address&gt;</code> <code>&lt;value&gt;</code> <code>[--prefix]</code> <code>[--duration S]</code> <code>[--reason R]</code></td><td><code>addBan</code></td></tr>
+<tr><td><code>ban remove &lt;type&gt; &lt;value&gt; [--prefix]</code></td><td><code>removeBan</code></td></tr>
+<tr><td><code>ban list</code></td><td><code>listBans</code></td></tr>
+<tr><td><code>retained list [filter]</code></td><td><code>listRetained</code>, <code>#</code> by default</td></tr>
+<tr><td><code>retained show &lt;topic&gt;</code></td><td><code>getRetained</code></td></tr>
+<tr><td><code>retained delete &lt;filter&gt;</code></td><td><code>deleteRetained</code></td></tr>
+<tr><td><code>subscription list [--prefix P]</code></td><td><code>listSubscriptions</code></td></tr>
+<tr><td><code>subscription subscribers &lt;filter&gt;</code></td><td><code>getSubscribers</code></td></tr>
+<tr><td><code>broker info</code></td><td><code>getBrokerInfo</code></td></tr>
+<tr><td><code>broker config</code></td><td><code>getConfig</code></td></tr>
+<tr><td><code>broker log-level [level]</code></td><td><code>getLogLevel</code>, or <code>setLogLevel</code> with a level</td></tr>
+<tr><td><code>broker reload</code></td><td><code>reload</code></td></tr>
+<tr><td><code>listener list</code>, <code>bridge list</code>, <code>plugin list</code></td><td><code>listListeners</code>, <code>listBridges</code>, <code>listPlugins</code></td></tr>
+</table>
+<p>The client, ban, retained and subscription lists also take <code>--offset N</code> and <code>--count N</code>.</p>
+<pre><span class="comment"># Clients connected from one network</span>
+mercurioctl client list --connected --address 10.1.0.0/16
+
+<span class="comment"># Disconnect a client without publishing its will, then ban its address for an hour</span>
+mercurioctl client disconnect sensor-7 --no-will
+mercurioctl ban add address 203.0.113.0/24 --duration 3600 --reason flooding
+
+<span class="comment"># Retained messages under a retired prefix, then delete them</span>
+mercurioctl retained list 'old/#'
+mercurioctl retained delete 'old/#'
+
+<span class="comment"># Debug one module until the next restart</span>
+mercurioctl broker log-level info,mercurio_server::session=debug</pre>
+
+<h2 id="dynsec">Dynamic security</h2>
+<p><code>mercurioctl dynsec</code> runs the <a href="security.html#dynamic-security">dynamic security</a> commands under <code>mosquitto_ctrl</code>'s names in kebab-case: <code>createClient</code> is <code>dynsec create-client</code>, <code>addRoleACL</code> is <code>dynsec add-role-acl</code>.</p>
+<pre><span class="comment"># A role that may publish under sensors/, a group with it, and a client in the group</span>
+mercurioctl dynsec create-role sensor
+mercurioctl dynsec add-role-acl sensor publishClientSend 'sensors/#' allow
+mercurioctl dynsec create-group sensors --role sensor
+mercurioctl dynsec create-client s1 --group sensors
+
+mercurioctl dynsec get-client s1</pre>
+<ul>
+<li><code>create-client</code> without <code>--password</code> asks for one twice. An empty one creates a client that can't log in until <code>set-client-password</code>.</li>
+<li><code>add-role-acl</code> takes the ACL type, the topic, <code>allow</code> or <code>deny</code>, and an optional priority.</li>
+<li>mosquitto_ctrl's <code>modifyClient</code>, <code>modifyGroup</code> and <code>modifyRole</code> don't exist here; use the add, remove and set commands. Its <code>init</code> is <code>mercuriod dynsec-init</code>, which writes the file before the broker starts.</li>
+<li>When dynamic security isn't enabled, nothing answers: mercurioctl waits for <code>--timeout</code>, exits with status 2 and asks whether it is enabled.</li>
+</ul>
+
+<h2 id="output">Output</h2>
+<p>Lists print as tables, other answers as <code>name: value</code> lines. Times are in UTC, and empty values print as <code>-</code>:</p>
+<pre>$ mercurioctl client list
+CLIENT ID  USERNAME  CONNECTED  ADDRESS          SINCE                 SUBS  QUEUED  INFLIGHT
+monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0       0</pre>
+<ul>
+<li>A list longer than what was shown ends with a line such as <code>1-100 of 250; --offset 100 shows the next ones</code>.</li>
+<li><code>--json</code> prints the answer's <code>data</code> as the broker sends it, with the field names and Unix times of the <a href="admin.html#commands">command reference</a>, and nothing for commands without data.</li>
+<li><code>broker config</code> always prints JSON.</li>
+<li>A table cell holds one line, so <code>retained show</code> prints a payload's line breaks as spaces. <code>--json</code> keeps them: <code>mercurioctl retained show status/door --json | jq -r .payload</code>.</li>
+</ul>
+
+<h2 id="exit-status">Exit status</h2>
+<table>
+<tr><th>Status</th><th>Means</th></tr>
+<tr><td><code>0</code></td><td>Success</td></tr>
+<tr><td><code>1</code></td><td>The broker refused: the command failed, with its <code>code</code> in parentheses after the message, or access control refused the request or its answer topic. <code>broker reload</code> also exits 1 when any file failed to load, after printing the table.</td></tr>
+<tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, closed the connection, or didn't answer within <code>--timeout</code></td></tr>
+<tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or mismatched passwords</td></tr>
+</table>
+<p>Messages go to standard error, so scripts can read the output:</p>
+<pre><span class="comment"># Disconnect every client of a retired user</span>
+mercurioctl --json client list --user legacy --connected | jq -r '.clients[].clientid' |
+    while read -r id; do mercurioctl client disconnect "$id"; done</pre>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>

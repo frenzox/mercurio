@@ -21,6 +21,8 @@
 <li><a href="listeners.html">Listeners &amp; transports</a></li>
 <li><a href="bridges.html">Bridges</a></li>
 <li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html">Administration</a></li>
+<li><a href="mercurioctl.html">mercurioctl</a></li>
 </ul>
 <h2>Clients &amp; libraries</h2>
 <ul>
@@ -84,7 +86,7 @@ pattern read users/%u/inbox</pre>
 <li>A will counts as a publish: a client whose will topic it may not publish to is refused at CONNECT.</li>
 </ul>
 <p>An ACL file works without passwords too, for example with <a href="#tls">client certificates</a>.</p>
-<div class="note"><code>$SYS</code> topics only accept the broker's own statistics. <code>$CONTROL</code> topics, which administer the broker, are refused to every client unless an ACL file, dynamic security or an HTTP ACL endpoint grants them.</div>
+<div class="note"><code>$SYS</code> topics only accept the broker's own statistics. <code>$CONTROL</code> topics, which administer the broker, are refused to every client unless an ACL file, dynamic security or an HTTP ACL endpoint grants them. <a href="admin.html#remote">Administration</a> lists the grants its commands need; clients of the admin socket need none.</div>
 
 <h2 id="tls">TLS and client certificates</h2>
 <pre>[server.tls]
@@ -135,21 +137,17 @@ mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
 enabled = true
 allow_anonymous = false
 dynamic_security = "/var/lib/mercurio/dynamic-security.json"</pre>
-<p>The administrator sends commands to <code>$CONTROL/dynamic-security/v1</code> and reads the answers on <code>$CONTROL/dynamic-security/v1/response</code>. Several commands can go in one message:</p>
-<pre>recado sub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1/response' &amp;
+<p>Manage it with <a href="mercurioctl.html#dynsec">mercurioctl</a>, on the broker's host through the <a href="admin.html#socket">admin socket</a>, or from anywhere as the administrator:</p>
+<pre><span class="comment"># On the broker's host, as root or a member of the mercurio group</span>
+mercurioctl dynsec create-role sensor
+mercurioctl dynsec add-role-acl sensor publishClientSend 'sensors/#' allow
+mercurioctl dynsec create-group sensors --role sensor
+mercurioctl dynsec create-client s1 --group sensors   <span class="comment"># asks for the password</span>
 
-recado pub -u admin -P "$ADMIN_PASSWORD" -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
-  {"command": "createRole", "rolename": "sensor"},
-  {"command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
-   "topic": "sensors/#", "allow": true},
-  {"command": "createGroup", "groupname": "sensors", "roles": [{"rolename": "sensor"}]},
-  {"command": "createClient", "username": "s1", "password": "s1-secret",
-   "groups": [{"groupname": "sensors"}]}
-]}'</pre>
-<pre>{"responses":[{"command":"createRole"},{"command":"addRoleACL"},
- {"command":"createGroup"},{"command":"createClient"}]}</pre>
-<p>Failed commands carry an <code>error</code>, and commands carrying <code>correlationData</code> get it back.</p>
-<p>Only clients of listeners that use the main <code>[auth]</code> can send commands: a listener with its own <code>[listeners.auth]</code> doesn't include dynamic security.</p>
+<span class="comment"># From another machine</span>
+mercurioctl -H broker.example.com -u admin dynsec list-clients</pre>
+<p>Underneath, these are JSON commands published to <code>$CONTROL/dynamic-security/v1</code>, with the names and arguments of mosquitto's plugin. They use the same envelope and replies as the <a href="admin.html#protocol">broker's own commands</a>. Failed commands carry an <code>error</code>, without a <code>code</code>.</p>
+<p>Only clients of the admin socket and of listeners that use the main <code>[auth]</code> can send commands: a listener with its own <code>[listeners.auth]</code> doesn't include dynamic security.</p>
 
 <h3>Model</h3>
 <ul>
@@ -214,7 +212,7 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <p>MQTT 5 clients can authenticate with a method such as SCRAM through the AUTH packet, and re-authenticate during a connection. The daemon has no method configured; applications embedding the broker register methods through the server library. See <a href="embedding.html#auth">Embedding</a>.</p>
 
 <h2 id="reloading">Reloading</h2>
-<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, those of listeners included, without dropping connections.</p>
+<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
 <ul>
 <li>New ACL rules apply to every later publish, subscribe and delivery, connected clients included.</li>
 <li>Password changes apply to later logins.</li>

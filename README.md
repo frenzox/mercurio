@@ -27,27 +27,31 @@ top of Tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
   inside your own program.
 - **Easy to run.** `.deb` and `.rpm` packages set up the broker as a
   sandboxed systemd service, on x86_64, aarch64 and armv7 Linux.
+- **Administrable at runtime.** List, disconnect and ban clients, delete
+  sessions and retained messages, change the log level and reload files
+  while the broker runs, with `mercurioctl` or over MQTT on
+  `$CONTROL/broker/v1`.
 
 ## Install
 
 Each [release](https://github.com/frenzox/mercurio/releases) of
-`mercuriod`, the broker, and `recado`, the command-line client, has `.deb`
-and `.rpm` packages and a `.tar.gz`. Download the ones for your system and
-install them:
+`mercuriod`, the broker, `mercurioctl`, its administration tool, and
+`recado`, the command-line client, has `.deb` and `.rpm` packages and a
+`.tar.gz`. Download the ones for your system and install them:
 
 ```bash
 # Debian, Ubuntu, Raspberry Pi OS
-sudo apt install ./mercuriod_*.deb ./recado_*.deb
+sudo apt install ./mercuriod_*.deb ./mercurioctl_*.deb ./recado_*.deb
 
 # Fedora, RHEL, openSUSE
-sudo dnf install ./mercuriod-*.rpm ./recado-*.rpm
+sudo dnf install ./mercuriod-*.rpm ./mercurioctl-*.rpm ./recado-*.rpm
 ```
 
 The broker then runs as the `mercuriod` service, configured by
 `/etc/mercurio/config.toml`. Or install the binaries with cargo:
 
 ```bash
-cargo install mercuriod recado
+cargo install mercuriod mercurioctl recado
 ```
 
 ## Quick start
@@ -70,6 +74,14 @@ Any MQTT client works with the broker, mosquitto's included:
 
 ```bash
 mosquitto_sub -V mqttv5 -t 'sensors/#' -v
+```
+
+On the packaged service, `mercurioctl` looks at and changes the running
+broker from the same host, as root or a member of the `mercurio` group:
+
+```bash
+sudo mercurioctl client list
+sudo mercurioctl broker log-level debug
 ```
 
 ## Features
@@ -105,7 +117,12 @@ mosquitto_sub -V mqttv5 -t 'sensors/#' -v
   with access to HTTP and sockets limited to allowlists
 - [`$SYS` statistics](https://frenzox.github.io/mercurio/operations.html),
   logging to a file or syslog, limits on connections, queues and sessions
-- Configuration reloads on SIGHUP, graceful shutdown on SIGTERM
+- [Administration](https://frenzox.github.io/mercurio/admin.html) at
+  runtime on `$CONTROL/broker/v1` and with
+  [`mercurioctl`](https://frenzox.github.io/mercurio/mercurioctl.html):
+  clients, sessions, bans, retained messages, subscriptions, the log level
+- Configuration reloads on SIGHUP or `mercurioctl broker reload`, graceful
+  shutdown on SIGTERM
 
 **Client library**
 
@@ -156,6 +173,8 @@ The [documentation](https://frenzox.github.io/mercurio/) is built from
 | [Listeners & transports](https://frenzox.github.io/mercurio/listeners.html) | TLS, WebSocket, Unix sockets, PROXY protocol, mount points |
 | [Bridges](https://frenzox.github.io/mercurio/bridges.html) | Forwarding topics to and from other brokers |
 | [Operations & monitoring](https://frenzox.github.io/mercurio/operations.html) | Persistence, limits, statistics, logs |
+| [Administration](https://frenzox.github.io/mercurio/admin.html) | The admin socket, permissions, the `$CONTROL/broker/v1` commands, bans, upgrading |
+| [mercurioctl](https://frenzox.github.io/mercurio/mercurioctl.html) | Administering the broker from the command line |
 | [Command-line client](https://frenzox.github.io/mercurio/cli.html) | `recado pub` and `recado sub` |
 | [Rust client library](https://frenzox.github.io/mercurio/client.html) | Connecting, publishing and subscribing from Rust |
 | [Embedding the broker](https://frenzox.github.io/mercurio/embedding.html) | Running `mercurio-server` in your program, Rust plugins |
@@ -168,6 +187,7 @@ The [documentation](https://frenzox.github.io/mercurio/) is built from
 |-------|----------|
 | [`mercuriod`](mercuriod) | The broker daemon: configuration, logging, password files, WASM plugins |
 | [`recado`](recado) | The `recado pub` and `recado sub` command-line client |
+| [`mercurioctl`](mercurioctl) | The administration tool for a running broker |
 | [`mercurio-client`](mercurio-client) | The async client library |
 | [`mercurio-server`](mercurio-server) | The broker as a library, with the `Plugin` trait |
 | [`mercurio-plugin`](mercurio-plugin) | The SDK for writing WASM plugins in Rust |

@@ -21,6 +21,8 @@
 <li><a href="listeners.html">Listeners &amp; transports</a></li>
 <li><a href="bridges.html">Bridges</a></li>
 <li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html">Administration</a></li>
+<li><a href="mercurioctl.html">mercurioctl</a></li>
 </ul>
 <h2>Clients &amp; libraries</h2>
 <ul>
@@ -76,6 +78,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <table>
 <tr><th>Method</th><th>Meaning</th></tr>
 <tr><td><code>new(host, port)</code></td><td>Broker address</td></tr>
+<tr><td><code>unix(path)</code></td><td>A broker on a Unix socket instead, such as its admin socket; no TLS. Unix only</td></tr>
 <tr><td><code>client_id(id)</code></td><td>Client id; the broker assigns one when not set</td></tr>
 <tr><td><code>username(name)</code>, <code>password(bytes)</code></td><td>Credentials</td></tr>
 <tr><td><code>protocol_version(v)</code></td><td><code>ProtocolVersion::V5</code> (default), <code>V3_1_1</code> or <code>V3_1</code></td></tr>
@@ -92,6 +95,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>connect_timeout(seconds)</code></td><td>Longest wait for the connection, 30 by default</td></tr>
 </table>
 <p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own.</p>
+<p>The optional <code>clap</code> feature adds <code>cli::ConnectArgs</code>: the connection options recado and mercurioctl share, to flatten into your own <code>clap</code> command, and turned into <code>ConnectOptions</code> by <code>to_connect_options()</code>.</p>
 
 <h2>Persistent sessions and reconnection</h2>
 <pre>use std::time::Duration;
@@ -171,6 +175,7 @@ let options = ConnectOptions::new("localhost", 1883).authenticator(Token("secret
 <h2>Examples in the repository</h2>
 <ul>
 <li><code>recado/</code>: the command-line client, built on this library.</li>
+<li><code>mercurioctl/</code>: the administration tool, which runs the broker's commands with MQTT 5 request and response.</li>
 <li><code>mercurio-client/examples/bench.rs</code>: a load generator with concurrent publishers and subscribers.</li>
 </ul>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
