@@ -13,10 +13,10 @@ use mercurio_server::{
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Main configuration structure.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct Config {
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct Config {
 }
 
 /// A connection to another broker, as an MQTT 5 client.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BridgeConfig {
     /// Names the bridge in logs and in its default client id
     pub name: String,
@@ -81,6 +81,7 @@ pub struct BridgeConfig {
 
     pub username: Option<String>,
 
+    #[serde(serialize_with = "redact_some")]
     pub password: Option<String>,
 
     #[serde(default)]
@@ -89,7 +90,7 @@ pub struct BridgeConfig {
     pub topics: Vec<BridgeTopic>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct BridgeTlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -103,7 +104,7 @@ pub struct BridgeTlsConfig {
     pub key_path: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BridgeProtocol {
     #[default]
@@ -118,7 +119,7 @@ fn default_true() -> bool {
 /// Topics forwarded through a bridge, as in mosquitto's `topic` option:
 /// `pattern` is matched below `local_prefix` on this broker and below
 /// `remote_prefix` on the remote one.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BridgeTopic {
     pub pattern: String,
 
@@ -135,7 +136,7 @@ pub struct BridgeTopic {
     pub remote_prefix: String,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// From this broker to the remote one
@@ -147,7 +148,7 @@ pub enum Direction {
 }
 
 /// An extra listener, with its own protocol and TLS settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListenerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -198,7 +199,7 @@ pub struct ListenerConfig {
 /// A WebAssembly plugin, run after the built-in authentication and access
 /// control, in the order the tables appear. A reload on SIGHUP rereads its
 /// file; its other settings only change on restart.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 // Without WebAssembly support only the table's presence is checked
 #[cfg_attr(not(feature = "wasm"), allow(dead_code))]
@@ -209,7 +210,7 @@ pub struct PluginConfig {
     pub name: Option<String>,
 
     /// Passed to the plugin's `init`
-    #[serde(default)]
+    #[serde(default, serialize_with = "redact")]
     pub config: BTreeMap<String, String>,
 
     /// Hosts it may send HTTP requests to, `host` (HTTPS) or `host:port`
@@ -240,6 +241,90 @@ impl PluginConfig {
     }
 }
 
+/// What `getConfig` shows in place of a secret.
+const REDACTED: &str = "<redacted>";
+
+fn redact<T, S: Serializer>(_: &T, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(REDACTED)
+}
+
+fn redact_some<S: Serializer>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(_) => serializer.serialize_str(REDACTED),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn redact_url<S: Serializer>(url: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&redacted_url(url))
+}
+
+fn redact_http_url<S: Serializer>(url: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&redacted_http_url(url))
+}
+
+fn redact_some_url<S: Serializer>(url: &Option<String>, serializer: S) -> Result<S::Ok, S::Error> {
+    match url {
+        Some(url) => redact_http_url(url, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// `url` with the password of `scheme://user:password@host` redacted, or
+/// redacted whole when it passes a secret as a parameter, as PostgreSQL
+/// URLs and connection strings may (`password=`, `sslpassword=`, `token=`).
+/// PostgreSQL URLs take their credentials up to the first `@`, so a
+/// password with an unescaped `/`, `?` or `#` is covered too. Secrets in the
+/// path of a URL are not recognised.
+pub fn redacted_url(url: &str) -> Cow<'_, str> {
+    const SECRET_PARAMS: [&str; 6] = ["password", "passwd", "pwd", "secret", "token", "apikey"];
+    let query = if url.contains("://") {
+        url.split_once('?').map_or("", |(_, query)| query)
+    } else {
+        url
+    };
+    let lower = query.to_ascii_lowercase().replace(['_', '-'], "");
+    if SECRET_PARAMS.iter().any(|p| lower.contains(p)) {
+        return REDACTED.into();
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.into();
+    };
+    let (user_info, host_and_tail) = if matches!(scheme, "postgres" | "postgresql") {
+        let Some(split) = rest.split_once('@') else {
+            return url.into();
+        };
+        split
+    } else {
+        let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        let Some((user_info, host)) = authority.rsplit_once('@') else {
+            return url.into();
+        };
+        (user_info, &rest[authority.len() - host.len()..])
+    };
+    let Some((user, _)) = user_info.split_once(':') else {
+        return url.into();
+    };
+    format!("{scheme}://{user}:{REDACTED}@{host_and_tail}").into()
+}
+
+/// `url` of an HTTP auth service with any user info and query redacted, as
+/// reqwest sends the first as basic auth and the second may carry a key; the
+/// whole URL when an `@` appears elsewhere than in a clean authority, and
+/// secrets in the path are not recognised.
+pub fn redacted_http_url(url: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return REDACTED.into();
+    };
+    if rest.contains('@') {
+        return REDACTED.into();
+    }
+    match rest.find(['?', '#']) {
+        Some(at) => format!("{scheme}://{}?{REDACTED}", &rest[..at]).into(),
+        None => url.into(),
+    }
+}
+
 /// The names of the broker's own plugins, which `$CONTROL/<name>/...`
 /// topics and logs already use.
 const BUILT_IN_PLUGINS: [&str; 6] = [
@@ -255,7 +340,7 @@ fn default_plugin_memory_mb() -> usize {
     64
 }
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     #[default]
@@ -274,7 +359,7 @@ impl From<Protocol> for Transport {
 
 /// Where the broker keeps sessions, retained messages, wills and in-flight
 /// messages.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum StorageConfig {
     /// Lost on restart
@@ -286,6 +371,7 @@ pub enum StorageConfig {
     /// `postgres://user:password@localhost/mercurio`, whose certificate is
     /// verified against `ca_path` or the Mozilla root certificates
     Postgres {
+        #[serde(serialize_with = "redact_url")]
         url: String,
         ca_path: Option<PathBuf>,
         /// When another broker holds the database, wait and take over once
@@ -383,7 +469,7 @@ fn merge(into: &mut toml::Table, from: toml::Table) {
 }
 
 /// Server configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct ServerConfig {
     /// Host address to bind to
@@ -551,7 +637,7 @@ impl Default for ServerConfig {
 }
 
 /// TLS configuration for the server.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct TlsServerConfig {
     /// Enable TLS
@@ -583,7 +669,7 @@ pub struct TlsServerConfig {
     pub subject_as_username: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 pub enum MinTlsVersion {
     #[default]
     #[serde(rename = "1.2")]
@@ -628,7 +714,7 @@ impl TlsServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RedirectConfig {
     /// The server clients should use, such as `broker2.example.com:1883`
     pub server_reference: String,
@@ -730,7 +816,7 @@ impl ServerConfig {
 }
 
 /// Logging configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     #[serde(default = "default_log_level")]
@@ -765,7 +851,7 @@ fn default_log_level() -> String {
 
 /// The Unix socket administrators on this host reach the broker through,
 /// with no credentials or access control.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     /// Path of the socket; empty turns it off
@@ -786,7 +872,7 @@ impl Default for AdminConfig {
 }
 
 /// Authentication configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct AuthConfig {
     /// Enable authentication
@@ -812,12 +898,14 @@ pub struct AuthConfig {
     pub http: Option<HttpAuthConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HttpAuthConfig {
     /// Checks user names and passwords, in place of `password_file`
+    #[serde(serialize_with = "redact_some_url")]
     pub user_url: Option<String>,
 
     /// Checks topic access, in place of `acl_file`
+    #[serde(serialize_with = "redact_some_url")]
     pub acl_url: Option<String>,
 
     #[serde(default = "default_http_timeout")]
@@ -857,7 +945,7 @@ fn default_allow_anonymous() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminConfig, Config, Protocol};
+    use super::{redacted_http_url, redacted_url, AdminConfig, Config, Protocol};
 
     #[test]
     fn test_tls_acceptor_builds_with_every_dependency_linked() {
@@ -1062,5 +1150,170 @@ mod tests {
         let admin = config.admin.expect("the shipped config has [admin]");
         assert_eq!(admin.socket, "/run/mercurio/admin.sock");
         assert_eq!(admin.group, "mercurio");
+    }
+
+    #[test]
+    fn test_serialized_config_hides_secrets() {
+        let config: Config = toml::from_str(
+            r#"
+            [server.tls]
+            enabled = true
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [storage]
+            backend = "postgres"
+            url = "postgres://mercurio:hunter2@db.example.com/mercurio"
+
+            [auth.http]
+            user_url = "https://svc:pa55@auth.example.com/user"
+            acl_url = "https://auth.example.com/acl"
+
+            [[bridges]]
+            name = "cloud"
+            host = "cloud.example.com"
+            username = "edge"
+            password = "s3cret"
+            [[bridges.topics]]
+            pattern = "a/#"
+
+            [[plugins]]
+            path = "audit.wasm"
+            config = { token = "tok3n" }
+            "#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        let text = json.to_string();
+        for secret in ["hunter2", "pa55", "s3cret", "tok3n"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert_eq!(
+            json["storage"]["url"],
+            "postgres://mercurio:<redacted>@db.example.com/mercurio"
+        );
+        assert_eq!(json["storage"]["backend"], "postgres");
+        assert_eq!(json["auth"]["http"]["user_url"], "<redacted>");
+        assert_eq!(
+            json["auth"]["http"]["acl_url"],
+            "https://auth.example.com/acl"
+        );
+        assert_eq!(json["bridges"][0]["password"], "<redacted>");
+        assert_eq!(json["bridges"][0]["username"], "edge");
+        assert_eq!(json["plugins"][0]["config"], "<redacted>");
+        assert_eq!(json["server"]["tls"]["key_path"], "key.pem");
+        assert_eq!(json["server"]["port"], 1883);
+        assert_eq!(json["logging"]["level"], "info");
+
+        let plain: Config = toml::from_str(
+            "[[bridges]]\nname = \"b\"\nhost = \"h\"\n[[bridges.topics]]\npattern = \"#\"\n",
+        )
+        .unwrap();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json["bridges"][0]["password"].is_null());
+        assert_eq!(json["storage"]["backend"], "memory");
+    }
+
+    #[test]
+    fn test_no_secret_bearing_field_is_shown() {
+        let config: Config = toml::from_str(
+            r#"
+            [storage]
+            backend = "postgres"
+            url = "host=db user=u password=SECRET-pg sslmode=require"
+
+            [auth]
+            enabled = true
+            [auth.http]
+            user_url = "https://svc:SECRET-user@auth.example.com/user?token=SECRET-tok"
+            acl_url = "https://auth.example.com/acl?api_key=SECRET-key"
+
+            [[listeners]]
+            port = 1884
+            [listeners.auth.http]
+            user_url = "https://SECRET-l1@auth.example.com/user"
+            acl_url = "https://h/acl?key=SECRET-l2"
+
+            [[bridges]]
+            name = "cloud"
+            host = "cloud.example.com"
+            password = "SECRET-bridge"
+            [[bridges.topics]]
+            pattern = "a/#"
+
+            [[plugins]]
+            path = "audit.wasm"
+            config = { token = "SECRET-plugin", other = "SECRET-other" }
+            "#,
+        )
+        .unwrap();
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(!text.contains("SECRET-"), "{text}");
+
+        let url: Config = toml::from_str(
+            "[storage]\nbackend = \"postgres\"\nurl = \"postgres://u:SECRET-a@h/db?sslpassword=SECRET-b\"\n",
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&url).unwrap().contains("SECRET-"));
+    }
+
+    #[test]
+    fn test_http_urls_hide_user_info_and_queries() {
+        for url in [
+            "https://TOKEN@auth.example.com/user",
+            "https://svc:SECRET-x@auth.example.com/user",
+            "https://h/user?key=SECRET-x",
+            "https://h/user?sig=SECRET-x#SECRET-y",
+            "https://svc:SECRET-x/y@h/user",
+        ] {
+            let shown = redacted_http_url(url);
+            assert!(
+                !shown.contains("TOKEN") && !shown.contains("SECRET-"),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            redacted_http_url("https://h/user?a=1"),
+            "https://h/user?<redacted>"
+        );
+        assert_eq!(
+            redacted_http_url("https://h:8080/acl"),
+            "https://h:8080/acl"
+        );
+        assert_eq!(redacted_http_url("not a url"), "<redacted>");
+    }
+
+    #[test]
+    fn test_url_passwords_are_redacted() {
+        assert_eq!(
+            redacted_url("postgres://u:p@h:5432/db"),
+            "postgres://u:<redacted>@h:5432/db"
+        );
+        assert_eq!(redacted_url("postgres://u@h/db"), "postgres://u@h/db");
+        for url in [
+            "postgres://u:pa/ss@h/db",
+            "postgres://u:p?ss@h/db",
+            "postgres://u:p#ss@h/db",
+            "postgresql://u:pa/ss@h/db",
+        ] {
+            let shown = redacted_url(url);
+            assert!(!shown.contains("ss@") && !shown.contains("pa/"), "{shown}");
+            assert!(!shown.contains("p?") && !shown.contains("p#"), "{shown}");
+            assert!(shown.ends_with("@h/db"), "{shown}");
+        }
+        assert_eq!(redacted_url("https://h/path@x"), "https://h/path@x");
+        assert_eq!(redacted_url("postgres://h/db?password=p"), "<redacted>");
+        assert_eq!(redacted_url("postgres://h/db?sslPassword=p"), "<redacted>");
+        assert_eq!(redacted_url("https://h/a?api_key=k"), "<redacted>");
+        assert_eq!(redacted_url("host=h password=p"), "<redacted>");
+        assert_eq!(redacted_url("host=h PASSWORD=p"), "<redacted>");
+        assert_eq!(
+            redacted_url("https://auth.example.com/token"),
+            "https://auth.example.com/token"
+        );
+        assert_eq!(
+            redacted_url("https://auth.example.com/acl"),
+            "https://auth.example.com/acl"
+        );
     }
 }

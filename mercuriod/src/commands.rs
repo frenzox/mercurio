@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use mercurio_server::{
-    admin::{AdminError, AdminExtension},
+    admin::{AdminError, AdminExtension, ErrorCode},
     plugin::BoxFuture,
 };
 use serde::{de::DeserializeOwned, Deserialize};
@@ -19,6 +19,9 @@ pub struct DaemonCommands {
     log_level: LogLevel,
     /// The files SIGHUP rereads too
     reloadable: Arc<[Arc<dyn Reload>]>,
+    /// The configuration, with its secrets redacted; None when it couldn't
+    /// be shown as JSON
+    config: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -31,12 +34,19 @@ impl DaemonCommands {
         DaemonCommands {
             log_level,
             reloadable: Arc::new([]),
+            config: None,
         }
     }
 
     /// Reloads `files` on `reload`.
     pub fn with_reload(mut self, files: Arc<[Arc<dyn Reload>]>) -> Self {
         self.reloadable = files;
+        self
+    }
+
+    /// Answers `getConfig` with `config`.
+    pub fn with_config(mut self, config: Option<Value>) -> Self {
+        self.config = config;
         self
     }
 
@@ -64,6 +74,12 @@ impl AdminExtension for DaemonCommands {
                 "getLogLevel" => Ok(json!({ "level": self.log_level.get() })),
                 "setLogLevel" => self.set_log_level(args),
                 "reload" => Ok(self.reload()),
+                "getConfig" => self.config.clone().ok_or_else(|| {
+                    AdminError::new(
+                        ErrorCode::Unavailable,
+                        "the configuration can't be shown as JSON",
+                    )
+                }),
                 _ => return None,
             })
         })
@@ -80,7 +96,7 @@ mod tests {
 
     use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
     use mercurio_server::{
-        admin::AdminExtension,
+        admin::{AdminExtension, ErrorCode},
         server::{LocalConnector, LocalListener, Server, ServerConfig},
     };
     use mercurio_storage::memory::MemoryStore;
@@ -202,5 +218,26 @@ mod tests {
             none.handle("reload", &args).await.unwrap(),
             Ok(json!({ "items": [] }))
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_config_returns_the_config_given() {
+        let args = json!({ "command": "getConfig" });
+        let config = json!({ "server": { "port": 1883 } });
+        // The filter must stay alive for the level to change
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let commands = DaemonCommands::new(log_level).with_config(Some(config.clone()));
+        assert_eq!(
+            commands.handle("getConfig", &args).await.unwrap(),
+            Ok(config)
+        );
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let without = DaemonCommands::new(log_level);
+        let error = without
+            .handle("getConfig", &args)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unavailable);
     }
 }

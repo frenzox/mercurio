@@ -149,6 +149,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let log_level = logging::init(&config.logging, cli.verbose)?;
+    // Now, before parts of the configuration are moved out
+    let shown_config = serde_json::to_value(&config)
+        .inspect_err(|e| tracing::warn!("getConfig will be unavailable: {}", e))
+        .ok();
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -304,8 +308,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
-    let commands =
-        Arc::new(commands::DaemonCommands::new(log_level).with_reload(Arc::clone(&reloadable)));
+    let commands = Arc::new(
+        commands::DaemonCommands::new(log_level)
+            .with_reload(Arc::clone(&reloadable))
+            .with_config(shown_config),
+    );
 
     let mut server_config = ServerConfig::default();
     server_config.tls = tls_config;
