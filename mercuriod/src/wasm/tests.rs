@@ -411,7 +411,7 @@ async fn test_payload_rewrite_tags_and_drops() {
 async fn test_webhook_audit_posts_events() {
     use std::sync::Arc;
 
-    use mercurio_server::server::ServerConfig;
+    use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let hook = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -460,45 +460,80 @@ async fn test_webhook_audit_posts_events() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let mounted = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mounted_addr = mounted.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.plugins = vec![plugin];
     config.sys_interval = None;
+    config.listeners = vec![{
+        let mut mounted = ListenerConfig::new(mounted, Transport::Mqtt);
+        mounted.mount_point = Some("tenant/".into());
+        mounted
+    }];
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
         std::future::pending::<()>(),
     ));
 
-    let id = b"audited-client";
-    let mut connect = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 5, 0x02, 0x00, 60, 0x00];
-    connect.extend_from_slice(&(id.len() as u16).to_be_bytes());
-    connect.extend_from_slice(id);
-    let mut packet = vec![0x10, connect.len() as u8];
-    packet.extend(connect);
+    // MQTT 5 CONNECT with clean start and the given properties
+    let connect = |id: &[u8], properties: &[u8]| {
+        let mut connect = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 5, 0x02, 0x00, 60];
+        connect.push(properties.len() as u8);
+        connect.extend_from_slice(properties);
+        connect.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        connect.extend_from_slice(id);
+        let mut packet = vec![0x10, connect.len() as u8];
+        packet.extend(connect);
+        packet
+    };
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream.write_all(&packet).await.unwrap();
+    stream
+        .write_all(&connect(b"audited-client", &[]))
+        .await
+        .unwrap();
     let mut connack = [0u8; 4];
     stream.read_exact(&mut connack).await.unwrap();
     assert_eq!(connack[0], 0x20);
 
-    let found = async {
-        loop {
-            if let Some(body) = bodies
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|body| body.contains("audited-client"))
-            {
-                return body.clone();
+    let posted = |text: &'static str| {
+        let bodies = Arc::clone(&bodies);
+        async move {
+            loop {
+                if let Some(body) = bodies
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|body| body.contains(text))
+                {
+                    return body.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     };
-    let request = tokio::time::timeout(Duration::from_secs(2), found)
+    let request = tokio::time::timeout(Duration::from_secs(2), posted("audited-client"))
         .await
         .expect("the webhook never received the event");
     assert!(request.starts_with("POST /audit "), "{request}");
     assert!(request.contains(r#""event":"connected""#), "{request}");
+
+    // A session of a mounted listener, expiring a second after its client
+    // leaves, is reported with the mount point
+    let mut stream = tokio::net::TcpStream::connect(mounted_addr).await.unwrap();
+    stream
+        .write_all(&connect(b"expiring", &[0x11, 0x00, 0x00, 0x00, 0x01]))
+        .await
+        .unwrap();
+    let mut connack = [0u8; 3];
+    stream.read_exact(&mut connack).await.unwrap();
+    assert_eq!(connack[0], 0x20);
+    drop(stream);
+    let request = tokio::time::timeout(Duration::from_secs(5), posted("session-expired"))
+        .await
+        .expect("the webhook never received the expiry");
+    assert!(request.contains(r#""client":"expiring""#), "{request}");
+    assert!(request.contains(r#""mountPoint":"tenant/""#), "{request}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

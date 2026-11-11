@@ -27,11 +27,15 @@ impl Plugin for WebhookAudit {
             return;
         };
         let body = match event {
-            Event::Connected(client) => object("connected", &client.client_id),
-            Event::Disconnected(gone) => object("disconnected", &gone.client.client_id),
-            Event::Subscribed(sub) => object("subscribed", &sub.client.client_id),
-            Event::Unsubscribed(sub) => object("unsubscribed", &sub.client.client_id),
-            Event::SessionExpired(client_id) => object("session-expired", &client_id),
+            Event::Connected(client) => object("connected", &client.client_id, None),
+            Event::Disconnected(gone) => object("disconnected", &gone.client.client_id, None),
+            Event::Subscribed(sub) => object("subscribed", &sub.client.client_id, None),
+            Event::Unsubscribed(sub) => object("unsubscribed", &sub.client.client_id, None),
+            Event::SessionExpired(expired) => object(
+                "session-expired",
+                &expired.client_id,
+                expired.mount_point.as_deref(),
+            ),
         };
         if let Err(error) = post(url, body.as_bytes()) {
             host::log(Level::Warn, &format!("posting to {url} failed: {error}"));
@@ -39,11 +43,17 @@ impl Plugin for WebhookAudit {
     }
 }
 
-fn object(event: &str, client: &str) -> String {
+/// The JSON body for `event` of `client`, with the mount point that, with
+/// the client id, names an expired session.
+fn object(event: &str, client: &str, mount_point: Option<&str>) -> String {
+    let mount_point = mount_point
+        .map(|m| format!(r#","mountPoint":"{}""#, escape(m)))
+        .unwrap_or_default();
     format!(
-        r#"{{"event":"{}","client":"{}"}}"#,
+        r#"{{"event":"{}","client":"{}"{}}}"#,
         escape(event),
-        escape(client)
+        escape(client),
+        mount_point
     )
 }
 

@@ -17,7 +17,8 @@ pub use bindings::exports::mercurio::plugin::guest::Guest;
 pub use bindings::mercurio::plugin::host;
 pub use bindings::mercurio::plugin::types::{
     Access, AuthResult, Challenge, ClientInfo, Connection, Decision, Disconnected, Event, Hooks,
-    Level, Message, MessageAction, Qos, Registration, Subscribed, Success, Unsubscribed,
+    Level, Message, MessageAction, Qos, Registration, SessionExpired, Subscribed, Success,
+    Unsubscribed,
 };
 
 /// A plugin's settings, the `config` table of its `[[plugins]]` entry in

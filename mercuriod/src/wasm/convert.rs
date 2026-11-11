@@ -148,7 +148,14 @@ pub(crate) fn event(event: &Event) -> Option<wit::Event> {
             client: client(c),
             filter: filter.clone(),
         }),
-        Event::SessionExpired { client_id, .. } => wit::Event::SessionExpired(client_id.clone()),
+        Event::SessionExpired {
+            client_id,
+            mount_point,
+            ..
+        } => wit::Event::SessionExpired(wit::SessionExpired {
+            client_id: client_id.clone(),
+            mount_point: mount_point.clone(),
+        }),
         _ => return None,
     })
 }

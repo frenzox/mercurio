@@ -61,13 +61,16 @@ interface types {
   record disconnected { client: client-info, reason: option<u8> }
   record subscribed { client: client-info, filter: string, qos: qos }
   record unsubscribed { client: client-info, filter: string }
+  /// A session that ended as its expiry passed. The same client id can
+  /// have a session under each mount point, so both name it.
+  record session-expired { client-id: string, mount-point: option<string> }
 
   variant event {
     connected(client-info),
     disconnected(disconnected),
     subscribed(subscribed),
     unsubscribed(unsubscribed),
-    session-expired(string),
+    session-expired(session-expired),
   }
 
   /// The hooks a plugin implements; the broker calls no others.

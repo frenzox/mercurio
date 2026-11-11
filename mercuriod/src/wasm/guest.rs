@@ -289,7 +289,9 @@ fn old_event(event: &wit::Event) -> old::Event {
             client: client_info(&u.client),
             filter: u.filter.clone(),
         }),
-        wit::Event::SessionExpired(client_id) => old::Event::SessionExpired(client_id.clone()),
+        wit::Event::SessionExpired(expired) => {
+            old::Event::SessionExpired(expired.client_id.clone())
+        }
     }
 }
 
@@ -367,5 +369,17 @@ mod tests {
         };
         let back = new_message(old_message(message.clone()));
         assert_eq!(format!("{back:?}"), format!("{message:?}"));
+    }
+
+    #[test]
+    fn test_0_1_expired_sessions_carry_the_client_id_alone() {
+        let expired = wit::Event::SessionExpired(wit::SessionExpired {
+            client_id: "c".into(),
+            mount_point: Some("tenant/".into()),
+        });
+        let old::Event::SessionExpired(client_id) = old_event(&expired) else {
+            panic!("expected a session-expired event");
+        };
+        assert_eq!(client_id, "c");
     }
 }
