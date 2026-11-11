@@ -1,6 +1,7 @@
 //! Mercuriod - MQTT broker daemon
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,26 +11,31 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
+use mercurio_server::admin::AdminExtension;
+use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
-    ServerConfig, Socket, Transport,
+    Server, ServerConfig, Socket, Transport,
 };
 use mercurio_storage::{
+    memory::MemoryStore,
     postgres::{DatabaseLock, PostgresStore},
     sqlite::SqliteStore,
+    MqttStore,
 };
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
 
 #[cfg(target_os = "linux")]
 mod admin_socket;
 mod bridge;
+mod commands;
 mod config;
 mod credentials;
 mod dynsec;
 mod http_auth;
+mod logging;
 mod reload;
 #[cfg(unix)]
 mod syslog;
@@ -146,55 +152,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Config::default()
     };
 
-    // Initialize logging
-    let log_level = if cli.verbose {
-        "debug"
-    } else {
-        &config.logging.level
-    };
-
-    let mut filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    if !config.logging.connection_messages {
-        filter = filter.add_directive(
-            format!("{}=off", mercurio_server::CONNECTIONS)
-                .parse()
-                .expect("valid directive"),
-        );
-    }
-    #[cfg(unix)]
-    let syslog = match config.logging.syslog {
-        true => Some(
-            syslog::Syslog::connect("/dev/log")
-                .map_err(|e| format!("Failed to connect to syslog at /dev/log: {}", e))?,
-        ),
-        false => None,
-    };
-    #[cfg(not(unix))]
-    let syslog: Option<std::io::Sink> = match config.logging.syslog {
-        true => return Err("syslog is only supported on Unix".into()),
-        false => None,
-    };
-    match (syslog, &config.logging.file) {
-        (Some(syslog), _) => fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(syslog)
-            .init(),
-        (None, Some(path)) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("Failed to open log file {}: {}", path, e))?;
-            fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-        }
-        (None, None) => fmt().with_env_filter(filter).init(),
-    }
+    let log_level = logging::init(&config.logging, cli.verbose)?;
+    // Now, before parts of the configuration are moved out
+    let shown_config = serde_json::to_value(&config)
+        .inspect_err(|e| tracing::warn!("getConfig will be unavailable: {}", e))
+        .ok();
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -344,10 +306,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (connector, local_listener) = LocalConnector::new();
     let plugins = chain(&builtins, None);
 
-    for bridge in config.bridges {
-        info!("Starting bridge {}", bridge.name);
-        bridge::spawn(bridge, connector.clone())?;
-    }
+    let bridges = config
+        .bridges
+        .into_iter()
+        .map(|bridge| {
+            info!("Starting bridge {}", bridge.name);
+            bridge::spawn(bridge, connector.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
+    let commands = Arc::new(
+        commands::DaemonCommands::new(log_level)
+            .with_reload(Arc::clone(&reloadable))
+            .with_config(shown_config)
+            .with_bridges(bridges),
+    );
 
     let mut server_config = ServerConfig::default();
     server_config.tls = tls_config;
@@ -357,6 +331,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     server_config.policy = policy;
     server_config.listeners = listeners;
     server_config.local_listener = Some(local_listener);
+    let extension: Arc<dyn AdminExtension> = commands.clone();
+    server_config.admin_extension = Some(extension);
     server_config.sys_interval =
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     #[cfg(unix)]
@@ -364,18 +340,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match config.storage {
         StorageConfig::Memory => {
-            mercurio_server::server::run_with_config(listener, server_config, shutdown).await
+            let storage = Arc::new(MemoryStore::new());
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
-                .await
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
-                .await
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
     };
     // Removed now, as exiting skips destructors
@@ -395,6 +370,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// Sets the broker up, hands its `Admin` to the daemon's commands, and
+/// serves until `shutdown`.
+async fn serve<St: MqttStore + 'static>(
+    listener: TcpListener,
+    config: ServerConfig,
+    storage: Arc<St>,
+    commands: &commands::DaemonCommands,
+    shutdown: impl Future,
+) -> Result<(), ServerError> {
+    let server = Server::new(listener, config, storage).await?;
+    commands.set_admin(server.admin());
+    server.run(shutdown).await
 }
 
 /// `host:port`, with an IPv6 host in brackets.
@@ -601,21 +590,17 @@ async fn load_plugins(
     }
 }
 
-/// Rereads the ACL and password files and the WebAssembly plugins on
-/// SIGHUP. ACL and plugin changes apply to every later check or call;
-/// password changes apply to later connections.
+/// Rereads the ACL, password and dynamic security files and the
+/// WebAssembly plugins on SIGHUP, as the `reload` command does. ACL and
+/// plugin changes apply to every later check or call; password changes
+/// apply to later connections.
 #[cfg(unix)]
-async fn reload_on_sighup(files: Vec<Arc<dyn Reload>>) {
+async fn reload_on_sighup(files: Arc<[Arc<dyn Reload>]>) {
     let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
         .expect("failed to listen for SIGHUP");
     while hangup.recv().await.is_some() {
         info!("Received SIGHUP, reloading");
-        for file in &files {
-            match file.reload() {
-                Ok(()) => info!("Reloaded {}", file.path()),
-                Err(e) => error!("Keeping the previous {}: {}", file.path(), e),
-            }
-        }
+        reload::reload_all(&files);
     }
 }
 

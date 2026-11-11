@@ -16,7 +16,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::plugin::{
-    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -515,7 +515,8 @@ impl DynamicSecurity {
     }
 
     /// Writes a new state file with an administrator client, `admin`, whose
-    /// role may send every command and read `$SYS`.
+    /// role may send every dynamic security and broker admin command and
+    /// read `$SYS`.
     pub fn init(path: &str, admin: &str, password: &str) -> Result<(), String> {
         if Path::new(path).exists() {
             return Err(format!("{path} already exists"));
@@ -540,6 +541,9 @@ impl DynamicSecurity {
                     acl(AclType::PublishClientSend, "$CONTROL/dynamic-security/#"),
                     acl(AclType::SubscribePattern, "$CONTROL/dynamic-security/#"),
                     acl(AclType::PublishClientReceive, "$CONTROL/dynamic-security/#"),
+                    acl(AclType::PublishClientSend, "$CONTROL/broker/v1/#"),
+                    acl(AclType::SubscribePattern, "$CONTROL/broker/v1/#"),
+                    acl(AclType::PublishClientReceive, "$CONTROL/broker/v1/#"),
                     acl(AclType::SubscribePattern, "$SYS/#"),
                     acl(AclType::PublishClientReceive, "$SYS/#"),
                 ],
@@ -603,8 +607,22 @@ impl DynamicSecurity {
 fn read(path: &str) -> Result<Data, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read dynamic security file {path}: {e}"))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Invalid dynamic security file {path}: {e}"))
+    serde_json::from_str(&contents).map_err(|e| {
+        // serde_json quotes the offending value, which can be a hash or a
+        // salt, and the returned text reaches admin clients
+        error!("Invalid dynamic security file {path}: {e}");
+        let category = match e.classify() {
+            serde_json::error::Category::Io => "io",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "data",
+            serde_json::error::Category::Eof => "eof",
+        };
+        format!(
+            "Invalid dynamic security file {path}: {category} error at line {} column {}",
+            e.line(),
+            e.column()
+        )
+    })
 }
 
 /// Replaces the file in one step, so a crash never leaves half of it.
@@ -646,6 +664,14 @@ impl DynamicSecurity {
 impl Plugin for DynamicSecurity {
     fn name(&self) -> &str {
         "dynamic-security"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&[
+            "authenticate",
+            "authorize",
+            "on_control",
+        ])
     }
 
     fn on_control<'a>(
@@ -710,6 +736,10 @@ impl Reload for DynamicSecurity {
     fn path(&self) -> &str {
         &self.path
     }
+
+    fn item(&self) -> &str {
+        self.name()
+    }
 }
 
 #[cfg(test)]
@@ -742,6 +772,28 @@ mod tests {
             .await
             .is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_reload_error_does_not_quote_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-secret-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = std::sync::Arc::new(DynamicSecurity::load(path).unwrap());
+        std::fs::write(
+            path,
+            "{\n \"clients\": [{\"username\": \"a\", \"disabled\": \"SECRET-hash\"}]\n}",
+        )
+        .unwrap();
+
+        let files: Vec<std::sync::Arc<dyn Reload>> = vec![security];
+        let items = crate::reload::reload_all(&files);
+        let error = items[0].error.as_deref().unwrap();
+        assert!(!error.contains("SECRET-hash"), "{error}");
+        assert!(error.contains("data error at line 2"), "{error}");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -956,6 +1008,56 @@ mod tests {
         assert_eq!(
             security.authorize(&s1, "sensors/t1", Access::Write).await,
             Decision::Allow
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_status_is_builtin() {
+        use mercurio_server::plugin::{PluginKind, PluginStatus};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-status-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        assert_eq!(
+            security.status(),
+            PluginStatus::new("dynamic-security", PluginKind::Builtin).with_hooks(&[
+                "authenticate",
+                "authorize",
+                "on_control"
+            ])
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_init_grants_the_broker_admin_api() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-broker-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        for (topic, access) in [
+            ("$CONTROL/broker/v1", Access::Write),
+            ("$CONTROL/broker/v1/listClients", Access::Write),
+            ("$CONTROL/broker/v1/response", Access::Subscribe),
+            ("$CONTROL/broker/v1/response", Access::Read),
+        ] {
+            assert_eq!(
+                security.authorize(&identity("admin"), topic, access).await,
+                Decision::Allow,
+                "{topic} {access:?}"
+            );
+        }
+        assert_eq!(
+            security
+                .authorize(&identity("other"), "$CONTROL/broker/v1", Access::Write)
+                .await,
+            Decision::Deny
         );
         std::fs::remove_file(path).unwrap();
     }

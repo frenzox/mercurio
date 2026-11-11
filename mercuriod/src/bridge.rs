@@ -7,14 +7,20 @@
 //! topic goes both ways. MQTT 3.1.1 has no No Local, so with such a remote
 //! broker the copies it echoes back are recognised and dropped instead.
 
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use mercurio_client::{
     ConnectOptions, Event, MqttClient, ProtocolVersion, QoS, SubscriptionOptions,
 };
+use mercurio_core::message::unix_millis;
 use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::server::LocalConnector;
+use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::config::{BridgeConfig, BridgeProtocol, Direction};
@@ -91,9 +97,82 @@ fn routes(config: &BridgeConfig) -> Result<(Vec<Route>, Vec<Route>), String> {
     Ok((outbound, inbound))
 }
 
-/// Starts the bridge in the background. Fails only on an invalid
-/// configuration; an unreachable remote broker is retried.
-pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<(), String> {
+/// How a bridge's link to its remote broker stands, for `listBridges`. Its
+/// task writes it only when the link comes up or goes down.
+pub struct BridgeStatus {
+    name: String,
+    client_id: String,
+    link: Mutex<Link>,
+}
+
+struct Link {
+    connected: bool,
+    /// The remote broker's `host:port`, the last one while disconnected
+    remote_address: Option<String>,
+    /// Unix seconds since the link came up or went down, or since the
+    /// bridge started before it first connected
+    since: u64,
+}
+
+/// One entry of `listBridges`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeEntry {
+    name: String,
+    connected: bool,
+    remote_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connected_since: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disconnected_since: Option<u64>,
+    /// Messages waiting in the bridge's session on this broker
+    queued: usize,
+}
+
+impl BridgeStatus {
+    pub fn new(name: &str, client_id: &str) -> BridgeStatus {
+        BridgeStatus {
+            name: name.to_string(),
+            client_id: client_id.to_string(),
+            link: Mutex::new(Link {
+                connected: false,
+                remote_address: None,
+                since: unix_millis() / 1000,
+            }),
+        }
+    }
+
+    /// The bridge's client id, on this broker as on the remote one.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub fn entry(&self, queued: usize) -> BridgeEntry {
+        let link = self.link.lock().unwrap();
+        BridgeEntry {
+            name: self.name.clone(),
+            connected: link.connected,
+            remote_address: link.remote_address.clone(),
+            connected_since: link.connected.then_some(link.since),
+            disconnected_since: (!link.connected).then_some(link.since),
+            queued,
+        }
+    }
+
+    fn set(&self, connected: bool, remote_address: Option<&str>) {
+        let mut link = self.link.lock().unwrap();
+        link.connected = connected;
+        if let Some(address) = remote_address {
+            link.remote_address = Some(address.to_string());
+        }
+        link.since = unix_millis() / 1000;
+    }
+}
+
+/// Starts the bridge in the background and returns the status it keeps up
+/// to date. Fails only on an invalid configuration; an unreachable remote
+/// broker is retried.
+pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeStatus>, String> {
     let (outbound, inbound) = routes(&config)?;
     let client_id = config
         .client_id
@@ -114,7 +193,7 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<(), String> 
     let remote_options = addresses
         .into_iter()
         .map(|(host, port)| {
-            let address = format!("{host}:{port}");
+            let address = crate::address(&host, port);
             let mut options = ConnectOptions::new(host, port)
                 .client_id(client_id.clone())
                 .protocol_version(protocol_version)
@@ -137,7 +216,9 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<(), String> 
         })
         .collect();
 
+    let status = Arc::new(BridgeStatus::new(&config.name, &client_id));
     let bridge = Bridge {
+        status: Arc::clone(&status),
         name: config.name,
         state_topic: config
             .notifications
@@ -147,7 +228,7 @@ pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<(), String> 
         inbound,
     };
     tokio::spawn(bridge.run(local_options, remote_options));
-    Ok(())
+    Ok(status)
 }
 
 /// The remote brokers to try, in order.
@@ -177,6 +258,7 @@ fn addresses(config: &BridgeConfig) -> Result<Vec<(String, u16)>, String> {
 }
 
 struct Bridge {
+    status: Arc<BridgeStatus>,
     name: String,
     /// Where the bridge's state is published, `1` when connected
     state_topic: Option<String>,
@@ -215,6 +297,7 @@ impl Bridge {
             };
             if self.subscribe(&remote, &self.inbound).await {
                 info!("Bridge {} connected to {}", self.name, address);
+                self.status.set(true, Some(address.as_str()));
                 self.notify(&local, "1").await;
                 let local_closed = tokio::select! {
                     _ = self.forward(&local, &remote, &self.outbound, true) => true,
@@ -226,6 +309,7 @@ impl Bridge {
                     return;
                 }
                 error!("Bridge {} lost its connection", self.name);
+                self.status.set(false, None);
                 self.notify(&local, "0").await;
             }
             let _ = remote.disconnect().await;
@@ -335,7 +419,7 @@ impl Bridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{forwarded_topic, routes, Route};
+    use super::{forwarded_topic, routes, BridgeStatus, Route};
     use crate::config::Config;
     use mercurio_client::QoS;
 
@@ -428,5 +512,34 @@ mod tests {
             outbound[0].rename("site/sensors/t1").as_deref(),
             Some("plant1/sensors/t1")
         );
+    }
+
+    #[test]
+    fn test_status_follows_the_link() {
+        let status = BridgeStatus::new("cloud", "mercurio-bridge-cloud");
+        assert_eq!(status.client_id(), "mercurio-bridge-cloud");
+        let entry = serde_json::to_value(status.entry(3)).unwrap();
+        assert_eq!(entry["name"], "cloud");
+        assert_eq!(entry["connected"], false);
+        assert!(entry["remoteAddress"].is_null(), "{entry}");
+        assert!(entry["disconnectedSince"].is_u64(), "{entry}");
+        assert!(entry.get("connectedSince").is_none(), "{entry}");
+        assert_eq!(entry["queued"], 3);
+
+        status.set(true, Some("10.0.0.1:1883"));
+        let entry = serde_json::to_value(status.entry(0)).unwrap();
+        assert_eq!(entry["connected"], true);
+        assert_eq!(entry["remoteAddress"], "10.0.0.1:1883");
+        assert!(entry["connectedSince"].is_u64(), "{entry}");
+        assert!(entry.get("disconnectedSince").is_none(), "{entry}");
+
+        status.set(false, None);
+        let entry = serde_json::to_value(status.entry(0)).unwrap();
+        assert_eq!(entry["connected"], false);
+        assert_eq!(entry["remoteAddress"], "10.0.0.1:1883");
+
+        status.set(true, Some(&crate::address("2001:db8::1", 1883)));
+        let entry = serde_json::to_value(status.entry(0)).unwrap();
+        assert_eq!(entry["remoteAddress"], "[2001:db8::1]:1883");
     }
 }

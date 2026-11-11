@@ -475,3 +475,72 @@ async fn test_webhook_audit_posts_events() {
     assert!(request.starts_with("POST /audit "), "{request}");
     assert!(request.contains(r#""event":"connected""#), "{request}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_status_reports_hooks_copies_and_failures() {
+    use mercurio_server::plugin::PluginKind;
+
+    // Its own runtime, which the reload below uses too
+    let runtime = Runtime::new().unwrap();
+    let plugin = WasmPlugin::load(&runtime, settings("misbehave", &[]))
+        .await
+        .unwrap();
+    let status = plugin.status();
+    assert_eq!(status.name, "misbehave");
+    assert_eq!(status.kind, PluginKind::Wasm);
+    assert_eq!(status.hooks, ["begin_auth", "on_control"]);
+    assert_eq!(status.instances, Some(1));
+    assert_eq!(status.failures, Some(0));
+    assert_eq!(status.last_error, None);
+
+    // The trapped copy is dropped, and the failure is remembered
+    assert_eq!(control(&plugin, "panic", b"ouch").await, None);
+    let status = plugin.status();
+    assert_eq!(status.instances, Some(0));
+    assert_eq!(status.failures, Some(1));
+    let last_error = status.last_error.expect("the failure");
+    assert!(last_error.contains("on_control"), "{last_error}");
+
+    // Copies are made again on demand, and failures outlive a reload
+    assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
+    assert_eq!(plugin.status().instances, Some(1));
+    plugin.reload(&runtime).await.unwrap();
+    let status = plugin.status();
+    assert_eq!((status.instances, status.failures), (Some(1), Some(1)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_plugins_shows_wasm_plugins() {
+    use std::sync::Arc;
+
+    use mercurio_server::{
+        plugin::PluginKind,
+        server::{Server, ServerConfig},
+    };
+    use mercurio_storage::memory::MemoryStore;
+
+    let plugin = WasmPlugin::load(
+        &Runtime::new().unwrap(),
+        settings("deny-topic", &[("prefix", "secret/")]),
+    )
+    .await
+    .unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = vec![plugin as Arc<dyn Plugin>];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
+        .await
+        .unwrap();
+    let plugins = server.admin().plugins().await;
+    let [status] = &plugins[..] else {
+        panic!("expected one plugin: {plugins:?}");
+    };
+    assert_eq!(status.name, "deny-topic");
+    assert_eq!(status.kind, PluginKind::Wasm);
+    assert_eq!(status.hooks, ["authorize"]);
+    assert_eq!((status.instances, status.failures), (Some(1), Some(0)));
+    let json = serde_json::to_value(status).unwrap();
+    assert_eq!(json["kind"], "wasm");
+    assert_eq!(json["instances"], 1);
+    assert!(json.get("lastError").is_none(), "{json}");
+}

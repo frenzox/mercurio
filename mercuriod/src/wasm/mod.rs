@@ -19,12 +19,12 @@ use bytes::Bytes;
 use mercurio_core::reason::ReasonCode;
 use mercurio_server::plugin::{
     ready, Access, AuthExchange, AuthResult, BoxFuture, ClientInfo, Credentials, Decision, Event,
-    MessageAction, Plugin, PluginMessage,
+    MessageAction, Plugin, PluginKind, PluginMessage, PluginStatus,
 };
 use wasmtime::component::Component;
 
 use crate::reload::Reload;
-use pool::Pool;
+use pool::{Health, Pool};
 use runtime::bindings::{
     self,
     mercurio::plugin::types::{self as wit, Hooks},
@@ -64,6 +64,8 @@ pub struct WasmPlugin {
     loaded: RwLock<Arc<Loaded>>,
     /// Kept across reloads, so the new code sees what the old stored
     kv: Arc<Kv>,
+    /// Kept across reloads, so failures count since the broker started
+    health: Arc<Health>,
 }
 
 struct Loaded {
@@ -76,11 +78,13 @@ impl WasmPlugin {
     /// Compiles the plugin, makes its first copy and runs its `init`.
     pub async fn load(runtime: &Runtime, settings: PluginSettings) -> anyhow::Result<Arc<Self>> {
         let kv = Arc::new(Kv::default());
-        let loaded = Loaded::new(runtime, &settings, Arc::clone(&kv)).await?;
+        let health = Arc::new(Health::default());
+        let loaded = Loaded::new(runtime, &settings, Arc::clone(&kv), Arc::clone(&health)).await?;
         Ok(Arc::new(WasmPlugin {
             settings,
             loaded: RwLock::new(Arc::new(loaded)),
             kv,
+            health,
         }))
     }
 
@@ -88,7 +92,13 @@ impl WasmPlugin {
     /// replaces the running code with it. Calls already running finish on
     /// the old code; on error the old code stays. The settings stay too.
     pub async fn reload(&self, runtime: &Runtime) -> anyhow::Result<()> {
-        let loaded = Loaded::new(runtime, &self.settings, Arc::clone(&self.kv)).await?;
+        let loaded = Loaded::new(
+            runtime,
+            &self.settings,
+            Arc::clone(&self.kv),
+            Arc::clone(&self.health),
+        )
+        .await?;
         *self.loaded.write().unwrap() = Arc::new(loaded);
         Ok(())
     }
@@ -135,6 +145,10 @@ impl Reload for Reloader {
     fn path(&self) -> &str {
         &self.path
     }
+
+    fn item(&self) -> &str {
+        self.plugin.name()
+    }
 }
 
 impl Loaded {
@@ -142,6 +156,7 @@ impl Loaded {
         runtime: &Runtime,
         settings: &PluginSettings,
         kv: Arc<Kv>,
+        health: Arc<Health>,
     ) -> anyhow::Result<Self> {
         let path = settings.path.clone();
         let engine = runtime.engine.clone();
@@ -177,6 +192,7 @@ impl Loaded {
             settings.config.clone(),
             settings.timeout,
             settings.instances,
+            health,
         );
         let (instance, registration) = pool.create().await?;
         pool.put(instance);
@@ -227,6 +243,28 @@ fn compatible(version: &str) -> bool {
 impl Plugin for WasmPlugin {
     fn name(&self) -> &str {
         &self.settings.name
+    }
+
+    fn status(&self) -> PluginStatus {
+        let loaded = self.loaded();
+        let has = |hook| loaded.hooks.contains(hook);
+        let hooks: Vec<&str> = [
+            (has(Hooks::AUTHENTICATE), "authenticate"),
+            (!loaded.auth_methods.is_empty(), "begin_auth"),
+            (has(Hooks::AUTHORIZE), "authorize"),
+            (has(Hooks::ON_MESSAGE), "on_message"),
+            (has(Hooks::ON_EVENT), "on_event"),
+            (has(Hooks::ON_TICK), "on_tick"),
+            (has(Hooks::ON_CONTROL), "on_control"),
+        ]
+        .into_iter()
+        .filter_map(|(registered, hook)| registered.then_some(hook))
+        .collect();
+        let mut status = PluginStatus::new(self.name(), PluginKind::Wasm).with_hooks(&hooks);
+        status.instances = Some(loaded.pool.live());
+        status.failures = Some(self.health.failures());
+        status.last_error = self.health.last_error();
+        status
     }
 
     fn authenticate<'a>(

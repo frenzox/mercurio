@@ -15,7 +15,7 @@ use std::{
 };
 
 use mercurio_server::plugin::{
-    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 use serde_json::json;
 use tracing::warn;
@@ -80,6 +80,17 @@ impl HttpAuth {
 impl Plugin for HttpAuth {
     fn name(&self) -> &str {
         "http-auth"
+    }
+
+    fn status(&self) -> PluginStatus {
+        let mut hooks = Vec::new();
+        if self.user_url.is_some() {
+            hooks.push("authenticate");
+        }
+        if self.acl_url.is_some() {
+            hooks.push("authorize");
+        }
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&hooks)
     }
 
     fn authenticate<'a>(
@@ -257,5 +268,34 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(check(&auth, "secret").await, Decision::Deny);
+    }
+
+    #[test]
+    fn test_status_is_builtin() {
+        use mercurio_server::plugin::{Plugin, PluginKind, PluginStatus};
+
+        let status = |user: Option<&str>, acl: Option<&str>| {
+            HttpAuth::new(
+                user.map(String::from),
+                acl.map(String::from),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .status()
+        };
+        let both = status(Some("http://u"), Some("http://a"));
+        assert_eq!(
+            both,
+            PluginStatus::new("http-auth", PluginKind::Builtin)
+                .with_hooks(&["authenticate", "authorize"])
+        );
+        assert_eq!(
+            status(Some("http://u"), None),
+            PluginStatus::new("http-auth", PluginKind::Builtin).with_hooks(&["authenticate"])
+        );
+        assert_eq!(
+            status(None, Some("http://a")),
+            PluginStatus::new("http-auth", PluginKind::Builtin).with_hooks(&["authorize"])
+        );
     }
 }

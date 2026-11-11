@@ -3,7 +3,10 @@
 //! again, so it is dropped and a fresh one made when needed.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -24,6 +27,47 @@ use super::{
 pub(crate) struct Instance {
     pub(crate) store: Store<State>,
     pub(crate) guest: Guest,
+    _live: Live,
+}
+
+/// Counts a copy among the live ones for as long as it exists, wherever
+/// it is dropped: back in the pool, after a trap, or with a cancelled call.
+struct Live(Arc<AtomicUsize>);
+
+impl Live {
+    fn new(count: &Arc<AtomicUsize>) -> Live {
+        count.fetch_add(1, Ordering::Relaxed);
+        Live(Arc::clone(count))
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// The calls of a plugin that failed since the broker started; shared by
+/// the code a reload replaces and the new code.
+#[derive(Default)]
+pub(crate) struct Health {
+    failures: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl Health {
+    fn failed(&self, error: String) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.lock().unwrap() = Some(error);
+    }
+
+    pub(crate) fn failures(&self) -> u64 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
 }
 
 pub(crate) struct Pool {
@@ -34,6 +78,8 @@ pub(crate) struct Pool {
     timeout: Duration,
     idle: Mutex<Vec<Instance>>,
     permits: Semaphore,
+    live: Arc<AtomicUsize>,
+    health: Arc<Health>,
 }
 
 impl Pool {
@@ -44,6 +90,7 @@ impl Pool {
         config: Vec<(String, String)>,
         timeout: Duration,
         instances: usize,
+        health: Arc<Health>,
     ) -> Pool {
         Pool {
             name,
@@ -53,7 +100,14 @@ impl Pool {
             timeout,
             idle: Mutex::default(),
             permits: Semaphore::new(instances.max(1)),
+            live: Arc::default(),
+            health,
         }
+    }
+
+    /// Copies alive now, idle or in a call.
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// A fresh copy, initialised; its registration is returned too.
@@ -92,7 +146,11 @@ impl Pool {
                 })??;
         let registration =
             registration.map_err(|message| anyhow::anyhow!("plugin `{}`: {message}", self.name))?;
-        let instance = Instance { store, guest };
+        let instance = Instance {
+            store,
+            guest,
+            _live: Live::new(&self.live),
+        };
         Ok((instance, registration))
     }
 
@@ -116,7 +174,7 @@ impl Pool {
             None => match self.create().await {
                 Ok((instance, _)) => instance,
                 Err(error) => {
-                    tracing::warn!(plugin = %self.name, "Couldn't start a copy for {hook}: {error:#}");
+                    self.failed(format!("Couldn't start a copy for {hook}: {error:#}"));
                     return None;
                 }
             },
@@ -130,14 +188,19 @@ impl Pool {
                 Some(value)
             }
             Err(_) => {
-                tracing::warn!(plugin = %self.name, "Took longer than {:?} in {hook}", self.timeout);
+                self.failed(format!("Took longer than {:?} in {hook}", self.timeout));
                 None
             }
             Ok(Err(error)) => {
-                tracing::warn!(plugin = %self.name, "Failed in {hook}: {error:#}");
+                self.failed(format!("Failed in {hook}: {error:#}"));
                 None
             }
         }
+    }
+
+    fn failed(&self, error: String) {
+        tracing::warn!(plugin = %self.name, "{error}");
+        self.health.failed(error);
     }
 
     fn arm(&self, store: &mut Store<State>) {
