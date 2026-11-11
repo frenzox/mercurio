@@ -1,19 +1,54 @@
 //! JSON Web Tokens given as CONNECT passwords.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{decode, AlgorithmFamily, DecodingKey, Validation};
+use jsonwebtoken::jwk::{Jwk, PublicKeyUse};
+use jsonwebtoken::{decode, decode_header, Algorithm, AlgorithmFamily, DecodingKey, Validation};
 use serde_json::{Map, Value};
+use tracing::warn;
 
-use crate::config::JwtAuthConfig;
+use crate::config::{redacted_http_url, JwtAuthConfig};
+use crate::http_auth::is_plaintext_to_remote;
+
+/// Longest wait for the key set server, under the default 5 s
+/// `plugin_timeout` so a refresh usually ends before the CONNECT gives up.
+const JWKS_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Least `jwks_refresh_seconds`, as any client can make the broker fetch the
+/// set by naming a key it lacks.
+const MIN_JWKS_REFRESH: u64 = 10;
 
 pub(crate) struct Verifier {
-    key: DecodingKey,
+    keys: Keys,
     validation: Validation,
     username_claim: String,
+}
+
+enum Keys {
+    File(DecodingKey),
+    Set(Jwks),
+}
+
+/// A key and the `kid` it goes by.
+type KeyWithId = (Option<String>, DecodingKey);
+
+/// Keys fetched from `jwks_url`, fetched again when a token names a key the
+/// set lacks.
+struct Jwks {
+    agent: ureq::Agent,
+    url: String,
+    algorithms: Vec<Algorithm>,
+    refresh_every: Duration,
+    /// Shared with the fetch, which stores its result even after the check
+    /// that started it has given up
+    keys: Arc<RwLock<Vec<KeyWithId>>>,
+    /// When the set was last fetched; held while fetching it, so a burst of
+    /// unknown keys makes a single request
+    fetched: tokio::sync::Mutex<Instant>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -49,7 +84,7 @@ impl Verifier {
         if config.algorithms.iter().any(|alg| alg.family() != family) {
             return Err("auth.jwt.algorithms must all take the same kind of key".into());
         }
-        let key = if let Some(path) = &config.secret_file {
+        let keys = if let Some(path) = &config.secret_file {
             if family != AlgorithmFamily::Hmac {
                 return Err("auth.jwt.secret_file only takes HS256, HS384 and HS512".into());
             }
@@ -61,7 +96,7 @@ impl Verifier {
             if secret.len() < 32 {
                 return Err(format!("{path}: the secret must be at least 32 bytes long"));
             }
-            DecodingKey::from_secret(secret)
+            Keys::File(DecodingKey::from_secret(secret))
         } else if let Some(path) = &config.public_key_file {
             let pem = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             match family {
@@ -74,9 +109,47 @@ impl Verifier {
                 AlgorithmFamily::Ec => DecodingKey::from_ec_pem(&pem),
                 AlgorithmFamily::Ed => DecodingKey::from_ed_pem(&pem),
             }
-            .map_err(|e| format!("{path}: {e}"))?
+            .map_err(|e| format!("{path}: {e}"))
+            .map(Keys::File)?
+        } else if let Some(url) = &config.jwks_url {
+            if family == AlgorithmFamily::Hmac {
+                return Err(
+                    "auth.jwt.jwks_url does not take HS256, HS384 or HS512, whose keys are secret"
+                        .into(),
+                );
+            }
+            let lower = url.to_ascii_lowercase();
+            if !lower.starts_with("https://")
+                && !(lower.starts_with("http://") && !is_plaintext_to_remote(url))
+            {
+                return Err(format!(
+                    "auth.jwt.jwks_url {} must be https://, or http:// to a loopback address",
+                    redacted_http_url(url)
+                ));
+            }
+            if config.jwks_refresh_seconds < MIN_JWKS_REFRESH {
+                return Err(format!(
+                    "auth.jwt.jwks_refresh_seconds must be at least {MIN_JWKS_REFRESH}"
+                ));
+            }
+            // A redirect could lead to plain HTTP
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(JWKS_TIMEOUT))
+                .max_redirects(0)
+                .build()
+                .into();
+            let keys = fetch(&agent, url, &config.algorithms)
+                .map_err(|e| format!("auth.jwt.jwks_url {}: {e}", redacted_http_url(url)))?;
+            Keys::Set(Jwks {
+                agent,
+                url: url.clone(),
+                algorithms: config.algorithms.clone(),
+                refresh_every: Duration::from_secs(config.jwks_refresh_seconds),
+                keys: Arc::new(RwLock::new(keys)),
+                fetched: tokio::sync::Mutex::new(Instant::now()),
+            })
         } else {
-            return Err("auth.jwt.jwks_url is not supported yet".into());
+            unreachable!("exactly one key source is set")
         };
 
         let mut validation = Validation::new(first);
@@ -96,17 +169,62 @@ impl Verifier {
             None => validation.validate_aud = false,
         }
         Ok(Self {
-            key,
+            keys,
             validation,
             username_claim: config.username_claim.clone(),
         })
+    }
+
+    /// Like `check`, fetching the key set again first when the token names
+    /// a key it lacks.
+    pub(crate) async fn check_async(&self, password: &[u8]) -> Checked {
+        let Keys::Set(jwks) = &self.keys else {
+            return self.check(password);
+        };
+        if !looks_like_token(password) {
+            return Checked::NotAToken;
+        }
+        if let Some(checked) = self.check_against(jwks, password) {
+            return checked;
+        }
+        jwks.refresh().await;
+        self.check(password)
     }
 
     pub(crate) fn check(&self, password: &[u8]) -> Checked {
         if !looks_like_token(password) {
             return Checked::NotAToken;
         }
-        let claims = match decode::<Map<String, Value>>(password, &self.key, &self.validation) {
+        match &self.keys {
+            Keys::File(key) => self.verify(password, key),
+            Keys::Set(jwks) => self
+                .check_against(jwks, password)
+                .unwrap_or(Checked::Invalid("the token's key is not in the key set")),
+        }
+    }
+
+    /// None when the token names a key the set lacks.
+    fn check_against(&self, jwks: &Jwks, password: &[u8]) -> Option<Checked> {
+        let kid = match decode_header(password) {
+            Ok(header) => header.kid,
+            Err(error) => return Some(Checked::Invalid(reason(error.kind()))),
+        };
+        let keys = jwks.keys.read().unwrap();
+        let key = match (kid, keys.as_slice()) {
+            (Some(kid), keys) => {
+                &keys
+                    .iter()
+                    .find(|(id, _)| id.as_deref() == Some(kid.as_str()))?
+                    .1
+            }
+            (None, [(_, key)]) => key,
+            (None, _) => return Some(Checked::Invalid("the token names no key")),
+        };
+        Some(self.verify(password, key))
+    }
+
+    fn verify(&self, password: &[u8], key: &DecodingKey) -> Checked {
+        let claims = match decode::<Map<String, Value>>(password, key, &self.validation) {
             Ok(data) => data.claims,
             Err(error) => return Checked::Invalid(reason(error.kind())),
         };
@@ -124,6 +242,80 @@ impl Verifier {
             expires,
         }
     }
+}
+
+impl Jwks {
+    async fn refresh(&self) {
+        let mut fetched = self.fetched.lock().await;
+        if fetched.elapsed() < self.refresh_every {
+            return;
+        }
+        *fetched = Instant::now();
+        let (agent, url, algorithms, keys) = (
+            self.agent.clone(),
+            self.url.clone(),
+            self.algorithms.clone(),
+            Arc::clone(&self.keys),
+        );
+        let fetch = move || match fetch(&agent, &url, &algorithms) {
+            Ok(fetched) => *keys.write().unwrap() = fetched,
+            Err(e) => warn!(
+                "Fetching the JWT key set from {} failed, so the old one stays: {e}",
+                redacted_http_url(&url)
+            ),
+        };
+        if let Err(e) = tokio::task::spawn_blocking(fetch).await {
+            warn!("Fetching the JWT key set failed: {e}");
+        }
+    }
+}
+
+/// The signing keys at `url` that one of `algorithms` can use. Keys of other
+/// types, and ones this library cannot read, are skipped.
+fn fetch(
+    agent: &ureq::Agent,
+    url: &str,
+    algorithms: &[Algorithm],
+) -> Result<Vec<KeyWithId>, String> {
+    let body = agent
+        .get(url)
+        .call()
+        .and_then(|mut response| match response.status() {
+            status if status.is_success() => response.body_mut().read_to_string(),
+            status => Err(ureq::Error::StatusCode(status.as_u16())),
+        })
+        .map_err(|e| match e {
+            // Its message repeats the URL, which may hold secrets
+            ureq::Error::BadUri(_) => "bad URL".to_string(),
+            e => e.to_string(),
+        })?;
+    let set: Value = serde_json::from_str(&body).map_err(|e| format!("not a key set: {e}"))?;
+    let Some(keys) = set.get("keys").and_then(Value::as_array) else {
+        return Err("not a key set: no keys array".to_string());
+    };
+    let keys: Vec<KeyWithId> = keys
+        .iter()
+        .filter_map(|jwk| serde_json::from_value::<Jwk>(jwk.clone()).ok())
+        .filter(|jwk| jwk.common.public_key_use != Some(PublicKeyUse::Encryption))
+        .filter(|jwk| {
+            jwk.common.key_algorithm.is_none_or(|alg| {
+                alg.to_string()
+                    .parse::<Algorithm>()
+                    .is_ok_and(|alg| algorithms.contains(&alg))
+            })
+        })
+        .filter_map(|jwk| {
+            let key = DecodingKey::from_jwk(&jwk).ok()?;
+            algorithms
+                .iter()
+                .any(|alg| alg.family() == key.family())
+                .then_some((jwk.common.key_id, key))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Err("the key set holds no key for the configured algorithms".to_string());
+    }
+    Ok(keys)
 }
 
 /// Three dot-separated segments, the first a base64url JSON object with an
@@ -160,14 +352,18 @@ fn reason(kind: &ErrorKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use jsonwebtoken::jwk::Jwk;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::http_auth::tests::{backend_with_body, join_all};
 
     fn fixture(name: &str) -> String {
         format!("{}/tests/fixtures/jwt/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -476,5 +672,213 @@ mod tests {
             ..hs_config()
         };
         assert!(Verifier::from_config(&config).is_err());
+    }
+
+    fn rsa_key() -> EncodingKey {
+        EncodingKey::from_rsa_pem(&std::fs::read(fixture("rsa.key")).unwrap()).unwrap()
+    }
+
+    /// A key set of the RSA fixture under each of `kids`.
+    fn rsa_set(kids: &[&str]) -> String {
+        let keys: Vec<Value> = kids
+            .iter()
+            .map(|kid| {
+                let mut jwk = Jwk::from_encoding_key(&rsa_key(), Algorithm::RS256).unwrap();
+                jwk.common.key_id = Some(kid.to_string());
+                serde_json::to_value(jwk).unwrap()
+            })
+            .collect();
+        json!({ "keys": keys }).to_string()
+    }
+
+    fn rsa_token(kid: Option<&str>) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = kid.map(str::to_string);
+        let claims = json!({ "sub": "alice", "exp": now() + 300 });
+        encode(&header, &claims, &rsa_key()).unwrap()
+    }
+
+    /// A key set server answering its `index`th request with `respond`.
+    fn jwks_server(
+        respond: impl Fn(usize) -> (&'static str, String) + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let backend = backend_with_body(Duration::ZERO, move |_, index| respond(index));
+        (backend.url, backend.requests)
+    }
+
+    fn jwks_config(url: &str, refresh_seconds: u64) -> JwtAuthConfig {
+        JwtAuthConfig {
+            jwks_url: Some(url.to_string()),
+            jwks_refresh_seconds: refresh_seconds,
+            ..config(&[Algorithm::RS256])
+        }
+    }
+
+    /// A verifier refreshing its set more often than `from_config` allows.
+    fn jwks_verifier(url: &str, refresh_seconds: u64) -> Verifier {
+        let mut verifier = Verifier::from_config(&jwks_config(url, 300)).unwrap();
+        let Keys::Set(jwks) = &mut verifier.keys else {
+            unreachable!("a jwks_url gives a key set")
+        };
+        jwks.refresh_every = Duration::from_secs(refresh_seconds);
+        verifier
+    }
+
+    #[test]
+    fn test_jwks_refreshes_closer_than_ten_seconds_are_refused() {
+        let (url, _) = jwks_server(|_| ("200 OK", rsa_set(&["k1"])));
+        let error = Verifier::from_config(&jwks_config(&url, 9)).err().unwrap();
+        assert!(error.contains("jwks_refresh_seconds"), "{error}");
+        assert!(Verifier::from_config(&jwks_config(&url, 10)).is_ok());
+    }
+
+    fn is_valid(checked: Checked) -> bool {
+        matches!(checked, Checked::Valid { .. })
+    }
+
+    #[tokio::test]
+    async fn test_a_token_signed_by_a_key_in_the_set_verifies() {
+        let (url, requests) = jwks_server(|_| ("200 OK", rsa_set(&["a", "b"])));
+        let verifier = Verifier::from_config(&jwks_config(&url, 300)).unwrap();
+        assert!(is_valid(
+            verifier.check_async(rsa_token(Some("b")).as_bytes()).await
+        ));
+        assert!(is_valid(verifier.check(rsa_token(Some("a")).as_bytes())));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_a_token_without_kid_needs_a_set_of_one_usable_key() {
+        let ec = EncodingKey::from_ec_pem(&std::fs::read(fixture("ec.key")).unwrap()).unwrap();
+        let mut ec =
+            serde_json::to_value(Jwk::from_encoding_key(&ec, Algorithm::ES256).unwrap()).unwrap();
+        ec["kid"] = json!("ec");
+        let mut set: Value = serde_json::from_str(&rsa_set(&["a"])).unwrap();
+        set["keys"].as_array_mut().unwrap().push(ec);
+        let (url, _) = jwks_server(move |_| ("200 OK", set.to_string()));
+        let verifier = Verifier::from_config(&jwks_config(&url, 300)).unwrap();
+        assert!(is_valid(
+            verifier.check_async(rsa_token(None).as_bytes()).await
+        ));
+
+        let (url, _) = jwks_server(|_| ("200 OK", rsa_set(&["a", "b"])));
+        let verifier = Verifier::from_config(&jwks_config(&url, 300)).unwrap();
+        assert!(is_invalid(
+            verifier.check_async(rsa_token(None).as_bytes()).await
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_rotated_set_is_fetched_for_an_unknown_kid() {
+        let (url, requests) = jwks_server(|index| match index {
+            0 => ("200 OK", rsa_set(&["old"])),
+            _ => ("200 OK", rsa_set(&["new"])),
+        });
+        let verifier = jwks_verifier(&url, 0);
+        assert!(is_valid(
+            verifier
+                .check_async(rsa_token(Some("new")).as_bytes())
+                .await
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_kids_fetch_the_set_once_per_refresh_window() {
+        let (url, requests) = jwks_server(|_| ("200 OK", rsa_set(&["a"])));
+        let verifier = jwks_verifier(&url, 1);
+        let tokens: Vec<String> = (0..20)
+            .map(|i| rsa_token(Some(&format!("unknown-{i}"))))
+            .collect();
+        for token in &tokens[..10] {
+            assert!(is_invalid(verifier.check_async(token.as_bytes()).await));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let checks = tokens[10..]
+            .iter()
+            .map(|token| verifier.check_async(token.as_bytes()));
+        for checked in join_all(checks).await {
+            assert!(is_invalid(checked));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_refresh_keeps_the_old_keys() {
+        let (url, requests) = jwks_server(|index| match index {
+            0 => ("200 OK", rsa_set(&["a"])),
+            _ => ("500 Internal Server Error", String::new()),
+        });
+        let verifier = jwks_verifier(&url, 0);
+        assert!(is_invalid(
+            verifier.check_async(rsa_token(Some("x")).as_bytes()).await
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(is_valid(
+            verifier.check_async(rsa_token(Some("a")).as_bytes()).await
+        ));
+    }
+
+    #[test]
+    fn test_the_set_must_load_at_start() {
+        let (url, _) = jwks_server(|_| ("500 Internal Server Error", String::new()));
+        assert!(Verifier::from_config(&jwks_config(&url, 300)).is_err());
+        let (url, _) = jwks_server(|_| ("200 OK", "not json".to_string()));
+        assert!(Verifier::from_config(&jwks_config(&url, 300)).is_err());
+        let (url, _) = jwks_server(|_| ("200 OK", json!({ "keys": [] }).to_string()));
+        assert!(Verifier::from_config(&jwks_config(&url, 300)).is_err());
+    }
+
+    #[test]
+    fn test_redirects_are_not_followed() {
+        let (good, _) = jwks_server(|_| ("200 OK", rsa_set(&["a"])));
+        assert!(Verifier::from_config(&jwks_config(&good, 300)).is_ok());
+        // The test server writes the status line as given, so it can carry
+        // a header too
+        let found: &'static str = format!("302 Found\r\nLocation: {good}").leak();
+        let (url, _) = jwks_server(move |_| (found, String::new()));
+        assert!(Verifier::from_config(&jwks_config(&url, 300)).is_err());
+    }
+
+    #[test]
+    fn test_hmac_algorithms_are_refused_with_a_jwks_url() {
+        let (url, requests) = jwks_server(|_| ("200 OK", rsa_set(&["a"])));
+        let config = JwtAuthConfig {
+            algorithms: vec![Algorithm::HS256],
+            ..jwks_config(&url, 300)
+        };
+        assert!(Verifier::from_config(&config).is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_refresh_outlives_the_check_that_gave_up_on_it() {
+        let backend = backend_with_body(Duration::from_millis(300), |_, index| match index {
+            0 => ("200 OK", rsa_set(&["old"])),
+            _ => ("200 OK", rsa_set(&["new"])),
+        });
+        let verifier = jwks_verifier(&backend.url, 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let token = rsa_token(Some("new"));
+        let check = verifier.check_async(token.as_bytes());
+        assert!(tokio::time::timeout(Duration::from_millis(50), check)
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(is_valid(verifier.check_async(token.as_bytes()).await));
+        assert_eq!(backend.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_jwks_urls_must_be_https_unless_on_loopback() {
+        for url in [
+            "http://issuer.example/jwks.json",
+            "ftp://issuer.example/jwks.json",
+        ] {
+            let error = Verifier::from_config(&jwks_config(url, 300)).err().unwrap();
+            assert!(error.contains("https"), "{error}");
+        }
     }
 }
