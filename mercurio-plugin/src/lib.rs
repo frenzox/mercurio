@@ -160,7 +160,9 @@ pub trait Plugin {
     /// retain and QoS limits. The one exception is a topic changed to one
     /// starting with `$`, such as `$SYS/...` or `$CONTROL/...`: the broker
     /// drops such a message, still acknowledging it, and logs a warning.
-    /// Will messages aren't passed to this hook.
+    /// Will messages aren't passed to this hook, nor the messages the
+    /// plugin published itself with [`host::publish`], so republishing
+    /// what it sees can't feed itself.
     fn on_message(_client: ClientInfo, _message: Message) -> MessageAction {
         MessageAction::Keep
     }

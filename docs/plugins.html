@@ -38,27 +38,29 @@
 </nav>
 <main>
 <h1>WebAssembly plugins</h1>
-<p class="lead">A plugin is a WebAssembly component that <code>mercuriod</code> loads from a file and runs in a sandbox. It can authenticate clients, decide topic access, change or drop messages and react to events, without a rebuild of the broker.</p>
+<p class="lead">A plugin is a WebAssembly component that <code>mercuriod</code> loads from a file and runs in a sandbox. It can authenticate clients, decide topic access, change, drop or publish messages and react to events, without a rebuild of the broker.</p>
 
 <h2 id="overview">What a plugin can do</h2>
 <p>A plugin implements the hooks it needs. <code>init</code> returns the list of hooks the broker calls; the others are never called.</p>
 <table>
 <tr><th>Hook</th><th>Called</th></tr>
 <tr><td><code>authenticate</code></td><td>For a client that sends a username and password. Returns allow, deny or defer.</td></tr>
-<tr><td><code>auth-step</code></td><td>For each step of MQTT 5 enhanced authentication, for the methods the plugin lists in <code>init</code>. Its <code>success</code> carries no data for the client, so methods that end with a server message, such as SCRAM, need a Rust plugin.</td></tr>
-<tr><td><code>authorize</code></td><td>When a client publishes, subscribes or receives a topic (<code>write</code>, <code>subscribe</code>, <code>read</code>). Returns allow, deny or defer. Publishing to <code>$CONTROL/...</code>, which administers the broker, is never asked here, so a WebAssembly plugin can't grant it: use an ACL file, dynamic security or an HTTP ACL endpoint for that.</td></tr>
+<tr><td><code>auth-step</code></td><td>For each step of MQTT 5 enhanced authentication, for the methods the plugin lists in <code>init</code>. Returns <code>continue</code> with a challenge, <code>failed</code> with a reason code, or <code>success</code> with the user name and, for methods that end with a server message such as SCRAM, the data to send the client in the CONNACK or in the AUTH that ends a re-authentication.</td></tr>
+<tr><td><code>authorize</code></td><td>When a client publishes, subscribes or receives a topic (<code>write</code>, <code>subscribe</code>, <code>read</code>). Returns allow, deny or defer. Publishing to <code>$CONTROL/...</code> is not asked here, but in <code>authorize-control</code>.</td></tr>
+<tr><td><code>authorize-control</code></td><td>When a client publishes to <code>$CONTROL/...</code>, which administers the broker or a plugin. A request to <code>$CONTROL/broker/v1</code> is asked about twice: for that topic, then for each of its commands as <code>$CONTROL/broker/v1/&lt;command&gt;</code>. Returns allow, deny or defer; when every plugin defers, the client is refused, so a plugin that allows every topic in <code>authorize</code> does not make every client an administrator.</td></tr>
 <tr><td><code>on-message</code></td><td>For each published message. Returns keep, drop or a replacement message. A replacement moved to a different topic that starts with <code>$</code>, such as <code>$SYS/...</code> or <code>$CONTROL/...</code>, is dropped and logged.</td></tr>
 <tr><td><code>on-event</code></td><td>When a client connects, disconnects, subscribes or unsubscribes, and when a session expires.</td></tr>
 <tr><td><code>on-tick</code></td><td>Once a second, for periodic work.</td></tr>
 <tr><td><code>on-control</code></td><td>For a publish to <code>$CONTROL/&lt;plugin name&gt;/...</code>. It may return a response payload, which only the client that sent the request receives: on its Response Topic, or on the request's topic followed by <code>/response</code>.</td></tr>
 </table>
-<p>The interface is <a href="https://github.com/frenzox/mercurio/blob/master/wit/plugin.wit"><code>wit/plugin.wit</code></a>. A plugin also imports the <code>host</code> interface: <code>log</code> and a key-value store.</p>
+<p>The interface is <a href="https://github.com/frenzox/mercurio/blob/master/wit/plugin.wit"><code>wit/plugin.wit</code></a>, version 0.2. A plugin also imports the <code>host</code> interface: <code>log</code>, a <a href="#kv">key-value store</a> and <a href="#publish"><code>publish</code></a>.</p>
+<p>Hooks get the client as a <code>client-info</code>: its client id; its user name, set only once the broker verified it, except in <code>authenticate</code> and <code>auth-step</code> during CONNECT, where it is the name the client claims; its address; and its <code>connection</code>, none where no connection is known, such as for the publisher of a retained message. The connection gives the listener's address or socket path (<code>local</code> for clients inside the broker), the MQTT version (3, 4 or 5), whether it is TLS, the name taken from the client's certificate on a listener that takes user names from certificates, and the listener's mount point. Topics reach plugins with the mount point in front.</p>
 
 <h3>How it runs</h3>
 <p>Plugins join the same chain as plugins written against the server library, after the built-in password and ACL checks and in the order of the <code>[[plugins]]</code> tables. The rules of the chain (the first allow or deny decides, defer asks the next plugin, every plugin sees a message in turn) are described in <a href="embedding.html#auth">Embedding the broker</a>.</p>
 <ul>
 <li>Time limits fail closed. A call that runs out of time or traps denies, for authentication and access control, and drops, for messages.</li>
-<li>A plugin runs as several copies, set by <code>instances</code>, so calls run in parallel. A hook is a plain function: it keeps no state in statics, because the next call may run in another copy.</li>
+<li>A plugin runs as several copies, set by <code>instances</code>, so calls run in parallel. A hook is a plain function: it keeps no changing state in statics, because the next call may run in another copy. Settings are the exception: they are the same for every copy and never change, and each copy runs <code>init</code> before any other hook, so a copy may keep them in a static set in <code>init</code>, such as a Rust <code>OnceLock</code>.</li>
 <li>A copy that traps or runs out of time is discarded. A fresh copy takes its place and runs <code>init</code> again.</li>
 </ul>
 
@@ -70,6 +72,16 @@
 <li>It is not transactional. A <code>kv-get</code> followed by a <code>kv-set</code> can race with another copy doing the same, so do not rely on a read-modify-write being atomic.</li>
 </ul>
 
+<h3 id="publish">Publishing</h3>
+<p><code>publish</code> sends a message with a topic, payload, QoS, retain flag and the MQTT 5 properties <code>on-message</code> sees. The plugin publishes as the client <code>mercurio-plugin-&lt;name&gt;</code>, inside the broker: access control is not asked, and the message is retained and sent on as any client's. The call returns once the message is queued. A message published before the broker serves clients, such as from <code>init</code>, goes out once it does.</p>
+<ul>
+<li>Topics that start with <code>$</code>, such as <code>$SYS/...</code> and <code>$CONTROL/...</code>, are refused, as are topic names that are not valid, such as ones with wildcards.</li>
+<li>A message is at most 64 KiB, counting its topic, payload and properties.</li>
+<li>A plugin publishes at most 100 messages at once, then 100 a second, all its copies together. The limit stays across SIGHUP reloads.</li>
+<li>At most 256 messages wait to go out.</li>
+</ul>
+<p>A refused message returns an error and nothing is published; the call itself does not fail. The broker logs the first refusal of a run.</p>
+<p>The other plugins' <code>on-message</code> see the message as from <code>mercurio-plugin-&lt;name&gt;</code>; the publishing plugin's own <code>on-message</code> does not, so a plugin that republishes what it sees never feeds itself. Two plugins that republish each other's messages still loop, at the pace their rate limits allow, so give such pairs topics that do not overlap. <code>on-event</code> sees the plugin's client connect, on its first message.</p>
 <h2 id="writing">Writing a plugin in Rust</h2>
 <p>Install the target and make a library crate:</p>
 <pre>rustup target add wasm32-wasip2
@@ -81,23 +93,24 @@ crate-type = ["cdylib"]
 [dependencies]
 mercurio-plugin = "0.1"</pre>
 <p>This plugin, <code>examples/plugins/deny-topic</code>, refuses publishing under a topic prefix from its configuration and defers every other decision:</p>
-<pre>use mercurio_plugin::{
-    export_plugin, host, Access, ClientInfo, Decision, Hooks, Plugin, Registration,
+<pre>use std::sync::OnceLock;
+
+use mercurio_plugin::{
+    export_plugin, Access, ClientInfo, Config, Decision, Hooks, Plugin, Registration,
 };
+
+/// Set by `init`; settings never change, so each copy keeps its own.
+static PREFIX: OnceLock&lt;String&gt; = OnceLock::new();
 
 struct DenyTopic;
 
 impl Plugin for DenyTopic {
-    fn init(config: Vec&lt;(String, String)&gt;) -&gt; Result&lt;Registration, String&gt; {
-        let prefix = config
-            .into_iter()
-            .find(|(key, _)| key == "prefix")
-            .map(|(_, value)| value)
-            .ok_or("missing `prefix`")?;
+    fn init(config: Config) -&gt; Result&lt;Registration, String&gt; {
+        let prefix = config.require("prefix")?;
         if prefix.is_empty() {
             return Err("`prefix` is empty, which would deny every publish".into());
         }
-        host::kv_set("prefix", prefix.as_bytes())?;
+        let _ = PREFIX.set(prefix.to_string());
         Ok(Registration {
             hooks: Hooks::AUTHORIZE,
             auth_methods: Vec::new(),
@@ -105,10 +118,10 @@ impl Plugin for DenyTopic {
     }
 
     fn authorize(_client: ClientInfo, topic: String, access: Access) -&gt; Decision {
-        let Some(prefix) = host::kv_get("prefix") else {
+        let Some(prefix) = PREFIX.get() else {
             return Decision::Defer;
         };
-        if access == Access::Write &amp;&amp; topic.as_bytes().starts_with(&amp;prefix) {
+        if access == Access::Write &amp;&amp; topic.starts_with(prefix.as_str()) {
             Decision::Deny
         } else {
             Decision::Defer
@@ -117,7 +130,7 @@ impl Plugin for DenyTopic {
 }
 
 export_plugin!(DenyTopic);</pre>
-<p>If <code>init</code> returns an error, the plugin does not load and the broker does not start. Combine flags to register more hooks, such as <code>Hooks::AUTHORIZE | Hooks::ON_MESSAGE</code>. The <code>examples/plugins</code> directory also has <code>webhook-audit</code>, which sends an HTTP request, and <code>payload-rewrite</code>, which changes messages.</p>
+<p><code>init</code> gets the plugin's <code>config</code> table as a <code>Config</code>: <code>get</code> returns a setting if it is there, and <code>require</code> returns it or an error that names it. If <code>init</code> returns an error, the plugin does not load and the broker does not start. Combine flags to register more hooks, such as <code>Hooks::AUTHORIZE | Hooks::ON_MESSAGE</code>. The <code>examples/plugins</code> directory also has <code>webhook-audit</code>, which sends an HTTP request, and <code>payload-rewrite</code>, which changes messages.</p>
 <p>Build it:</p>
 <pre>cargo build --release --target wasm32-wasip2</pre>
 <p>The component is <code>target/wasm32-wasip2/release/deny_topic.wasm</code>. Load it in the broker's configuration:</p>
@@ -130,8 +143,9 @@ config = { prefix = "$internal/" }</pre>
 path = "/etc/mercurio/plugins/webhook_audit.wasm"
 config = { url = "http://audit.internal/events" }
 allow_http = ["audit.internal:80"]</pre>
-<p>A plugin built for <code>mercurio:plugin/guest@0.1.x</code> loads. A component built for another version is refused, with an error that names the version. See the <a href="configuration.html#plugins">configuration reference</a> for every key.</p>
-<p>The broker matches a component to the interface by the shape of its types, so adding a hook, a field or a case would break plugins built for the old shape. Such changes come with a new minor version, such as 0.2. A 0.1.x release changes only documentation, so a plugin built for any 0.1.x loads in a broker built for any other.</p>
+<p>A plugin built for <code>mercurio:plugin/guest@0.2.x</code> or <code>@0.1.x</code> loads. A component built for another version is refused, with an error that names the version. <code>listPlugins</code> in the <a href="admin.html">admin API</a> shows the version each plugin was built for. See the <a href="configuration.html#plugins">configuration reference</a> for every key.</p>
+<p>The broker matches a component to the interface by the shape of its types, so adding a hook, a field or a case would break plugins built for the old shape. Such changes come with a new minor version. A 0.2.x release changes only documentation, so a plugin built for any 0.2.x loads in a broker built for any other.</p>
+<p>Plugins built for 0.1 keep loading and run as before: they get the client without its connection, have no <code>authorize-control</code> hook, so they defer on <code>$CONTROL</code>, send no data with an authentication <code>success</code>, and cannot publish. To use those, rebuild against 0.2. In the Rust SDK, <code>init</code> takes a <code>Config</code> instead of a list of pairs, and <code>AuthResult::Success</code> takes a <code>Success</code> with the user name and the data.</p>
 
 <h2 id="sandbox">The sandbox</h2>
 <ul>
@@ -149,7 +163,7 @@ allow_http = ["audit.internal:80"]</pre>
 
 <h2 id="reloading">Reloading</h2>
 <p>Send <code>SIGHUP</code> to swap a plugin's code. The broker rereads each plugin's file, and replaces the running code once the new file has loaded and run <code>init</code>. Calls already running finish on the old code. If the new file fails to load, the old code keeps running and the broker logs why. The store is kept.</p>
-<p>Changes to the <code>[[plugins]]</code> tables, such as <code>config</code>, <code>instances</code> or the allowlists, need a restart.</p>
+<p>Changes to the <code>[[plugins]]</code> tables, such as <code>config</code>, <code>instances</code> or the allowlists, need a restart. A reload can change the interface version a plugin was built for.</p>
 
 <h2 id="cost">Cost</h2>
 <p>A call into a component costs about 0.5 microseconds (0.55 in a microbenchmark of <code>authorize</code>). In the broker's benchmark, fan-in with QoS 1 had about 0.7% less throughput with an <code>authorize</code> plugin (<code>deny-topic</code>) on every message, and about 1.6% less with an <code>on-message</code> plugin. Fan-out was within noise. These numbers are approximate and depend on what the plugin does.</p>
