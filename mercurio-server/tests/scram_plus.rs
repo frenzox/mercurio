@@ -209,6 +209,14 @@ async fn plus_over_tls_1_3_succeeds() {
 }
 
 #[tokio::test]
+async fn plain_scram_over_tls_1_3_still_succeeds_by_default() {
+    let (_, secure) = start(false).await;
+    let (mut stream, _) = tls_connect(secure, "192.0.2.6").await;
+    let code = login(&mut stream, MECHANISM, client(None), None).await;
+    assert_eq!(code, Some(ReasonCode::Success));
+}
+
+#[tokio::test]
 async fn plus_over_plain_tcp_is_refused() {
     let (plain, _) = start(false).await;
     let mut stream = TcpStream::connect(plain).await.unwrap();
@@ -224,8 +232,7 @@ async fn plus_with_the_wrong_exporter_is_a_failed_login() {
         let (mut stream, mut exporter) = tls_connect(secure, attacker).await;
         exporter[0] ^= 1;
         let code = login(&mut stream, MECHANISM_PLUS, client(Some(exporter)), None).await;
-        assert_ne!(code, Some(ReasonCode::Success));
-        assert!(code.is_some());
+        assert_eq!(code, Some(ReasonCode::MalformedPacket));
     }
     // Banned now, even with the right exporter
     if let Some((mut stream, exporter)) = try_tls_connect(secure, attacker).await {
