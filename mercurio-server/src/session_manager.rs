@@ -568,8 +568,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let session = match resumed {
             Some(mut session) => {
                 session.set_connect_packet(connect_packet).await;
-                // The client is back to take its queue from memory
-                session.stop_queue_journal();
                 session
             }
             None => SessionDropGuard::new(connect_packet, self.queue_limits).session(),
@@ -601,6 +599,21 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             self.writers.write(&client_id, Write::DeleteSession);
         }
 
+        // The queue of a session outliving its connection is kept in
+        // storage, connected or not, so a crash loses none of it; a stored
+        // one restored here is there already
+        let journaled = persistent && self.storage.is_durable();
+        let restored = !queue_to_restore.is_empty();
+        session.restore_queue(queue_to_restore);
+        if journaled {
+            session.start_queue_journal(self.writers.get(&client_id), restored);
+        } else {
+            session.stop_queue_journal();
+            if restored {
+                self.writers.write(&client_id, Write::ClearQueue);
+            }
+        }
+
         {
             let mut persistent_clients = self.shared.persistent.lock().unwrap();
             if persistent {
@@ -609,11 +622,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 persistent_clients.remove(&client_id);
             }
         }
-        if !queue_to_restore.is_empty() {
-            session.restore_queue(queue_to_restore);
-            self.writers.write(&client_id, Write::ClearQueue);
-        }
-
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
         let mut subscriptions = session.get_subscriptions().await;
@@ -919,12 +927,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             self.end_session(client_id, generation, None).await;
         } else if self.storage.is_durable() {
             // Messages for the client now wait in its queue until it returns;
-            // keep them on disk meanwhile, unless another connection already
-            // took the session over
+            // keep them on disk meanwhile, as they are already unless the
+            // session was to end with the connection, and unless another
+            // connection took the session over
             let manager = self.shared.state.lock().await;
             if let Some(session) = manager.sessions.get(client_id).map(|s| s.session()) {
                 if session.generation() == generation {
-                    session.start_queue_journal(self.writers.get(client_id));
+                    session.start_queue_journal(self.writers.get(client_id), false);
                 }
             }
         }
@@ -1192,7 +1201,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         session
             .restore_incoming_qos2(self.storage.get_incoming_qos2(client_id).await?)
             .await;
-        session.start_queue_journal(self.writers.get(client_id));
+        session.start_queue_journal(self.writers.get(client_id), true);
         self.shared
             .persistent
             .lock()
@@ -1318,7 +1327,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn save_subscription_changes(&self, client_id: &str, changes: Vec<Write>) {
         if self.is_persistent(client_id) {
             for change in changes {
-                self.writers.write_paced(client_id, Box::new(change)).await;
+                self.writers
+                    .write_paced(client_id, Box::new([change]))
+                    .await;
             }
         }
     }
@@ -1329,20 +1340,41 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers.write(client_id, Write::DeleteWill);
     }
 
-    /// Store an inflight message (QoS 1/2 awaiting acknowledgment).
-    pub(crate) async fn store_inflight(&self, client_id: &str, message: &InflightMessage) {
-        if self.is_persistent(client_id) {
-            self.writers
-                .write_paced(client_id, Box::new(Write::StoreInflight(message.clone())))
-                .await;
-        }
+    /// Stores a QoS 1 or 2 message sent and awaiting acknowledgment,
+    /// removing it from the stored queue, if it was at `dequeued` there, in
+    /// the same batch: it is in one place or the other, whenever the broker
+    /// stops.
+    pub(crate) async fn store_inflight(
+        &self,
+        client_id: &str,
+        message: &InflightMessage,
+        dequeued: Option<u64>,
+    ) {
+        let writes: Box<[Write]> = match (self.is_persistent(client_id), dequeued) {
+            (true, Some(sequence)) => Box::new([
+                Write::StoreInflight(message.clone()),
+                Write::Dequeue(sequence),
+            ]),
+            (true, None) => Box::new([Write::StoreInflight(message.clone())]),
+            (false, Some(sequence)) => Box::new([Write::Dequeue(sequence)]),
+            (false, None) => return,
+        };
+        self.writers.write_paced(client_id, writes).await;
+    }
+
+    /// Removes a message dropped from the queue, rather than sent, from
+    /// the stored queue.
+    pub(crate) async fn dequeue(&self, client_id: &str, sequence: u64) {
+        self.writers
+            .write_paced(client_id, Box::new([Write::Dequeue(sequence)]))
+            .await;
     }
 
     /// Mark a QoS 2 message as released once the client sent PUBREC.
     pub(crate) async fn release_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::ReleaseInflight(packet_id)))
+                .write_paced(client_id, Box::new([Write::ReleaseInflight(packet_id)]))
                 .await;
         }
     }
@@ -1351,7 +1383,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn remove_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::RemoveInflight(packet_id)))
+                .write_paced(client_id, Box::new([Write::RemoveInflight(packet_id)]))
                 .await;
         }
     }
@@ -1361,7 +1393,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::StoreIncomingQos2(packet_id)))
+                .write_paced(client_id, Box::new([Write::StoreIncomingQos2(packet_id)]))
                 .await;
         }
     }
@@ -1370,7 +1402,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::RemoveIncomingQos2(packet_id)))
+                .write_paced(client_id, Box::new([Write::RemoveIncomingQos2(packet_id)]))
                 .await;
         }
     }
@@ -1587,6 +1619,10 @@ mod tests {
             message: &mercurio_core::message::Message,
         ) -> mercurio_storage::Result<()> {
             self.inner.enqueue(client_id, sequence, message).await
+        }
+
+        async fn dequeue(&self, client_id: &str, sequence: u64) -> mercurio_storage::Result<()> {
+            self.inner.dequeue(client_id, sequence).await
         }
 
         async fn load_queue(
@@ -2142,7 +2178,7 @@ mod tests {
         };
 
         // Store inflight message
-        manager.store_inflight("client1", &inflight).await;
+        manager.store_inflight("client1", &inflight, None).await;
         manager.flush().await;
 
         // Verify it's stored by checking storage directly
@@ -2300,6 +2336,7 @@ mod tests {
                     properties: Default::default(),
                     subscription_identifiers: Vec::new(),
                 },
+                None,
             )
             .await;
         manager.flush().await;
@@ -2905,7 +2942,7 @@ mod tests {
                 properties: Default::default(),
                 subscription_identifiers: Vec::new(),
             };
-            manager.store_inflight("client1", &inflight).await;
+            manager.store_inflight("client1", &inflight, None).await;
         }
         manager.flush().await;
 

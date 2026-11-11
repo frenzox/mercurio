@@ -27,9 +27,10 @@ const ATTEMPTS: u32 = 5;
 const PENDING_LIMIT: usize = 10_000;
 
 pub(crate) enum Op {
-    /// With whether it holds a pending-change permit. Boxed: the channel
-    /// allocates its slots ahead, and every client has one.
-    Write(Box<Write>, bool),
+    /// Changes that go to storage in the same batch, with whether they hold
+    /// a pending-change permit. Boxed: the channel allocates its slots
+    /// ahead, and every client has one.
+    Write(Box<[Write]>, bool),
     /// Answered once every change sent before it is applied
     Flush(oneshot::Sender<()>),
 }
@@ -52,17 +53,18 @@ impl Writer {
     /// Sends a change without waiting, for those bounded by other limits,
     /// such as the queue's.
     pub(crate) fn write(&self, write: Write) {
-        let _ = self.ops.send(Op::Write(Box::new(write), false));
+        let _ = self.ops.send(Op::Write(Box::new([write]), false));
     }
 
-    /// Sends a change once fewer than `PENDING_LIMIT` are waiting for
-    /// storage. Boxed already, so the wait doesn't carry the whole change.
-    pub(crate) async fn write_paced(&self, write: Box<Write>) {
+    /// Sends changes, applied in one batch, once fewer than `PENDING_LIMIT`
+    /// are waiting for storage. Boxed already, so the wait doesn't carry
+    /// them whole.
+    pub(crate) async fn write_paced(&self, writes: Box<[Write]>) {
         let Ok(permit) = self.pending.acquire().await else {
             return;
         };
         permit.forget();
-        if self.ops.send(Op::Write(write, true)).is_err() {
+        if self.ops.send(Op::Write(writes, true)).is_err() {
             self.pending.add_permits(1);
         }
     }
@@ -155,8 +157,8 @@ impl<S: BatchStore + 'static> Writers<S> {
         self.get(client_id).write(write);
     }
 
-    pub(crate) async fn write_paced(&self, client_id: &str, write: Box<Write>) {
-        self.get(client_id).write_paced(write).await;
+    pub(crate) async fn write_paced(&self, client_id: &str, writes: Box<[Write]>) {
+        self.get(client_id).write_paced(writes).await;
     }
 
     /// Lets the client's writer stop once it has applied what it was sent.
@@ -230,8 +232,8 @@ async fn run<S: BatchStore>(
         let mut permits = 0;
         while let Some(op) = next {
             match op {
-                Op::Write(write, paced) => {
-                    batch.push(*write);
+                Op::Write(writes, paced) => {
+                    batch.extend(writes.into_vec());
                     permits += usize::from(paced);
                 }
                 Op::Flush(done) => flushed.push(done),
@@ -258,10 +260,11 @@ async fn run<S: BatchStore>(
 }
 
 /// Drops changes that a later one in the batch undoes, such as a message
-/// stored in flight and then removed once acknowledged, which under load is
-/// most of them.
+/// stored in flight and then removed once acknowledged, or queued and then
+/// sent, which under load is most of them.
 fn compact(batch: &mut Vec<Write>) {
-    let (mut removed, mut released) = (HashSet::new(), HashSet::new());
+    let (mut removed, mut released, mut dequeued) =
+        (HashSet::new(), HashSet::new(), HashSet::new());
     let (mut queue_cleared, mut session_deleted) = (false, false);
     let mut keep = vec![true; batch.len()];
     for (i, write) in batch.iter().enumerate().rev() {
@@ -281,7 +284,14 @@ fn compact(batch: &mut Vec<Write>) {
             Write::StoreIncomingQos2(packet_id) => {
                 keep[i] = !session_deleted && !released.contains(packet_id);
             }
-            Write::Enqueue(..) => keep[i] = !session_deleted && !queue_cleared,
+            Write::Dequeue(sequence) => {
+                dequeued.insert(*sequence);
+                keep[i] = !session_deleted && !queue_cleared;
+            }
+            // The removal stays, as harmless as it is cheap
+            Write::Enqueue(sequence, _) => {
+                keep[i] = !session_deleted && !queue_cleared && !dequeued.contains(sequence);
+            }
             Write::ClearQueue => queue_cleared = true,
             Write::DeleteSession => session_deleted = true,
             _ => {}
@@ -385,6 +395,9 @@ mod tests {
                     Write::ReleaseInflight(p) => format!("release {p}"),
                     Write::RemoveInflight(p) => format!("remove {p}"),
                     Write::StoreIncomingQos2(p) => format!("received {p}"),
+                    Write::Enqueue(s, _) => format!("queue {s}"),
+                    Write::Dequeue(s) => format!("dequeue {s}"),
+                    Write::ClearQueue => "clear".into(),
                     Write::RemoveIncomingQos2(p) => format!("pubrel {p}"),
                     Write::DeleteSession => "delete".into(),
                     _ => "other".into(),
@@ -417,6 +430,32 @@ mod tests {
         ];
         compact(&mut batch);
         assert_eq!(describe(&batch), ["received 2", "pubrel 1", "received 1"]);
+
+        let queued = |sequence| {
+            Write::Enqueue(
+                sequence,
+                mercurio_core::message::Message {
+                    packet_id: None,
+                    topic: "q".into(),
+                    dup: false,
+                    qos: mercurio_core::qos::QoS::AtLeastOnce,
+                    retain: false,
+                    payload: None,
+                    properties: Default::default(),
+                    expires_at: None,
+                    subscription_identifiers: Vec::new(),
+                    origin: None,
+                },
+            )
+        };
+        // A message queued and sent within the batch is only removed
+        let mut batch = vec![queued(1), queued(2), Write::Dequeue(1), inflight(1)];
+        compact(&mut batch);
+        assert_eq!(describe(&batch), ["queue 2", "dequeue 1", "store 1"]);
+
+        let mut batch = vec![queued(4), Write::Dequeue(3), Write::ClearQueue, queued(5)];
+        compact(&mut batch);
+        assert_eq!(describe(&batch), ["clear", "queue 5"]);
     }
 
     #[test]

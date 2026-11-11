@@ -15,6 +15,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    puback::PubAckPacket,
     publish::{PublishPacket, PublishProperties},
     pubrel::PubRelPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
@@ -222,6 +223,15 @@ impl Client {
         };
     }
 
+    async fn puback(&mut self, packet_id: u16) {
+        self.send(ControlPacket::PubAck(PubAckPacket {
+            packet_id,
+            reason: ReasonCode::Success,
+            properties: None,
+        }))
+        .await;
+    }
+
     /// The next PUBLISH, skipping nothing else.
     async fn next_publish(&mut self) -> Option<PublishPacket> {
         match self.receive().await? {
@@ -396,5 +406,135 @@ async fn subscription_changes_survive_a_crash() {
         received.push(publish.topic_name);
     }
     assert_eq!(received, ["a", "c"]);
+    broker.stop().await;
+}
+
+/// Payloads of the PUBLISH packets the client receives until the broker
+/// pauses, acknowledging each, with whether it was flagged as a duplicate.
+async fn drain(client: &mut Client) -> Vec<(String, bool)> {
+    let mut received = Vec::new();
+    while let Some(publish) = client.next_publish().await {
+        if let Some(packet_id) = publish.packet_id {
+            client.puback(packet_id).await;
+        }
+        let payload = publish.payload.unwrap_or_default();
+        received.push((String::from_utf8(payload.to_vec()).unwrap(), publish.dup));
+    }
+    received
+}
+
+/// A client with a backlog of QoS 1 messages reconnects with a small
+/// Receive Maximum, takes a few, and the broker crashes: after the restart
+/// it gets every message it hadn't acknowledged, each once, in order.
+#[tokio::test]
+async fn queued_messages_of_connected_clients_survive_a_crash() {
+    let db = database("queue");
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", Connect::default()).await;
+    subscriber.subscribe("q", QoS::AtLeastOnce).await;
+    drop(subscriber);
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    for i in 1..=10 {
+        publisher.publish(message("q", &i.to_string())).await;
+    }
+
+    let resume = Connect {
+        clean_start: false,
+        receive_maximum: 2,
+        ..Default::default()
+    };
+    let (mut subscriber, resumed) = Client::connect(broker.addr, "s", resume).await;
+    assert!(resumed);
+    let first = subscriber.next_publish().await.unwrap();
+    let second = subscriber.next_publish().await.unwrap();
+    // Acknowledging the first lets the third through
+    subscriber.puback(first.packet_id.unwrap()).await;
+    let third = subscriber.next_publish().await.unwrap();
+    assert_eq!(
+        [&first, &second, &third].map(|p| p.payload.clone().unwrap()),
+        [&b"1"[..], b"2", b"3"]
+    );
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    let (mut subscriber, resumed) = Client::connect(
+        broker.addr,
+        "s",
+        Connect {
+            receive_maximum: 100,
+            ..resume
+        },
+    )
+    .await;
+    assert!(resumed);
+    let received = drain(&mut subscriber).await;
+    let expected: Vec<(String, bool)> = (2..=10).map(|i| (i.to_string(), i <= 3)).collect();
+    assert_eq!(received, expected);
+
+    // Every one acknowledged, nothing is left for the next restart
+    broker.crash().await;
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", resume).await;
+    assert!(drain(&mut subscriber).await.is_empty());
+    broker.stop().await;
+}
+
+/// A queued message dropped rather than sent, here as too large for the
+/// client, leaves storage too.
+#[tokio::test]
+async fn dropped_queued_messages_stay_dropped_after_a_crash() {
+    let db = database("dropped");
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", Connect::default()).await;
+    subscriber.subscribe("q", QoS::AtLeastOnce).await;
+    drop(subscriber);
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    publisher.publish(message("q", &"x".repeat(200))).await;
+    publisher.publish(message("q", "small")).await;
+
+    // Resumes with a Maximum Packet Size the first message exceeds
+    let mut stream = TcpStream::connect(broker.addr).await.unwrap();
+    let connect = ConnectPacket {
+        protocol_version: ProtocolVersion::V5,
+        flags: ConnectFlags::default(),
+        keepalive: 60,
+        properties: Some(ConnectProperties {
+            session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
+                3600,
+            )),
+            maximum_packet_size: Some(mercurio_core::properties::MaximumPacketSize::new(100)),
+            ..Default::default()
+        }),
+        payload: ConnectPayload {
+            client_id: "s".into(),
+            ..Default::default()
+        },
+    };
+    let mut encoded = BytesMut::new();
+    ControlPacket::Connect(connect).encode(&mut encoded);
+    stream.write_all(&encoded).await.unwrap();
+    let mut subscriber = Client {
+        stream,
+        buffer: BytesMut::new(),
+    };
+    assert!(matches!(
+        subscriber.receive().await,
+        Some(ControlPacket::ConnAck(_))
+    ));
+    let received = drain(&mut subscriber).await;
+    assert_eq!(received, [("small".to_string(), false)]);
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(
+        broker.addr,
+        "s",
+        Connect {
+            clean_start: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(drain(&mut subscriber).await.is_empty());
     broker.stop().await;
 }

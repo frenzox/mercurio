@@ -298,8 +298,9 @@ pub trait InflightStore: Send + Sync {
     async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
 }
 
-/// Messages waiting for disconnected clients, kept so they survive a
-/// restart. Each message is identified by its sequence in the client's queue.
+/// Messages waiting to be sent to the clients of sessions that outlive
+/// their connection, kept so they survive a restart. Each message is
+/// identified by its sequence in the client's queue.
 #[async_trait]
 pub trait QueueStore: Send + Sync {
     /// Whether stored queues outlive the process. Stores that don't are
@@ -311,6 +312,10 @@ pub trait QueueStore: Send + Sync {
     /// Stores `message` at position `sequence` of the client's queue,
     /// replacing what is stored there.
     async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()>;
+
+    /// Removes the message at position `sequence` of the client's queue, if
+    /// it is stored.
+    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()>;
 
     /// The client's queued messages, in sequence order.
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
@@ -351,10 +356,13 @@ pub enum Write {
     StoreIncomingQos2(u16),
     /// The client sent PUBREL for this packet id
     RemoveIncomingQos2(u16),
-    /// Store a message queued for a disconnected client, at this position
-    /// in its queue
+    /// Store a message queued for the client, at this position in its
+    /// queue
     Enqueue(u64, Message),
-    /// Drop the stored queue, once the client took it
+    /// Remove the message at this position of the client's queue, which
+    /// left the queue: sent, in the batch storing it in flight, or dropped
+    Dequeue(u64),
+    /// Drop the stored queue
     ClearQueue,
     /// Remove the session and everything stored with it
     DeleteSession,
@@ -443,6 +451,7 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
             Write::Enqueue(sequence, message) => {
                 store.enqueue(client_id, *sequence, message).await?
             }
+            Write::Dequeue(sequence) => store.dequeue(client_id, *sequence).await?,
             Write::ClearQueue => store.clear_queue(client_id).await?,
             Write::DeleteSession => {
                 store.delete_session(client_id).await?;
@@ -470,9 +479,90 @@ impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use mercurio_core::qos::QoS;
+    use std::sync::Arc;
 
-    use super::{BanStore, BatchStore, SessionState, StoredBan, StoredSubscription, Write};
+    use bytes::Bytes;
+    use mercurio_core::{message::Message, qos::QoS};
+
+    use super::{
+        BanStore, BatchStore, InflightMessage, SessionState, StoredBan, StoredSubscription, Write,
+    };
+
+    fn queued(payload: &str) -> Message {
+        Message {
+            packet_id: None,
+            topic: Arc::from("q"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Some(Bytes::from(payload.to_string())),
+            properties: Default::default(),
+            expires_at: None,
+            subscription_identifiers: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// What every durable store does with queued messages: each leaves the
+    /// queue on its own, in the batch that stores it in flight when it is
+    /// sent, batches apply in order, and applying one twice is harmless.
+    pub(crate) async fn queue_round_trip(store: &dyn BatchStore) {
+        let payloads = |queue: Vec<(u64, Message)>| -> Vec<(u64, String)> {
+            queue
+                .into_iter()
+                .map(|(sequence, message)| {
+                    let payload = message.payload.unwrap_or_default();
+                    (sequence, String::from_utf8(payload.to_vec()).unwrap())
+                })
+                .collect()
+        };
+        let sent = InflightMessage {
+            packet_id: 9,
+            topic: "q".into(),
+            payload: Some(Bytes::from_static(b"1")),
+            qos: QoS::AtLeastOnce,
+            dup: false,
+            retain: false,
+            expires_at: None,
+            sequence: 0,
+            released: false,
+            properties: Default::default(),
+            subscription_identifiers: Vec::new(),
+        };
+        let batch = [
+            Write::Enqueue(1, queued("1")),
+            Write::Enqueue(2, queued("2")),
+            Write::Enqueue(3, queued("3")),
+            Write::StoreInflight(sent),
+            Write::Dequeue(1),
+            Write::Dequeue(3),
+            Write::Enqueue(3, queued("3 again")),
+            Write::Enqueue(4, queued("4")),
+            Write::Dequeue(4),
+            // Removing what isn't stored is no error
+            Write::Dequeue(10),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                payloads(store.load_queue("c").await.unwrap()),
+                [(2, "2".to_string()), (3, "3 again".to_string())]
+            );
+            let inflight = store.get_all_inflight("c").await.unwrap();
+            assert_eq!(inflight.len(), 1);
+            assert_eq!(inflight[0].packet_id, 9);
+        }
+        store
+            .apply("other", &[Write::Enqueue(2, queued("other"))])
+            .await
+            .unwrap();
+        store.apply("c", &[Write::Dequeue(2)]).await.unwrap();
+        assert_eq!(
+            payloads(store.load_queue("c").await.unwrap()),
+            [(3, "3 again".to_string())]
+        );
+        assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
+    }
 
     /// What every store does with subscriptions: a session saved whole
     /// replaces them, single ones are added and removed in order, applying

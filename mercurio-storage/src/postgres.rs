@@ -845,7 +845,8 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
         | Write::RemoveInflight(_)
         | Write::StoreIncomingQos2(_)
         | Write::RemoveIncomingQos2(_)
-        | Write::Enqueue(..) => {
+        | Write::Enqueue(..)
+        | Write::Dequeue(_) => {
             unreachable!("applied in bulk by bulk_statements")
         }
         Write::ClearQueue => vec![(
@@ -884,7 +885,8 @@ enum Fate<'a> {
 /// the same as applying them in order.
 fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params)> {
     let mut fates: HashMap<u16, Fate> = HashMap::new();
-    let mut queued: BTreeMap<u64, &Message> = BTreeMap::new();
+    // None once removed
+    let mut queued: BTreeMap<u64, Option<&Message>> = BTreeMap::new();
     // Whether each packet id ends up stored
     let mut incoming: HashMap<u16, bool> = HashMap::new();
     for write in run {
@@ -903,7 +905,10 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
                 fates.insert(*packet_id, Fate::Removed);
             }
             Write::Enqueue(sequence, message) => {
-                queued.insert(*sequence, message);
+                queued.insert(*sequence, Some(message));
+            }
+            Write::Dequeue(sequence) => {
+                queued.insert(*sequence, None);
             }
             Write::StoreIncomingQos2(packet_id) => {
                 incoming.insert(*packet_id, true);
@@ -1001,7 +1006,21 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
             vec![id(), Box::new(received_ids)],
         ));
     }
-    let queued: Vec<(&u64, &&Message)> = queued.iter().collect();
+    let dequeued: Vec<i64> = queued
+        .iter()
+        .filter(|(_, message)| message.is_none())
+        .map(|(sequence, _)| *sequence as i64)
+        .collect();
+    if !dequeued.is_empty() {
+        statements.push((
+            "DELETE FROM queued_messages WHERE client_id = $1 AND sequence = ANY($2)",
+            vec![id(), Box::new(dequeued)],
+        ));
+    }
+    let queued: Vec<(&u64, &&Message)> = queued
+        .iter()
+        .filter_map(|(sequence, message)| Some((sequence, message.as_ref()?)))
+        .collect();
     if !queued.is_empty() {
         statements.push((
             "INSERT INTO queued_messages
@@ -1047,6 +1066,7 @@ fn in_bulk(write: &Write) -> bool {
             | Write::StoreIncomingQos2(_)
             | Write::RemoveIncomingQos2(_)
             | Write::Enqueue(..)
+            | Write::Dequeue(_)
     )
 }
 
@@ -1563,6 +1583,10 @@ impl QueueStore for PostgresStore {
             .await
     }
 
+    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()> {
+        self.apply(client_id, &[Write::Dequeue(sequence)]).await
+    }
+
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
         self.query(
             "SELECT * FROM queued_messages WHERE client_id = $1 ORDER BY sequence",
@@ -1966,6 +1990,14 @@ mod tests {
         assert!(store.load_session("c").await.unwrap().is_none());
         assert!(store.load_queue("c").await.unwrap().is_empty());
         assert!(store.get_all_inflight("c").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_queued_messages_leave_one_at_a_time() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        crate::testing::queue_round_trip(&store).await;
     }
 
     #[tokio::test]

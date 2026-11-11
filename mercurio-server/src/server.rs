@@ -2156,8 +2156,8 @@ where
                 },
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
-                message = session.next_outgoing(window_open) => {
-                    Step::Done(self.send_outgoing(&session, &client_id, message).await?)
+                (message, journaled) = session.next_outgoing(window_open) => {
+                    Step::Done(self.send_outgoing(&session, &client_id, message, journaled).await?)
                 }
                 _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
                 Ok(()) = lease.close.changed() => {
@@ -2276,12 +2276,14 @@ where
         Ok(Flow::PacketHandled)
     }
 
-    /// Sends a message the session queued for the client.
+    /// Sends a message the session queued for the client, at `journaled`
+    /// in the queue's journal if it is stored there.
     async fn send_outgoing(
         &mut self,
         session: &Session,
         client_id: &str,
         message: Message,
+        journaled: Option<u64>,
     ) -> Result<Flow> {
         let mut session = session.clone();
         // Checked per message: a permitted subscription can still
@@ -2294,6 +2296,9 @@ where
                 .may(&identity, &message.topic, Access::Read)
                 .await
             {
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
                 return Ok(Flow::Continue);
             }
         }
@@ -2301,15 +2306,25 @@ where
         // in-flight record is stored, not the packet
         let (write, inflight) = {
             let Some(Outgoing { packet, inflight }) = session.prepare_publish(message).await else {
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
                 return Ok(Flow::Continue);
             };
             debug!("Sending {} to client {:?}", describe(&packet), client_id);
             (self.connection.write_packet(packet), inflight)
         };
-        if let Some(inflight) = inflight {
-            self.session_manager
-                .store_inflight(client_id, &inflight)
-                .await;
+        match inflight {
+            Some(inflight) => {
+                self.session_manager
+                    .store_inflight(client_id, &inflight, journaled)
+                    .await
+            }
+            None => {
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
+            }
         }
         write.await?;
         Stats::add(&self.stats.messages_sent);

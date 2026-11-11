@@ -330,6 +330,10 @@ impl QueueStore for MemoryStore {
         Ok(())
     }
 
+    async fn dequeue(&self, _client_id: &str, _sequence: u64) -> Result<()> {
+        Ok(())
+    }
+
     async fn load_queue(&self, _client_id: &str) -> Result<Vec<(u64, Message)>> {
         Ok(Vec::new())
     }

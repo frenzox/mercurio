@@ -473,6 +473,12 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 ],
             )?;
         }
+        Write::Dequeue(sequence) => {
+            conn.execute(
+                "DELETE FROM queued_messages WHERE client_id = ?1 AND sequence = ?2",
+                params![client_id, *sequence as i64],
+            )?;
+        }
         Write::ClearQueue => {
             conn.execute(
                 "DELETE FROM queued_messages WHERE client_id = ?1",
@@ -908,6 +914,10 @@ impl QueueStore for SqliteStore {
             .await
     }
 
+    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()> {
+        self.apply(client_id, &[Write::Dequeue(sequence)]).await
+    }
+
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
         let client_id = client_id.to_string();
 
@@ -1314,6 +1324,11 @@ mod tests {
     #[tokio::test]
     async fn test_subscriptions() {
         crate::testing::subscriptions_round_trip(&SqliteStore::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_queued_messages_leave_one_at_a_time() {
+        crate::testing::queue_round_trip(&SqliteStore::in_memory().unwrap()).await;
     }
 
     /// Sessions of databases from before subscriptions had a table of

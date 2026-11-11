@@ -609,7 +609,9 @@ With `backend = "memory"`, everything is lost when the broker stops. With
 retained messages, wills, queued messages and messages in flight are kept in
 the database, so
 clients with persistent sessions resume where they left off after a
-restart.
+restart. Queued QoS 1 and 2 messages of persistent sessions are kept whether
+their client is connected or not, each removed as it is sent, in the same
+write that records it in flight, or dropped; QoS 0 messages are not kept.
 
 Changes are written in the background within milliseconds, so a crash loses
 only the changes of its last moments; a shutdown writes everything first.

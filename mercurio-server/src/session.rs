@@ -1158,9 +1158,10 @@ impl Session {
         }
     }
 
-    /// Starts keeping the queue on disk while the client is away.
-    pub(crate) fn start_queue_journal(&self, journal: crate::writer::Writer) {
-        self.shared.queue.start_journal(journal);
+    /// Starts keeping the queue's QoS 1 and 2 messages in storage, unless
+    /// it does already. With `recorded`, those queued are there already.
+    pub(crate) fn start_queue_journal(&self, journal: crate::writer::Writer, recorded: bool) {
+        self.shared.queue.start_journal(journal, recorded);
     }
 
     pub(crate) fn stop_queue_journal(&self) {
@@ -1710,8 +1711,10 @@ impl Session {
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
-    /// doesn't hold the session state while waiting.
-    pub(crate) async fn next_outgoing(&self, window_open: bool) -> Message {
+    /// doesn't hold the session state while waiting. Also returns the
+    /// message's sequence if it is stored in the queue's journal, from
+    /// which it is to be removed once sent or dropped.
+    pub(crate) async fn next_outgoing(&self, window_open: bool) -> (Message, Option<u64>) {
         self.shared.queue.pop(!window_open).await
     }
 
@@ -2358,7 +2361,7 @@ mod tests {
     }
 
     async fn next_publish(session: &mut Session) -> PublishPacket {
-        let message = session.next_outgoing(true).await;
+        let (message, _) = session.next_outgoing(true).await;
         match session.prepare_publish(message).await.map(|o| o.packet) {
             Some(ControlPacket::Publish(p)) => p,
             other => panic!("Expected Publish packet, got {:?}", other),
