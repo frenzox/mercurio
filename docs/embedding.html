@@ -78,6 +78,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>policy</code></td><td><code>ConnectPolicy</code>: client id rules, redirection, response information</td></tr>
 <tr><td><code>listeners</code></td><td>Extra <code>ListenerConfig</code>s: TCP or Unix sockets, MQTT or WebSocket, with their own TLS, mount point, auth, plugins and limits</td></tr>
 <tr><td><code>local_listener</code></td><td>In-process connections, see <a href="#local">below</a></td></tr>
+<tr><td><code>admin_extension</code></td><td>Serves the <code>$CONTROL/broker/v1</code> commands the broker doesn't know, see <a href="#admin">below</a></td></tr>
 <tr><td><code>sys_interval</code></td><td>How often <code>$SYS</code> statistics are published</td></tr>
 </table>
 <pre>use mercurio_server::{
@@ -151,6 +152,7 @@ config.plugins = vec![Arc::new(OwnTopics)];</pre>
 <li><code>Access</code> is <code>Write</code> to publish, <code>Subscribe</code> to subscribe, with the topic filter, and <code>Read</code> to receive a message.</li>
 <li><code>ClientInfo::username</code> is only set for users the broker verified. <code>client_id</code> is empty in <code>authenticate</code> when the client asked the server to assign one.</li>
 <li><code>authorize</code> runs for every message, so keep it fast; a hook that is ready at once, as above, costs no timer. Cache answers that need I/O.</li>
+<li><code>Plugin::on_control</code> handles publishes to <code>$CONTROL/&lt;name&gt;/...</code>. Its answer goes only to the client that sent the request: on the request's Response Topic, with its Correlation Data, or on <code>$CONTROL/&lt;name&gt;/&lt;path&gt;/response</code> without one.</li>
 <li>A client publishing to <code>$CONTROL/&lt;name&gt;/x/response</code> reaches <code>Plugin::on_control</code> with path <code>x/response</code>; plugins that only answer requests should ignore such paths.</li>
 <li><code>auth::SimpleCredentialValidator</code> checks a list of users, and <code>acl::AclFile::parse</code> reads mosquitto's ACL format, if you want those from your own code.</li>
 </ul>
@@ -185,8 +187,29 @@ let client = MqttClient::connect(options).await?;
 client.publish("app/started", "1", QoS::AtLeastOnce).await?;</pre>
 <p>The daemon's bridges and dynamic security work this way.</p>
 
+<h2 id="admin">Administering it</h2>
+<p><code>Server</code> separates setting a broker up from serving it. In between it hands out an <code>Admin</code>, which runs the commands of the <a href="admin.html">admin API</a> as <code>async</code> methods, before and while the broker serves. The <code>run*</code> functions above are shortcuts for <code>Server::new</code> followed by <code>Server::run</code>.</p>
+<pre>use std::sync::Arc;
+use mercurio_server::{admin::ClientQuery, server::{Server, ServerConfig}};
+use mercurio_storage::memory::MemoryStore;
+
+let server = Server::new(listener, ServerConfig::default(), Arc::new(MemoryStore::new())).await?;
+let admin = server.admin();
+tokio::spawn(server.run(tokio::signal::ctrl_c()));
+
+let mut query = ClientQuery::default();
+query.connected = Some(true);
+for client in admin.clients(&amp;query).await.items {
+    println!("{} {:?}", client.client_id, client.address);
+}</pre>
+<ul>
+<li>Methods return plain structs. Failures are an <code>AdminError</code>, whose <code>code</code> is the protocol's.</li>
+<li>The broker serves the same commands over MQTT on <code>$CONTROL/broker/v1</code>, to clients access control allows. <code>ServerConfig::admin_extension</code> takes an <code>AdminExtension</code> for commands the broker doesn't know: mercuriod adds its bridge, configuration, log level and reload commands this way. Without one, those answer <code>unavailable</code>.</li>
+<li>A <code>ListenerConfig</code> on a Unix socket can be <code>trusted</code>: its clients skip authentication and access control, and run every command. Give it a <code>peer_filter</code> to choose clients by their user and group ids, as mercuriod's admin socket does, or keep the socket's permissions tight. <code>Server::new</code> refuses a trusted listener on TCP, with its own authentication or plugins, with <code>proxy_protocol</code> or serving WebSocket.</li>
+</ul>
+
 <h2>Logs</h2>
-<p>The broker logs through <code>tracing</code>. Install any subscriber, such as <code>tracing_subscriber::fmt().init()</code>. Connection and disconnection messages use the target <code>mercurio_server::CONNECTIONS</code>, so they can be filtered alone.</p>
+<p>The broker logs through <code>tracing</code>. Install any subscriber, such as <code>tracing_subscriber::fmt().init()</code>. Connection and disconnection messages use the target <code>mercurio::connections</code>, the constant <code>mercurio_server::CONNECTIONS</code>, so they can be filtered alone.</p>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>
 </body>
