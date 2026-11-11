@@ -769,7 +769,7 @@ impl MqttClient {
         reason: ReasonCode,
         session_expiry: Option<u32>,
     ) -> Result<()> {
-        let code = reason.get_code();
+        let code = reason.code();
         if !self.reports_reasons {
             if code != 0 || session_expiry.is_some() {
                 return Err(ClientError::NotSupported(
@@ -2025,7 +2025,7 @@ impl EventLoop {
     /// broker refused the message.
     fn complete_publish(&mut self, packet_id: u16, reason: ReasonCode) {
         if let Some(outgoing) = self.outgoing.remove(&packet_id) {
-            let result = if reason.get_code() >= 0x80 {
+            let result = if reason.code() >= 0x80 {
                 Err(ClientError::PublishRefused(reason))
             } else {
                 Ok(())
@@ -2053,7 +2053,7 @@ impl EventLoop {
             ControlPacket::PubAck(ack) => self.complete_publish(ack.packet_id, ack.reason),
             ControlPacket::PubRec(rec) => {
                 // A failure ends the exchange; otherwise release the message
-                if rec.reason.get_code() >= 0x80 {
+                if rec.reason.code() >= 0x80 {
                     self.complete_publish(rec.packet_id, rec.reason);
                 } else {
                     let reason = match self.outgoing.get_mut(&rec.packet_id) {
@@ -2094,7 +2094,7 @@ impl EventLoop {
                         .iter()
                         .zip(ack.payload)
                         .map(|((topic, _), granted)| {
-                            let code = granted.reason_code.get_code();
+                            let code = granted.reason_code.code();
                             SubscribeResult {
                                 topic: topic.clone(),
                                 qos: if code < 0x80 {
@@ -2127,7 +2127,7 @@ impl EventLoop {
                         .zip(reasons)
                         .map(|(topic, reason)| UnsubscribeResult {
                             topic,
-                            success: reason.get_code() < 0x80,
+                            success: reason.code() < 0x80,
                             reason,
                         })
                         .collect::<Vec<_>>();

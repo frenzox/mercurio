@@ -11,76 +11,82 @@ use crate::{
 /// MQTT reason code used in various packets to indicate success or failure.
 ///
 /// One enum covers the reason codes of every packet type (section 2.4).
-/// Codes below 0x80 report success and codes from 0x80 report failure. A
-/// few variants share a numeric code; see [`get_code`](ReasonCode::get_code).
+/// Codes below 0x80 report success and codes from 0x80 report failure.
+/// Each variant is one byte on the wire, and the discriminant is that byte.
+/// The spec gives 0x00 a different name in some packets; those names are
+/// constants for the same [`Success`](ReasonCode::Success) variant, so
+/// codes compare the way the wire does:
 ///
-/// The [`Decoder`] cannot know the packet type, so it reads 0x00 as
-/// [`Success`](ReasonCode::Success). The DISCONNECT decoder maps it to
-/// [`NormalDisconnection`](ReasonCode::NormalDisconnection), and the MQTT 3.x
-/// SUBACK decoder maps return codes itself. An unknown code is a
-/// [`MalformedPacket`](ReasonCode::MalformedPacket), and the packet
-/// decoders also refuse a known code their packet does not list; see
-/// [`is_valid_for`](ReasonCode::is_valid_for).
+/// ```
+/// use mercurio_core::reason::ReasonCode;
+///
+/// assert_eq!(ReasonCode::NormalDisconnection, ReasonCode::Success);
+/// assert_eq!(ReasonCode::GrantedQoS0, ReasonCode::Success);
+/// assert_eq!(u8::from(ReasonCode::PacketTooLarge), 0x95);
+/// assert_eq!(ReasonCode::try_from(0x95), Ok(ReasonCode::PacketTooLarge));
+/// ```
+///
+/// An unknown code is a [`MalformedPacket`](ReasonCode::MalformedPacket) to
+/// the [`Decoder`], and the packet decoders also refuse a known code their
+/// packet does not list; see [`is_valid_for`](ReasonCode::is_valid_for).
 ///
 /// It is also the error type of protocol failures, through
 /// [`Error::MQTTReasonCode`](crate::error::Error::MQTTReasonCode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ReasonCode {
-    /// 0x00 in CONNACK, PUBACK, PUBREC, PUBREL, PUBCOMP, UNSUBACK and AUTH.
+    /// 0x00 in every packet with a reason code. DISCONNECT names it
+    /// [`NormalDisconnection`](ReasonCode::NormalDisconnection) and SUBACK
+    /// [`GrantedQoS0`](ReasonCode::GrantedQoS0).
     #[default]
-    Success,
-    /// 0x00 in DISCONNECT: the connection closes without publishing the
-    /// will message.
-    NormalDisconnection,
-    /// 0x00 in SUBACK.
-    GrantedQoS0,
+    Success = 0x00,
     /// 0x01 in SUBACK.
-    GrantedQoS1,
+    GrantedQoS1 = 0x01,
     /// 0x02 in SUBACK.
-    GrantedQoS2,
+    GrantedQoS2 = 0x02,
     /// 0x04 in DISCONNECT: the client closes the connection and asks the
     /// server to publish its will message.
-    DisconnectWithWillMessage,
-    NoMatchingSubscribers,
-    NoSubscriptionExisted,
-    ContinueAuthentication,
-    ReAuthenticate,
-    UnspecifiedError,
-    MalformedPacket,
-    ProtocolError,
-    ImplementationSpecificError,
-    UnsupportedProtocolVersion,
-    ClientIdentifierNotValid,
-    BadUserNameOrPassword,
-    NotAuthorized,
-    ServerUnavailable,
-    ServerBusy,
-    Banned,
-    ServerShuttingDown,
-    BadAuthenticationMethod,
-    KeepAliveTimeout,
-    SessionTakenOver,
-    TopicFilterInvalid,
-    TopicNameInvalid,
-    PacketIdentifierInUse,
-    PacketIdentifierNotFound,
-    ReceiveMaximumExceeded,
-    TopicAliasInvalid,
-    PacketTooLarge,
-    MessageRateTooHigh,
-    QuotaExceeded,
-    AdministrativeAction,
-    PayloadFormatInvalid,
-    RetainNotSupported,
-    QoSNotSupported,
-    UseAnotherServer,
-    ServerMoved,
-    SharedSubscriptionsNotSupported,
-    ConnectionRateExceeded,
-    MaximumConnectTime,
-    SubscriptionIdentifiersNotSupported,
-    WildcardSubscriptionsNotSupported,
+    DisconnectWithWillMessage = 0x04,
+    NoMatchingSubscribers = 0x10,
+    NoSubscriptionExisted = 0x11,
+    ContinueAuthentication = 0x18,
+    ReAuthenticate = 0x19,
+    UnspecifiedError = 0x80,
+    MalformedPacket = 0x81,
+    ProtocolError = 0x82,
+    ImplementationSpecificError = 0x83,
+    UnsupportedProtocolVersion = 0x84,
+    ClientIdentifierNotValid = 0x85,
+    BadUserNameOrPassword = 0x86,
+    NotAuthorized = 0x87,
+    ServerUnavailable = 0x88,
+    ServerBusy = 0x89,
+    Banned = 0x8a,
+    ServerShuttingDown = 0x8b,
+    BadAuthenticationMethod = 0x8c,
+    KeepAliveTimeout = 0x8d,
+    SessionTakenOver = 0x8e,
+    TopicFilterInvalid = 0x8f,
+    TopicNameInvalid = 0x90,
+    PacketIdentifierInUse = 0x91,
+    PacketIdentifierNotFound = 0x92,
+    ReceiveMaximumExceeded = 0x93,
+    TopicAliasInvalid = 0x94,
+    PacketTooLarge = 0x95,
+    MessageRateTooHigh = 0x96,
+    QuotaExceeded = 0x97,
+    AdministrativeAction = 0x98,
+    PayloadFormatInvalid = 0x99,
+    RetainNotSupported = 0x9a,
+    QoSNotSupported = 0x9b,
+    UseAnotherServer = 0x9c,
+    ServerMoved = 0x9d,
+    SharedSubscriptionsNotSupported = 0x9e,
+    ConnectionRateExceeded = 0x9f,
+    MaximumConnectTime = 0xa0,
+    SubscriptionIdentifiersNotSupported = 0xa1,
+    WildcardSubscriptionsNotSupported = 0xa2,
 }
 
 impl fmt::Display for ReasonCode {
@@ -88,8 +94,6 @@ impl fmt::Display for ReasonCode {
         use ReasonCode::*;
         let msg = match self {
             Success => "Success",
-            NormalDisconnection => "Normal disconnection",
-            GrantedQoS0 => "Granted QoS 0",
             GrantedQoS1 => "Granted QoS 1",
             GrantedQoS2 => "Granted QoS 2",
             DisconnectWithWillMessage => "Disconnect with will message",
@@ -141,62 +145,28 @@ impl fmt::Display for ReasonCode {
 impl std::error::Error for ReasonCode {}
 
 impl ReasonCode {
-    /// The byte that encodes this reason code.
-    ///
-    /// [`Success`](ReasonCode::Success),
-    /// [`NormalDisconnection`](ReasonCode::NormalDisconnection) and
-    /// [`GrantedQoS0`](ReasonCode::GrantedQoS0) are all 0x00, so the code
-    /// alone does not tell them apart.
-    pub fn get_code(&self) -> u8 {
-        use ReasonCode::*;
+    /// 0x00 in DISCONNECT: the connection closes without publishing the
+    /// will message.
+    #[allow(non_upper_case_globals)]
+    pub const NormalDisconnection: ReasonCode = ReasonCode::Success;
 
-        match *self {
-            Success => 0x00,
-            NormalDisconnection => 0x00,
-            GrantedQoS0 => 0x00,
-            GrantedQoS1 => 0x01,
-            GrantedQoS2 => 0x02,
-            DisconnectWithWillMessage => 0x04,
-            NoMatchingSubscribers => 0x10,
-            NoSubscriptionExisted => 0x11,
-            ContinueAuthentication => 0x18,
-            ReAuthenticate => 0x19,
-            UnspecifiedError => 0x80,
-            MalformedPacket => 0x81,
-            ProtocolError => 0x82,
-            ImplementationSpecificError => 0x83,
-            UnsupportedProtocolVersion => 0x84,
-            ClientIdentifierNotValid => 0x85,
-            BadUserNameOrPassword => 0x86,
-            NotAuthorized => 0x87,
-            ServerUnavailable => 0x88,
-            ServerBusy => 0x89,
-            Banned => 0x8a,
-            ServerShuttingDown => 0x8b,
-            BadAuthenticationMethod => 0x8c,
-            KeepAliveTimeout => 0x8d,
-            SessionTakenOver => 0x8e,
-            TopicFilterInvalid => 0x8f,
-            TopicNameInvalid => 0x90,
-            PacketIdentifierInUse => 0x91,
-            PacketIdentifierNotFound => 0x92,
-            ReceiveMaximumExceeded => 0x93,
-            TopicAliasInvalid => 0x94,
-            PacketTooLarge => 0x95,
-            MessageRateTooHigh => 0x96,
-            QuotaExceeded => 0x97,
-            AdministrativeAction => 0x98,
-            PayloadFormatInvalid => 0x99,
-            RetainNotSupported => 0x9a,
-            QoSNotSupported => 0x9b,
-            UseAnotherServer => 0x9c,
-            ServerMoved => 0x9d,
-            SharedSubscriptionsNotSupported => 0x9e,
-            ConnectionRateExceeded => 0x9f,
-            MaximumConnectTime => 0xa0,
-            SubscriptionIdentifiersNotSupported => 0xa1,
-            WildcardSubscriptionsNotSupported => 0xa2,
-        }
+    /// 0x00 in SUBACK: the subscription was granted at QoS 0.
+    #[allow(non_upper_case_globals)]
+    pub const GrantedQoS0: ReasonCode = ReasonCode::Success;
+
+    /// The byte that encodes this reason code.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Whether the code reports success: any code below 0x80.
+    pub const fn is_success(self) -> bool {
+        self.code() < 0x80
+    }
+
+    /// Whether the code reports a failure: 0x80 and above.
+    pub const fn is_error(self) -> bool {
+        !self.is_success()
     }
 
     /// Whether an MQTT 5 packet of `packet_type` may carry this reason code,
@@ -205,18 +175,14 @@ impl ReasonCode {
     /// (SUBACK), 3.11.3 (UNSUBACK), 3.14.2.1 (DISCONNECT) and 3.15.2.1
     /// (AUTH). Packets without a reason code allow none.
     ///
-    /// It compares the encoded byte, so [`Success`](ReasonCode::Success),
-    /// [`NormalDisconnection`](ReasonCode::NormalDisconnection) and
-    /// [`GrantedQoS0`](ReasonCode::GrantedQoS0) are valid wherever 0x00 is.
-    ///
     /// ```
     /// use mercurio_core::{protocol::PacketType, reason::ReasonCode};
     ///
     /// assert!(ReasonCode::PacketIdentifierNotFound.is_valid_for(PacketType::PubRel));
     /// assert!(!ReasonCode::PacketIdentifierNotFound.is_valid_for(PacketType::PubAck));
     /// ```
-    pub fn is_valid_for(&self, packet_type: PacketType) -> bool {
-        let code = self.get_code();
+    pub fn is_valid_for(self, packet_type: PacketType) -> bool {
+        let code = self.code();
         match packet_type {
             PacketType::ConnAck => matches!(
                 code,
@@ -249,21 +215,21 @@ impl ReasonCode {
     }
 }
 
-impl Encoder for ReasonCode {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.get_code().encode(buffer);
-    }
-
-    fn encoded_size(&self) -> usize {
-        self.get_code().encoded_size()
+impl From<ReasonCode> for u8 {
+    fn from(reason: ReasonCode) -> u8 {
+        reason.code()
     }
 }
 
-impl Decoder for ReasonCode {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+/// The reason code a byte encodes, or the byte itself when no packet
+/// type lists it.
+impl TryFrom<u8> for ReasonCode {
+    type Error = u8;
+
+    fn try_from(code: u8) -> Result<Self, u8> {
         use ReasonCode::*;
 
-        let reason = match u8::decode(buffer)? {
+        let reason = match code {
             0x00 => Success,
             0x01 => GrantedQoS1,
             0x02 => GrantedQoS2,
@@ -307,10 +273,26 @@ impl Decoder for ReasonCode {
             0xa0 => MaximumConnectTime,
             0xa1 => SubscriptionIdentifiersNotSupported,
             0xa2 => WildcardSubscriptionsNotSupported,
-            _ => return Err(MalformedPacket.into()),
+            _ => return Err(code),
         };
 
         Ok(reason)
+    }
+}
+
+impl Encoder for ReasonCode {
+    fn encode(&self, buffer: &mut bytes::BytesMut) {
+        self.code().encode(buffer);
+    }
+
+    fn encoded_size(&self) -> usize {
+        1
+    }
+}
+
+impl Decoder for ReasonCode {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        ReasonCode::try_from(u8::decode(buffer)?).map_err(|_| ReasonCode::MalformedPacket.into())
     }
 }
 
@@ -352,15 +334,29 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_is_valid_under_each_of_its_names() {
-        for code in [
-            ReasonCode::Success,
-            ReasonCode::NormalDisconnection,
-            ReasonCode::GrantedQoS0,
-        ] {
-            assert!(code.is_valid_for(PacketType::Disconnect));
-            assert!(code.is_valid_for(PacketType::SubAck));
-            assert!(code.is_valid_for(PacketType::PubAck));
+    fn test_zero_has_one_value_under_each_of_its_names() {
+        let decoded = ReasonCode::decode(&mut &[0x00][..]).unwrap();
+        assert_eq!(decoded, ReasonCode::NormalDisconnection);
+        assert_eq!(decoded, ReasonCode::GrantedQoS0);
+        assert!(matches!(decoded, ReasonCode::NormalDisconnection));
+    }
+
+    #[test]
+    fn test_every_byte_converts_back_to_itself() {
+        for byte in 0..=u8::MAX {
+            if let Ok(reason) = ReasonCode::try_from(byte) {
+                assert_eq!(u8::from(reason), byte);
+            }
         }
+        assert_eq!(known_codes().len(), 43);
+        assert_eq!(ReasonCode::try_from(0x03), Err(0x03));
+    }
+
+    #[test]
+    fn test_success_and_error_split_at_0x80() {
+        assert!(ReasonCode::NoMatchingSubscribers.is_success());
+        assert!(!ReasonCode::NoMatchingSubscribers.is_error());
+        assert!(ReasonCode::UnspecifiedError.is_error());
+        assert!(!ReasonCode::UnspecifiedError.is_success());
     }
 }

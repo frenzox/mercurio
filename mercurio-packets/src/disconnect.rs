@@ -113,13 +113,9 @@ impl DisconnectPacket {
 impl Decoder for DisconnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         crate::decode_packet(buffer, PacketType::Disconnect, |_, buffer| {
-            // 0x00 is "Normal disconnection" in DISCONNECT, whether it is
-            // sent or left out
+            // A reason left out is a normal disconnection
             let reason = if buffer.has_remaining() {
-                match crate::decode_reason(buffer, PacketType::Disconnect)? {
-                    ReasonCode::Success => ReasonCode::NormalDisconnection,
-                    reason => reason,
-                }
+                crate::decode_reason(buffer, PacketType::Disconnect)?
             } else {
                 ReasonCode::NormalDisconnection
             };

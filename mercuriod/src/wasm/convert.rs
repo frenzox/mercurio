@@ -124,7 +124,7 @@ pub(crate) fn event(event: &Event) -> Option<wit::Event> {
             client: c, reason, ..
         } => wit::Event::Disconnected(wit::Disconnected {
             client: client(c),
-            reason: reason.map(|reason| reason.get_code()),
+            reason: reason.map(|reason| reason.code()),
         }),
         Event::Subscribed {
             client: c,

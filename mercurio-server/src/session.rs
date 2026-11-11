@@ -1326,7 +1326,7 @@ impl Session {
         session.unsent.retain(|id| *id != packet_id);
 
         // A failure reason ends the exchange: the client won't take the message
-        if packet.reason.get_code() >= 0x80 {
+        if packet.reason.code() >= 0x80 {
             session.pubrecs.remove(&packet_id);
             return Ok(None);
         }

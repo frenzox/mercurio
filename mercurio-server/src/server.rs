@@ -2031,7 +2031,7 @@ where
 
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::MQTTReasonCode(reason)) = &result {
-            if protocol_version.supports_reason_codes() && reason.get_code() >= 0x80 {
+            if protocol_version.supports_reason_codes() && reason.code() >= 0x80 {
                 let disconnect = ControlPacket::Disconnect(DisconnectPacket {
                     reason: *reason,
                     properties: Some(DisconnectProperties {
@@ -2415,7 +2415,7 @@ where
                     .await?;
                 // The client now awaits PUBREL's answer for this id
                 if let Some(ControlPacket::PubRec(pubrec)) = &response {
-                    if pubrec.reason.get_code() < 0x80 {
+                    if pubrec.reason.code() < 0x80 {
                         self.session_manager
                             .store_incoming_qos2(client_id, pubrec.packet_id)
                             .await;
@@ -2432,7 +2432,7 @@ where
                 response
             }
             HotPacket::PubRec(rec) => {
-                let (packet_id, failed) = (rec.packet_id, rec.reason.get_code() >= 0x80);
+                let (packet_id, failed) = (rec.packet_id, rec.reason.code() >= 0x80);
                 let response = session.handle_pubrec(rec).await?;
                 if failed {
                     self.session_manager
@@ -2592,9 +2592,7 @@ where
                 let inflight_completed = match &packet {
                     ControlPacket::PubAck(ack) => Some(ack.packet_id),
                     ControlPacket::PubComp(comp) => Some(comp.packet_id),
-                    ControlPacket::PubRec(rec) if rec.reason.get_code() >= 0x80 => {
-                        Some(rec.packet_id)
-                    }
+                    ControlPacket::PubRec(rec) if rec.reason.code() >= 0x80 => Some(rec.packet_id),
                     _ => None,
                 };
 

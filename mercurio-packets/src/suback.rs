@@ -80,11 +80,7 @@ impl Encoder for SubAckPayload {
 
 impl Decoder for SubAckPayload {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        // 0x00 is "Granted QoS 0" in SUBACK
-        let reason_code = match crate::decode_reason(buffer, PacketType::SubAck)? {
-            ReasonCode::Success => ReasonCode::GrantedQoS0,
-            reason => reason,
-        };
+        let reason_code = crate::decode_reason(buffer, PacketType::SubAck)?;
 
         Ok(SubAckPayload { reason_code })
     }

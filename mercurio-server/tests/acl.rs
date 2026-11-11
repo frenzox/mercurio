@@ -155,7 +155,7 @@ async fn topics_follow_the_acl() {
 
     assert_eq!(reader.subscribe("alice/#").await, ReasonCode::NotAuthorized);
     // Granted QoS 0
-    assert_eq!(reader.subscribe("public/#").await.get_code(), 0x00);
+    assert_eq!(reader.subscribe("public/#").await.code(), 0x00);
 
     // Accepted; nobody happens to be subscribed
     assert_eq!(
@@ -183,7 +183,7 @@ async fn shared_subscriptions_are_checked_by_their_topic_filter() {
     let (mut reader, _) = Client::connect(addr, "reader", None, None).await;
 
     // Granted QoS 0, as for public/# itself
-    assert_eq!(reader.subscribe("$share/g/public/#").await.get_code(), 0x00);
+    assert_eq!(reader.subscribe("$share/g/public/#").await.code(), 0x00);
     assert_eq!(
         reader.subscribe("$share/g/alice/#").await,
         ReasonCode::NotAuthorized
@@ -210,5 +210,5 @@ async fn credentials_are_verified_without_required_authentication() {
 
     let (mut alice, accepted) = Client::connect(addr, "a", Some(("alice", "secret")), None).await;
     assert_eq!(accepted, ReasonCode::Success);
-    assert_eq!(alice.subscribe("alice/#").await.get_code(), 0x00);
+    assert_eq!(alice.subscribe("alice/#").await.code(), 0x00);
 }
