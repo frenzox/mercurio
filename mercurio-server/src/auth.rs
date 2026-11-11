@@ -1,5 +1,10 @@
-//! Built-in authentication plugins: PLAIN enhanced authentication and an
-//! in-memory user name and password check.
+//! Built-in authentication plugins for tests and demos: PLAIN enhanced
+//! authentication and an in-memory user name and password check.
+//!
+//! Both keep passwords in plaintext, in memory. They compare them in
+//! constant time, and take as long for an unknown user as for a wrong
+//! password, but a real deployment wants hashed passwords, such as
+//! `mercuriod`'s password file or dynamic security, or a plugin of its own.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -12,7 +17,7 @@ use crate::plugin::{
     PluginKind, PluginStatus,
 };
 
-/// PLAIN authentication method (RFC 4616).
+/// PLAIN authentication method (RFC 4616), for tests and demos.
 ///
 /// Expects authentication data in the format: `\0username\0password`
 /// where the first byte is NUL (authorization identity is empty).
@@ -99,8 +104,8 @@ impl PlainExchange {
             return AuthResult::Failed(ReasonCode::MalformedPacket);
         };
 
-        match self.credentials.get(&username) {
-            Some(stored_password) if stored_password == &password => AuthResult::Success {
+        match check_password(&self.credentials, &username, password.as_bytes()) {
+            Some(true) => AuthResult::Success {
                 username: Some(username),
                 data: None,
             },
@@ -109,7 +114,42 @@ impl PlainExchange {
     }
 }
 
-/// Simple in-memory credential validator using a username -> password map.
+/// Whether `password` is `username`'s in `credentials`; None for an unknown
+/// user, found as slowly as a wrong password so timing doesn't tell which
+/// users exist.
+fn check_password(
+    credentials: &HashMap<String, String>,
+    username: &str,
+    password: &[u8],
+) -> Option<bool> {
+    match credentials.get(username) {
+        Some(stored) => Some(same_password(stored.as_bytes(), password)),
+        None => {
+            same_password(UNKNOWN_USER_PASSWORD, password);
+            None
+        }
+    }
+}
+
+/// Compared with for unknown users, so they take as long as known ones.
+const UNKNOWN_USER_PASSWORD: &[u8] = b"no password matches this one, as the user is unknown";
+
+/// Compares in time that depends on the longer length only, never on where
+/// the two differ, so timing tells nothing about the stored password.
+fn same_password(stored: &[u8], given: &[u8]) -> bool {
+    let mut difference = stored.len() ^ given.len();
+    for i in 0..stored.len().max(given.len()) {
+        let (a, b) = (stored.get(i), given.get(i));
+        difference |= usize::from(a.unwrap_or(&0) ^ b.unwrap_or(&0));
+    }
+    std::hint::black_box(difference) == 0
+}
+
+/// In-memory user name and password check, for tests and demos.
+///
+/// It answers only for the users it holds: a wrong password is denied, and
+/// an unknown user is left to the next plugin, so it can sit in front of
+/// another source of users.
 pub struct SimpleCredentialValidator {
     credentials: HashMap<String, String>,
 }
@@ -135,16 +175,17 @@ impl Plugin for SimpleCredentialValidator {
         _: &'a ClientInfo,
         credentials: &'a Credentials<'a>,
     ) -> BoxFuture<'a, Decision> {
-        let valid = std::str::from_utf8(credentials.password).is_ok_and(|password| {
-            self.credentials
-                .get(credentials.username)
-                .is_some_and(|stored| stored == password)
-        });
-        ready(if valid {
-            Decision::Allow
-        } else {
-            Decision::Deny
-        })
+        ready(
+            match check_password(
+                &self.credentials,
+                credentials.username,
+                credentials.password,
+            ) {
+                Some(true) => Decision::Allow,
+                Some(false) => Decision::Deny,
+                None => Decision::Defer,
+            },
+        )
     }
 }
 
@@ -315,7 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_credential_validator_unknown_user() {
+    async fn test_credential_validator_leaves_unknown_users_to_the_next_plugin() {
         let mut creds = HashMap::new();
         creds.insert("user".to_string(), "pass".to_string());
         let validator = SimpleCredentialValidator::new(creds);
@@ -327,7 +368,17 @@ mod tests {
                     &Credentials::new("unknown", b"pass")
                 )
                 .await,
-            Decision::Deny
+            Decision::Defer
         );
+    }
+
+    #[test]
+    fn test_passwords_match_only_when_equal() {
+        assert!(same_password(b"secret", b"secret"));
+        assert!(same_password(b"", b""));
+        assert!(!same_password(b"secret", b"secreT"));
+        assert!(!same_password(b"secret", b"secret!"));
+        assert!(!same_password(b"secret", b"secre"));
+        assert!(!same_password(b"", b"x"));
     }
 }
