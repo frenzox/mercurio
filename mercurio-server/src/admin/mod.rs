@@ -525,7 +525,7 @@ impl Admin {
         // Walked once the ban is in force: a client connecting meanwhile
         // either checks again after this and sees the ban, or is listed here
         let close = Close::Admin {
-            reason: ReasonCode::Banned,
+            reason: ReasonCode::AdministrativeAction,
             send_will: false,
         };
         for entry in self.inner.directory.entries().await {

@@ -1744,7 +1744,7 @@ where
                     client_id
                 );
                 let close = Close::Admin {
-                    reason: ReasonCode::Banned,
+                    reason: ReasonCode::AdministrativeAction,
                     send_will: false,
                 };
                 self.session_manager.close_own(&lease, close).await;
@@ -2377,7 +2377,7 @@ where
                             identity.client_id
                         );
                         let close = Close::Admin {
-                            reason: ReasonCode::Banned,
+                            reason: ReasonCode::AdministrativeAction,
                             send_will: false,
                         };
                         return self.close_for(&session, protocol_version, close).await;

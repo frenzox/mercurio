@@ -168,7 +168,7 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <p>A ban refuses clients by client id, user name or address, until it expires or is removed:</p>
 <pre>{"command": "addBan", "type": "address", "value": "203.0.113.0/24", "duration": 3600, "reason": "flooding"}</pre>
 <ul>
-<li>Connected clients that match are disconnected at once with Banned (0x8A), without publishing their will. New connections that match are refused at CONNECT with Banned, or Not Authorized for MQTT 3.x clients.</li>
+<li>Connected clients that match are disconnected at once with Administrative Action (0x98), as MQTT allows Banned only in CONNACK, without publishing their will. New connections that match are refused at CONNECT with Banned, or Not Authorized for MQTT 3.x clients.</li>
 <li><code>clientid</code> and <code>username</code> bans match the whole value, or with <code>prefix</code> every value starting with it. A user name ban matches the user the broker verified, so never an anonymous client. A client id ban matches the id the broker assigned to clients that sent none.</li>
 <li><code>address</code> bans take an IP address or CIDR range and match the client's address, or behind a load balancer the one its PROXY header gives. An IPv6 range never matches IPv4 clients, <code>::/0</code> included: ban <code>0.0.0.0/0</code> as well to refuse everyone. IPv4 clients on an IPv6 listener are matched as IPv4.</li>
 <li>Adding a ban with the type, value and prefix of an existing one replaces its duration and reason.</li>

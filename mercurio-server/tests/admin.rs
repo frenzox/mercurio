@@ -1448,7 +1448,7 @@ async fn a_ban_closes_matching_clients_without_their_will() {
     let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
         panic!("Expected DISCONNECT");
     };
-    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert_eq!(disconnect.reason, ReasonCode::AdministrativeAction);
     assert!(watcher.receive().await.is_none(), "the will is dropped");
     // A client the ban doesn't match stays connected
     other.subscribe("a").await;
@@ -1476,7 +1476,7 @@ async fn a_client_banned_while_it_connects_is_closed_once_up() {
     let Some(ControlPacket::Disconnect(disconnect)) = late.receive().await else {
         panic!("Expected DISCONNECT");
     };
-    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert_eq!(disconnect.reason, ReasonCode::AdministrativeAction);
     assert!(watcher.receive().await.is_none(), "the will is dropped");
     let mut admin = admin_client(addr).await;
     let details = wait_for(&mut admin, "late", |d| d["connected"] == false).await;
@@ -1511,7 +1511,7 @@ async fn re_authenticating_as_a_banned_user_closes_the_client() {
     let Some(ControlPacket::Disconnect(disconnect)) = device.receive().await else {
         panic!("Expected DISCONNECT");
     };
-    assert_eq!(disconnect.reason, ReasonCode::Banned);
+    assert_eq!(disconnect.reason, ReasonCode::AdministrativeAction);
     assert!(watcher.receive().await.is_none(), "the will is dropped");
 }
 
