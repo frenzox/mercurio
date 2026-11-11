@@ -1467,6 +1467,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercurioctl"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "mercurio-client",
+ "mercurio-server",
+ "rpassword",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mercuriod"
 version = "0.4.3"
 dependencies = [

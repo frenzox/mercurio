@@ -57,6 +57,7 @@ persistence in SQLite or PostgreSQL, bridges and WASM plugins. The service
 runs as the mercurio user, reads /etc/mercurio/config.toml and keeps its
 state in /var/lib/mercurio."""
 depends = "libc6 (>= 2.18), libgcc-s1 | libgcc1, systemd | systemd-standalone-sysusers"
+recommends = "mercurioctl"
 maintainer-scripts = "contrib/debian"
 systemd-units = { unit-scripts = "contrib", enable = true, start = true }
 assets = [
@@ -92,3 +93,6 @@ if [ $1 -ge 1 ]; then
     systemctl try-restart mercuriod.service >/dev/null 2>&1 || :
 fi
 """
+
+[package.metadata.generate-rpm.recommends]
+mercurioctl = "*"

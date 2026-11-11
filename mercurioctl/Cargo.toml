@@ -1,0 +1,48 @@
+[package]
+name = "mercurioctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Command-line administration for the Mercurio MQTT broker"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+homepage = "https://frenzox.github.io/mercurio/"
+keywords = ["mqtt", "mqtt5", "broker", "admin", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "mercurioctl"
+path = "src/main.rs"
+
+[dependencies]
+mercurio-client = { path = "../mercurio-client", version = "0.4.0", features = ["clap"] }
+
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[dev-dependencies]
+mercurio-server = { path = "../mercurio-server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+[package.metadata.deb]
+maintainer = "Guilherme Felipe da Silva <gfsilva.eng@gmail.com>"
+section = "net"
+extended-description = """\
+mercurioctl administers a running Mercurio MQTT broker: clients and
+sessions, bans, retained messages, subscriptions, listeners, bridges,
+plugins, the log level, reloading and dynamic security. On the broker's
+host it connects through the admin socket, with no credentials."""
+depends = "libc6 (>= 2.18), libgcc-s1 | libgcc1"
+assets = [
+    ["target/release/mercurioctl", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mercurioctl/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/mercurioctl", dest = "/usr/bin/mercurioctl", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mercurioctl/README.md", mode = "644", doc = true },
+]

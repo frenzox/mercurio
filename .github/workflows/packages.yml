@@ -2,11 +2,11 @@ name: packages
 
 on:
   push:
-    tags: ['mercuriod-v*', 'recado-v*']
+    tags: ['mercuriod-v*', 'recado-v*', 'mercurioctl-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build packages for, such as mercuriod-v0.4.1
+        description: Release tag to build packages for, such as mercuriod-v0.4.1 or mercurioctl-v0.1.0
         required: true
 
 jobs:
@@ -26,8 +26,10 @@ jobs:
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
       TARGET: ${{ matrix.target }}
-      CRATE: ${{ startsWith(inputs.tag || github.ref_name, 'recado-') && 'recado' || 'mercuriod' }}
     steps:
+      # The tag names the crate: mercuriod-v0.4.1 is mercuriod's
+      - name: Crate
+        run: echo "CRATE=${TAG%-v*}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
