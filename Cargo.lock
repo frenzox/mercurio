@@ -1416,6 +1416,7 @@ dependencies = [
  "futures-util",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-scram",
  "mercurio-server",
  "rpassword",
  "rustls",
@@ -1451,6 +1452,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mercurio-scram"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hmac",
+ "pbkdf2",
+ "sha2 0.11.1",
+ "stringprep",
+ "subtle",
+]
+
+[[package]]
 name = "mercurio-server"
 version = "0.5.0"
 dependencies = [
@@ -1460,6 +1474,7 @@ dependencies = [
  "futures-util",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-scram",
  "mercurio-storage",
  "rand 0.8.8",
  "rustls",
@@ -1523,6 +1538,7 @@ dependencies = [
  "libc",
  "mercurio-client",
  "mercurio-core",
+ "mercurio-scram",
  "mercurio-server",
  "mercurio-storage",
  "pbkdf2",

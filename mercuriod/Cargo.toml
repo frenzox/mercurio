@@ -22,6 +22,7 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:http
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-client = { path = "../mercurio-client", version = "0.4.1" }
 mercurio-server = { path = "../mercurio-server", version = "0.5.0" }
+mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
 mercurio-storage = { path = "../mercurio-storage", version = "0.3.3", features = ["sqlite", "postgres"] }
 
 argon2 = "0.5"

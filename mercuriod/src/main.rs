@@ -6,11 +6,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
 use mercurio_server::admin::AdminExtension;
+use mercurio_server::auth::ScramAuth;
 use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
@@ -711,7 +710,9 @@ fn build_auth(
         let mut value = ServerAuthConfig::default();
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
-        return Ok((value, vec![security.clone()], Some(security)));
+        // SCRAM-SHA-256 for the clients whose password was set with keys
+        let scram = Arc::new(ScramAuth::new(security.clone()));
+        return Ok((value, vec![security.clone(), scram], Some(security)));
     }
 
     let http = match &config.http {
@@ -735,7 +736,8 @@ fn build_auth(
         let validator = Arc::new(Reloadable::load(path, load_credentials)?);
         info!("Loaded credentials from {}", path);
         reloadable.push(validator.clone());
-        plugins.push(validator);
+        plugins.push(validator.clone());
+        plugins.push(Arc::new(ScramAuth::new(validator)));
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
@@ -835,7 +837,8 @@ fn load_acl_file(path: &str) -> Result<AclFile, String> {
 }
 
 fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
-    Ok(HashedCredentialValidator::new(password_file::load(path)?))
+    let loaded = password_file::load(path)?;
+    Ok(HashedCredentialValidator::new(loaded.hashes).with_scram(loaded.scram))
 }
 
 /// Add or update a user in the password file.
@@ -844,13 +847,15 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
     let mut users = password_file::read_users(path)?;
     let password = prompt_new_password(username)?;
 
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| format!("Failed to hash password: {}", e))?
-        .to_string();
+    let (hash, scram) = credentials::hash_new_password(&password)?;
 
-    users.insert(username.to_string(), hash);
+    users.insert(
+        username.to_string(),
+        password_file::User {
+            hash,
+            scram: Some(scram),
+        },
+    );
     password_file::write_users(path, &users)?;
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
@@ -951,6 +956,116 @@ mod tests {
         .map_err(|e| panic!("{e}"))
         .unwrap();
         assert_eq!(plugins.len(), 1);
+    }
+
+    /// A broker with the authentication `toml` sets up; its port.
+    async fn broker_with(toml: &str) -> u16 {
+        use mercurio_server::server::ServerConfig;
+
+        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true)
+            .map_err(|e| panic!("{e}"))
+            .unwrap();
+        let mut config = ServerConfig::default();
+        config.auth = value;
+        config.plugins = plugins;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(mercurio_server::server::run_with_config(
+            listener,
+            config,
+            std::future::pending::<()>(),
+        ));
+        port
+    }
+
+    /// Logs `username` in with `password`, by SCRAM-SHA-256 or as a plain
+    /// user name and password.
+    async fn login(port: u16, username: &str, password: &str, scram: bool) -> bool {
+        use mercurio_client::{ConnectOptions, MqttClient, ScramSha256};
+
+        let options = ConnectOptions::new("127.0.0.1", port).client_id(username);
+        let options = if scram {
+            options.authenticator(ScramSha256::new(username, password))
+        } else {
+            options.username(username).password(password.to_string())
+        };
+        match MqttClient::connect(options).await {
+            Ok(client) => {
+                if scram {
+                    client.reauthenticate().await.unwrap();
+                }
+                let _ = client.disconnect().await;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Both logins of `alice`, whose password is `secret`, and of `legacy`,
+    /// whose password `old` was set without SCRAM keys.
+    async fn check_logins(port: u16) {
+        assert!(login(port, "alice", "secret", true).await);
+        assert!(login(port, "alice", "secret", false).await);
+        assert!(!login(port, "alice", "wrong", true).await);
+        assert!(!login(port, "nobody", "secret", true).await);
+        assert!(login(port, "legacy", "old", false).await);
+        assert!(!login(port, "legacy", "old", true).await);
+    }
+
+    fn argon2_hash(password: &str) -> String {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scram_logs_in_against_the_password_file() {
+        use crate::password_file::{write_users, User};
+
+        let path = std::env::temp_dir().join(format!("mercuriod-scram-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let (hash, scram) = crate::credentials::hash_new_password("secret").unwrap();
+        let users = [
+            (
+                "alice".to_string(),
+                User {
+                    hash,
+                    scram: Some(scram),
+                },
+            ),
+            ("legacy".to_string(), User::new(argon2_hash("old"))),
+        ];
+        write_users(path, &users.into_iter().collect()).unwrap();
+        let port = broker_with(&format!("enabled = true\npassword_file = \"{path}\"\n")).await;
+        std::fs::remove_file(path).unwrap();
+        check_logins(port).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scram_logs_in_against_dynamic_security() {
+        use crate::dynsec::DynamicSecurity;
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-scram-dynsec-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "alice", "secret").unwrap();
+        // A client of an older release, without SCRAM keys
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        file["clients"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "username": "legacy", "password": argon2_hash("old") }));
+        std::fs::write(path, file.to_string()).unwrap();
+
+        let port = broker_with(&format!("enabled = true\ndynamic_security = \"{path}\"\n")).await;
+        std::fs::remove_file(path).unwrap();
+        check_logins(port).await;
     }
 
     #[test]

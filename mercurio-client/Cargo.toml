@@ -27,6 +27,7 @@ websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-packets = { path = "../mercurio-packets", version = "0.2.1" }
+mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
 
 bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }

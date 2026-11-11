@@ -379,6 +379,51 @@ async fn the_password_can_come_from_the_environment() {
     assert!(!help.contains("hunter2"), "{help}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn scram_logs_in_without_sending_the_password() {
+    use mercurio_server::auth::{ScramAuth, StoredCredentials};
+
+    let users = [(
+        "alice".to_string(),
+        StoredCredentials::generate("secret", 4096).unwrap(),
+    )];
+    let mut config = ServerConfig::default();
+    config.auth.require_auth = true;
+    config.plugins = vec![Arc::new(
+        ScramAuth::new(Arc::new(
+            users
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        ))
+        .decoy_iterations(4096),
+    )];
+    let broker = start_with(config).await;
+    let publish = [
+        "pub",
+        "--auth-method",
+        "scram-sha-256",
+        "-u",
+        "alice",
+        "-t",
+        "a",
+        "-m",
+        "x",
+    ];
+    let output = broker
+        .run_with(&publish, b"", &[("RECADO_PASSWORD", "secret")])
+        .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let wrong = [&publish[..], &["-P", "wrong"]].concat();
+    let output = broker.run(&wrong).await;
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+
+    // Enhanced authentication is MQTT 5's
+    let old = [&publish[..], &["-P", "secret", "-V", "311"]].concat();
+    let output = broker.run(&old).await;
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+}
+
 /// Not UTF-8, with a NUL and a line feed in the middle.
 const BINARY: &[u8] = &[0xff, 0x00, b'\n', 0xfe, 0x80];
 

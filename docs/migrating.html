@@ -121,6 +121,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td>dynamic security plugin</td><td><code>[auth] dynamic_security</code>, with the same commands and the same order of roles, groups and priorities; convert mosquitto's <code>dynamic-security.json</code>, passwords included, with <code>mercuriod dynsec-import</code>, or start a new file with <code>mercuriod dynsec-init</code></td></tr>
 <tr><td><code>mosquitto_ctrl dynsec …</code></td><td><a href="mercurioctl.html#dynsec"><code>mercurioctl dynsec …</code></a>, with the same commands in kebab-case; <code>mosquitto_ctrl dynsec init</code> is <code>mercuriod dynsec-init</code></td></tr>
 <tr><td>mosquitto-go-auth HTTP backend</td><td><code>[auth.http]</code></td></tr>
+<tr><td>none: mosquitto has no built-in enhanced authentication method</td><td><a href="security.html#scram">SCRAM-SHA-256</a>, offered with <code>password_file</code> and <code>dynamic_security</code>. Passwords from <code>mosquitto_passwd</code> or <code>dynsec-import</code> have no SCRAM keys: they keep working for plain logins and get keys when set again</td></tr>
 <tr><td><code>check_retain_source</code></td><td><code>check_retain_source</code></td></tr>
 <tr><td><code>allow_zero_length_clientid</code>, <code>auto_id_prefix</code>, <code>clientid_prefixes</code></td><td>the same, in <code>[server]</code></td></tr>
 </table>

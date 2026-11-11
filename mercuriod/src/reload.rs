@@ -3,6 +3,7 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use mercurio_server::{
+    auth::{ScramCredentialStore, StoredCredentials},
     plugin::{Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginStatus},
     tls::Tls,
 };
@@ -156,6 +157,17 @@ impl<T: Plugin> Plugin for Reloadable<T> {
     ) -> BoxFuture<'a, Decision> {
         let current = self.get();
         Box::pin(async move { current.authorize_control(client, topic).await })
+    }
+}
+
+impl<T: ScramCredentialStore> ScramCredentialStore for Reloadable<T> {
+    fn scram_credentials<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        username: &'a str,
+    ) -> BoxFuture<'a, Option<StoredCredentials>> {
+        let current = self.get();
+        Box::pin(async move { current.scram_credentials(client, username).await })
     }
 }
 

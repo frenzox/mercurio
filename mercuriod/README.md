@@ -276,7 +276,10 @@ enabled = false
 # Allow clients that send no user name (when auth is enabled)
 allow_anonymous = false
 
-# User names and Argon2 password hashes, managed with `mercuriod passwd`
+# User names and Argon2 password hashes, managed with `mercuriod passwd`,
+# which also stores SCRAM-SHA-256 keys so clients can log in without
+# sending the password; entries set before, or by mosquitto_passwd, get
+# them when their password is set again
 # password_file = "/etc/mercurio/passwd"
 
 # Restrict the topics each client may publish and subscribe to, using
