@@ -69,22 +69,36 @@ impl Admitted {
 
 /// Binds the admin socket `config` asks for, as a trusted listener. None
 /// when `socket` is empty, or when the socket can't be set up safely, which
-/// is logged: the broker then runs without it.
-pub fn open(config: &AdminConfig) -> Option<(ListenerConfig, AdminSocket)> {
+/// is logged: the broker then runs without it. An error when another
+/// process serves the socket, likely another broker, which a new one must
+/// not take the socket from.
+pub fn open(config: &AdminConfig) -> Result<Option<(ListenerConfig, AdminSocket)>, String> {
     if config.socket.is_empty() {
-        return None;
+        return Ok(None);
     }
     let path = Path::new(&config.socket);
+    if in_use(path) {
+        return Err(format!(
+            "Another process serves the admin socket {}; stop it, or set another `socket` in [admin]",
+            path.display()
+        ));
+    }
     match bind(path, &config.group) {
         Ok(opened) => {
             info!("Serving the admin socket on {}", path.display());
-            Some(opened)
+            Ok(Some(opened))
         }
         Err(e) => {
             warn!("Running without the admin socket {}: {}", path.display(), e);
-            None
+            Ok(None)
         }
     }
+}
+
+/// Whether a process accepts connections on the Unix socket at `path`, as
+/// opposed to a socket file left behind by one that stopped.
+pub fn in_use(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 fn bind(path: &Path, group_name: &str) -> Result<(ListenerConfig, AdminSocket), String> {
@@ -401,6 +415,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_socket_another_process_serves_is_left_alone() {
+        let dir = private_dir("live");
+        let path = dir.join("admin.sock");
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let config = AdminConfig {
+            socket: path.to_str().unwrap().to_string(),
+            group: String::new(),
+        };
+        let Err(error) = open(&config) else {
+            panic!("took over a live socket");
+        };
+        assert!(error.contains(&config.socket), "{error}");
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        live.set_nonblocking(true).unwrap();
+        assert!(live.accept().is_ok(), "the first process still serves");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn unsafe_or_missing_places_are_refused() {
         let dir = private_dir("refused");
         let file = dir.join("file");
@@ -419,7 +452,7 @@ mod tests {
             socket: String::new(),
             group: String::new(),
         };
-        assert!(open(&off).is_none());
+        assert!(open(&off).unwrap().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

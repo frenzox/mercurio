@@ -299,7 +299,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "linux")]
     let admin =
-        admin_socket::open(&config.admin.clone().unwrap_or_default()).map(|(listener, socket)| {
+        admin_socket::open(&config.admin.clone().unwrap_or_default())?.map(|(listener, socket)| {
             listeners.push(listener);
             socket
         });

@@ -55,7 +55,7 @@ group = "mercurio"</pre>
 <pre>sudo usermod -aG mercurio alice
 sudo systemctl restart mercuriod</pre>
 <p>The broker reads the group's members when it starts, so a new member needs a restart of the broker, and a new login before their own processes carry the group. Changes to <code>[admin]</code> also need a restart.</p>
-<p>With another <code>socket</code> path, every directory on it must be writable only by root or the broker's user: anyone who can write to one of them could put their own socket in its place. The broker refuses a socket whose directory belongs to another user or is writable by its group or by others; the directories above it are up to you. A broker that can't create its socket, such as one started by hand where <code>/run/mercurio</code> doesn't exist, logs a warning and runs without it. For a broker run as yourself:</p>
+<p>With another <code>socket</code> path, every directory on it must be writable only by root or the broker's user: anyone who can write to one of them could put their own socket in its place. The broker refuses a socket whose directory belongs to another user or is writable by its group or by others; the directories above it are up to you. A broker that can't create its socket, such as one started by hand where <code>/run/mercurio</code> doesn't exist, logs a warning and runs without it. A socket file left by a broker that stopped without removing it is replaced; one where another process still accepts connections, such as a second broker started with the same configuration, stops the new broker with an error instead. For a broker run as yourself:</p>
 <pre>mkdir -m 700 -p "$XDG_RUNTIME_DIR/mercurio"</pre>
 <pre>[admin]
 socket = "/run/user/1000/mercurio/admin.sock"</pre>
