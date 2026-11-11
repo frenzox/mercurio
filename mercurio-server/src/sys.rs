@@ -286,20 +286,25 @@ pub(crate) fn counters(
     counters
 }
 
+/// Stored sessions set aside at restore as they couldn't be read.
+pub(crate) const SET_ASIDE: &str = "storage/set aside sessions";
+
 /// The counters published under `$SYS/broker/`, read now.
 pub(crate) async fn current<St: MqttStore + 'static>(
     broker: &Broker<St>,
     session_manager: &SessionManager<St>,
     stats: &Stats,
 ) -> Vec<(&'static str, u64)> {
-    counters(
+    let mut counters = counters(
         stats,
         session_manager.session_count().await,
         session_manager.expired_count(),
         broker.retained_count().await,
         broker.topics().subscription_count(),
         session_manager.storage_failures(),
-    )
+    );
+    counters.push((SET_ASIDE, session_manager.set_aside_count().await as u64));
+    counters
 }
 
 /// The Prometheus metric a `$SYS/broker/` counter is exposed as: its name,
@@ -343,6 +348,11 @@ fn metric(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
             gauge,
         ),
         "subscriptions/count" => ("mercurio_subscriptions", "Subscriptions", gauge),
+        SET_ASIDE => (
+            "mercurio_sessions_set_aside",
+            "Stored sessions set aside as they could not be read, their clients refused",
+            gauge,
+        ),
         "store/batches/retried" => (
             "mercurio_storage_batches_retried_total",
             "Batches of session changes written again after a storage error",

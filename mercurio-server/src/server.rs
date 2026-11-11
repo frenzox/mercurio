@@ -1922,6 +1922,15 @@ where
                         )
                         .await;
                 }
+                Err(StartError::SetAside) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::ServerUnavailable,
+                        )
+                        .await;
+                }
                 Err(StartError::Storage(e)) => return Err(e),
             };
         start_result.assigned_client_id |= assigned_client_id;

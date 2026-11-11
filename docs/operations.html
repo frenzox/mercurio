@@ -122,11 +122,13 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td><td>Batches of session changes written again after a storage error, and given up on, their changes lost on the next restart</td></tr>
 <tr><td><code>storage/failed batches</code></td><td>Batches of changes storage refused for good since start; the clients they belonged to are written whole again once storage takes it</td></tr>
 <tr><td><code>storage/dirty clients</code></td><td>Clients whose stored state differs from the broker's until it is written whole again</td></tr>
+<tr><td><code>storage/set aside sessions</code></td><td>Stored sessions that couldn't be read when the broker started, left in storage untouched; see below</td></tr>
 <tr><td><code>load/messages/received/1min</code>, <code>5min</code>, <code>15min</code></td><td>Messages received per minute, averaged over 1, 5 and 15 minutes</td></tr>
 <tr><td><code>load/messages/sent/…</code>, <code>load/bytes/received/…</code>, <code>load/bytes/sent/…</code>, <code>load/connections/…</code></td><td>The same for messages sent, bytes and new connections</td></tr>
 <tr><td><code>connection/&lt;client id&gt;/state</code></td><td><code>1</code> or <code>0</code> for each <a href="bridges.html">bridge</a></td></tr>
 </table>
 <p>Clients may subscribe to <code>$SYS</code> topics, subject to ACLs, but never publish to them. Wildcards at the start of a filter, such as <code>#</code> or <code>+/broker</code>, don't match <code>$SYS</code> topics.</p>
+<p>A stored session that can't be read when the broker starts, such as one written by a newer version before a downgrade, or a damaged row, doesn't keep the broker from starting. The broker logs an error naming the client and what failed, leaves the session's rows in storage as they are, and counts it in <code>storage/set aside sessions</code>. Its client is refused with Server Unavailable until the session is deleted with <code>mercurioctl client delete-session &lt;client id&gt;</code>, after which it connects with a new session.</p>
 
 <h2 id="metrics">Health and metrics</h2>
 <p>A WebSocket listener with <code>health = true</code> answers <code>GET /healthz</code> with <code>200 OK</code> while the broker serves, and <code>503 Service Unavailable</code> to a request read as it starts stopping; once it has stopped, the listener refuses connections. With <code>metrics = true</code> it answers <code>GET /metrics</code> with the counters of <code>$SYS</code> in the Prometheus text format, read at the time of the request whatever <code>sys_interval</code> is. Both are off by default and need no <code>http_dir</code>.</p>

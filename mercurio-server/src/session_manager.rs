@@ -21,7 +21,7 @@ use mercurio_core::{
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
 use mercurio_storage::{
-    BatchStore, InflightMessage, RetainedMessageStore, SessionOwner, SessionState,
+    BatchStore, InflightMessage, RetainedMessageStore, SessionOwner, SessionState, StorageError,
     StoredSubscription, StoredWillMessage, Write,
 };
 use tracing::{error, warn};
@@ -93,6 +93,10 @@ struct State {
     /// Held by a new connection while it checks whom its client id belongs
     /// to and claims it; present while one does
     admissions: HashMap<String, Arc<Mutex<()>>>,
+    /// Clients whose stored session couldn't be read at restore: their
+    /// rows stay in storage untouched, and their connections are refused
+    /// until the session is deleted
+    set_aside: HashSet<String>,
 }
 
 struct ExpiryTimer {
@@ -252,6 +256,8 @@ pub(crate) enum StartError {
     OwnedByAnother(Box<ConnectPacket>),
     /// The connection using the client id didn't let go of it in time
     Busy,
+    /// The client's stored session couldn't be read, and was set aside
+    SetAside,
     Storage(Error),
 }
 
@@ -435,6 +441,16 @@ type StoredSession = (
     Vec<u16>,
 );
 
+/// A session a previous run stored, as restore reads it: its state, will,
+/// queue, in-flight messages and incoming QoS 2 packet ids.
+type RestoredSession = (
+    SessionState,
+    Option<StoredWillMessage>,
+    Vec<(u64, Message)>,
+    Vec<InflightMessage>,
+    Vec<u16>,
+);
+
 /// Result of starting a session, includes subscriptions, will, and inflight to restore if resuming.
 pub(crate) struct SessionStartResult {
     pub session: Session,
@@ -468,6 +484,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 restored_wills: HashMap::new(),
                 expiry_timers: HashMap::new(),
                 admissions: HashMap::new(),
+                set_aside: HashSet::new(),
             }),
             persistent: Default::default(),
             local: Default::default(),
@@ -522,6 +539,21 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
         let storage_error =
             |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e.to_string()));
+        if self
+            .shared
+            .state
+            .lock()
+            .await
+            .set_aside
+            .contains(&connect_packet.payload.client_id)
+        {
+            warn!(
+                "Refusing client `{}`: its stored session couldn't be read and was set aside \
+                 until it is deleted",
+                connect_packet.payload.client_id
+            );
+            return Err(StartError::SetAside);
+        }
         let mut claim = match self
             .acquire_client_id(&connect_packet.payload.client_id, &owner)
             .await
@@ -1056,7 +1088,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let (removed, was_restored) = {
             let mut manager = self.shared.state.lock().await;
             manager.stop_expiry_timer(client_id);
-            let was_restored = manager.restored_wills.remove(client_id).is_some();
+            // A session set aside is only in storage
+            let was_restored = manager.restored_wills.remove(client_id).is_some()
+                | manager.set_aside.remove(client_id);
             (manager.sessions.remove(client_id), was_restored)
         };
         if let Some(removed) = &removed {
@@ -1142,9 +1176,16 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let mut wills = Vec::new();
 
         for client_id in client_ids {
-            let Some(state) = self.storage.load_session(&client_id).await? else {
-                continue;
+            let stored = match self.read_stored(&client_id).await {
+                Ok(Some(stored)) => stored,
+                Ok(None) => continue,
+                Err(StorageError::SerializationError(e)) => {
+                    self.set_aside(&client_id, &e).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
+            let (state, will, queue, inflight, incoming_qos2) = stored;
             // Sessions connected when the broker stopped count as
             // disconnected from now on
             let deadline = state
@@ -1155,12 +1196,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             // Live sessions go back in memory, subscribed, so messages keep
             // being queued for their clients until they reconnect
             if deadline.is_none_or(|d| d > now) {
-                self.restore_session(&client_id, state, broker).await?;
+                self.restore_session(&client_id, state, (queue, inflight, incoming_qos2), broker)
+                    .await;
             }
 
             // The clients were disconnected by the shutdown, so their wills
             // are due after their delay, or when the session ends if sooner
-            if let Some(stored) = self.storage.load_will(&client_id).await? {
+            if let Some(stored) = will {
                 let will = WillMessage::from(stored.clone());
                 let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
                 self.shared
@@ -1181,14 +1223,55 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         Ok(wills)
     }
 
+    /// Everything stored for `client_id`, read before any of it is
+    /// restored, so a session that can't be read whole is set aside whole.
+    async fn read_stored(
+        &self,
+        client_id: &str,
+    ) -> mercurio_storage::Result<Option<RestoredSession>> {
+        let Some(state) = self.storage.load_session(client_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            state,
+            self.storage.load_will(client_id).await?,
+            self.storage.load_queue(client_id).await?,
+            self.storage.load_inflight(client_id).await?,
+            self.storage.load_incoming_qos2(client_id).await?,
+        )))
+    }
+
+    /// Leaves the stored session of `client_id` as it is, unrestored, and
+    /// refuses its client until an operator deletes the session.
+    async fn set_aside(&self, client_id: &str, reason: &str) {
+        error!(
+            "The stored session of client `{}` can't be read, setting it aside: {}. Its \
+             client is refused until the session is deleted with the admin API, such as \
+             `mercurioctl client delete-session`",
+            client_id, reason
+        );
+        self.shared
+            .state
+            .lock()
+            .await
+            .set_aside
+            .insert(client_id.to_string());
+    }
+
+    /// How many stored sessions were set aside as they couldn't be read.
+    pub(crate) async fn set_aside_count(&self) -> usize {
+        self.shared.state.lock().await.set_aside.len()
+    }
+
     /// Recreates the in-memory state of a session persisted by a previous
     /// run, whose client has not reconnected yet.
     async fn restore_session<B: RetainedMessageStore>(
         &self,
         client_id: &str,
         state: SessionState,
+        (queue, inflight, incoming_qos2): (Vec<(u64, Message)>, Vec<InflightMessage>, Vec<u16>),
         broker: &Broker<B>,
-    ) -> mercurio_storage::Result<()> {
+    ) {
         // Stands in for the client's CONNECT until it sends a new one
         let connect_packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
@@ -1218,13 +1301,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         {
             error!("Failed to restore subscriptions of `{}`: {}", client_id, e);
         }
-        session.restore_queue(self.storage.load_queue(client_id).await?);
-        session
-            .restore_inflight(self.storage.load_inflight(client_id).await?)
-            .await;
-        session
-            .restore_incoming_qos2(self.storage.load_incoming_qos2(client_id).await?)
-            .await;
+        session.restore_queue(queue);
+        session.restore_inflight(inflight).await;
+        session.restore_incoming_qos2(incoming_qos2).await;
         session.start_queue_journal(self.writers.get(client_id), true);
         self.shared
             .persistent
@@ -1238,7 +1317,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             .await
             .sessions
             .insert(client_id.to_string(), SessionDropGuard::from(session));
-        Ok(())
     }
 
     /// Waits until every change made so far is in storage, as on shutdown.
@@ -1558,6 +1636,8 @@ mod tests {
     struct FaultyStore {
         inner: MemoryStore,
         fail_queue_loads: std::sync::atomic::AtomicBool,
+        /// Clients whose stored queue can't be read
+        undecodable: std::sync::Mutex<HashSet<String>>,
         /// Reads that wait, by method and client id
         stalled: std::sync::Mutex<HashSet<(&'static str, String)>>,
         permits: tokio::sync::Semaphore,
@@ -1570,6 +1650,7 @@ mod tests {
             FaultyStore {
                 inner: MemoryStore::new(),
                 fail_queue_loads: Default::default(),
+                undecodable: Default::default(),
                 stalled: Default::default(),
                 permits: tokio::sync::Semaphore::new(0),
                 stalls: Default::default(),
@@ -1651,6 +1732,11 @@ mod tests {
             {
                 return Err(mercurio_storage::StorageError::OperationFailed(
                     "unavailable".into(),
+                ));
+            }
+            if self.undecodable.lock().unwrap().contains(client_id) {
+                return Err(mercurio_storage::StorageError::SerializationError(
+                    "0xff is not a property identifier".into(),
                 ));
             }
             self.stall("load_queue", client_id).await;
@@ -2361,6 +2447,61 @@ mod tests {
             .unwrap();
         assert!(manager.take_restored_will("a").await);
         assert!(!manager.take_restored_will("b").await);
+    }
+
+    /// A stored session that can't be read doesn't keep the broker from
+    /// starting: it is set aside, its rows left as they are, and its client
+    /// refused until an operator deletes it.
+    #[tokio::test]
+    async fn test_a_session_that_cannot_be_read_is_set_aside() {
+        let storage = Arc::new(FaultyStore::default());
+        for client_id in ["good", "bad"] {
+            save_persistent_session(&storage.inner, client_id, 3600).await;
+            storage
+                .store_will(client_id, &stored_will(5))
+                .await
+                .unwrap();
+        }
+        storage
+            .undecodable
+            .lock()
+            .unwrap()
+            .insert("bad".to_string());
+
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        let wills = manager.restore_from_storage(&broker).await.unwrap();
+        let due: Vec<&str> = wills.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(due, ["good"]);
+        assert!(manager.entry("good").await.is_some());
+        assert!(manager.entry("bad").await.is_none());
+        assert_eq!(manager.set_aside_count().await, 1);
+
+        let mut resume = connect_packet("bad");
+        resume.flags.clean_start = false;
+        let refused = manager
+            .start_session(resume.clone(), SessionOwner::default())
+            .await;
+        assert!(matches!(refused, Err(StartError::SetAside)));
+        // Clean Start doesn't get past it either
+        let refused = manager
+            .start_session(connect_packet("bad"), SessionOwner::default())
+            .await;
+        assert!(matches!(refused, Err(StartError::SetAside)));
+        manager.flush().await;
+        assert!(storage.inner.load_session("bad").await.unwrap().is_some());
+        assert!(storage.inner.load_will("bad").await.unwrap().is_some());
+
+        manager.delete_session("bad", false).await.unwrap();
+        manager.flush().await;
+        assert!(storage.inner.load_session("bad").await.unwrap().is_none());
+        assert!(storage.inner.load_will("bad").await.unwrap().is_none());
+        assert_eq!(manager.set_aside_count().await, 0);
+        storage.undecodable.lock().unwrap().clear();
+        manager
+            .start_session(resume, SessionOwner::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
