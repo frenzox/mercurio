@@ -196,6 +196,14 @@ pub struct Limits {
     /// Like `max_publish_rate`, for the payload bytes of the PUBLISH
     /// packets one client sends per second.
     pub max_publish_bytes_rate: Option<Rate>,
+    /// How long a client may stay over `max_publish_rate` or
+    /// `max_publish_bytes_rate` without a break: one that still has more
+    /// waiting than its rate allows after this long is disconnected with
+    /// Message Rate Too High, or just disconnected if it speaks MQTT 3.x.
+    /// It is over its rate from the first PUBLISH the rate holds back
+    /// until it has nothing waiting when the broker reads from it again.
+    /// Clients are only slowed down when unset.
+    pub publish_rate_grace: Option<Duration>,
     /// Failed logins that get a client address banned for a while,
     /// through the same bans as the admin API's, listed with their expiry
     /// and the reason `automatic: …`. Addresses count as for
@@ -237,6 +245,7 @@ impl Default for Limits {
             max_connections_per_ip: None,
             max_publish_rate: None,
             max_publish_bytes_rate: None,
+            publish_rate_grace: None,
             login_failures: None,
             max_sessions: None,
         }
@@ -314,6 +323,10 @@ impl Bucket {
 struct Pacing {
     messages: Option<Bucket>,
     bytes: Option<Bucket>,
+    /// How long the client may stay over its rate
+    grace: Option<Duration>,
+    /// Since when the client is over its rate, if it is
+    over_since: Option<Instant>,
 }
 
 impl Pacing {
@@ -321,6 +334,8 @@ impl Pacing {
         Pacing {
             messages: limits.max_publish_rate.map(Bucket::new),
             bytes: limits.max_publish_bytes_rate.map(Bucket::new),
+            grace: limits.publish_rate_grace,
+            over_since: None,
         }
     }
 
@@ -329,7 +344,28 @@ impl Pacing {
     fn publish(&mut self, bytes: usize) -> Option<Duration> {
         let messages = self.messages.as_mut().and_then(|b| b.take(1.0));
         let bytes = self.bytes.as_mut().and_then(|b| b.take(bytes as f64));
-        messages.max(bytes)
+        let wait = messages.max(bytes);
+        match wait {
+            Some(_) => {
+                self.over_since.get_or_insert_with(Instant::now);
+            }
+            None => self.over_since = None,
+        }
+        wait
+    }
+
+    /// Records that the client had nothing waiting once its rate allowed
+    /// reading from it again, so it is no longer over its rate.
+    fn caught_up(&mut self) {
+        self.over_since = None;
+    }
+
+    /// Whether the client has been over its rate for longer than allowed.
+    fn past_grace(&self) -> bool {
+        match (self.grace, self.over_since) {
+            (Some(grace), Some(since)) => since.elapsed() > grace,
+            _ => false,
+        }
     }
 }
 
@@ -2685,7 +2721,15 @@ where
                 // starts over once it may send again
                 _ = &mut paused, if !reading => {
                     reading = true;
-                    Step::Done(Flow::PacketHandled)
+                    // A client with nothing waiting by now has slowed down
+                    // to its rate; one with more is still over it
+                    match self.connection.read_packet().now_or_never() {
+                        Some(packet) => Step::Read(packet?),
+                        None => {
+                            pacing.caught_up();
+                            Step::Done(Flow::PacketHandled)
+                        }
+                    }
                 }
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
@@ -2728,6 +2772,10 @@ where
                         };
                         let flow = self.handle_hot(&session, &key, packet).await?;
                         if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
+                            if pacing.past_grace() {
+                                warn!("Client {} stayed over its publish rate, disconnecting", key);
+                                return Err(ReasonCode::MessageRateTooHigh.into());
+                            }
                             reading = false;
                             paused
                                 .as_mut()

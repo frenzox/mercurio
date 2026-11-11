@@ -912,6 +912,11 @@ pub struct ServerConfig {
     /// `max_publish_bytes_rate` by default
     pub publish_bytes_burst: Option<u32>,
 
+    /// Seconds a client may stay over `max_publish_rate` or
+    /// `max_publish_bytes_rate` before it is disconnected with Message Rate
+    /// Too High; clients are only slowed down when unset
+    pub publish_rate_grace: Option<u64>,
+
     /// Failed logins from one address within `login_failure_window` that
     /// get it banned for `login_failure_ban`; 0 turns this off
     #[serde(default = "default_login_failure_attempts")]
@@ -990,6 +995,7 @@ impl Default for ServerConfig {
             publish_rate_burst: None,
             max_publish_bytes_rate: None,
             publish_bytes_burst: None,
+            publish_rate_grace: None,
             login_failure_attempts: default_login_failure_attempts(),
             login_failure_window: default_login_failure_window(),
             login_failure_ban: default_login_failure_ban(),
@@ -1367,6 +1373,15 @@ impl ServerConfig {
             self.max_publish_bytes_rate,
             self.publish_bytes_burst,
         )?;
+        if self.publish_rate_grace.is_some()
+            && limits.max_publish_rate.is_none()
+            && limits.max_publish_bytes_rate.is_none()
+        {
+            return Err(
+                "publish_rate_grace needs max_publish_rate or max_publish_bytes_rate".into(),
+            );
+        }
+        limits.publish_rate_grace = self.publish_rate_grace.map(Duration::from_secs);
         if self.login_failure_attempts > 0 {
             if self.login_failure_window == 0 || self.login_failure_ban == 0 {
                 return Err(
@@ -1932,6 +1947,21 @@ mod tests {
         assert_eq!(limits("").unwrap().max_publish_rate, None);
         assert!(limits("[server]\npublish_rate_burst = 5\n").is_err());
         assert!(limits("[server]\nmax_publish_rate = 0\n").is_err());
+    }
+
+    #[test]
+    fn test_publish_rate_grace_needs_a_rate() {
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        let set = limits("[server]\nmax_publish_bytes_rate = 1000\npublish_rate_grace = 30\n");
+        assert_eq!(
+            set.unwrap().publish_rate_grace,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(limits("").unwrap().publish_rate_grace, None);
+        assert!(limits("[server]\npublish_rate_grace = 30\n").is_err());
     }
 
     #[test]

@@ -223,6 +223,11 @@ max_inflight = 64
 # The same for the payload bytes one client publishes
 # max_publish_bytes_rate = 1048576
 # publish_bytes_burst = 4194304
+# Seconds a client may stay over either rate, with more waiting each time
+# the broker reads from it again, before it is disconnected with Message
+# Rate Too High (MQTT 3.x clients are just disconnected). Clients are only
+# slowed down by default
+# publish_rate_grace = 30
 # login_failure_window = 60
 # login_failure_ban = 300
 # Seconds one call of a plugin hook may take, for built-in authentication

@@ -482,6 +482,65 @@ async fn clients_over_their_publish_rate_are_read_more_slowly() {
     assert_eq!(pong, [0xd0, 0x00]);
 }
 
+/// `count` QoS 0 PUBLISH packets to "t".
+fn qos0_publishes(count: usize) -> Vec<u8> {
+    [0x30, 0x05, 0x00, 0x01, b't', 0x00, b'x'].repeat(count)
+}
+
+#[tokio::test]
+async fn clients_over_their_publish_rate_past_the_grace_are_disconnected() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_publish_rate = Some(Rate::new(20, 5));
+        value.publish_rate_grace = Some(Duration::from_millis(300));
+        value
+    })
+    .await;
+    let (mut stream, _) = connect(addr, b'p').await;
+
+    // Two seconds' worth at the rate, sent at once
+    let started = std::time::Instant::now();
+    stream.write_all(&qos0_publishes(45)).await.unwrap();
+    // DISCONNECT, Message Rate Too High
+    assert_eq!(
+        common::disconnect_reason(&read_until_closed(&mut stream).await),
+        0x96
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn clients_back_under_their_publish_rate_within_the_grace_are_served() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_publish_rate = Some(Rate::new(20, 5));
+        value.publish_rate_grace = Some(Duration::from_secs(2));
+        value
+    })
+    .await;
+    let (mut stream, _) = connect(addr, b'p').await;
+
+    // Over the rate for half a second, then at it for a while, then over
+    // again for half a second: never two seconds in a row
+    stream.write_all(&qos0_publishes(15)).await.unwrap();
+    sleep(Duration::from_millis(1000)).await;
+    for _ in 0..10 {
+        stream.write_all(&qos0_publishes(1)).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+    }
+    stream.write_all(&qos0_publishes(15)).await.unwrap();
+    sleep(Duration::from_millis(1000)).await;
+
+    stream.write_all(&[0xc0, 0x00]).await.unwrap();
+    let mut pong = [0u8; 2];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut pong))
+        .await
+        .expect("no PINGRESP")
+        .unwrap();
+    assert_eq!(pong, [0xd0, 0x00]);
+}
+
 #[tokio::test]
 async fn listeners_close_connections_beyond_their_rate() {
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
