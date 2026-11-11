@@ -264,6 +264,7 @@ pub(crate) struct AdminParts {
 pub(crate) trait Directory: Send + Sync {
     fn session_count(&self) -> BoxFuture<'_, usize>;
     fn expired_count(&self) -> u64;
+    fn storage_failures(&self) -> (u64, usize);
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
     fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
     fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool>;
@@ -287,6 +288,10 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
 
     fn expired_count(&self) -> u64 {
         SessionManager::expired_count(self)
+    }
+
+    fn storage_failures(&self) -> (u64, usize) {
+        SessionManager::storage_failures(self)
     }
 
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>> {
@@ -397,6 +402,7 @@ impl Admin {
             inner.directory.expired_count(),
             retained,
             inner.topics.subscription_count(),
+            inner.directory.storage_failures(),
         );
         BrokerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),

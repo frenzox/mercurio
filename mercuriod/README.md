@@ -615,6 +615,10 @@ write that records it in flight, or dropped; QoS 0 messages are not kept.
 
 Changes are written in the background within milliseconds, so a crash loses
 only the changes of its last moments; a shutdown writes everything first.
+Changes the database fails to take are retried; when it keeps refusing
+them, as opposed to being out of reach, they are given up after a few
+attempts, and the client's whole state is written again, replacing what the
+database holds for it, as soon as the database takes it.
 
 The SQLite database runs in WAL mode: while the broker runs, it keeps
 `-wal` and `-shm` files next to the database, and recent changes may be
@@ -639,7 +643,10 @@ Every `sys_interval` seconds the broker publishes retained statistics under
 `messages/sent`, `bytes/received`, `bytes/sent`,
 `retained messages/count` and `subscriptions/count`, and the 1, 5 and 15
 minute averages per minute of messages, bytes and connections under
-`load/`, such as `load/messages/received/1min`. Clients
+`load/`, such as `load/messages/received/1min`. Two more tell how storage
+fares: `storage/failed batches`, the batches of changes given up since the
+broker started, and `storage/dirty clients`, the clients whose stored state
+is to be written whole again because of them. Clients
 may subscribe to them, but not publish to `$SYS` topics.
 
 ## Running

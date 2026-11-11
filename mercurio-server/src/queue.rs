@@ -196,6 +196,21 @@ impl MessageQueue {
         }
     }
 
+    /// The QoS 1 and 2 messages queued, as the journal holds them; none
+    /// without a journal.
+    pub(crate) fn journaled(&self) -> Vec<(u64, Message)> {
+        let state = self.state.lock().unwrap();
+        if state.journal.is_none() {
+            return Vec::new();
+        }
+        state
+            .messages
+            .iter()
+            .filter(|(_, message)| message.qos != QoS::AtMostOnce)
+            .cloned()
+            .collect()
+    }
+
     /// Puts back messages recorded by a previous run, keeping their order.
     pub(crate) fn restore(&self, messages: Vec<(u64, Message)>) {
         let mut state = self.state.lock().unwrap();

@@ -63,8 +63,8 @@ use crate::{
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
-    InflightMessage, RetainedMessageStore, SessionOwner, StoredSubscription, StoredWillMessage,
-    Write,
+    InflightMessage, RetainedMessageStore, SessionOwner, SessionState, StoredSubscription,
+    StoredWillMessage, Write,
 };
 
 /// Will message to be published on abnormal client disconnect.
@@ -346,8 +346,8 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// The task holding the will of the last connection until its delay
-    /// passes; a newer generation aborts it
-    pending_will: Option<AbortHandle>,
+    /// passes, with a copy of that will; a newer generation aborts it
+    pending_will: Option<(AbortHandle, WillMessage)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
@@ -501,20 +501,25 @@ impl Session {
     pub(crate) async fn set_generation(&self, generation: u64) {
         let mut state = self.shared.state.lock().await;
         self.shared.generation.store(generation, Ordering::Release);
-        if let Some(will) = state.pending_will.take() {
+        if let Some((will, _)) = state.pending_will.take() {
             will.abort();
         }
     }
 
-    /// Records the task holding the will of the connection of `generation`
+    /// Records the task holding `will`, of the connection of `generation`,
     /// until its delay passes, aborting it if a newer connection has
     /// already taken over.
-    pub(crate) async fn set_pending_will(&self, generation: u64, will: AbortHandle) {
+    pub(crate) async fn set_pending_will(
+        &self,
+        generation: u64,
+        task: AbortHandle,
+        will: WillMessage,
+    ) {
         let mut state = self.shared.state.lock().await;
         if self.generation() == generation {
-            state.pending_will = Some(will);
+            state.pending_will = Some((task, will));
         } else {
-            will.abort();
+            task.abort();
         }
     }
 
@@ -1156,6 +1161,84 @@ impl Session {
             will_pending: state.will_message.is_some() || state.pending_will.is_some(),
             counters: Arc::clone(&presence.counters),
         }
+    }
+
+    /// What storage holds for this session when it is up to date, as the
+    /// writes that store it once what was stored is removed: the session
+    /// with its subscriptions, its will if it has one, and for a session
+    /// that outlives its connection, its messages in flight, the packet ids
+    /// of incoming QoS 2 messages awaiting PUBREL and its journaled queue.
+    pub(crate) async fn stored_state(&self, persistent: bool) -> Vec<Write> {
+        let state = self.shared.state.lock().await;
+        let mut writes = vec![Write::SaveSession(SessionState {
+            client_id: state.client_id.clone(),
+            subscriptions: state.subscriptions.values().cloned().collect(),
+            expiry_interval: state
+                .presence
+                .session_expiry
+                .map(|expiry| expiry.as_secs().try_into().unwrap_or(u32::MAX)),
+            expires_at: state.presence.expires_at,
+            owner: state.owner.clone(),
+        })];
+        let pending = state.pending_will.as_ref().map(|(_, will)| will);
+        if let Some(will) = state.will_message.as_ref().or(pending) {
+            writes.push(Write::StoreWill(will.clone().into()));
+        }
+        if !persistent {
+            return writes;
+        }
+        for (packet_id, sent) in &state.unacknowledged_messages {
+            let properties = sent.publish.properties.as_ref();
+            writes.push(Write::StoreInflight(InflightMessage {
+                packet_id: *packet_id,
+                topic: sent.publish.topic_name.clone(),
+                payload: sent.publish.payload.clone(),
+                qos: sent.publish.qos_level,
+                dup: false,
+                retain: sent.publish.retain,
+                expires_at: sent.expires_at,
+                sequence: sent.sequence,
+                released: false,
+                properties: message_properties(properties),
+                subscription_identifiers: properties
+                    .map(|p| {
+                        p.subscription_identifiers
+                            .iter()
+                            .map(|id| id.value.0)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }));
+        }
+        for (packet_id, sequence) in &state.pubrecs {
+            writes.push(Write::StoreInflight(InflightMessage {
+                packet_id: *packet_id,
+                topic: String::new(),
+                payload: None,
+                qos: QoS::ExactlyOnce,
+                dup: false,
+                retain: false,
+                expires_at: None,
+                sequence: *sequence,
+                released: true,
+                properties: MessageProperties::default(),
+                subscription_identifiers: Vec::new(),
+            }));
+        }
+        writes.extend(
+            state
+                .incoming_qos2
+                .iter()
+                .map(|packet_id| Write::StoreIncomingQos2(*packet_id)),
+        );
+        writes.extend(
+            self.shared
+                .queue
+                .journaled()
+                .into_iter()
+                .map(|(sequence, message)| Write::Enqueue(sequence, message)),
+        );
+        writes
     }
 
     /// Starts keeping the queue's QoS 1 and 2 messages in storage, unless
@@ -3551,7 +3634,9 @@ mod tests {
         let will = Arc::new(session.take_will().await.unwrap());
 
         let pending = holding(&will);
-        session.set_pending_will(0, pending.abort_handle()).await;
+        session
+            .set_pending_will(0, pending.abort_handle(), (*will).clone())
+            .await;
         assert!(session.snapshot().await.will_pending);
         session.set_generation(1).await;
         assert!(pending.await.unwrap_err().is_cancelled());
@@ -3560,13 +3645,17 @@ mod tests {
 
         // One left by a connection already superseded is freed at once
         let stale = holding(&will);
-        session.set_pending_will(0, stale.abort_handle()).await;
+        session
+            .set_pending_will(0, stale.abort_handle(), (*will).clone())
+            .await;
         assert!(stale.await.unwrap_err().is_cancelled());
         assert_eq!(Arc::strong_count(&will), 1);
 
         // Once claimed, a takeover no longer cuts the will off
         let claimed = holding(&will);
-        session.set_pending_will(1, claimed.abort_handle()).await;
+        session
+            .set_pending_will(1, claimed.abort_handle(), (*will).clone())
+            .await;
         assert!(session.claim_pending_will(1).await);
         session.set_generation(2).await;
         tokio::task::yield_now().await;

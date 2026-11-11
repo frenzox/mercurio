@@ -1872,6 +1872,7 @@ where
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
             let will_session = session.clone();
+            let pending = will.clone();
 
             let publish = async move {
                 if !delay.is_zero() {
@@ -1891,7 +1892,7 @@ where
                 // Aborted, freeing the will, as soon as a new connection
                 // takes the session over or the session is deleted
                 let task = tokio::spawn(publish).abort_handle();
-                session.set_pending_will(generation, task).await;
+                session.set_pending_will(generation, task, pending).await;
             }
         }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use crate::CONNECTIONS;
@@ -28,10 +28,10 @@ use tracing::{error, warn};
 
 use crate::{
     broker::Broker,
-    plugin::{Chain, Event},
+    plugin::{BoxFuture, Chain, Event},
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
-    writer::Writers,
+    writer::{Snapshots, Writers},
 };
 
 pub(crate) struct SessionManagerDropGuard<S: BatchStore> {
@@ -80,8 +80,9 @@ struct State {
     connections: HashMap<String, ConnectionSlot>,
     /// Source of ConnectionSlot::generation, unique across slots
     next_generation: u64,
-    /// Clients whose will, left over from a previous run, is still due
-    restored_wills: HashSet<String>,
+    /// Clients whose will, left over from a previous run, is still due,
+    /// with that will
+    restored_wills: HashMap<String, StoredWillMessage>,
     /// The expiry timer that may end each session. Deleting or resuming a
     /// session, or scheduling a new timer for it, stops the timer.
     expiry_timers: HashMap<String, ExpiryTimer>,
@@ -111,7 +112,7 @@ impl State {
                 .connections
                 .get(client_id)
                 .map(|slot| slot.holder.generation),
-            restored_will: self.restored_wills.contains(client_id),
+            restored_will: self.restored_wills.contains_key(client_id),
         }
     }
 
@@ -458,7 +459,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 sessions: HashMap::new(),
                 connections: HashMap::new(),
                 next_generation: 0,
-                restored_wills: HashSet::new(),
+                restored_wills: HashMap::new(),
                 expiry_timers: HashMap::new(),
                 admissions: HashMap::new(),
             }),
@@ -468,13 +469,24 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             expiry_chain: Default::default(),
         });
 
+        let writers = Writers::new(Arc::clone(&storage));
+        writers.set_snapshots(Box::new(StoredState {
+            shared: Arc::downgrade(&shared),
+            durable: storage.is_durable(),
+        }));
         SessionManager {
             shared,
-            writers: Writers::new(Arc::clone(&storage)),
+            writers,
             storage,
             queue_limits,
             takeover_wait: None,
         }
+    }
+
+    /// Batches of changes given up since the broker started, and clients
+    /// whose stored state is dirty until it is stored whole again.
+    pub(crate) fn storage_failures(&self) -> (u64, usize) {
+        self.writers.failures()
     }
 
     /// Starts or resumes the session of the client in `connect_packet`,
@@ -1034,7 +1046,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let (removed, was_restored) = {
             let mut manager = self.shared.state.lock().await;
             manager.stop_expiry_timer(client_id);
-            let was_restored = manager.restored_wills.remove(client_id);
+            let was_restored = manager.restored_wills.remove(client_id).is_some();
             (manager.sessions.remove(client_id), was_restored)
         };
         if let Some(removed) = &removed {
@@ -1138,15 +1150,15 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
             // The clients were disconnected by the shutdown, so their wills
             // are due after their delay, or when the session ends if sooner
-            if let Some(will) = self.storage.get_will(&client_id).await? {
-                let will = WillMessage::from(will);
+            if let Some(stored) = self.storage.get_will(&client_id).await? {
+                let will = WillMessage::from(stored.clone());
                 let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
                 self.shared
                     .state
                     .lock()
                     .await
                     .restored_wills
-                    .insert(client_id.clone());
+                    .insert(client_id.clone(), stored);
                 wills.push((client_id.clone(), will, due));
             }
 
@@ -1259,6 +1271,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             .await
             .restored_wills
             .remove(client_id)
+            .is_some()
     }
 
     /// Discards the session of `client_id` unless a connection newer than
@@ -1405,6 +1418,40 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 .write_paced(client_id, Box::new([Write::RemoveIncomingQos2(packet_id)]))
                 .await;
         }
+    }
+}
+
+/// Takes what the broker holds for a client, for its writer to store it
+/// whole.
+struct StoredState {
+    shared: Weak<Shared>,
+    durable: bool,
+}
+
+impl Snapshots for StoredState {
+    fn snapshot<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<Vec<Write>>> {
+        Box::pin(async move {
+            let shared = self.shared.upgrade()?;
+            let (session, restored_will) = {
+                let state = shared.state.lock().await;
+                (
+                    state.sessions.get(client_id).map(SessionDropGuard::session),
+                    state.restored_wills.get(client_id).cloned(),
+                )
+            };
+            let persistent = self.durable && shared.persistent.lock().unwrap().contains(client_id);
+            let mut writes = vec![Write::DeleteSession];
+            if let Some(session) = session {
+                writes.extend(session.stored_state(persistent).await);
+            }
+            // A will from before a restart, still due
+            if let Some(will) = restored_will {
+                if !writes.iter().any(|w| matches!(w, Write::StoreWill(_))) {
+                    writes.push(Write::StoreWill(will));
+                }
+            }
+            Some(writes)
+        })
     }
 }
 
@@ -1650,6 +1697,308 @@ mod tests {
     /// messages and subscriptions in it
     fn durable_storage() -> Arc<SqliteStore> {
         Arc::new(SqliteStore::in_memory().unwrap())
+    }
+
+    /// A SQLite store whose batches fail for good while `failing` is set.
+    #[derive(Default)]
+    struct FailingWrites {
+        inner: Option<SqliteStore>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingWrites {
+        fn new() -> Arc<Self> {
+            Arc::new(FailingWrites {
+                inner: Some(SqliteStore::in_memory().unwrap()),
+                failing: Default::default(),
+            })
+        }
+
+        fn inner(&self) -> &SqliteStore {
+            self.inner.as_ref().unwrap()
+        }
+
+        fn fail(&self, failing: bool) {
+            self.failing
+                .store(failing, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BatchStore for FailingWrites {
+        async fn apply(&self, client_id: &str, writes: &[Write]) -> mercurio_storage::Result<()> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(mercurio_storage::StorageError::OperationFailed(
+                    "disk full".into(),
+                ));
+            }
+            self.inner().apply(client_id, writes).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for FailingWrites {
+        async fn save_session(
+            &self,
+            client_id: &str,
+            session: &SessionState,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().save_session(client_id, session).await
+        }
+
+        async fn load_session(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Option<SessionState>> {
+            self.inner().load_session(client_id).await
+        }
+
+        async fn delete_session(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().delete_session(client_id).await
+        }
+
+        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<String>> {
+            self.inner().list_sessions().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WillStore for FailingWrites {
+        async fn store_will(
+            &self,
+            client_id: &str,
+            will: &StoredWillMessage,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().store_will(client_id, will).await
+        }
+
+        async fn get_will(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Option<StoredWillMessage>> {
+            self.inner().get_will(client_id).await
+        }
+
+        async fn delete_will(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().delete_will(client_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InflightStore for FailingWrites {
+        async fn store_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+            message: &InflightMessage,
+        ) -> mercurio_storage::Result<()> {
+            self.inner()
+                .store_inflight(client_id, packet_id, message)
+                .await
+        }
+
+        async fn get_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<Option<InflightMessage>> {
+            self.inner().get_inflight(client_id, packet_id).await
+        }
+
+        async fn remove_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().remove_inflight(client_id, packet_id).await
+        }
+
+        async fn release_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().release_inflight(client_id, packet_id).await
+        }
+
+        async fn get_all_inflight(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Vec<InflightMessage>> {
+            self.inner().get_all_inflight(client_id).await
+        }
+
+        async fn store_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().store_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn remove_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner()
+                .remove_incoming_qos2(client_id, packet_id)
+                .await
+        }
+
+        async fn get_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner().get_incoming_qos2(client_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueueStore for FailingWrites {
+        async fn enqueue(
+            &self,
+            client_id: &str,
+            sequence: u64,
+            message: &Message,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().enqueue(client_id, sequence, message).await
+        }
+
+        async fn dequeue(&self, client_id: &str, sequence: u64) -> mercurio_storage::Result<()> {
+            self.inner().dequeue(client_id, sequence).await
+        }
+
+        async fn load_queue(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Vec<(u64, Message)>> {
+            self.inner().load_queue(client_id).await
+        }
+
+        async fn clear_queue(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().clear_queue(client_id).await
+        }
+    }
+
+    fn queued(payload: &'static str) -> Message {
+        Message {
+            packet_id: None,
+            topic: Arc::from("t"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Some(Bytes::from_static(payload.as_bytes())),
+            properties: Default::default(),
+            expires_at: None,
+            subscription_identifiers: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// Once a batch of a client's changes is given up, storage holds
+    /// something else than the broker; the client's whole state is stored
+    /// again, replacing it, as soon as storage takes it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_client_whose_changes_were_given_up_is_stored_whole_again() {
+        let storage = FailingWrites::new();
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        let mut connect = resuming("c");
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
+                3600,
+            )),
+            ..Default::default()
+        });
+        let started = manager
+            .start_session(connect, owned_by("alice"))
+            .await
+            .unwrap();
+        let mut session = started.session;
+        session
+            .attach(Arc::from("test"), 60, Some(Duration::from_secs(3600)))
+            .await;
+        manager.flush().await;
+        // In storage, though no longer in the broker
+        storage.enqueue("c", 3, &queued("stale")).await.unwrap();
+        session.restore_queue(vec![(4, queued("kept"))]);
+
+        storage.fail(true);
+        let subscription = StoredSubscription::new("a", QoS::AtLeastOnce);
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        session
+            .restore_subscriptions(vec![subscription.clone()], &broker)
+            .await
+            .unwrap();
+        manager
+            .save_subscription_changes(
+                "c",
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "a",
+                    QoS::AtLeastOnce,
+                ))],
+            )
+            .await;
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 1));
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert!(stored.subscriptions.is_empty());
+
+        // Changes made meanwhile don't pile up waiting for storage
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..20_000 {
+                manager.remove_inflight("c", 1).await;
+            }
+        })
+        .await
+        .expect("a dirty client's changes wait for storage");
+
+        // Without a change or a flush, a later attempt stores it whole
+        storage.fail(false);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(manager.storage_failures(), (1, 0));
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert_eq!(stored.subscriptions, [subscription]);
+        assert_eq!(stored.owner, owned_by("alice"));
+        assert_eq!(stored.expiry_interval, Some(3600));
+        let queue = storage.load_queue("c").await.unwrap();
+        assert_eq!(queue.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [4]);
+    }
+
+    /// A dirty client is stored whole at its next change too, and its
+    /// changes are applied again once it is clean.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_dirty_client_is_stored_whole_at_its_next_change() {
+        let storage = FailingWrites::new();
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        let started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        mark_persistent(&manager, "c");
+        storage.fail(true);
+        manager.delete_will("c");
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 1));
+
+        storage.fail(false);
+        started.session.restore_incoming_qos2(vec![7]).await;
+        manager.store_incoming_qos2("c", 7).await;
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 0));
+        assert_eq!(storage.get_incoming_qos2("c").await.unwrap(), [7]);
+        manager.remove_incoming_qos2("c", 7).await;
+        manager.flush().await;
+        assert!(storage.get_incoming_qos2("c").await.unwrap().is_empty());
+
+        // A session gone from the broker is gone from storage too
+        storage.fail(true);
+        manager
+            .end_connection(started.lease, Some(Duration::ZERO))
+            .await;
+        manager.flush().await;
+        assert!(storage.load_session("c").await.unwrap().is_some());
+        storage.fail(false);
+        manager.flush().await;
+        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert_eq!(manager.storage_failures(), (2, 0));
     }
 
     fn mark_persistent<S: BatchStore>(manager: &SessionManager<S>, client_id: &str) {
