@@ -2190,57 +2190,62 @@ where
             mount_point: key.mount_point.clone(),
         };
         let client_id = connect_packet.payload.client_id.clone();
-        let mut start_result =
-            match Box::pin(self.session_manager.start_session(*connect_packet, owner)).await {
-                Ok(start_result) => start_result,
-                Err(StartError::OwnedByAnother(connect_packet)) => {
-                    return self
-                        .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
-                        .await;
-                }
-                Err(StartError::Busy) => {
-                    warn!(
-                        "The connection using client id `{}` didn't let go of it in time",
-                        client_id
-                    );
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerBusy,
-                        )
-                        .await;
-                }
-                Err(StartError::TooManySessions) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::QuotaExceeded,
-                        )
-                        .await;
-                }
-                // Logged where the admissions are counted
-                Err(StartError::Crowded) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerBusy,
-                        )
-                        .await;
-                }
-                Err(StartError::SetAside) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerUnavailable,
-                        )
-                        .await;
-                }
-                Err(StartError::Storage(e)) => return Err(e),
-            };
+        let mut start_result = match Box::pin(self.session_manager.start_session(
+            *connect_packet,
+            owner,
+            expiry,
+        ))
+        .await
+        {
+            Ok(start_result) => start_result,
+            Err(StartError::OwnedByAnother(connect_packet)) => {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+            Err(StartError::Busy) => {
+                warn!(
+                    "The connection using client id `{}` didn't let go of it in time",
+                    client_id
+                );
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerBusy,
+                    )
+                    .await;
+            }
+            Err(StartError::TooManySessions) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::QuotaExceeded,
+                    )
+                    .await;
+            }
+            // Logged where the admissions are counted
+            Err(StartError::Crowded) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerBusy,
+                    )
+                    .await;
+            }
+            Err(StartError::SetAside) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerUnavailable,
+                    )
+                    .await;
+            }
+            Err(StartError::Storage(e)) => return Err(e),
+        };
         // A client whose id was replaced learns the one it has
         start_result.assigned_client_id |= assigned_client_id || renamed;
         let mut session = start_result.session;

@@ -546,3 +546,42 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
     assert!(drain(&mut subscriber).await.is_empty());
     broker.stop().await;
 }
+
+/// Connects an MQTT 3.1.1 client asking to keep its session; returns the
+/// connection and whether a session was resumed.
+async fn connect_v311(addr: SocketAddr, client_id: u8) -> (TcpStream, bool) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x00, 0x00, 0x3c, 0x00, 0x01,
+            client_id,
+        ])
+        .await
+        .unwrap();
+    let mut connack = [0u8; 4];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut connack))
+        .await
+        .expect("no CONNACK")
+        .unwrap();
+    assert_eq!(connack[3], 0, "connection refused");
+    (stream, connack[2] == 0x01)
+}
+
+/// The session of an MQTT 3.x client is stored with the expiry
+/// `persistent_client_expiration` gives it from the start, so a crash while
+/// the client is connected doesn't leave a session that never expires.
+#[tokio::test]
+async fn persistent_client_expiration_holds_across_a_crash() {
+    let db = database("persistent-client-expiration");
+    let mut config = ServerConfig::default();
+    config.limits.persistent_client_expiration = Some(Duration::from_secs(1));
+    let broker = Broker::with_config(&db, config);
+    let (_client, _) = connect_v311(broker.addr, b'c').await;
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    sleep(Duration::from_millis(1500)).await;
+    let (_client, resumed) = connect_v311(broker.addr, b'c').await;
+    assert!(!resumed, "the session outlived its expiry");
+    broker.stop().await;
+}

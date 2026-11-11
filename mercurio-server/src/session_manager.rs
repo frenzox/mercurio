@@ -543,10 +543,14 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     /// Fails as busy when the connection using the client id doesn't let go
     /// of it within `takeover_wait`; that connection is still asked to
     /// close, and nothing else changes.
+    /// The session outlives its connection by `expiry`, forever if None:
+    /// what the server applies, which for MQTT 3.x clients comes from its
+    /// configuration, so storage holds that from the start.
     pub(crate) async fn start_session(
         &mut self,
         mut connect_packet: ConnectPacket,
         owner: SessionOwner,
+        expiry: Option<Duration>,
     ) -> std::result::Result<SessionStartResult, StartError> {
         // Clients without an identifier each get a unique one, so they never
         // share a session entry
@@ -555,8 +559,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             connect_packet.payload.client_id = Uuid::new_v4().hyphenated().to_string();
         }
 
-        let expiry = session_expiry(&connect_packet);
-        let expiry_interval = expiry.map(|e| e.as_secs() as u32);
+        let expiry_interval = expiry.map(|e| e.as_secs().try_into().unwrap_or(u32::MAX));
         let persistent = expiry_interval != Some(0);
 
         let storage_error =
@@ -739,6 +742,17 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             lease: claim.keep(OnDrop::End(expiry)),
             inflight_to_retry,
         })
+    }
+
+    /// `start_session` with the expiry the CONNECT asks for.
+    #[cfg(test)]
+    pub(crate) async fn start_session_as_asked(
+        &mut self,
+        connect_packet: ConnectPacket,
+        owner: SessionOwner,
+    ) -> std::result::Result<SessionStartResult, StartError> {
+        let expiry = session_expiry(&connect_packet);
+        self.start_session(connect_packet, owner, expiry).await
     }
 
     /// Counts the session of `key` among those outliving their
@@ -1933,7 +1947,7 @@ mod tests {
             ..Default::default()
         });
         let started = manager
-            .start_session(connect, owned_by("alice"))
+            .start_session_as_asked(connect, owned_by("alice"))
             .await
             .unwrap();
         let mut session = started.session;
@@ -1997,7 +2011,7 @@ mod tests {
         let storage = FailingWrites::new();
         let mut manager = SessionManager::new(Arc::clone(&storage));
         let started = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         mark_persistent(&manager, "c");
@@ -2058,7 +2072,7 @@ mod tests {
             ..Default::default()
         });
         let _started = manager
-            .start_session(connect, SessionOwner::default())
+            .start_session_as_asked(connect, SessionOwner::default())
             .await
             .unwrap();
         storage.fail(false);
@@ -2097,7 +2111,7 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
 
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         storage
@@ -2161,7 +2175,7 @@ mod tests {
         ));
 
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         manager
@@ -2196,7 +2210,7 @@ mod tests {
         let hour = Duration::from_secs(3600);
 
         let started = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         manager.end_connection(started.lease, Some(hour)).await;
@@ -2204,7 +2218,7 @@ mod tests {
 
         // Resumed
         let started = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         // What is left is the new connection's lease
@@ -2227,7 +2241,7 @@ mod tests {
         let broker = crate::broker::Broker::new(storage.clone());
 
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let mut session = started.session;
@@ -2253,7 +2267,7 @@ mod tests {
         manager.end_connection(started.lease, None).await;
 
         let resumed = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         assert!(resumed.resume);
@@ -2273,7 +2287,7 @@ mod tests {
         let broker = crate::broker::Broker::new(storage);
 
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let mut session = started.session;
@@ -2349,7 +2363,7 @@ mod tests {
         let mut connect = connect_packet("c");
         connect.clean_start = false;
         let started = manager
-            .start_session(connect, SessionOwner::default())
+            .start_session_as_asked(connect, SessionOwner::default())
             .await
             .unwrap();
         assert!(started.resume);
@@ -2440,7 +2454,7 @@ mod tests {
         let mut manager: SessionManager<FaultyStore> = SessionManager::new(storage.clone());
 
         let result = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await;
         assert!(matches!(result, Err(StartError::Storage(_))));
         assert!(manager.shared.state.lock().await.connections.is_empty());
@@ -2453,7 +2467,7 @@ mod tests {
         storage.stall_reads("load_queue", "c");
         let mut manager: SessionManager<FaultyStore> = SessionManager::new(storage.clone());
 
-        let start = manager.start_session(resuming("c"), SessionOwner::default());
+        let start = manager.start_session_as_asked(resuming("c"), SessionOwner::default());
         assert!(tokio::time::timeout(Duration::from_millis(50), start)
             .await
             .is_err());
@@ -2478,7 +2492,7 @@ mod tests {
             let mut stuck = manager.clone();
             let a = tokio::spawn(async move {
                 stuck
-                    .start_session(resuming("a"), SessionOwner::default())
+                    .start_session_as_asked(resuming("a"), SessionOwner::default())
                     .await
                     .map(|_| ())
             });
@@ -2486,7 +2500,7 @@ mod tests {
 
             tokio::time::timeout(Duration::from_secs(1), async {
                 let started = manager
-                    .start_session(resuming("b"), SessionOwner::default())
+                    .start_session_as_asked(resuming("b"), SessionOwner::default())
                     .await
                     .unwrap();
                 manager
@@ -2512,14 +2526,14 @@ mod tests {
         let mut alice = manager.clone();
         let alice = tokio::spawn(async move {
             alice
-                .start_session(resuming("gw-01"), owned_by("alice"))
+                .start_session_as_asked(resuming("gw-01"), owned_by("alice"))
                 .await
         });
         storage.wait_for_stalls(1).await;
         let mut mallory = manager.clone();
         let mallory = tokio::spawn(async move {
             mallory
-                .start_session(resuming("gw-01"), owned_by("mallory"))
+                .start_session_as_asked(resuming("gw-01"), owned_by("mallory"))
                 .await
                 .map(|_| ())
         });
@@ -2545,7 +2559,7 @@ mod tests {
 
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage.clone());
         manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         manager.flush().await;
@@ -2582,7 +2596,7 @@ mod tests {
         let mut reconnect = connect_packet("b");
         reconnect.clean_start = false;
         manager
-            .start_session(reconnect, SessionOwner::default())
+            .start_session_as_asked(reconnect, SessionOwner::default())
             .await
             .unwrap();
         assert!(manager.take_restored_will(&key("a")).await);
@@ -2623,12 +2637,12 @@ mod tests {
         let mut resume = connect_packet("bad");
         resume.clean_start = false;
         let refused = manager
-            .start_session(resume.clone(), SessionOwner::default())
+            .start_session_as_asked(resume.clone(), SessionOwner::default())
             .await;
         assert!(matches!(refused, Err(StartError::SetAside)));
         // Clean Start doesn't get past it either
         let refused = manager
-            .start_session(connect_packet("bad"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("bad"), SessionOwner::default())
             .await;
         assert!(matches!(refused, Err(StartError::SetAside)));
         manager.flush().await;
@@ -2662,7 +2676,7 @@ mod tests {
         assert_eq!(manager.set_aside_count().await, 0);
         storage.undecodable.lock().unwrap().clear();
         manager
-            .start_session(resume, SessionOwner::default())
+            .start_session_as_asked(resume, SessionOwner::default())
             .await
             .unwrap();
     }
@@ -2917,7 +2931,7 @@ mod tests {
     async fn test_a_later_close_with_the_will_keeps_the_will_dropped() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let banned = Close::Admin {
@@ -2942,7 +2956,7 @@ mod tests {
     async fn test_a_deletion_drops_the_will_a_pending_disconnect_kept() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let mut started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let disconnect = Close::Admin {
@@ -2992,13 +3006,19 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         manager.max_sessions = Some(2);
         let owner = SessionOwner::default;
-        let a = manager.start_session(lasting("a"), owner()).await.unwrap();
+        let a = manager
+            .start_session_as_asked(lasting("a"), owner())
+            .await
+            .unwrap();
         manager
             .end_connection(a.lease, Some(Duration::from_secs(3600)))
             .await;
-        let _b = manager.start_session(lasting("b"), owner()).await.unwrap();
+        let _b = manager
+            .start_session_as_asked(lasting("b"), owner())
+            .await
+            .unwrap();
 
-        let refused = manager.start_session(lasting("c"), owner()).await;
+        let refused = manager.start_session_as_asked(lasting("c"), owner()).await;
         assert!(matches!(refused, Err(StartError::TooManySessions)));
         assert!(gone(&manager, "c").await);
         assert!(!manager
@@ -3010,8 +3030,14 @@ mod tests {
 
         // Sessions ending with their connection don't count, and an
         // existing session may still be resumed
-        let _d = manager.start_session(clean("d"), owner()).await.unwrap();
-        let a = manager.start_session(lasting("a"), owner()).await.unwrap();
+        let _d = manager
+            .start_session_as_asked(clean("d"), owner())
+            .await
+            .unwrap();
+        let a = manager
+            .start_session_as_asked(lasting("a"), owner())
+            .await
+            .unwrap();
         assert!(a.resume);
     }
 
@@ -3030,7 +3056,7 @@ mod tests {
         let storage = durable_storage();
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         let started = manager
-            .start_session(resuming("gw-01"), owned_by("alice"))
+            .start_session_as_asked(resuming("gw-01"), owned_by("alice"))
             .await
             .unwrap();
         mark_persistent(&manager, "gw-01");
@@ -3050,10 +3076,10 @@ mod tests {
         for owner in [owned_by("mallory"), SessionOwner::default()] {
             assert_refused(
                 manager
-                    .start_session(resuming("gw-01"), owner.clone())
+                    .start_session_as_asked(resuming("gw-01"), owner.clone())
                     .await,
             );
-            assert_refused(manager.start_session(clean("gw-01"), owner).await);
+            assert_refused(manager.start_session_as_asked(clean("gw-01"), owner).await);
         }
         // A refusal leaves no claim on the client id behind, and the
         // session as it was
@@ -3064,7 +3090,7 @@ mod tests {
         assert_eq!(stored.subscriptions.len(), 1);
 
         let alice_again = manager
-            .start_session(resuming("gw-01"), owned_by("alice"))
+            .start_session_as_asked(resuming("gw-01"), owned_by("alice"))
             .await
             .unwrap();
         assert!(alice_again.resume, "its own session resumes");
@@ -3089,17 +3115,17 @@ mod tests {
         let storage = durable_storage();
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         let alice = manager
-            .start_session(lasting("c"), on_mount_point("a/", owned_by("alice")))
+            .start_session_as_asked(lasting("c"), on_mount_point("a/", owned_by("alice")))
             .await
             .unwrap();
         // Another user, and an anonymous client without a mount point,
         // each get a session of their own
         let bob = manager
-            .start_session(lasting("c"), on_mount_point("b/", owned_by("bob")))
+            .start_session_as_asked(lasting("c"), on_mount_point("b/", owned_by("bob")))
             .await
             .unwrap();
         let plain = manager
-            .start_session(lasting("c"), SessionOwner::default())
+            .start_session_as_asked(lasting("c"), SessionOwner::default())
             .await
             .unwrap();
         assert!(!bob.resume && !plain.resume);
@@ -3111,7 +3137,7 @@ mod tests {
         // Another user on the same mount point is still refused
         assert_refused(
             manager
-                .start_session(clean("c"), on_mount_point("a/", owned_by("mallory")))
+                .start_session_as_asked(clean("c"), on_mount_point("a/", owned_by("mallory")))
                 .await,
         );
         assert_eq!(*alice.lease.close.borrow(), None);
@@ -3155,7 +3181,7 @@ mod tests {
         let mut taker = manager.clone();
         let takeover = tokio::spawn(async move {
             taker
-                .start_session(lasting("c"), on_mount_point("a/", owned_by("alice")))
+                .start_session_as_asked(lasting("c"), on_mount_point("a/", owned_by("alice")))
                 .await
         });
         let mut close = alice.lease.close.clone();
@@ -3197,11 +3223,11 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         manager.set_expiry_chain(Chain::new(vec![events.clone()], Duration::from_secs(1)));
         let soon = manager
-            .start_session(lasting("c"), on_mount_point("a/", SessionOwner::default()))
+            .start_session_as_asked(lasting("c"), on_mount_point("a/", SessionOwner::default()))
             .await
             .unwrap();
         let later = manager
-            .start_session(lasting("c"), SessionOwner::default())
+            .start_session_as_asked(lasting("c"), SessionOwner::default())
             .await
             .unwrap();
         manager
@@ -3271,7 +3297,7 @@ mod tests {
         manager.restore_from_storage(&broker).await.unwrap();
         assert_eq!(manager.keys_of("c").await, [key("c"), mounted("a/", "c")]);
         let resumed = manager
-            .start_session(lasting("c"), on_mount_point("a/", owned_by("alice")))
+            .start_session_as_asked(lasting("c"), on_mount_point("a/", owned_by("alice")))
             .await
             .unwrap();
         assert!(resumed.resume);
@@ -3280,7 +3306,7 @@ mod tests {
         // On the mount point, another user is refused the id
         assert_refused(
             manager
-                .start_session(lasting("c"), on_mount_point("a/", owned_by("bob")))
+                .start_session_as_asked(lasting("c"), on_mount_point("a/", owned_by("bob")))
                 .await,
         );
     }
@@ -3289,10 +3315,14 @@ mod tests {
     async fn test_another_owner_cannot_close_a_connection() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(connect_packet("c"), owned_by("alice"))
+            .start_session_as_asked(connect_packet("c"), owned_by("alice"))
             .await
             .unwrap();
-        assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
+        assert_refused(
+            manager
+                .start_session_as_asked(clean("c"), owned_by("mallory"))
+                .await,
+        );
         assert_eq!(*started.lease.close.borrow(), None);
         assert_eq!(
             manager.entry(&key("c")).await.unwrap().generation,
@@ -3304,14 +3334,14 @@ mod tests {
     async fn test_a_pending_claim_holds_the_client_id_for_its_owner() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let first = manager
-            .start_session(connect_packet("c"), owned_by("alice"))
+            .start_session_as_asked(connect_packet("c"), owned_by("alice"))
             .await
             .unwrap();
         // Alice's second connection waits for the first to finish
         let mut taking_over = manager.clone();
         let second = tokio::spawn(async move {
             taking_over
-                .start_session(connect_packet("c"), owned_by("alice"))
+                .start_session_as_asked(connect_packet("c"), owned_by("alice"))
                 .await
                 .map(|started| started.lease.generation)
         });
@@ -3319,7 +3349,11 @@ mod tests {
         close.changed().await.unwrap();
         assert_eq!(*close.borrow(), Some(Close::TakenOver));
 
-        assert_refused(manager.start_session(clean("c"), owned_by("mallory")).await);
+        assert_refused(
+            manager
+                .start_session_as_asked(clean("c"), owned_by("mallory"))
+                .await,
+        );
         manager.end_connection(first.lease, None).await;
         assert!(second.await.unwrap().is_ok());
     }
@@ -3329,7 +3363,7 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         manager.takeover_wait = Some(Duration::from_millis(100));
         let first = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
 
@@ -3341,7 +3375,7 @@ mod tests {
             let mut taking_over = manager.clone();
             takeovers.push(tokio::spawn(async move {
                 taking_over
-                    .start_session(connect_packet("c"), SessionOwner::default())
+                    .start_session_as_asked(connect_packet("c"), SessionOwner::default())
                     .await
                     .map(|_| ())
             }));
@@ -3366,13 +3400,13 @@ mod tests {
     async fn test_an_abandoned_takeover_hands_the_client_id_back() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let first = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let mut taking_over = manager.clone();
         let takeover = tokio::spawn(async move {
             taking_over
-                .start_session(connect_packet("c"), SessionOwner::default())
+                .start_session_as_asked(connect_packet("c"), SessionOwner::default())
                 .await
                 .map(|_| ())
         });
@@ -3446,7 +3480,7 @@ mod tests {
         let mut alice = manager.clone();
         let mut start = Box::pin(async move {
             alice
-                .start_session(resuming("c"), owned_by("alice"))
+                .start_session_as_asked(resuming("c"), owned_by("alice"))
                 .await
                 .map(|_| ())
         });
@@ -3468,7 +3502,7 @@ mod tests {
         assert!(gone(&manager, "c").await, "the client id stayed claimed");
         let mut mallory = manager.clone();
         mallory
-            .start_session(resuming("c"), owned_by("mallory"))
+            .start_session_as_asked(resuming("c"), owned_by("mallory"))
             .await
             .unwrap();
         assert!(manager.shared.state.lock().await.admissions.is_empty());
@@ -3480,7 +3514,7 @@ mod tests {
         storage.stall_reads("load_session", "c");
         let mut manager: SessionManager<FaultyStore> = SessionManager::new(storage.clone());
 
-        let start = manager.start_session(resuming("c"), SessionOwner::default());
+        let start = manager.start_session_as_asked(resuming("c"), SessionOwner::default());
         assert!(tokio::time::timeout(Duration::from_millis(50), start)
             .await
             .is_err());
@@ -3497,7 +3531,7 @@ mod tests {
     async fn test_an_end_of_connection_abandoned_once_released_still_expires() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
 
@@ -3519,13 +3553,13 @@ mod tests {
     async fn test_a_start_abandoned_after_taking_the_session_leaves_it_to_expire() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let first = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         let mut taking_over = manager.clone();
         let mut second = Box::pin(async move {
             taking_over
-                .start_session(resuming("c"), SessionOwner::default())
+                .start_session_as_asked(resuming("c"), SessionOwner::default())
                 .await
                 .map(|_| ())
         });
@@ -3554,7 +3588,7 @@ mod tests {
     async fn test_a_takeover_abandoned_midway_leaves_the_delayed_will_due() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let first = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         let generation = first.lease.generation;
@@ -3578,7 +3612,7 @@ mod tests {
         let mut taking_over = manager.clone();
         let mut second = Box::pin(async move {
             taking_over
-                .start_session(resuming("c"), SessionOwner::default())
+                .start_session_as_asked(resuming("c"), SessionOwner::default())
                 .await
                 .map(|_| ())
         });
@@ -3603,7 +3637,7 @@ mod tests {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
         let mut started = manager
-            .start_session(resuming("c"), SessionOwner::default())
+            .start_session_as_asked(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
         started
@@ -3649,12 +3683,12 @@ mod tests {
         }
 
         let result = manager
-            .start_session(connect_packet("fresh"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("fresh"), SessionOwner::default())
             .await;
         assert!(matches!(result, Err(StartError::Crowded)));
         // A client id already being admitted still waits its turn
         let started = manager
-            .start_session(connect_packet("c0"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c0"), SessionOwner::default())
             .await
             .unwrap();
         manager
@@ -3668,7 +3702,7 @@ mod tests {
     async fn test_a_dropped_lease_gives_the_client_id_back() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(connect_packet("c"), owned_by("alice"))
+            .start_session_as_asked(connect_packet("c"), owned_by("alice"))
             .await
             .unwrap();
 
@@ -3676,7 +3710,7 @@ mod tests {
         drop(started.lease);
         assert!(gone(&manager, "c").await, "the client id stayed claimed");
         manager
-            .start_session(clean("c"), owned_by("mallory"))
+            .start_session_as_asked(clean("c"), owned_by("mallory"))
             .await
             .unwrap();
     }
@@ -3685,7 +3719,7 @@ mod tests {
     async fn test_an_abandoned_end_of_connection_gives_the_client_id_back() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(connect_packet("c"), owned_by("alice"))
+            .start_session_as_asked(connect_packet("c"), owned_by("alice"))
             .await
             .unwrap();
 
@@ -3702,7 +3736,7 @@ mod tests {
     async fn test_an_abandoned_deletion_gives_the_client_id_back() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         let c = key("c");
@@ -3729,13 +3763,13 @@ mod tests {
     async fn test_a_session_without_expiry_ends_under_a_waiting_takeover() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         let first = manager
-            .start_session(clean("c"), SessionOwner::default())
+            .start_session_as_asked(clean("c"), SessionOwner::default())
             .await
             .unwrap();
         let mut taking_over = manager.clone();
         let second = tokio::spawn(async move {
             taking_over
-                .start_session(resuming("c"), SessionOwner::default())
+                .start_session_as_asked(resuming("c"), SessionOwner::default())
                 .await
                 .map(|started| started.resume)
         });
@@ -3769,12 +3803,12 @@ mod tests {
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         assert_refused(
             manager
-                .start_session(resuming("gw-01"), owned_by("mallory"))
+                .start_session_as_asked(resuming("gw-01"), owned_by("mallory"))
                 .await,
         );
         assert_refused(
             manager
-                .start_session(clean("gw-01"), owned_by("mallory"))
+                .start_session_as_asked(clean("gw-01"), owned_by("mallory"))
                 .await,
         );
         manager.flush().await;
@@ -3783,7 +3817,7 @@ mod tests {
         assert_eq!(stored.subscriptions.len(), 1);
 
         let alice = manager
-            .start_session(resuming("gw-01"), owned_by("alice"))
+            .start_session_as_asked(resuming("gw-01"), owned_by("alice"))
             .await
             .unwrap();
         assert!(alice.resume);
@@ -3795,7 +3829,7 @@ mod tests {
         let storage = durable_storage();
         let mut manager: SessionManager<SqliteStore> = SessionManager::new(storage.clone());
         let started = manager
-            .start_session(connect_packet("c"), SessionOwner::default())
+            .start_session_as_asked(connect_packet("c"), SessionOwner::default())
             .await
             .unwrap();
         mark_persistent(&manager, "c");
@@ -3813,7 +3847,7 @@ mod tests {
         let mut fresh = connect_packet("c");
         fresh.clean_start = true;
         let _connected = manager
-            .start_session(fresh, SessionOwner::default())
+            .start_session_as_asked(fresh, SessionOwner::default())
             .await
             .unwrap();
         manager.flush().await;
