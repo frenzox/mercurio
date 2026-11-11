@@ -40,9 +40,55 @@ const SALT_LEN: usize = 16;
 /// Random bytes in a nonce, before base64.
 const NONCE_LEN: usize = 18;
 
-/// The GS2 header of a client that supports no channel binding, the only
-/// kind this implementation speaks.
+/// The GS2 header of a client that does not use channel binding.
 const GS2_HEADER: &str = "n,,";
+const GS2_HEADER_TLS_EXPORTER: &str = "p=tls-exporter,,";
+
+pub const MECHANISM_PLUS: &str = "SCRAM-SHA-256-PLUS";
+pub const TLS_EXPORTER_LABEL: &[u8] = b"EXPORTER-Channel-Binding";
+/// Bytes of tls-exporter channel binding data
+pub const TLS_EXPORTER_LEN: usize = 32;
+
+/// What the client puts in the GS2 header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientBinding {
+    /// `n`: the client does not support channel binding
+    Unsupported,
+    /// `p=tls-exporter`, bound to this data
+    TlsExporter([u8; TLS_EXPORTER_LEN]),
+}
+
+impl ClientBinding {
+    /// The `c=` value: the GS2 header followed by the binding data.
+    fn channel_binding(&self) -> String {
+        match self {
+            ClientBinding::Unsupported => STANDARD.encode(GS2_HEADER),
+            ClientBinding::TlsExporter(data) => {
+                let mut bytes = GS2_HEADER_TLS_EXPORTER.as_bytes().to_vec();
+                bytes.extend_from_slice(data);
+                STANDARD.encode(bytes)
+            }
+        }
+    }
+
+    fn gs2_header(&self) -> &'static str {
+        match self {
+            ClientBinding::Unsupported => GS2_HEADER,
+            ClientBinding::TlsExporter(_) => GS2_HEADER_TLS_EXPORTER,
+        }
+    }
+}
+
+/// What the client asked for, for the server to check against the method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedBinding {
+    /// `n`
+    None,
+    /// `y`: the client supports binding and believes the server does not
+    SupportedButUnused,
+    /// `p=tls-exporter`
+    TlsExporter,
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -318,6 +364,7 @@ pub struct ScramClient {
     username: String,
     password: String,
     salted: Option<(Vec<u8>, u32, Key)>,
+    binding: ClientBinding,
     state: ClientState,
 }
 
@@ -342,12 +389,18 @@ impl ScramClient {
             username: username.into(),
             password: password.into(),
             salted: None,
+            binding: ClientBinding::Unsupported,
             state: ClientState::Idle,
         }
     }
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// The binding of the next exchange; `Unsupported` by default.
+    pub fn set_binding(&mut self, binding: ClientBinding) {
+        self.binding = binding;
     }
 
     /// Begins an exchange with a random nonce: the `client-first-message`.
@@ -362,7 +415,7 @@ impl ScramClient {
     pub fn start_with_nonce(&mut self, nonce: &str) -> Result<String, Error> {
         let username = prepare_username(&self.username).ok_or(Error::InvalidUsername)?;
         let first_bare = format!("n={},r={nonce}", escape_username(&username));
-        let message = format!("{GS2_HEADER}{first_bare}");
+        let message = format!("{}{first_bare}", self.binding.gs2_header());
         self.state = ClientState::SentFirst {
             nonce: nonce.to_string(),
             first_bare,
@@ -420,7 +473,7 @@ impl ScramClient {
             }
         };
         let client_key = client_key(&salted);
-        let without_proof = format!("c={},r={combined}", STANDARD.encode(GS2_HEADER));
+        let without_proof = format!("c={},r={combined}", self.binding.channel_binding());
         let auth_message = format!("{first_bare},{server_first},{without_proof}");
         let signature = hmac(&stored_key(&client_key), auth_message.as_bytes());
         let proof: Vec<u8> = client_key
@@ -468,9 +521,14 @@ pub enum ServerError {
     ExtensionsNotSupported,
     InvalidProof,
     ChannelBindingsDontMatch,
-    /// The client requires channel binding, which this implementation
-    /// does not offer.
+    /// The client requires channel binding, and the connection has no
+    /// channel binding data.
     ChannelBindingNotSupported,
+    /// The client asked for a channel binding type other than
+    /// `tls-exporter`.
+    UnsupportedChannelBindingType,
+    /// The client believes the server has no channel binding, which it has.
+    ServerDoesOfferChannelBinding,
     InvalidUsernameEncoding,
     /// The random source failed.
     NoResources,
@@ -486,6 +544,8 @@ impl ServerError {
             ServerError::InvalidProof => "invalid-proof",
             ServerError::ChannelBindingsDontMatch => "channel-bindings-dont-match",
             ServerError::ChannelBindingNotSupported => "channel-binding-not-supported",
+            ServerError::UnsupportedChannelBindingType => "unsupported-channel-binding-type",
+            ServerError::ServerDoesOfferChannelBinding => "server-does-offer-channel-binding",
             ServerError::InvalidUsernameEncoding => "invalid-username-encoding",
             ServerError::NoResources => "no-resources",
             ServerError::OtherError => "other-error",
@@ -522,8 +582,8 @@ impl ClientFirst {
         match flag {
             // A client that could bind channels but believes the server
             // can't is right
-            "n" | "y" => {}
-            _ if flag.starts_with("p=") => return Err(ServerError::ChannelBindingNotSupported),
+            "n" | "y" | "p=tls-exporter" => {}
+            _ if flag.starts_with("p=") => return Err(ServerError::UnsupportedChannelBindingType),
             _ => return Err(ServerError::InvalidEncoding),
         }
         let attributes = attributes(bare).ok_or(ServerError::InvalidEncoding)?;
@@ -557,6 +617,15 @@ impl ClientFirst {
         })
     }
 
+    /// What the client asked for.
+    pub fn binding(&self) -> RequestedBinding {
+        match self.gs2_header.as_bytes()[0] {
+            b'n' => RequestedBinding::None,
+            b'y' => RequestedBinding::SupportedButUnused,
+            _ => RequestedBinding::TlsExporter,
+        }
+    }
+
     /// The user the client logs in as.
     pub fn username(&self) -> &str {
         &self.username
@@ -564,12 +633,14 @@ impl ClientFirst {
 
     /// The `server-first-message` for `credentials`, with a random nonce,
     /// and the state that checks the client's proof.
+    /// `exporter` is the connection's tls-exporter data, when it has any.
     pub fn respond(
         self,
         credentials: &StoredCredentials,
+        exporter: Option<&[u8; TLS_EXPORTER_LEN]>,
     ) -> Result<(String, AwaitingProof), ServerError> {
         let nonce = random_nonce().map_err(|_| ServerError::NoResources)?;
-        Ok(self.respond_with_nonce(credentials, &nonce))
+        self.respond_with_nonce(credentials, &nonce, exporter)
     }
 
     /// As [`respond`](Self::respond), with `nonce` as the server's part of
@@ -578,7 +649,19 @@ impl ClientFirst {
         self,
         credentials: &StoredCredentials,
         nonce: &str,
-    ) -> (String, AwaitingProof) {
+        exporter: Option<&[u8; TLS_EXPORTER_LEN]>,
+    ) -> Result<(String, AwaitingProof), ServerError> {
+        let mut cbind = self.gs2_header.clone().into_bytes();
+        match (self.binding(), exporter) {
+            (RequestedBinding::TlsExporter, None) => {
+                return Err(ServerError::ChannelBindingNotSupported)
+            }
+            (RequestedBinding::TlsExporter, Some(data)) => cbind.extend_from_slice(data),
+            (RequestedBinding::SupportedButUnused, Some(_)) => {
+                return Err(ServerError::ServerDoesOfferChannelBinding)
+            }
+            _ => {}
+        }
         let combined = format!("{}{nonce}", self.nonce);
         let server_first = format!(
             "r={combined},s={},i={}",
@@ -586,13 +669,13 @@ impl ClientFirst {
             credentials.iterations
         );
         let awaiting = AwaitingProof {
-            channel_binding: STANDARD.encode(&self.gs2_header),
+            channel_binding: STANDARD.encode(cbind),
             nonce: combined,
             auth_prefix: format!("{},{server_first}", self.bare),
             stored_key: credentials.stored_key,
             server_key: credentials.server_key,
         };
-        (server_first, awaiting)
+        Ok((server_first, awaiting))
     }
 }
 
@@ -654,31 +737,6 @@ impl AwaitingProof {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn user_names_are_prepared_with_saslprep() {
-        // U+2168 ROMAN NUMERAL NINE maps to "IX"; U+00AD SOFT HYPHEN maps to nothing
-        let mut client = ScramClient::new("us\u{00AD}er\u{2168}", "pencil");
-        let first = client.start_with_nonce("rOprNGfwEbeRWgbNEkqO").unwrap();
-        assert_eq!(first, "n,,n=userIX,r=rOprNGfwEbeRWgbNEkqO");
-
-        let parsed = ClientFirst::parse("n,,n=us\u{00AD}er\u{2168},r=abc".as_bytes()).unwrap();
-        assert_eq!(parsed.username(), "userIX");
-    }
-
-    #[test]
-    fn user_names_saslprep_refuses_fail_the_exchange() {
-        // U+0007 is a prohibited control character
-        let mut client = ScramClient::new("us\u{0007}er", "pencil");
-        assert!(matches!(
-            client.start_with_nonce("rOprNGfwEbeRWgbNEkqO"),
-            Err(Error::InvalidUsername)
-        ));
-        assert_eq!(
-            ClientFirst::parse("n,,n=us\u{0007}er,r=abc".as_bytes()).err(),
-            Some(ServerError::InvalidUsernameEncoding)
-        );
-    }
     use super::*;
 
     // RFC 7677, section 3
@@ -711,7 +769,9 @@ mod tests {
     fn server_follows_the_rfc_7677_example() {
         let first = ClientFirst::parse(CLIENT_FIRST.as_bytes()).unwrap();
         assert_eq!(first.username(), "user");
-        let (server_first, awaiting) = first.respond_with_nonce(&rfc_credentials(), SERVER_NONCE);
+        let (server_first, awaiting) = first
+            .respond_with_nonce(&rfc_credentials(), SERVER_NONCE, None)
+            .unwrap();
         assert_eq!(server_first, SERVER_FIRST);
         assert_eq!(
             awaiting.verify(CLIENT_FINAL.as_bytes()).unwrap(),
@@ -723,7 +783,7 @@ mod tests {
     fn a_wrong_password_fails_at_the_proof() {
         let mut client = ScramClient::new("user", "pen");
         let first = ClientFirst::parse(client.start().unwrap().as_bytes()).unwrap();
-        let (server_first, awaiting) = first.respond(&rfc_credentials()).unwrap();
+        let (server_first, awaiting) = first.respond(&rfc_credentials(), None).unwrap();
         let client_final = client.respond(server_first.as_bytes()).unwrap();
         assert_eq!(
             awaiting.verify(client_final.as_bytes()).unwrap_err(),
@@ -747,7 +807,7 @@ mod tests {
 
         let mut client = ScramClient::new("nobody", "");
         let first = ClientFirst::parse(client.start().unwrap().as_bytes()).unwrap();
-        let (server_first, awaiting) = first.respond(&decoy).unwrap();
+        let (server_first, awaiting) = first.respond(&decoy, None).unwrap();
         let client_final = client.respond(server_first.as_bytes()).unwrap();
         assert_eq!(
             awaiting.verify(client_final.as_bytes()).unwrap_err(),
@@ -838,12 +898,72 @@ mod tests {
         assert_eq!(client.salted.clone().unwrap(), cached);
     }
 
+    const EXPORTER: [u8; TLS_EXPORTER_LEN] = [7; TLS_EXPORTER_LEN];
+
+    fn bound_exchange(
+        client_sees: [u8; TLS_EXPORTER_LEN],
+        server_sees: Option<&[u8; TLS_EXPORTER_LEN]>,
+    ) -> Result<(), ServerError> {
+        let credentials = StoredCredentials::derive("pencil", b"salt", MIN_ITERATIONS);
+        let mut client = ScramClient::new("user", "pencil");
+        client.set_binding(ClientBinding::TlsExporter(client_sees));
+        let first = client.start_with_nonce("clientnonce").unwrap();
+        assert!(first.starts_with("p=tls-exporter,,n=user,"));
+        let parsed = ClientFirst::parse(first.as_bytes())?;
+        assert_eq!(parsed.binding(), RequestedBinding::TlsExporter);
+        let (server_first, awaiting) =
+            parsed.respond_with_nonce(&credentials, "servernonce", server_sees)?;
+        let client_final = client.respond(server_first.as_bytes()).unwrap();
+        let server_final = awaiting.verify(client_final.as_bytes())?;
+        client.finish(server_final.as_bytes()).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn a_bound_exchange_succeeds_when_both_ends_see_the_same_channel() {
+        assert_eq!(bound_exchange(EXPORTER, Some(&EXPORTER)), Ok(()));
+    }
+
+    #[test]
+    fn a_bound_exchange_fails_across_two_channels() {
+        // What a man in the middle produces: each side has its own TLS session
+        assert_eq!(
+            bound_exchange(EXPORTER, Some(&[8; TLS_EXPORTER_LEN])),
+            Err(ServerError::ChannelBindingsDontMatch)
+        );
+    }
+
+    #[test]
+    fn binding_needs_a_channel_and_a_known_type() {
+        assert_eq!(
+            bound_exchange(EXPORTER, None),
+            Err(ServerError::ChannelBindingNotSupported)
+        );
+        assert_eq!(
+            ClientFirst::parse(b"p=tls-unique,,n=user,r=abc").err(),
+            Some(ServerError::UnsupportedChannelBindingType)
+        );
+    }
+
+    #[test]
+    fn a_client_told_there_is_no_binding_is_refused_where_there_is() {
+        let credentials = StoredCredentials::derive("pencil", b"salt", MIN_ITERATIONS);
+        let parsed = ClientFirst::parse(b"y,,n=user,r=abc").unwrap();
+        assert_eq!(parsed.binding(), RequestedBinding::SupportedButUnused);
+        assert_eq!(
+            parsed
+                .respond_with_nonce(&credentials, "s", Some(&EXPORTER))
+                .err(),
+            Some(ServerError::ServerDoesOfferChannelBinding)
+        );
+    }
+
     #[test]
     fn the_server_refuses_channel_binding_extensions_and_bad_names() {
         let parse = |message: &str| ClientFirst::parse(message.as_bytes()).map(|_| ());
         assert_eq!(
             parse("p=tls-server-end-point,,n=user,r=abc"),
-            Err(ServerError::ChannelBindingNotSupported)
+            Err(ServerError::UnsupportedChannelBindingType)
         );
         assert_eq!(parse("y,,n=user,r=abc"), Ok(()));
         assert_eq!(
@@ -885,7 +1005,9 @@ mod tests {
     fn the_server_checks_the_client_final_message() {
         let verify = |client_final: &str| {
             let first = ClientFirst::parse(CLIENT_FIRST.as_bytes()).unwrap();
-            let (_, awaiting) = first.respond_with_nonce(&rfc_credentials(), SERVER_NONCE);
+            let (_, awaiting) = first
+                .respond_with_nonce(&rfc_credentials(), SERVER_NONCE, None)
+                .unwrap();
             awaiting.verify(client_final.as_bytes())
         };
         let nonce = "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
@@ -940,5 +1062,30 @@ mod tests {
         let b = StoredCredentials::generate("pencil", MIN_ITERATIONS).unwrap();
         assert_ne!(a.salt, b.salt);
         assert_eq!(a.salt.len(), SALT_LEN);
+    }
+
+    #[test]
+    fn user_names_are_prepared_with_saslprep() {
+        // U+2168 ROMAN NUMERAL NINE maps to "IX"; U+00AD SOFT HYPHEN maps to nothing
+        let mut client = ScramClient::new("us\u{00AD}er\u{2168}", "pencil");
+        let first = client.start_with_nonce("rOprNGfwEbeRWgbNEkqO").unwrap();
+        assert_eq!(first, "n,,n=userIX,r=rOprNGfwEbeRWgbNEkqO");
+
+        let parsed = ClientFirst::parse("n,,n=us\u{00AD}er\u{2168},r=abc".as_bytes()).unwrap();
+        assert_eq!(parsed.username(), "userIX");
+    }
+
+    #[test]
+    fn user_names_saslprep_refuses_fail_the_exchange() {
+        // U+0007 is a prohibited control character
+        let mut client = ScramClient::new("us\u{0007}er", "pencil");
+        assert!(matches!(
+            client.start_with_nonce("rOprNGfwEbeRWgbNEkqO"),
+            Err(Error::InvalidUsername)
+        ));
+        assert_eq!(
+            ClientFirst::parse("n,,n=us\u{0007}er,r=abc".as_bytes()).err(),
+            Some(ServerError::InvalidUsernameEncoding)
+        );
     }
 }

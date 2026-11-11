@@ -19,7 +19,7 @@ let client_first = client.start().unwrap();
 
 let first = ClientFirst::parse(client_first.as_bytes()).unwrap();
 assert_eq!(first.username(), "user");
-let (server_first, awaiting) = first.respond(&stored).unwrap();
+let (server_first, awaiting) = first.respond(&stored, None).unwrap();
 
 let client_final = client.respond(server_first.as_bytes()).unwrap();
 let server_final = awaiting.verify(client_final.as_bytes()).unwrap();

@@ -210,7 +210,8 @@ let options = ConnectOptions::new("broker.example.com", 443)
 
 let options = ConnectOptions::new("localhost", 1883)
     .authenticator(ScramSha256::new("alice", "secret"));</pre>
-<p>Otherwise, implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>Bytes</code>, which the crate re-exports from the <code>bytes</code> crate, as it does <code>ReasonCode</code>, <code>QoS</code> and <code>ProtocolVersion</code>:</p>
+<p>For SCRAM-SHA-256-PLUS, which ties the login to the TLS connection (<a href="security.html#scram-plus">details</a>), use <code>ScramSha256::new("alice", "secret").channel_binding(true)</code>. It needs a TLS 1.3 connection made by the client itself: on any other connection, and with a custom <code>connector</code>, which never provides the TLS exporter, it fails before CONNECT is sent with "channel binding needs a TLS 1.3 connection".</p>
+<p>Otherwise, implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. <code>start()</code> returns an error to stop the connection before CONNECT is sent. Before it, the client calls <code>channel(exporter)</code> with the 32-byte TLS exporter value of the connection, or <code>None</code> when it has none; the default does nothing. Authentication data is <code>Bytes</code>, which the crate re-exports from the <code>bytes</code> crate, as it does <code>ReasonCode</code>, <code>QoS</code> and <code>ProtocolVersion</code>:</p>
 <pre>use mercurio_client::{Authenticator, Bytes};
 
 struct Token(String);
@@ -220,8 +221,8 @@ impl Authenticator for Token {
         "TOKEN".into()
     }
 
-    fn start(&amp;mut self) -&gt; Option&lt;Bytes&gt; {
-        Some(Bytes::from(self.0.clone()))
+    fn start(&amp;mut self) -&gt; Result&lt;Option&lt;Bytes&gt;, String&gt; {
+        Ok(Some(Bytes::from(self.0.clone())))
     }
 
     fn respond(&amp;mut self, _challenge: Option&lt;Bytes&gt;) -&gt; Result&lt;Option&lt;Bytes&gt;, String&gt; {

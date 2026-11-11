@@ -319,6 +319,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     cert_identity: Option<String>,
     /// Whether the connection is TLS
     tls: bool,
+    tls_exporter: Option<[u8; 32]>,
     mount_point: Option<String>,
     http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
@@ -457,6 +458,16 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         );
                         return None;
                     }
+                }
+                let (_, conn) = tls_stream.get_ref();
+                if conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
+                    self.tls_exporter = conn
+                        .export_keying_material(
+                            [0u8; 32],
+                            mercurio_scram::TLS_EXPORTER_LABEL,
+                            Some(&[]),
+                        )
+                        .ok();
                 }
                 self.tls = true;
                 Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
@@ -608,6 +619,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             stats: self.stats,
             cert_identity: self.cert_identity,
             tls: self.tls,
+            tls_exporter: self.tls_exporter,
             mount_point: self.mount_point,
             connection_info: None,
             local: self.local,
@@ -669,6 +681,7 @@ where
     limits: Limits,
     cert_identity: Option<String>,
     tls: bool,
+    tls_exporter: Option<[u8; 32]>,
     mount_point: Option<String>,
     /// What plugins are told about the connection, once CONNECT is read
     connection_info: Option<Arc<ConnectionInfo>>,
@@ -1297,6 +1310,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 tls: false,
+                tls_exporter: None,
                 mount_point: None,
                 http_site: None,
                 allowed_origins: None,
@@ -1551,6 +1565,7 @@ where
         let mut connection_info =
             ConnectionInfo::new(Arc::clone(&self.listener), connect_packet.protocol_version);
         connection_info.tls = self.tls;
+        connection_info.tls_exporter = self.tls_exporter;
         connection_info.certificate = self.cert_identity.clone();
         connection_info.mount_point = self.mount_point.clone();
         self.connection_info = Some(Arc::new(connection_info));

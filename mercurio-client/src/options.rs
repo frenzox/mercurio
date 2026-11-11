@@ -335,8 +335,13 @@ pub trait Authenticator: Send {
     /// The method name the broker knows it by.
     fn method(&self) -> String;
 
-    /// Begins an exchange, returning the data to send first.
-    fn start(&mut self) -> Option<Bytes>;
+    /// Called before every `start`, including a re-authentication, with the connection's
+    /// tls-exporter channel binding data: None unless it is TLS 1.3.
+    fn channel(&mut self, _tls_exporter: Option<[u8; 32]>) {}
+
+    /// Begins an exchange, returning the data to send first. An error gives
+    /// up before anything goes to the broker.
+    fn start(&mut self) -> Result<Option<Bytes>, String>;
 
     /// Answers a challenge from the broker. An error gives up, closing the
     /// connection.

@@ -55,8 +55,8 @@ impl Authenticator for Slow {
         "SLOW".into()
     }
 
-    fn start(&mut self) -> Option<Bytes> {
-        None
+    fn start(&mut self) -> Result<Option<Bytes>, String> {
+        Ok(None)
     }
 
     fn respond(&mut self, _: Option<Bytes>) -> Result<Option<Bytes>, String> {

@@ -166,6 +166,9 @@ pub struct ConnectionInfo {
     /// The listener's mount point, which prefixes every topic the client
     /// uses; topics reach plugins with it
     pub mount_point: Option<String>,
+    /// The connection's tls-exporter channel binding data (RFC 9266), for
+    /// SCRAM-SHA-256-PLUS. None unless the connection is TLS 1.3.
+    pub tls_exporter: Option<[u8; 32]>,
 }
 
 impl ConnectionInfo {
@@ -176,6 +179,7 @@ impl ConnectionInfo {
             tls: false,
             certificate: None,
             mount_point: None,
+            tls_exporter: None,
         }
     }
 }
