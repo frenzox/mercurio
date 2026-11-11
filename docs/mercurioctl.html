@@ -118,7 +118,7 @@ mercurioctl retained delete 'old/#'
 mercurioctl broker log-level info,mercurio_server::session=debug</pre>
 
 <h2 id="dynsec">Dynamic security</h2>
-<p><code>mercurioctl dynsec</code> runs the <a href="security.html#dynamic-security">dynamic security</a> commands, named in kebab-case as <code>mosquitto_ctrl</code> names them: <code>createClient</code> is <code>dynsec create-client</code>, <code>addRoleACL</code> is <code>dynsec add-role-acl</code>.</p>
+<p><code>mercurioctl dynsec</code> runs the <a href="security.html#dynamic-security">dynamic security</a> commands under <code>mosquitto_ctrl</code>'s names in kebab-case: <code>createClient</code> is <code>dynsec create-client</code>, <code>addRoleACL</code> is <code>dynsec add-role-acl</code>.</p>
 <pre><span class="comment"># A role that may publish under sensors/, a group with it, and a client in the group</span>
 mercurioctl dynsec create-role sensor
 mercurioctl dynsec add-role-acl sensor publishClientSend 'sensors/#' allow

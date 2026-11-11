@@ -118,6 +118,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td><code>allow_anonymous</code></td><td><code>[auth] enabled = true</code> with <code>allow_anonymous</code></td></tr>
 <tr><td><code>password_file</code>, <code>acl_file</code></td><td>the same, in <code>[auth]</code></td></tr>
 <tr><td>dynamic security plugin</td><td><code>[auth] dynamic_security</code>, with the same commands; create the file with <code>mercuriod dynsec-init</code></td></tr>
+<tr><td><code>mosquitto_ctrl dynsec …</code></td><td><a href="mercurioctl.html#dynsec"><code>mercurioctl dynsec …</code></a>, with the same commands in kebab-case; <code>mosquitto_ctrl dynsec init</code> is <code>mercuriod dynsec-init</code></td></tr>
 <tr><td>mosquitto-go-auth HTTP backend</td><td><code>[auth.http]</code></td></tr>
 <tr><td><code>check_retain_source</code></td><td><code>check_retain_source</code></td></tr>
 <tr><td><code>allow_zero_length_clientid</code>, <code>auto_id_prefix</code>, <code>clientid_prefixes</code></td><td>the same, in <code>[server]</code></td></tr>
@@ -163,7 +164,8 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <li>A bridge's local side is trusted: this broker's ACLs don't restrict what it forwards in.</li>
 <li>Bridges to MQTT 3.1.1 brokers drop the remote broker's echo of what they forwarded, without mosquitto's <code>try_private</code> extension; see <a href="bridges.html">Bridges</a>.</li>
 <li>Over HTTP authentication, <code>clientid</code> is empty in login requests.</li>
-<li>Dynamic security has no client or group priorities for roles; the ACL priority decides.</li>
+<li>Dynamic security has no client or group priorities for roles; the ACL priority decides. It has no <code>modifyClient</code>, <code>modifyGroup</code> or <code>modifyRole</code>: change clients, groups and roles with the add, remove and set commands.</li>
+<li>The answer to a <code>$CONTROL</code> request goes only to the client that sent it. Other clients subscribed to <code>…/response</code> don't see it.</li>
 </ul>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>
