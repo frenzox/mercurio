@@ -350,7 +350,6 @@ impl<S: BatchStore + 'static> Abandon for SessionManager<S> {
                         .await;
                     drop(guard);
                     manager.let_go(&client_id, generation).await;
-                    manager.expire_after(client_id, generation, expiry).await;
                 });
             }
         }
@@ -896,16 +895,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.end_own_session(&lease.client_id, lease.generation, expiry)
             .await;
         self.release(&mut lease).await;
-        self.expire_after(
-            std::mem::take(&mut lease.client_id),
-            lease.generation,
-            expiry,
-        )
-        .await;
     }
 
     /// What ending its connection does to the session of `client_id` while
-    /// the connection of `generation` still holds the client id.
+    /// the connection of `generation` still holds the client id. Done
+    /// before the id is released, so all of it comes before anything a
+    /// connection taking over does, in memory and in storage.
     async fn end_own_session(&self, client_id: &str, generation: u64, expiry: Option<Duration>) {
         // Ending before releasing the id means a connection waiting to take
         // over can never observe a session that is about to vanish
@@ -922,20 +917,17 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 }
             }
         }
-    }
-
-    /// Ends the session of a connection that has ended after its `expiry`.
-    async fn expire_after(&self, client_id: String, generation: u64, expiry: Option<Duration>) {
         if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
             // Recorded so a restarted broker still expires the session
             self.writers.write(
-                &client_id,
+                client_id,
                 Write::SetExpiry {
                     interval: expiry.as_secs() as u32,
                     expires_at: unix_millis() + expiry.as_millis() as u64,
                 },
             );
-            self.schedule_end(client_id, generation, expiry).await;
+            self.schedule_end(client_id.to_string(), generation, expiry)
+                .await;
         }
     }
 
@@ -2575,6 +2567,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the admission stayed behind");
+    }
+
+    #[tokio::test]
+    async fn test_an_end_of_connection_abandoned_once_released_still_expires() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+
+        let held = manager.shared.state.lock().await;
+        let mut ending =
+            Box::pin(manager.end_connection(started.lease, Some(Duration::from_millis(100))));
+        assert!(poll_briefly(&mut ending).await.is_none());
+        // Takes one more step, then waits for the manager's lock again
+        let release = queue_for_lock(&manager).await;
+        drop(held);
+        assert!(poll_briefly(&mut ending).await.is_none());
+        drop(ending);
+        let _ = release.send(());
+
+        assert!(gone(&manager, "c").await, "the session never expires");
     }
 
     #[tokio::test]
