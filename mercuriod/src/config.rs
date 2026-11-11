@@ -213,6 +213,15 @@ pub struct ListenerConfig {
     /// plain HTTP requests
     pub http_dir: Option<String>,
 
+    /// With `protocol = "websocket"`, answer `GET /healthz`
+    #[serde(default)]
+    pub health: bool,
+
+    /// With `protocol = "websocket"`, answer `GET /metrics` with the
+    /// statistics in the Prometheus text format
+    #[serde(default)]
+    pub metrics: bool,
+
     /// With `protocol = "websocket"`, the origins of the web pages that
     /// may connect, such as `https://app.example.com`; any when unset
     pub allowed_origins: Option<Vec<String>>,
@@ -794,7 +803,7 @@ pub struct ServerConfig {
     pub max_session_expiry: Option<u64>,
 
     /// Topics that may hold a retained message at once, the broker's own
-    /// `$SYS` topics included; unbounded when unset
+    /// `$SYS` topics not counted; unbounded when unset
     pub max_retained_messages: Option<usize>,
 
     /// Connections one client address may hold at once, the address a PROXY
@@ -1768,6 +1777,7 @@ mod tests {
         assert!(config.server.redirect.is_some());
         assert!(config.auth.http.is_some());
         assert!(config.listeners.iter().any(|l| l.auth.is_some()));
+        assert!(config.listeners.iter().any(|l| l.health && l.metrics));
         assert!(config.bridges.iter().any(|b| !b.topics.is_empty()));
 
         let storage = storage.as_table().unwrap();

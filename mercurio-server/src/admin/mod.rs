@@ -633,6 +633,7 @@ impl Admin {
             messages_out: get(&s.counters.messages_out),
             bytes_in: get(&s.counters.bytes_in),
             bytes_out: get(&s.counters.bytes_out),
+            dropped: summary.dropped,
         })
     }
 
@@ -814,6 +815,10 @@ fn summary(entry: &ClientEntry, s: &SessionSnapshot) -> ClientSummary {
         subscriptions: s.subscriptions.len(),
         queued: s.queued,
         inflight: s.inflight,
+        dropped: s
+            .counters
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 

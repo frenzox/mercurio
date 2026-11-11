@@ -36,6 +36,7 @@ mod credentials;
 mod dynsec;
 mod http_auth;
 mod logging;
+mod notify;
 mod password_file;
 mod reload;
 #[cfg(unix)]
@@ -220,10 +221,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(held) => held,
                 None if *standby => {
                     info!("Another broker is using the database; standing by to take over");
+                    notify::notify("STATUS=Standing by: another broker is using the database");
                     let held = PostgresStore::connect_exclusive(url, &options, true)
                         .await?
                         .expect("waiting returns once the database is taken");
                     info!("Took over the database");
+                    notify::notify("STATUS=Took over the database, starting");
                     held
                 }
                 None => {
@@ -237,14 +240,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => (None, None),
     };
+    // Listened for from now on, before the service manager is told the
+    // broker is ready and may stop it; a standby still waiting is stopped
+    // by SIGTERM's default action
+    #[cfg(unix)]
+    let terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let stop = shutdown_signal(
+        #[cfg(unix)]
+        terminate,
+    );
     let shutdown = async {
         match &database_lock {
             Some(lock) => tokio::select! {
-                _ = shutdown_signal() => {}
+                _ = stop => {}
                 _ = lock.lost() => error!("Lost hold of the database; stopping, since a standby may take over"),
             },
-            None => shutdown_signal().await,
+            None => stop.await,
         }
+        notify::notify("STOPPING=1");
     };
 
     info!("Starting Mercurio MQTT broker on {}", listen_addr);
@@ -288,6 +301,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
         value.http_dir = extra.http_dir.clone().map(Into::into);
+        value.health = extra.health;
+        value.metrics = extra.metrics;
         value.allowed_origins = extra.allowed_origins.clone();
         value.auth = prepared.auth;
         value.plugins = prepared.plugins;
@@ -524,6 +539,9 @@ async fn serve<St: MqttStore + 'static>(
     if let Some(dynsec) = dynsec {
         dynsec.set_admin(server.admin());
     }
+    // The listeners are bound and the sessions restored: from here on,
+    // connections are served
+    notify::notify("READY=1\nSTATUS=Serving");
     server.run(shutdown).await
 }
 
@@ -605,17 +623,13 @@ async fn bind_listener(listener: &config::ListenerConfig) -> Result<(Socket, Str
     }
 }
 
-/// Resolves on Ctrl+C or, on Unix, SIGTERM: what service managers and
-/// container runtimes send to stop the daemon.
-async fn shutdown_signal() {
+/// Resolves on Ctrl+C or, on Unix, on `terminate`'s SIGTERM: what service
+/// managers and container runtimes send to stop the daemon.
+async fn shutdown_signal(#[cfg(unix)] mut terminate: signal::unix::Signal) {
     #[cfg(unix)]
-    {
-        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to listen for SIGTERM");
-        tokio::select! {
-            _ = signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
+    tokio::select! {
+        _ = signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
     }
     #[cfg(not(unix))]
     let _ = signal::ctrl_c().await;

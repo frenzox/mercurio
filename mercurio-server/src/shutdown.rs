@@ -32,6 +32,17 @@ impl Shutdown {
         self.shutdown
     }
 
+    /// Whether the shutdown signal has been sent, without waiting for it.
+    pub(crate) fn is_signalled(&mut self) -> bool {
+        if !self.shutdown {
+            self.shutdown = !matches!(
+                self.notify.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            );
+        }
+        self.shutdown
+    }
+
     /// Receive the shutdown notice, waiting if necessary.
     pub(crate) async fn recv(&mut self) {
         // If the shutdown signal has already been received, then return
@@ -45,5 +56,20 @@ impl Shutdown {
 
         // Remember that the signal has been received.
         self.shutdown = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_signal_is_seen_without_waiting() {
+        let (notify, receiver) = broadcast::channel(1);
+        let mut shutdown = Shutdown::new(receiver);
+        assert!(!shutdown.is_signalled());
+        notify.send(()).unwrap();
+        assert!(shutdown.is_signalled());
+        assert!(shutdown.is_shutdown());
     }
 }

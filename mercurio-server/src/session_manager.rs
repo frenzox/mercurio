@@ -31,6 +31,7 @@ use crate::{
     plugin::{Chain, Event},
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
+    sys::Stats,
     writer::Writers,
 };
 
@@ -44,6 +45,8 @@ pub(crate) struct SessionManager<S: BatchStore> {
     /// Every change to what is stored for a client goes through its writer
     writers: Writers<S>,
     queue_limits: QueueLimits,
+    /// Where the sessions' queues count the messages they lose
+    stats: Arc<Stats>,
     /// How long a new connection waits for the one it takes over to let go
     /// of the client id; forever when unset
     takeover_wait: Option<Duration>,
@@ -56,6 +59,7 @@ impl<S: BatchStore> Clone for SessionManager<S> {
             storage: Arc::clone(&self.storage),
             writers: self.writers.clone(),
             queue_limits: self.queue_limits,
+            stats: Arc::clone(&self.stats),
             takeover_wait: self.takeover_wait,
         }
     }
@@ -408,9 +412,11 @@ impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
         storage: Arc<S>,
         queue_limits: QueueLimits,
         takeover_wait: Duration,
+        stats: Arc<Stats>,
     ) -> SessionManagerDropGuard<S> {
         let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits);
         session_manager.takeover_wait = Some(takeover_wait);
+        session_manager.stats = stats;
         SessionManagerDropGuard { session_manager }
     }
 
@@ -472,6 +478,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             writers: Writers::new(Arc::clone(&storage)),
             storage,
             queue_limits,
+            stats: Default::default(),
             takeover_wait: None,
         }
     }
@@ -571,7 +578,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 session.stop_queue_journal();
                 session
             }
-            None => SessionDropGuard::new(connect_packet, self.queue_limits).session(),
+            None => {
+                SessionDropGuard::new(connect_packet, self.queue_limits, Arc::clone(&self.stats))
+                    .session()
+            }
         };
         session.set_generation(generation).await;
         session.set_owner(owner.clone()).await;
@@ -1161,7 +1171,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 ..Default::default()
             },
         };
-        let mut session = SessionDropGuard::new(connect_packet, self.queue_limits).session();
+        let mut session =
+            SessionDropGuard::new(connect_packet, self.queue_limits, Arc::clone(&self.stats))
+                .session();
         session.set_owner(state.owner.clone()).await;
         let expires_at = state.expires_at.or_else(|| {
             state

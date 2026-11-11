@@ -5,7 +5,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# The broker notifies readiness once its listeners are bound and it serves,
+# so units ordered after it start against a broker that accepts clients. A
+# PostgreSQL standby only does once it takes over, and shows that it waits
+# in `systemctl status`; as that may take any time, starting never times
+# out. The main process sends the notifications, which NotifyAccess's
+# default allows, through an AF_UNIX socket, which the sandbox below allows.
+Type=notify
+TimeoutStartSec=infinity
 # The packages create a static mercurio user, so files such as TLS keys can
 # be given to it; without one, systemd allocates a dynamic user of that name
 User=mercurio

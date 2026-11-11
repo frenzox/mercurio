@@ -69,7 +69,7 @@ use crate::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
     shutdown::Shutdown,
-    sys::{self, ConnectedGuard, Stats},
+    sys::{self, ConnectedGuard, DropCause, Stats},
     tls::{certificate_name, Tls},
     websocket,
 };
@@ -161,9 +161,9 @@ pub struct Limits {
     /// for longer, or for no expiry, are told to use this; it also bounds
     /// `persistent_client_expiration`. Unbounded when unset.
     pub max_session_expiry: Option<Duration>,
-    /// Topics that may hold a retained message at once, the broker's own
-    /// `$SYS` statistics included; retaining a message on another topic is
-    /// then refused with Quota Exceeded. Unbounded when unset.
+    /// Topics that may hold a retained message at once; retaining a message
+    /// on another topic is then refused with Quota Exceeded. The broker's
+    /// own `$SYS` topics, kept in memory, don't count. Unbounded when unset.
     pub max_retained_messages: Option<usize>,
     /// Connections one client address may hold at once, counting the
     /// address a PROXY header gives; further ones are closed before any
@@ -305,6 +305,14 @@ pub struct ListenerConfig {
     /// connect timeout, and a listener sends 32 at once at most; requests
     /// beyond that get Service Unavailable.
     pub http_dir: Option<PathBuf>,
+    /// On WebSocket listeners, answer `GET /healthz` with 200 OK while the
+    /// broker serves and 503 Service Unavailable once it is stopping.
+    pub health: bool,
+    /// On WebSocket listeners, answer `GET /metrics` with the `$SYS`
+    /// counters in the Prometheus text format. They tell anyone who reaches
+    /// the listener how loaded the broker is, so enable it on a listener
+    /// only monitoring can reach, such as one on a loopback address.
+    pub metrics: bool,
     /// On WebSocket listeners, the origins of the web pages that may
     /// connect, such as `https://app.example.com`. Browsers say which page
     /// opens a WebSocket in its `Origin` header; an upgrade from any other
@@ -344,6 +352,8 @@ impl ListenerConfig {
             plugins: None,
             max_connections: None,
             http_dir: None,
+            health: false,
+            metrics: false,
             allowed_origins: None,
             trusted: false,
             #[cfg(unix)]
@@ -445,7 +455,7 @@ struct EndpointSettings {
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
     chain: Option<Chain>,
-    http_files: Option<Arc<http::Files>>,
+    http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
 }
 
@@ -482,10 +492,14 @@ impl Endpoint {
             }
         }
         if config.transport != Transport::WebSocket
-            && (config.http_dir.is_some() || config.allowed_origins.is_some())
+            && (config.http_dir.is_some()
+                || config.allowed_origins.is_some()
+                || config.health
+                || config.metrics)
         {
             return Err(ServerError::Config(
-                "http_dir and allowed_origins only apply to WebSocket listeners".into(),
+                "http_dir, allowed_origins, health and metrics only apply to WebSocket listeners"
+                    .into(),
             ));
         }
         // A Unix socket's file permissions decide who may send the header
@@ -560,7 +574,15 @@ impl Endpoint {
                     false => config.auth.map(Arc::new),
                 },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
-                http_files: config.http_dir.map(|dir| Arc::new(http::Files::new(dir))),
+                http_site: (config.http_dir.is_some() || config.health || config.metrics).then(
+                    || {
+                        Arc::new(http::Site::new(
+                            config.http_dir,
+                            config.health,
+                            config.metrics,
+                        ))
+                    },
+                ),
                 allowed_origins: config.allowed_origins.map(Into::into),
             },
         })
@@ -615,7 +637,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// user name
     cert_identity: Option<String>,
     mount_point: Option<String>,
-    http_files: Option<Arc<http::Files>>,
+    http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
     /// An in-process connection, from the local listener
     local: bool,
@@ -716,7 +738,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         self.mount_point = settings.mount_point;
-        self.http_files = settings.http_files;
+        self.http_site = settings.http_site;
         self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
@@ -760,14 +782,14 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
     }
 
-    /// Reads the HTTP request on a WebSocket listener with files to serve.
+    /// Reads the HTTP request on a WebSocket listener with a site to serve.
     /// A WebSocket upgrade is returned to complete; any other request is
-    /// answered from `files`, under its own deadline as sending a file may
+    /// answered from `site`, under its own deadline as sending a file may
     /// take longer than connecting does, and None returned.
     async fn serve_http<S>(
         &mut self,
         stream: S,
-        files: &http::Files,
+        site: &http::Site,
         peer_addr: Option<SocketAddr>,
     ) -> Option<http::Rewind<S>>
     where
@@ -777,7 +799,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let (stream, head) =
             match connect_step(&mut self.shutdown, self.connect_deadline, request).await? {
                 Ok(Ok(http::Request::Upgrade(upgrade))) => return Some(upgrade),
-                Ok(Ok(http::Request::Files(stream, head))) => (stream, head),
+                Ok(Ok(http::Request::Plain(stream, head))) => (stream, head),
                 Ok(Err(e)) => {
                     debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e);
                     return None;
@@ -788,8 +810,37 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 }
             };
         let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
-        let response = Box::pin(http::respond(stream, &head, files));
-        match connect_step(&mut self.shutdown, deadline, response).await? {
+        let stopping = self.shutdown.is_signalled();
+        let (broker, session_manager, stats) = (&self.broker, &self.session_manager, &self.stats);
+        let page = |endpoint| async move {
+            match endpoint {
+                http::Endpoint::Health if stopping => http::Page {
+                    status: "503 Service Unavailable",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "stopping\n".into(),
+                },
+                http::Endpoint::Health => http::Page {
+                    status: "200 OK",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "ok\n".into(),
+                },
+                http::Endpoint::Metrics => {
+                    let counters = sys::current(broker, session_manager, stats).await;
+                    http::Page {
+                        status: "200 OK",
+                        content_type: "text/plain; version=0.0.4; charset=utf-8",
+                        body: sys::prometheus(&counters, stats),
+                    }
+                }
+            }
+        };
+        let response = Box::pin(http::respond(stream, &head, site, page));
+        // Once stopping, the answer must not be cut short by it
+        let answered = match stopping {
+            true => Some(time::timeout_at(deadline, response).await),
+            false => connect_step(&mut self.shutdown, deadline, response).await,
+        };
+        match answered? {
             Ok(Err(e)) => debug!(
                 target: CONNECTIONS,
                 "HTTP response to {:?} failed: {}", peer_addr, e
@@ -809,9 +860,8 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match transport {
             Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
-                let stream = match self.http_files.clone() {
-                    Some(files) => match Box::pin(self.serve_http(stream, &files, peer_addr)).await
-                    {
+                let stream = match self.http_site.clone() {
+                    Some(site) => match Box::pin(self.serve_http(stream, &site, peer_addr)).await {
                         Some(upgrade) => upgrade,
                         None => return,
                     },
@@ -1138,17 +1188,22 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-        let broker = Broker::new(Arc::clone(&storage));
-        let session_manager_holder =
-            SessionManagerDropGuard::new(Arc::clone(&storage), limits.queue, limits.write_timeout);
+        let broker = Broker::new(Arc::clone(&storage)).counted_in(Arc::clone(&stats));
+        let session_manager_holder = SessionManagerDropGuard::new(
+            Arc::clone(&storage),
+            limits.queue,
+            limits.write_timeout,
+            Arc::clone(&stats),
+        );
         let session_manager = session_manager_holder.session_manager();
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
         let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
+        broker.forget_stored_sys().await;
 
         let admin = Admin::new(AdminParts {
             directory: Arc::new(session_manager.clone()),
-            retained: storage.clone(),
+            retained: broker.retained_store(),
             topics: broker.topics(),
             stats: Arc::clone(&stats),
             listeners: endpoints.iter().map(|e| Arc::clone(&e.state)).collect(),
@@ -1402,7 +1457,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
-                http_files: None,
+                http_site: None,
                 allowed_origins: None,
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
@@ -2410,6 +2465,7 @@ where
                 .may(&identity, &message.topic, Access::Read)
                 .await
             {
+                session.count_drop(DropCause::NotAuthorized);
                 return Ok(Flow::Continue);
             }
         }

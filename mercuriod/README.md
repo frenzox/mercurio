@@ -183,8 +183,8 @@ max_inflight = 64
 # Most seconds any session may outlive its connection, MQTT 5 clients
 # included; worth setting where clients aren't trusted (unbounded by default)
 # max_session_expiry = 2592000
-# Topics that may hold a retained message at once, about 20 of the broker's
-# own $SYS topics included; further ones get Quota Exceeded (unbounded)
+# Topics that may hold a retained message at once, the broker's own $SYS
+# topics not counted; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
@@ -324,6 +324,18 @@ group = "mercurio"
 # Web pages from other origins are refused (browsers send the page's origin;
 # other clients send none and are not affected); any origin when unset
 # allowed_origins = ["https://app.example.com"]
+#
+# Health and Prometheus metrics endpoints over HTTP, on WebSocket listeners
+# only and off by default: GET /healthz answers 200 while the broker serves,
+# GET /metrics the statistics. Metrics tell anyone who reaches the listener
+# how loaded the broker is, so give them a listener of their own on a
+# loopback address
+# [[listeners]]
+# host = "127.0.0.1"
+# port = 9883
+# protocol = "websocket"
+# health = true
+# metrics = true
 #
 # Unix domain socket, for clients on the same machine. It belongs to the
 # broker's user with mode 0600, so only that user may connect, unless
@@ -685,10 +697,26 @@ Every `sys_interval` seconds the broker publishes retained statistics under
 `clients/connected`, `clients/disconnected`, `clients/total`,
 `clients/maximum`, `clients/expired`, `messages/received`,
 `messages/sent`, `bytes/received`, `bytes/sent`,
-`retained messages/count` and `subscriptions/count`, and the 1, 5 and 15
-minute averages per minute of messages, bytes and connections under
-`load/`, such as `load/messages/received/1min`. Clients
-may subscribe to them, but not publish to `$SYS` topics.
+`retained messages/count`, `subscriptions/count` and
+`publish/messages/dropped`, the messages lost before reaching a subscriber.
+Mercurio adds the dropped messages by cause under
+`publish/messages/dropped/` (`queue_full_qos0`, `queue_full`, `expired`,
+`too_large`, `not_authorized`, `no_share_member`) and the storage batches
+retried and given up on as `store/batches/retried` and
+`store/batches/dropped`. Under `load/` come the 1, 5 and 15
+minute averages per minute of messages, bytes and connections, such as
+`load/messages/received/1min`. Clients
+may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`
+messages, bridge states included, are kept in memory: new subscribers get
+the latest values, but they are not stored and don't count toward
+`max_retained_messages`.
+
+A WebSocket listener with `health = true` answers `GET /healthz` with 200
+while the broker serves; with `metrics = true`, `GET /metrics` gets the same
+counters in the Prometheus text format, as `mercurio_*` metrics. Both are
+off by default. Metrics show anyone who reaches the listener how loaded the
+broker is, so serve them on a listener of their own on a loopback address,
+as in the sample above.
 
 ## Running
 
@@ -719,6 +747,13 @@ It runs the broker sandboxed, with `/var/lib/mercurio` (for the SQLite
 database) and `/var/log/mercurio` (for a log `file`) as its only writable
 directories. Files the broker creates are readable by its user only, and
 it may keep 65536 files open, as each client connection takes one.
+
+The unit is `Type=notify`: the broker sends `READY=1` to `$NOTIFY_SOCKET`
+once its listeners are bound and it serves, so `systemctl start` returns,
+and units ordered after it start, only then. A PostgreSQL standby sends it
+once it takes over, and until then reports `STATUS=Standing by: ...` in
+`systemctl status`; as that may take any time, the unit sets
+`TimeoutStartSec=infinity`. On shutdown the broker sends `STOPPING=1`.
 
 ```bash
 # Copy service file

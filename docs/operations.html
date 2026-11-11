@@ -97,7 +97,7 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 </table>
 
 <h2 id="sys">$SYS statistics</h2>
-<p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged.</p>
+<p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged. Retained <code>$SYS</code> messages, bridge states included, are kept in memory: a new subscriber gets the latest values, but they are not written to storage and don't count toward <code>max_retained_messages</code> or <code>retained messages/count</code>.</p>
 <pre>recado sub -t '$SYS/broker/#' -T</pre>
 <table>
 <tr><th>Topic</th><th>Value</th></tr>
@@ -110,13 +110,64 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>clients/expired</code></td><td>Sessions ended by their expiry</td></tr>
 <tr><td><code>messages/received</code>, <code>messages/sent</code></td><td>PUBLISH packets since start</td></tr>
 <tr><td><code>bytes/received</code>, <code>bytes/sent</code></td><td>Bytes since start</td></tr>
-<tr><td><code>retained messages/count</code></td><td>Retained messages stored</td></tr>
+<tr><td><code>retained messages/count</code></td><td>Retained messages stored, <code>$SYS</code> ones not counted</td></tr>
 <tr><td><code>subscriptions/count</code></td><td>Subscriptions</td></tr>
+<tr><td><code>publish/messages/dropped</code></td><td>Messages accepted from a publisher and lost before reaching a subscriber, since start</td></tr>
+<tr><td><code>publish/messages/dropped/queue_full_qos0</code></td><td>QoS 0 messages that found a session's queue at <code>max_queued_qos0_messages</code></td></tr>
+<tr><td><code>publish/messages/dropped/queue_full</code></td><td>QoS 1 and 2 messages that found a session's queue at <code>max_queued_messages</code> or <code>max_queued_bytes</code></td></tr>
+<tr><td><code>publish/messages/dropped/expired</code></td><td>Messages whose expiry interval passed while they waited in a queue</td></tr>
+<tr><td><code>publish/messages/dropped/too_large</code></td><td>Messages larger than the subscriber's Maximum Packet Size</td></tr>
+<tr><td><code>publish/messages/dropped/not_authorized</code></td><td>Messages on a topic the subscriber may not read, although its subscription matched</td></tr>
+<tr><td><code>publish/messages/dropped/no_share_member</code></td><td>Messages no member of a shared subscription's group could take</td></tr>
+<tr><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td><td>Batches of session changes written again after a storage error, and given up on, their changes lost on the next restart</td></tr>
 <tr><td><code>load/messages/received/1min</code>, <code>5min</code>, <code>15min</code></td><td>Messages received per minute, averaged over 1, 5 and 15 minutes</td></tr>
 <tr><td><code>load/messages/sent/…</code>, <code>load/bytes/received/…</code>, <code>load/bytes/sent/…</code>, <code>load/connections/…</code></td><td>The same for messages sent, bytes and new connections</td></tr>
 <tr><td><code>connection/&lt;client id&gt;/state</code></td><td><code>1</code> or <code>0</code> for each <a href="bridges.html">bridge</a></td></tr>
 </table>
 <p>Clients may subscribe to <code>$SYS</code> topics, subject to ACLs, but never publish to them. Wildcards at the start of a filter, such as <code>#</code> or <code>+/broker</code>, don't match <code>$SYS</code> topics.</p>
+
+<h2 id="metrics">Health and metrics</h2>
+<p>A WebSocket listener with <code>health = true</code> answers <code>GET /healthz</code> with <code>200 OK</code> while the broker serves, and <code>503 Service Unavailable</code> to a request read as it starts stopping; once it has stopped, the listener refuses connections. With <code>metrics = true</code> it answers <code>GET /metrics</code> with the counters of <code>$SYS</code> in the Prometheus text format, read at the time of the request whatever <code>sys_interval</code> is. Both are off by default and need no <code>http_dir</code>.</p>
+<p>Metrics tell anyone who can reach the listener how many clients the broker has and how much traffic it carries. They name no clients or topics, but enable them on a listener of their own on a loopback address, or one only your monitoring network reaches:</p>
+<pre>[[listeners]]
+host = "127.0.0.1"
+port = 9883
+protocol = "websocket"
+health = true
+metrics = true</pre>
+<pre>$ curl -s http://127.0.0.1:9883/metrics
+# HELP mercurio_clients_connected Clients connected now
+# TYPE mercurio_clients_connected gauge
+mercurio_clients_connected 12
+<span class="comment">…</span>
+# HELP mercurio_messages_received_total PUBLISH packets received
+# TYPE mercurio_messages_received_total counter
+mercurio_messages_received_total 48210
+<span class="comment">…</span>
+# HELP mercurio_messages_dropped_total Messages lost before reaching a subscriber, by cause
+# TYPE mercurio_messages_dropped_total counter
+mercurio_messages_dropped_total{cause="queue_full_qos0"} 0
+mercurio_messages_dropped_total{cause="queue_full"} 3
+<span class="comment">…</span>
+# HELP mercurio_uptime_seconds Seconds since the broker started
+# TYPE mercurio_uptime_seconds gauge
+mercurio_uptime_seconds 86400</pre>
+<table>
+<tr><th>Metric</th><th>Type</th><th><code>$SYS/broker/</code></th></tr>
+<tr><td><code>mercurio_clients_connected</code></td><td>gauge</td><td><code>clients/connected</code></td></tr>
+<tr><td><code>mercurio_clients_connected_max</code></td><td>gauge</td><td><code>clients/maximum</code></td></tr>
+<tr><td><code>mercurio_sessions</code>, <code>mercurio_sessions_disconnected</code></td><td>gauge</td><td><code>clients/total</code>, <code>clients/disconnected</code></td></tr>
+<tr><td><code>mercurio_sessions_expired_total</code></td><td>counter</td><td><code>clients/expired</code></td></tr>
+<tr><td><code>mercurio_messages_received_total</code>, <code>mercurio_messages_sent_total</code></td><td>counter</td><td><code>messages/received</code>, <code>messages/sent</code></td></tr>
+<tr><td><code>mercurio_bytes_received_total</code>, <code>mercurio_bytes_sent_total</code></td><td>counter</td><td><code>bytes/received</code>, <code>bytes/sent</code></td></tr>
+<tr><td><code>mercurio_retained_messages</code></td><td>gauge</td><td><code>retained messages/count</code></td></tr>
+<tr><td><code>mercurio_subscriptions</code></td><td>gauge</td><td><code>subscriptions/count</code></td></tr>
+<tr><td><code>mercurio_messages_dropped_total{cause}</code></td><td>counter</td><td><code>publish/messages/dropped/&lt;cause&gt;</code>; their sum is <code>publish/messages/dropped</code></td></tr>
+<tr><td><code>mercurio_storage_batches_retried_total</code>, <code>mercurio_storage_batches_dropped_total</code></td><td>counter</td><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td></tr>
+<tr><td><code>mercurio_connections_total</code></td><td>counter</td><td>Connections accepted; the rate is <code>load/connections/…</code></td></tr>
+<tr><td><code>mercurio_uptime_seconds</code></td><td>gauge</td><td><code>uptime</code></td></tr>
+</table>
+<p>The endpoints share the listener's limits for plain HTTP: an 8 KiB request head, read within <code>connect_timeout</code>, 32 responses at once and a minute per response.</p>
 
 <h2 id="logging">Logging</h2>
 <pre>[logging]

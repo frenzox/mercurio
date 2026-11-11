@@ -138,8 +138,8 @@ mercurioctl dynsec get-client s1</pre>
 <h2 id="output">Output</h2>
 <p>Lists print as tables, other answers as <code>name: value</code> lines. Times are in UTC, and empty values print as <code>-</code>:</p>
 <pre>$ mercurioctl client list
-CLIENT ID  USERNAME  CONNECTED  ADDRESS          SINCE                 SUBS  QUEUED  INFLIGHT
-monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0       0</pre>
+CLIENT ID  USERNAME  CONNECTED  ADDRESS          SINCE                 SUBS  QUEUED  INFLIGHT  DROPPED
+monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0       0         0</pre>
 <ul>
 <li>A list longer than what was shown ends with a line such as <code>1-100 of 250; --offset 100 shows the next ones</code>.</li>
 <li><code>--json</code> prints the answer's <code>data</code> as the broker sends it, with the field names and Unix times of the <a href="admin.html#commands">command reference</a>, and nothing for commands without data.</li>

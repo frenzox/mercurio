@@ -1,11 +1,12 @@
 mod common;
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use bytes::BytesMut;
-use mercurio_core::protocol::ProtocolVersion;
+use bytes::{Bytes, BytesMut};
+use mercurio_core::{message::Message, protocol::ProtocolVersion, qos::QoS};
 use mercurio_packets::ControlPacket;
-use mercurio_server::server::ServerConfig;
+use mercurio_server::server::{Server, ServerConfig};
+use mercurio_storage::{memory::MemoryStore, RetainedMessageStore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -51,7 +52,7 @@ async fn statistics(addr: SocketAddr) -> HashMap<String, String> {
     let mut values = HashMap::new();
     // Every statistic is retained, so a new subscriber gets them all
     timeout(Duration::from_secs(2), async {
-        while values.len() < 28 {
+        while values.len() < 37 {
             if ControlPacket::check(&buffer).is_ok() {
                 if let ControlPacket::Publish(publish) =
                     ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
@@ -91,17 +92,58 @@ async fn statistics_are_published_under_sys() {
     assert!(values.contains_key("$SYS/broker/subscriptions/count"));
     assert_eq!(values["$SYS/broker/clients/maximum"], "1");
     assert_eq!(values["$SYS/broker/clients/expired"], "0");
+    assert_eq!(values["$SYS/broker/publish/messages/dropped"], "0");
+    assert_eq!(
+        values["$SYS/broker/publish/messages/dropped/queue_full_qos0"],
+        "0"
+    );
+    assert!(values.contains_key("$SYS/broker/store/batches/retried"));
+    assert!(values.contains_key("$SYS/broker/store/batches/dropped"));
     // CONNECT and three 8 byte PUBLISH packets
     assert_eq!(values["$SYS/broker/bytes/received"], "40");
-    // The statistics are retained messages themselves
-    let retained: usize = values["$SYS/broker/retained messages/count"]
-        .parse()
-        .unwrap();
-    assert!(retained >= 1, "{retained}");
+    // The statistics are kept apart from the retained messages stored
+    assert_eq!(values["$SYS/broker/retained messages/count"], "0");
     let load: f64 = values["$SYS/broker/load/messages/received/1min"]
         .parse()
         .unwrap();
     assert!(load > 0.0, "{load}");
+}
+
+#[tokio::test]
+async fn statistics_stay_out_of_the_retained_store() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let storage = Arc::new(MemoryStore::new());
+    // Left by an earlier version, which stored them
+    let stale = Message {
+        packet_id: None,
+        topic: Arc::from("$SYS/broker/old"),
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        payload: Some(Bytes::from_static(b"1")),
+        properties: Default::default(),
+        expires_at: None,
+        subscription_identifiers: Vec::new(),
+        origin: None,
+    };
+    storage
+        .store_retained("$SYS/broker/old", Some(stale))
+        .await
+        .unwrap();
+    let mut config = ServerConfig::default();
+    config.sys_interval = Some(Duration::from_millis(50));
+    let server = Server::new(listener, config, Arc::clone(&storage))
+        .await
+        .unwrap();
+    tokio::spawn(server.run(std::future::pending::<()>()));
+    sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(storage.count_retained().await.unwrap(), 0);
+    // Still sent to new subscribers, as retained messages
+    let values = statistics(addr).await;
+    assert!(values["$SYS/broker/version"].starts_with("mercurio "));
+    assert!(!values.contains_key("$SYS/broker/old"));
 }
 
 #[tokio::test]

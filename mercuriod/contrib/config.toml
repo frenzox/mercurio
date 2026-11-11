@@ -115,8 +115,8 @@ max_inflight = 64
 # Most seconds any session may outlive its connection, MQTT 5 clients
 # included; worth setting where clients aren't trusted (unbounded by default)
 # max_session_expiry = 2592000
-# Topics that may hold a retained message at once, about 20 of the broker's
-# own $SYS topics included; further ones get Quota Exceeded (unbounded)
+# Topics that may hold a retained message at once, the broker's own $SYS
+# topics not counted; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
@@ -256,6 +256,18 @@ group = "mercurio"
 # Web pages from other origins are refused (browsers send the page's origin;
 # other clients send none and are not affected); any origin when unset
 # allowed_origins = ["https://app.example.com"]
+#
+# Health and Prometheus metrics endpoints over HTTP, on WebSocket listeners
+# only and off by default: GET /healthz answers 200 while the broker serves,
+# GET /metrics the statistics. Metrics tell anyone who reaches the listener
+# how loaded the broker is, so give them a listener of their own on a
+# loopback address
+# [[listeners]]
+# host = "127.0.0.1"
+# port = 9883
+# protocol = "websocket"
+# health = true
+# metrics = true
 #
 # Unix domain socket, for clients on the same machine. It belongs to the
 # broker's user with mode 0600, so only that user may connect, unless

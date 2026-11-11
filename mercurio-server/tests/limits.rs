@@ -347,13 +347,14 @@ async fn retained_messages_beyond_the_limit_are_refused() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits.max_retained_messages = Some(1);
-    // The broker's own retained $SYS topics would count too
-    config.sys_interval = None;
+    // The broker's own $SYS topics don't count
+    config.sys_interval = Some(Duration::from_millis(50));
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,
         config,
         std::future::pending::<()>(),
     ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let (mut stream, _) = connect(addr, b'r').await;
 
     // Success, or No Matching Subscribers, also a success
