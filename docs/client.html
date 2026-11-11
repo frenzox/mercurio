@@ -155,6 +155,15 @@ client
     .await?;</pre>
 <p>Received messages carry their properties in <code>Event::Message { properties, .. }</code>, along with <code>qos</code>, <code>retain</code> and the <code>subscription_ids</code> they matched. <code>MessageProperties</code>, <code>Will</code>, <code>SubscribeResult</code> and <code>UnsubscribeResult</code> are <code>#[non_exhaustive]</code>, as are the struct-like variants of <code>Event</code>, <code>DisconnectReason</code> and <code>ClientError</code> apart from <code>Event::Disconnected</code>: build them with their constructors and setters, and match them with <code>..</code>, so new fields don't break your code.</p>
 
+<h2>Request and response</h2>
+<pre>use std::time::Duration;
+use mercurio_client::RequestOptions;
+
+let options = RequestOptions::new(Duration::from_secs(5)).response_prefix("replies");
+let response = client.request("requests/lamp", r#"{"on":true}"#, options).await?;
+println!("{}", String::from_utf8_lossy(&amp;response.payload));</pre>
+<p><code>request</code> publishes the message with a Response Topic and Correlation Data unique to the request, and resolves with the message a responder sends back with the same Correlation Data. The response topic is the broker's Response Information when <code>request_response_information(true)</code> got one, otherwise the prefix given, followed by a token of this client; the client subscribes to it once per session. Responses, late ones included, never come out of <code>recv</code>, so <code>request</code> and the event loop of the application work side by side. It fails with <code>ClientError::Timeout</code> when no response came in time, <code>SubscribeRefused</code> when the broker refuses the response topic, and as a publish does otherwise. MQTT 5 only.</p>
+
 <h2>Subscription options</h2>
 <pre>use mercurio_client::{QoS, RetainHandling, SubscriptionOptions};
 

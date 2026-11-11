@@ -51,6 +51,16 @@ pub enum Event {
     Stopped { error: Arc<ClientError> },
 }
 
+/// The answer to [`MqttClient::request`](crate::MqttClient::request).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Response {
+    /// The response topic it came on
+    pub topic: String,
+    pub payload: Bytes,
+    pub properties: MessageProperties,
+}
+
 /// Identifies a received message to acknowledge, with manual
 /// acknowledgement on. Only the connection it came on can acknowledge it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

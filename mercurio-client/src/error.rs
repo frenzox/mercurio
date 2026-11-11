@@ -69,6 +69,12 @@ pub enum ClientError {
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
 
+    /// The broker refused the subscription to the response topic of a
+    /// [`request`](crate::MqttClient::request).
+    #[error("Subscription to {topic} refused: {reason:?}")]
+    #[non_exhaustive]
+    SubscribeRefused { topic: String, reason: ReasonCode },
+
     /// The broker sent a packet the client didn't expect at that point.
     #[error("Protocol error: {0}")]
     Protocol(String),

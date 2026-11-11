@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -39,10 +40,11 @@ use tracing::{debug, error, info, warn};
 use crate::connection::{Connection, Stream};
 use crate::error::{transient_refusal, ClientError, Result};
 use crate::event::{
-    AckToken, ConnAckInfo, DisconnectReason, Event, SubscribeResult, UnsubscribeResult,
+    AckToken, ConnAckInfo, DisconnectReason, Event, Response, SubscribeResult, UnsubscribeResult,
 };
 use crate::options::{
-    check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
+    check_length, Backoff, ConnectOptions, MessageProperties, RequestOptions, SharedAuthenticator,
+    Will,
 };
 
 /// Topic filters with the options to subscribe to each with.
@@ -68,7 +70,16 @@ enum Command {
         response: oneshot::Sender<Result<()>>,
     },
     Ack(AckToken),
+    /// Hand the message on `topic` carrying `correlation` to `reply`
+    Expect {
+        topic: String,
+        correlation: Bytes,
+        reply: oneshot::Sender<Response>,
+    },
 }
+
+/// Response topics this client subscribed to on the current session.
+type ResponseTopics = Arc<std::sync::Mutex<HashSet<String>>>;
 
 /// An MQTT client for connecting to brokers.
 ///
@@ -85,6 +96,11 @@ pub struct MqttClient {
     reports_reasons: bool,
     /// The session expiry CONNECT asked for
     session_expiry: u32,
+    /// Sets this client's response topics and correlation data apart
+    request_token: String,
+    /// Numbers requests
+    requests: AtomicU64,
+    response_topics: ResponseTopics,
 }
 
 impl MqttClient {
@@ -98,6 +114,7 @@ impl MqttClient {
         let connack = Arc::new(RwLock::new(session.connack.clone()));
         let reports_reasons = options.protocol_version.supports_reason_codes();
         let session_expiry = options.session_expiry;
+        let response_topics = ResponseTopics::default();
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -108,6 +125,7 @@ impl MqttClient {
             event_tx,
             options,
             Arc::clone(&connack),
+            Arc::clone(&response_topics),
         ));
 
         Ok(MqttClient {
@@ -117,6 +135,9 @@ impl MqttClient {
             connack,
             reports_reasons,
             session_expiry,
+            request_token: random_token(),
+            requests: AtomicU64::new(0),
+            response_topics,
         })
     }
 
@@ -441,6 +462,7 @@ impl MqttClient {
         event_tx: mpsc::Sender<Event>,
         mut options: ConnectOptions,
         connack: Arc<RwLock<ConnAckInfo>>,
+        response_topics: ResponseTopics,
     ) {
         let mut state = EventLoop {
             connection,
@@ -466,6 +488,8 @@ impl MqttClient {
             next_delivery: 0,
             subscriptions: Vec::new(),
             held: None,
+            requests: HashMap::new(),
+            response_topics,
         };
         let mut keep_alive = session.connack.keep_alive;
         let mut backoff = options.reconnect_backoff();
@@ -547,6 +571,7 @@ impl MqttClient {
                     }
                 } else {
                     state.subscriptions.clear();
+                    lock(&state.response_topics).clear();
                 }
             }
             state.deliver(Event::Reconnected { session_present });
@@ -794,6 +819,82 @@ impl MqttClient {
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
+    /// Publishes a request to `topic` and waits for its response, MQTT 5's
+    /// request/response: the message gets a Response Topic, under which
+    /// the client subscribes once per topic and session, and Correlation
+    /// Data unique to this request, which the responder copies into its
+    /// answer. The Response Topic is the broker's Response Information, when
+    /// [`request_response_information`](ConnectOptions::request_response_information)
+    /// got one, or else the prefix of `options`, followed by `/` and a
+    /// token of this client.
+    ///
+    /// The response that matches resolves the request and doesn't come out
+    /// of [`recv`](Self::recv); nor do other messages on the response
+    /// topic, such as answers that arrive after their request timed out.
+    /// Fails with [`ClientError::Timeout`] when `options`' timeout passes
+    /// first, subscribing and publishing included, with
+    /// [`ClientError::SubscribeRefused`] when the broker refuses the
+    /// response topic, and as a publish does otherwise.
+    pub async fn request(
+        &self,
+        topic: &str,
+        payload: impl Into<Bytes>,
+        options: RequestOptions,
+    ) -> Result<Response> {
+        if !self.reports_reasons {
+            return Err(ClientError::NotSupported("request/response before MQTT 5"));
+        }
+        let base = self
+            .response_information()
+            .or(options.response_prefix.clone())
+            .ok_or_else(|| {
+                ClientError::InvalidArgument(
+                    "a request needs the broker's Response Information or a response prefix".into(),
+                )
+            })?;
+        let response_topic = format!("{}/{}", base.trim_end_matches('/'), self.request_token);
+        validate_publish_topic(&response_topic).map_err(|e| {
+            ClientError::InvalidArgument(format!("response topic `{response_topic}`: {e}"))
+        })?;
+        let payload = payload.into();
+        let asking = async {
+            if !lock(&self.response_topics).contains(&response_topic) {
+                let granted = self
+                    .subscribe(&[(response_topic.as_str(), QoS::AtLeastOnce)])
+                    .await?;
+                if let Some(refused) = granted.iter().find(|g| !g.success) {
+                    return Err(ClientError::SubscribeRefused {
+                        topic: response_topic.clone(),
+                        reason: refused.reason,
+                    });
+                }
+                lock(&self.response_topics).insert(response_topic.clone());
+            }
+            let number = self.requests.fetch_add(1, Ordering::Relaxed);
+            let correlation = Bytes::from(format!("{}-{number}", self.request_token));
+            let (reply, response) = oneshot::channel();
+            self.command_tx
+                .send(Command::Expect {
+                    topic: response_topic.clone(),
+                    correlation: correlation.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| ClientError::Closed)?;
+            let properties = options
+                .properties
+                .clone()
+                .response_topic(response_topic.clone())
+                .correlation_data(correlation);
+            self.publish_with_properties(topic, payload, options.qos, false, properties)
+                .await?;
+            response.await.map_err(|_| ClientError::Disconnected)
+        };
+        timeout(options.timeout, asking)
+            .await
+            .map_err(|_| ClientError::Timeout)?
+    }
+
     /// What the broker answered to `request_response_information`, often a
     /// topic prefix this client may use for response topics.
     pub fn response_information(&self) -> Option<String> {
@@ -837,6 +938,19 @@ impl MqttClient {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 16 hex digits another client is unlikely to pick: each `RandomState` is
+/// seeded randomly.
+fn random_token() -> String {
+    use std::hash::BuildHasher;
+
+    let random = std::collections::hash_map::RandomState::new();
+    format!("{:016x}", random.hash_one(std::process::id()))
 }
 
 /// SUBSCRIBE and UNSUBSCRIBE need at least one filter [MQTT-3.8.3-2,
@@ -986,6 +1100,9 @@ struct EventLoop {
     subscriptions: Vec<Subscription>,
     /// Events held back while resubscribing
     held: Option<VecDeque<Event>>,
+    /// Requests waiting for their response, by correlation data
+    requests: HashMap<Bytes, (String, oneshot::Sender<Response>)>,
+    response_topics: ResponseTopics,
 }
 
 /// A subscription the broker granted.
@@ -1191,6 +1308,9 @@ impl EventLoop {
                             self.reauthenticate(response).await;
                         }
                         Command::Ack(token) => self.acknowledge(token).await,
+                        Command::Expect { topic, correlation, reply } => {
+                            self.expect(topic, correlation, reply);
+                        }
                         Command::Disconnect { packet, response } => {
                             let result = self
                                 .connection
@@ -1487,6 +1607,10 @@ impl EventLoop {
                         }
                         // Delivered on a connection that is gone
                         Command::Ack(_) => {}
+                        // The response may come once reconnected
+                        Command::Expect { topic, correlation, reply } => {
+                            self.expect(topic, correlation, reply);
+                        }
                         Command::Disconnect { response, .. } => {
                             let _ = response.send(Ok(()));
                             return Err(None);
@@ -1791,6 +1915,36 @@ impl EventLoop {
         }
     }
 
+    fn expect(&mut self, topic: String, correlation: Bytes, reply: oneshot::Sender<Response>) {
+        // Requests that timed out gave up waiting
+        self.requests.retain(|_, (_, reply)| !reply.is_closed());
+        self.requests.insert(correlation, (topic, reply));
+    }
+
+    /// Whether `publish` is a response for [`MqttClient::request`], which
+    /// then gets it if it is still waiting. Responses never become events.
+    fn answers_request(&mut self, publish: &PublishPacket) -> bool {
+        let correlation = publish
+            .properties
+            .as_ref()
+            .and_then(|p| p.correlation_data.as_ref())
+            .map(|c| c.value.clone());
+        if let Some(correlation) = correlation {
+            if let Some((topic, _)) = self.requests.get(&correlation) {
+                if *topic == publish.topic_name {
+                    let (topic, reply) = self.requests.remove(&correlation).expect("found");
+                    let _ = reply.send(Response {
+                        topic,
+                        payload: publish.payload.clone().unwrap_or_default(),
+                        properties: MessageProperties::from_publish(publish.properties.clone()),
+                    });
+                    return true;
+                }
+            }
+        }
+        lock(&self.response_topics).contains(&publish.topic_name)
+    }
+
     /// Remembers the subscriptions the broker granted, and reports those
     /// it refused to make again.
     fn record_subscriptions(&mut self, pending: &PendingSubscribe, results: &[SubscribeResult]) {
@@ -1810,6 +1964,7 @@ impl EventLoop {
                     if let Some(index) = existing {
                         self.subscriptions.remove(index);
                     }
+                    lock(&self.response_topics).remove(filter);
                     self.deliver(Event::ResubscribeFailed {
                         topic: filter.clone(),
                         reason: result.reason,
@@ -2118,6 +2273,12 @@ impl EventLoop {
             _ => true,
         };
 
+        if deliver && self.answers_request(&publish) {
+            if let Some(token) = ack {
+                self.acknowledge(token).await;
+            }
+            return Ok(());
+        }
         if deliver {
             let subscription_ids = publish
                 .properties

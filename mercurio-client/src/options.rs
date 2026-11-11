@@ -203,6 +203,58 @@ impl MessageProperties {
     }
 }
 
+/// How [`MqttClient::request`](crate::MqttClient::request) asks: what the
+/// request waits for at most, and what its message looks like.
+///
+/// ```
+/// use std::time::Duration;
+/// use mercurio_client::{QoS, RequestOptions};
+///
+/// let options = RequestOptions::new(Duration::from_secs(5))
+///     .response_prefix("replies")
+///     .qos(QoS::AtMostOnce);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RequestOptions {
+    pub(crate) timeout: Duration,
+    pub(crate) response_prefix: Option<String>,
+    pub(crate) qos: QoS,
+    pub(crate) properties: MessageProperties,
+}
+
+impl RequestOptions {
+    /// A request answered within `timeout`, published with QoS 1 so a
+    /// request the broker refuses fails at once.
+    pub fn new(timeout: Duration) -> Self {
+        RequestOptions {
+            timeout,
+            response_prefix: None,
+            qos: QoS::AtLeastOnce,
+            properties: MessageProperties::default(),
+        }
+    }
+
+    /// Where responses come, below this prefix, when the broker offers no
+    /// Response Information.
+    pub fn response_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.response_prefix = Some(prefix.into());
+        self
+    }
+
+    /// The QoS the request is published with.
+    pub fn qos(mut self, qos: QoS) -> Self {
+        self.qos = qos;
+        self
+    }
+
+    /// Properties of the request message; its response topic and
+    /// correlation data are replaced.
+    pub fn properties(mut self, properties: MessageProperties) -> Self {
+        self.properties = properties;
+        self
+    }
+}
+
 /// Will message configuration, built with [`Will::new`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]

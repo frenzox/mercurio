@@ -31,7 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Optional manual acknowledgement of received messages, for
   at-least-once processing with the broker's flow control.
 - MQTT 5 properties, subscription options and identifiers, topic
-  aliases both ways, server redirection, and enhanced authentication.
+  aliases both ways, server redirection, request/response, and
+  enhanced authentication.
 - TLS verified with the operating system's certificate store or your
   own CA, client certificates, ALPN, or a rustls `ClientConfig` of
   your own.

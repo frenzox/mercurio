@@ -28,10 +28,12 @@ mod websocket;
 pub use client::{MqttClient, PendingPublish};
 pub use error::{ClientError, Result};
 pub use event::{
-    AckToken, ConnAckInfo, DisconnectReason, Event, SubscribeResult, UnsubscribeResult,
+    AckToken, ConnAckInfo, DisconnectReason, Event, Response, SubscribeResult, UnsubscribeResult,
 };
 pub use mercurio_packets::subscribe::{RetainHandling, SubscriptionOptions};
-pub use options::{Authenticator, Backoff, ConnectOptions, MessageProperties, Will};
+pub use options::{
+    Authenticator, Backoff, ConnectOptions, MessageProperties, RequestOptions, Will,
+};
 
 // Types of the public API that come from other crates, so applications
 // need no direct dependency on them
