@@ -167,6 +167,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 
 <h2 id="differences">Differences to know</h2>
 <ul>
+<li>Sessions end a week after their client left, by <code>max_session_expiry</code>'s default, also those of MQTT 3.x clients without clean session, which mosquitto keeps forever unless <code>persistent_client_expiration</code> is set. Set <code>max_session_expiry = "unlimited"</code> to keep them as mosquitto does.</li>
 <li><code>max_keepalive</code> doesn't apply to MQTT 3.1.1 and 3.1 clients, as those protocols can't tell a client the server's limit. Mosquitto refuses them when they ask for a longer keep-alive, or for none; Mercurio accepts them with the keep-alive they asked for.</li>
 <li>Mosquitto lets any client take over any client id. Mercurio refuses a client of another user, or on a listener with another mount point, with Not Authorized while the id has a session, and leaves that session alone. If a stale session blocks the new owner of an id, delete it with <code>mercurioctl client delete-session &lt;clientid&gt;</code> or wait for it to expire; see <a href="security.html#client-ids">Client id ownership</a>.</li>
 <li>A bridge's local side is trusted: this broker's ACLs don't restrict what it forwards in.</li>

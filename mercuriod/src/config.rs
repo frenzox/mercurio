@@ -858,8 +858,14 @@ pub struct ServerConfig {
     pub persistent_client_expiration: Option<u64>,
 
     /// Most seconds any session may outlive its connection; MQTT 5 clients
-    /// asking for longer are told to use this. Unbounded when unset
-    pub max_session_expiry: Option<u64>,
+    /// asking for longer are told to use this. A week by default;
+    /// `"unlimited"` lets sessions live forever
+    #[serde(default = "default_max_session_expiry")]
+    pub max_session_expiry: ExpiryBound,
+
+    /// Sessions outliving their connection the broker may hold, connected
+    /// or not; unbounded when unset
+    pub max_sessions: Option<usize>,
 
     /// Topics that may hold a retained message at once, the broker's own
     /// `$SYS` topics not counted; unbounded when unset
@@ -919,7 +925,8 @@ impl Default for ServerConfig {
             auto_id_prefix: String::new(),
             clientid_prefixes: Vec::new(),
             persistent_client_expiration: None,
-            max_session_expiry: None,
+            max_session_expiry: default_max_session_expiry(),
+            max_sessions: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
             plugin_timeout: default_plugin_timeout(),
@@ -927,6 +934,36 @@ impl Default for ServerConfig {
             tls: TlsServerConfig::default(),
         }
     }
+}
+
+/// A longest time, in seconds, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ExpiryBound {
+    Seconds(u64),
+    Unlimited(Unlimited),
+}
+
+/// The word `"unlimited"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Unlimited {
+    Unlimited,
+}
+
+impl ExpiryBound {
+    fn duration(self) -> Option<Duration> {
+        match self {
+            ExpiryBound::Seconds(seconds) => Some(Duration::from_secs(seconds)),
+            ExpiryBound::Unlimited(_) => None,
+        }
+    }
+}
+
+/// A week: sessions of clients that never return don't pile up forever,
+/// while devices offline over a weekend find theirs.
+fn default_max_session_expiry() -> ExpiryBound {
+    ExpiryBound::Seconds(7 * 24 * 3600)
 }
 
 /// Which message a full queue drops.
@@ -1202,7 +1239,8 @@ impl ServerConfig {
         limits.check_retain_source = self.check_retain_source;
         limits.max_subscriptions = Some(self.max_subscriptions);
         limits.max_topic_filter_length = self.max_topic_filter_length;
-        limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
+        limits.max_session_expiry = self.max_session_expiry.duration();
+        limits.max_sessions = self.max_sessions;
         limits.max_retained_messages = self.max_retained_messages;
         limits.max_connections_per_ip = self.max_connections_per_ip;
         Ok(limits)
@@ -1676,6 +1714,29 @@ mod tests {
         assert_eq!(config.server.limits().unwrap().max_inflight, 5);
         let config: Config = toml::from_str("[server]\nmax_inflight = 0\n").unwrap();
         assert!(config.server.limits().is_err());
+    }
+
+    #[test]
+    fn test_sessions_expire_after_a_week_unless_unlimited() {
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits().unwrap()
+        };
+        assert_eq!(
+            limits("").max_session_expiry,
+            Some(Duration::from_secs(604_800))
+        );
+        assert_eq!(
+            limits("[server]\nmax_session_expiry = 60\n").max_session_expiry,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            limits("[server]\nmax_session_expiry = \"unlimited\"\n").max_session_expiry,
+            None
+        );
+        assert!(toml::from_str::<Config>("[server]\nmax_session_expiry = \"forever\"\n").is_err());
+        assert_eq!(limits("").max_sessions, None);
+        assert_eq!(limits("[server]\nmax_sessions = 5\n").max_sessions, Some(5));
     }
 
     #[test]

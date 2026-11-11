@@ -120,8 +120,13 @@ max_inflight = 64
 # session expiry of its own
 # persistent_client_expiration = 604800
 # Most seconds any session may outlive its connection, MQTT 5 clients
-# included; worth setting where clients aren't trusted (unbounded by default)
-# max_session_expiry = 2592000
+# included; a week by default, "unlimited" to keep sessions forever
+# max_session_expiry = 604800
+# Sessions outliving their connection the broker may hold, connected or
+# not; a client that would start one more gets Quota Exceeded (MQTT 3.x:
+# Server Unavailable). Resuming one is never refused, and sessions ending
+# with their connection don't count (unbounded by default)
+# max_sessions = 100000
 # Topics that may hold a retained message at once, the broker's own $SYS
 # topics not counted; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000

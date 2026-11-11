@@ -180,6 +180,14 @@ pub struct Limits {
     /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
+    /// Sessions that outlive their connection the broker may hold,
+    /// connected or not; a CONNECT that would start one more is refused
+    /// with Quota Exceeded (Server Unavailable for MQTT 3.x). Resuming a
+    /// session is never refused. Sessions that end with their connection
+    /// (Clean Session in MQTT 3.x, a zero Session Expiry Interval in
+    /// MQTT 5) don't count: `max_connections` bounds them. Unbounded when
+    /// unset.
+    pub max_sessions: Option<usize>,
 }
 
 impl Default for Limits {
@@ -205,6 +213,7 @@ impl Default for Limits {
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
+            max_sessions: None,
         }
     }
 }
@@ -1203,6 +1212,7 @@ impl<St: MqttStore + 'static> Server<St> {
             Arc::clone(&storage),
             limits.queue,
             limits.write_timeout,
+            limits.max_sessions,
             Arc::clone(&stats),
         );
         let session_manager = session_manager_holder.session_manager();
@@ -1919,6 +1929,15 @@ where
                             protocol_version,
                             client_maximum_packet_size,
                             ReasonCode::ServerBusy,
+                        )
+                        .await;
+                }
+                Err(StartError::TooManySessions) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::QuotaExceeded,
                         )
                         .await;
                 }

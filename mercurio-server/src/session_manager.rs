@@ -50,6 +50,8 @@ pub(crate) struct SessionManager<S: BatchStore> {
     /// How long a new connection waits for the one it takes over to let go
     /// of the client id; forever when unset
     takeover_wait: Option<Duration>,
+    /// Sessions outliving their connection the broker may hold
+    max_sessions: Option<usize>,
 }
 
 impl<S: BatchStore> Clone for SessionManager<S> {
@@ -61,6 +63,7 @@ impl<S: BatchStore> Clone for SessionManager<S> {
             queue_limits: self.queue_limits,
             stats: Arc::clone(&self.stats),
             takeover_wait: self.takeover_wait,
+            max_sessions: self.max_sessions,
         }
     }
 }
@@ -235,6 +238,22 @@ impl<S: BatchStore + 'static> Drop for Admission<S> {
     }
 }
 
+/// A place among the sessions `max_sessions` counts, given back if the
+/// session doesn't start after all.
+struct Reservation {
+    shared: Arc<Shared>,
+    client_id: String,
+    armed: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.persistent.lock().unwrap().remove(&self.client_id);
+        }
+    }
+}
+
 /// How `acquire_client_id` ended.
 enum Acquired<S: BatchStore + 'static> {
     Lease(Claim<S>),
@@ -256,6 +275,8 @@ pub(crate) enum StartError {
     Busy,
     /// Too many connections were checking their client id at once
     Crowded,
+    /// The session would be one more than `max_sessions`
+    TooManySessions,
     Storage(Error),
 }
 
@@ -417,10 +438,12 @@ impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
         storage: Arc<S>,
         queue_limits: QueueLimits,
         takeover_wait: Duration,
+        max_sessions: Option<usize>,
         stats: Arc<Stats>,
     ) -> SessionManagerDropGuard<S> {
         let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits);
         session_manager.takeover_wait = Some(takeover_wait);
+        session_manager.max_sessions = max_sessions;
         session_manager.stats = stats;
         SessionManagerDropGuard { session_manager }
     }
@@ -491,6 +514,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             queue_limits,
             stats: Default::default(),
             takeover_wait: None,
+            max_sessions: None,
         }
     }
 
@@ -552,6 +576,14 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         // in place
         let generation = claim.generation;
         let client_id = connect_packet.payload.client_id.clone();
+        let Some(mut reservation) = self.reserve_session(&client_id, persistent) else {
+            warn!(
+                "Too many sessions, refusing a new one for client `{}`",
+                client_id
+            );
+            claim.let_go().await;
+            return Err(StartError::TooManySessions);
+        };
         let clean_start = connect_packet.flags.clean_start;
         let existing = self
             .shared
@@ -649,6 +681,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             } else {
                 persistent_clients.remove(&client_id);
             }
+            reservation.armed = false;
         }
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
@@ -682,6 +715,28 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             lease: claim.keep(OnDrop::End(expiry)),
             inflight_to_retry,
         })
+    }
+
+    /// Counts the session of `client_id` among those outliving their
+    /// connection, if it is one and isn't counted already. None when that
+    /// would make one more than `max_sessions`. Sessions ending with their
+    /// connection aren't counted: `max_connections` bounds them.
+    fn reserve_session(&self, client_id: &str, persistent: bool) -> Option<Reservation> {
+        let mut reservation = Reservation {
+            shared: Arc::clone(&self.shared),
+            client_id: client_id.to_string(),
+            armed: false,
+        };
+        let mut sessions = self.shared.persistent.lock().unwrap();
+        if !persistent || sessions.contains(client_id) {
+            return Some(reservation);
+        }
+        if self.max_sessions.is_some_and(|max| sessions.len() >= max) {
+            return None;
+        }
+        sessions.insert(client_id.to_string());
+        reservation.armed = true;
+        Some(reservation)
     }
 
     /// The session of `client_id` in storage, with its queue and in-flight
@@ -2784,6 +2839,40 @@ mod tests {
         let mut connect = connect_packet(client_id);
         connect.flags.clean_start = false;
         connect
+    }
+
+    fn lasting(client_id: &str) -> ConnectPacket {
+        let mut connect = resuming(client_id);
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
+                3600,
+            )),
+            ..Default::default()
+        });
+        connect
+    }
+
+    #[tokio::test]
+    async fn test_sessions_beyond_the_cap_are_refused() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        manager.max_sessions = Some(2);
+        let owner = SessionOwner::default;
+        let a = manager.start_session(lasting("a"), owner()).await.unwrap();
+        manager
+            .end_connection(a.lease, Some(Duration::from_secs(3600)))
+            .await;
+        let _b = manager.start_session(lasting("b"), owner()).await.unwrap();
+
+        let refused = manager.start_session(lasting("c"), owner()).await;
+        assert!(matches!(refused, Err(StartError::TooManySessions)));
+        assert!(gone(&manager, "c").await);
+        assert!(!manager.shared.persistent.lock().unwrap().contains("c"));
+
+        // Sessions ending with their connection don't count, and an
+        // existing session may still be resumed
+        let _d = manager.start_session(clean("d"), owner()).await.unwrap();
+        let a = manager.start_session(lasting("a"), owner()).await.unwrap();
+        assert!(a.resume);
     }
 
     fn assert_refused(result: std::result::Result<SessionStartResult, StartError>) {

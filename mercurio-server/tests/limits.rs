@@ -433,3 +433,38 @@ async fn topic_filters_beyond_the_limit_are_refused() {
         .unwrap();
     assert_eq!(suback, [0x90, 0x03, 0x00, 0x01, 0x80]);
 }
+
+/// CONNECT of an MQTT 5 client asking its session to outlive the
+/// connection by an hour; its CONNACK's reason code.
+async fn connect_lasting(addr: SocketAddr, client_id: u8) -> (TcpStream, u8) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x13, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x00, 0x00, 0x3c, 0x05, 0x11,
+            0x00, 0x00, 0x0e, 0x10, 0x00, 0x01, client_id,
+        ])
+        .await
+        .unwrap();
+    let connack = common::read_connack(&mut stream).await;
+    (stream, connack[3])
+}
+
+#[tokio::test]
+async fn sessions_beyond_the_limit_are_refused_with_quota_exceeded() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_sessions = Some(1);
+        value
+    })
+    .await;
+    let (first, reason) = connect_lasting(addr, b'a').await;
+    assert_eq!(reason, 0x00);
+    drop(first);
+    sleep(Duration::from_millis(100)).await;
+
+    // The session outlives its connection, so another one is refused
+    assert_eq!(connect_lasting(addr, b'b').await.1, 0x97);
+    // Resuming it isn't, nor is a session ending with its connection
+    assert_eq!(connect_lasting(addr, b'a').await.1, 0x00);
+    assert_eq!(connect(addr, b'c').await.1[3], 0x00);
+}
