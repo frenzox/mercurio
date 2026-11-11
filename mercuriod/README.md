@@ -3,7 +3,9 @@
 The [Mercurio](https://github.com/frenzox/mercurio) MQTT broker daemon. It
 serves MQTT 3.1, 3.1.1 and 5.0 over TCP, TLS and WebSocket. To try it, the
 [`recado`](https://crates.io/crates/recado) client publishes and subscribes
-from the command line.
+from the command line, and
+[`mercurioctl`](https://crates.io/crates/mercurioctl) administers it while
+it runs.
 
 ## Installation
 
@@ -33,6 +35,7 @@ cargo build --release --package mercuriod
 ```bash
 mercuriod [OPTIONS]
 mercuriod passwd -f <FILE> -u <USER> [-d]
+mercuriod dynsec-init -f <FILE> [-u <USER>]
 ```
 
 | Option | Description | Default |
@@ -235,6 +238,17 @@ allow_anonymous = false
 # timeout_seconds = 5
 # cache_seconds = 30
 
+[admin]
+# Unix socket for administering the broker from this machine, as mercurioctl
+# does. Its clients skip authentication and access control, so only root,
+# the broker's own user and the members of `group` may connect; others are
+# closed at once. Every directory on a custom socket path must be writable
+# only by root or the broker's user. "" turns it off. Linux only: elsewhere this is ignored.
+socket = "/run/mercurio/admin.sock"
+# Members are read when the broker starts; add an administrator with
+# `usermod -aG mercurio <user>`. "" leaves only root and the broker's user.
+group = "mercurio"
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.
@@ -368,19 +382,17 @@ mosquitto's dynamic security plugin. Create the file with an administrator:
 mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin
 ```
 
-The administrator sends commands, in the JSON format of mosquitto's
-plugin, to `$CONTROL/dynamic-security/v1`, and reads the answers on
-`$CONTROL/dynamic-security/v1/response`:
+The administrator manages it with `mercurioctl`, which names mosquitto's
+commands in kebab-case, as `mosquitto_ctrl` does:
 
 ```bash
-recado pub -u admin -P ... -t '$CONTROL/dynamic-security/v1' -m '{"commands": [
-  {"command": "createRole", "rolename": "sensor"},
-  {"command": "addRoleACL", "rolename": "sensor", "acltype": "publishClientSend",
-   "topic": "sensors/#", "allow": true},
-  {"command": "createClient", "username": "s1", "password": "...",
-   "roles": [{"rolename": "sensor"}]}
-]}'
+mercurioctl dynsec create-role sensor
+mercurioctl dynsec add-role-acl sensor publishClientSend 'sensors/#' allow
+mercurioctl dynsec create-client s1 --role sensor   # asks for the password
 ```
+
+Underneath, these are JSON commands on `$CONTROL/dynamic-security/v1`, in
+the format of mosquitto's plugin.
 
 Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
 `enableClient`, `disableClient`, `addClientRole`, `removeClientRole`,
@@ -397,7 +409,8 @@ decide publishing, `publishClientReceive` receiving, and
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
 
 `$CONTROL` topics are only open to clients when access control grants
-them, so a broker without `acl_file` or `dynamic_security` refuses them.
+them, so a broker without `acl_file` or `dynamic_security` refuses them
+over the network. The admin socket, below, needs no grant.
 
 ### HTTP authentication
 
@@ -413,12 +426,25 @@ every message is checked. `user_url` replaces `password_file` and
 
 ### Reloading
 
-Send `SIGHUP` (`systemctl reload mercuriod`) to reread `password_file`,
+Send `SIGHUP` (`systemctl reload mercuriod`), or run
+`mercurioctl broker reload`, to reread `password_file`,
 `acl_file` and `dynamic_security` without dropping connections. New ACL
 rules apply to every later publish and subscribe, including those of
 connected clients. Password changes apply to later logins. If a file fails
 to load, the broker logs the error and keeps the previous version. Other
 settings still need a restart.
+
+### Administration
+
+`mercurioctl` lists and disconnects clients, bans them, deletes sessions
+and retained messages, shows subscriptions, changes the log level and
+reloads files while the broker runs. On the broker's host it connects
+through the admin socket set in `[admin]`, `/run/mercurio/admin.sock` by
+default, which root, the broker's user and members of the `mercurio` group
+may use without credentials. Over the network it needs a user that access
+control grants `$CONTROL/broker/v1/#`. The
+[administration guide](https://frenzox.github.io/mercurio/admin.html)
+describes every command, its permissions and what changed since 0.4.
 
 ### TLS
 

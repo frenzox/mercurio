@@ -52,6 +52,7 @@ Connection options, for both commands:
 |---|---|---|
 | `-H, --host` | Broker host | `localhost` |
 | `-p, --port` | Broker port | `1883` |
+| `--unix` | Unix socket, instead of host and port | |
 | `-i, --client-id` | Client id | generated |
 | `-u, --username`, `-P, --password` | Credentials | |
 | `-V, --protocol-version` | `5`, `311` or `31` | `5` |

@@ -30,6 +30,8 @@ It supports:
 - Persistent sessions, retained messages, wills, shared subscriptions,
   topic aliases, message expiry and `$SYS` statistics.
 - In-process client connections, without TCP.
+- Administration while it runs: `Server::admin` from Rust, and the
+  `$CONTROL/broker/v1` commands over MQTT, extended with `AdminExtension`.
 
 The [embedding guide](https://frenzox.github.io/mercurio/embedding.html)
 covers each of these with examples.
