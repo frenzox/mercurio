@@ -69,6 +69,7 @@ the password on a terminal; `MERCURIOCTL_PASSWORD` keeps it out of `ps`.
 | `-u, --username`, `-P, --password` | Credentials | |
 | `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
+| `--ws`, `--ws-path` | MQTT over WebSocket, `wss://` with `--tls`, at the path given (`MERCURIOCTL_WS`, `MERCURIOCTL_WS_PATH`) | `/mqtt` |
 | `--json` | Print the response data as JSON | tables |
 | `--timeout` | Seconds to wait for the answer (`MERCURIOCTL_TIMEOUT`) | `10` |
 

@@ -77,7 +77,8 @@ pub fn resolve(mut args: ConnectArgs, admin_socket: &Path) -> ConnectArgs {
             && !args.tls
             && args.cafile.is_none()
             && !args.insecure
-            && args.cert.is_none();
+            && args.cert.is_none()
+            && !args.ws;
         if none_given && admin_socket.exists() {
             args.unix = Some(admin_socket.to_path_buf());
         }
@@ -315,6 +316,7 @@ mod tests {
             &["--cafile", "ca.pem"],
             &["--insecure"],
             &["--cert", "c.pem", "--key", "c.key"],
+            &["--ws"],
         ] {
             assert_eq!(resolve(connect(options), &socket).unix, None, "{options:?}");
         }

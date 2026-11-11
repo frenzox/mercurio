@@ -10,7 +10,8 @@
 //!   [`ConnectOptions::websocket`], `ws://` or, with TLS, `wss://`. Off by
 //!   default.
 //! - `clap`: the `cli` module, with command-line arguments for connecting
-//!   that tools can flatten into their own `clap` command. Off by default.
+//!   that tools can flatten into their own `clap` command. Off by default;
+//!   turns `websocket` on, for its `--ws`.
 #[cfg(feature = "clap")]
 pub mod cli;
 mod client;

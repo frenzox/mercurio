@@ -607,3 +607,31 @@ async fn sub_fails_when_the_timeout_comes_first() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(output.stdout, b"here\n");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_reaches_a_websocket_listener() {
+    use mercurio_server::server::{ListenerConfig, Transport};
+
+    let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_port = websocket.local_addr().unwrap().port().to_string();
+    let mut config = ServerConfig::default();
+    config.listeners = vec![ListenerConfig::new(websocket, Transport::WebSocket)];
+    let broker = start_with(config).await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("ws", QoS::AtMostOnce)])
+        .await
+        .unwrap();
+
+    for path in [&[][..], &["--ws-path", "/mqtt"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_recado"))
+            .env_clear()
+            .args(["pub", "-H", "127.0.0.1", "-p", &websocket_port, "--ws"])
+            .args(path)
+            .args(["-t", "ws", "-m", "over websocket"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(next_payload(&receiver).await, b"over websocket");
+    }
+}
