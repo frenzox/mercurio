@@ -26,8 +26,8 @@ allow = [
 ]
 
 [bans]
-# Duplicates come from wasmtime and the TLS stacks moving at their own pace;
-# report them without failing the build
+# Duplicates come from wasmtime, the PostgreSQL client and the RustCrypto
+# crates moving at their own pace; report them without failing the build
 multiple-versions = "warn"
 wildcards = "deny"
 # The workspace crates refer to each other by path in dev-dependencies, which

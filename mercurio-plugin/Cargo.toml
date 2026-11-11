@@ -1,15 +1,18 @@
 [package]
 name = "mercurio-plugin"
 version = "0.2.0"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "Write plugins for the mercurio MQTT broker as WebAssembly components"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "broker", "plugin", "wasm", "wit"]
 categories = ["wasm", "network-programming"]
 readme = "README.md"
+
+[lints]
+workspace = true
 
 [dependencies]
 wit-bindgen = "0.63"

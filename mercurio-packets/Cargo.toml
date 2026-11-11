@@ -1,12 +1,12 @@
 [package]
 name = "mercurio-packets"
 version = "0.2.1"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "MQTT packet encoding and decoding for the Mercurio MQTT implementation"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "mqtt5", "iot", "protocol", "no-std"]
 categories = ["network-programming", "encoding", "no-std"]
 
@@ -14,7 +14,10 @@ categories = ["network-programming", "encoding", "no-std"]
 default = ["std"]
 std = ["mercurio-core/std"]
 
+[lints]
+workspace = true
+
 [dependencies]
-bytes = { version = "1.0", default-features = false }
+bytes.workspace = true
 
 mercurio-core = { path = "../mercurio-core", version = "0.2.0", default-features = false }

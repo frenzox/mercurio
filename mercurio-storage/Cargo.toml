@@ -1,12 +1,12 @@
 [package]
 name = "mercurio-storage"
 version = "0.3.3"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "Storage abstraction layer for Mercurio MQTT broker"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "broker", "sqlite", "postgres", "persistence"]
 categories = ["network-programming", "database"]
 
@@ -25,23 +25,26 @@ postgres = [
     "dep:tracing",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
-async-trait = "0.1"
-bytes = "1"
-thiserror = "2"
+async-trait.workspace = true
+bytes = { workspace = true, features = ["std"] }
+thiserror.workspace = true
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }
-tokio = { version = "1", features = ["rt", "sync", "time"], optional = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-futures-util = { version = "0.3", optional = true }
+futures-util = { workspace = true, features = ["std", "async-await", "async-await-macro"], optional = true }
 tokio-postgres-rustls = { version = "0.14", optional = true }
-rustls = { version = "0.23", optional = true }
-webpki-roots = { version = "0.26", optional = true }
-tracing = { version = "0.1", optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true

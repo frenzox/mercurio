@@ -1,12 +1,12 @@
 [package]
 name = "mercurio-client"
 version = "0.4.1"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "MQTT client library for the Mercurio MQTT implementation"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "mqtt5", "client", "iot", "tokio"]
 categories = ["network-programming", "asynchronous"]
 
@@ -24,24 +24,27 @@ tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-
 # MQTT over WebSocket, ws:// and, with tls, wss://
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
+[lints]
+workspace = true
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-packets = { path = "../mercurio-packets", version = "0.2.1" }
 mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
 
-bytes = "1"
-tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+bytes = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "macros", "rt", "io-util"] }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
-webpki-roots = { version = "0.26", optional = true }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
-tracing = "0.1"
-thiserror = "1"
-clap = { version = "4", features = ["derive", "env"], optional = true }
-rpassword = { version = "7", optional = true }
+webpki-roots = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["sink", "std"], optional = true }
+tracing.workspace = true
+thiserror.workspace = true
+clap = { workspace = true, features = ["env"], optional = true }
+rpassword = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 mercurio-server = { path = "../mercurio-server" }

@@ -13,6 +13,61 @@ members = [
     "mercurioctl",
 ]
 
+# mercuriod sets its own rust-version, as wasmtime needs a newer Rust
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+homepage = "https://frenzox.github.io/mercurio/"
+
+# On top of rustc's and clippy's defaults, which CI denies with -D warnings.
+# unsafe_code is not forbidden here, as mercuriod calls into libc.
+[workspace.lints.rust]
+non_ascii_idents = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+lossy_float_literal = "warn"
+rc_buffer = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+todo = "warn"
+unimplemented = "warn"
+verbose_file_reads = "warn"
+
+# Third-party crates more than one member uses. Members add their own
+# features; default features stay off where a no_std or library crate needs
+# them off, so those crates opt back in with "std" or the features they use.
+# The members still name each other by path and version in their own
+# manifests, which release-plz bumps on release.
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.23.1"
+bytes = { version = "1.12.1", default-features = false }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+futures-util = { version = "0.3", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+rpassword = "7"
+rustls = "0.23.46"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2"
+tokio = "1.24"
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+webpki-roots = "1"
+
 [profile.release]
 debug = true  # Enable debug symbols for profiling
 
