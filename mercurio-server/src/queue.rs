@@ -37,6 +37,8 @@ pub struct QueueLimits {
     /// were published with a lower one, as mosquitto's
     /// `upgrade_outgoing_qos`. Outside the MQTT specification.
     pub upgrade_qos: bool,
+    /// Which message a full queue loses.
+    pub overflow: Overflow,
 }
 
 impl Default for QueueLimits {
@@ -46,8 +48,26 @@ impl Default for QueueLimits {
             max_messages: 10_000,
             max_bytes: Some(100 * 1024 * 1024),
             upgrade_qos: false,
+            overflow: Overflow::DropNewest,
         }
     }
+}
+
+/// Which message a full queue loses to stay within its limits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Overflow {
+    /// The message arriving, keeping what waits: a client that falls
+    /// behind gets the start of what it missed.
+    #[default]
+    DropNewest,
+    /// The oldest messages waiting of the same kind, QoS 0 or QoS 1 and 2,
+    /// as many as it takes to fit the new one: a client that falls behind
+    /// gets the latest. A message no room can be made for, or a QoS 0 one
+    /// with only QoS 1 and 2 messages waiting, is dropped as with
+    /// `DropNewest`. A shared subscription's member pushes nothing out: the
+    /// message goes to another member instead.
+    DropOldest,
 }
 
 /// Messages waiting to be sent to one session's client.
@@ -165,17 +185,27 @@ impl MessageQueue {
             state.evict_expired();
             self.count_drop(DropCause::Expired, (before - state.messages.len()) as u64);
         }
+        let mut made_room = false;
+        if full(&state) && lost_if_full && self.limits.overflow == Overflow::DropOldest {
+            let room = state.room_for(&message, limit, self.limits.max_bytes);
+            if let Some(evicted) = room {
+                made_room = true;
+                let lost = state.evict(&evicted);
+                self.count_drop(drop_cause(message.qos), lost);
+                if state.dropped == 0 {
+                    warn!(
+                        "Message queue full, dropping the oldest messages, starting with one on `{}`",
+                        message.topic
+                    );
+                }
+                state.dropped += lost;
+            }
+        }
         if full(&state) {
             if !lost_if_full {
                 return false;
             }
-            self.count_drop(
-                match message.qos {
-                    QoS::AtMostOnce => DropCause::QueueFullQos0,
-                    _ => DropCause::QueueFull,
-                },
-                1,
-            );
+            self.count_drop(drop_cause(message.qos), 1);
             if state.dropped == 0 {
                 warn!(
                     "Message queue full, dropping messages, starting with a QoS {} one on `{}`",
@@ -185,7 +215,7 @@ impl MessageQueue {
             state.dropped += 1;
             return false;
         }
-        if state.dropped > 0 {
+        if state.dropped > 0 && !made_room {
             warn!(
                 "Message queue has room again after dropping {} messages",
                 state.dropped
@@ -293,6 +323,45 @@ impl MessageQueue {
 }
 
 impl QueueState {
+    /// The positions of the oldest messages of `message`'s kind, QoS 0 or
+    /// QoS 1 and 2, to drop for it to fit within `limit` messages and
+    /// `max_bytes`; None if dropping all of them would not be enough.
+    fn room_for(&self, message: &Message, limit: usize, max_bytes: Option<usize>) -> Option<Vec<usize>> {
+        let qos0 = message.qos == QoS::AtMostOnce;
+        let size = payload_size(message);
+        let (mut count, mut bytes) = (self.messages.len(), self.bytes);
+        let mut evicted = Vec::new();
+        let fits = |count: usize, bytes: usize| {
+            count < limit && max_bytes.is_none_or(|max| bytes + size <= max)
+        };
+        for (position, (_, queued)) in self.messages.iter().enumerate() {
+            if fits(count, bytes) {
+                break;
+            }
+            if (queued.qos == QoS::AtMostOnce) == qos0 {
+                evicted.push(position);
+                count -= 1;
+                bytes -= payload_size(queued);
+            }
+        }
+        fits(count, bytes).then_some(evicted)
+    }
+
+    /// Drops the messages at `positions`, in ascending order, and their
+    /// copies in the journal. Returns how many it dropped.
+    fn evict(&mut self, positions: &[usize]) -> u64 {
+        for position in positions.iter().rev() {
+            let Some((sequence, message)) = self.messages.remove(*position) else {
+                continue;
+            };
+            self.bytes -= payload_size(&message);
+            if let Some(journal) = self.journal.as_ref().filter(|_| message.qos != QoS::AtMostOnce) {
+                journal.write(Write::Dequeue(sequence));
+            }
+        }
+        positions.len() as u64
+    }
+
     /// Records the queued QoS 1 and 2 messages in `journal`.
     fn record(&self, journal: &Writer) {
         for (sequence, message) in &self.messages {
@@ -319,6 +388,14 @@ impl QueueState {
             live
         });
         self.bytes -= freed;
+    }
+}
+
+/// Why a message of `qos` that found its queue full is lost.
+fn drop_cause(qos: QoS) -> DropCause {
+    match qos {
+        QoS::AtMostOnce => DropCause::QueueFullQos0,
+        _ => DropCause::QueueFull,
     }
 }
 
@@ -504,6 +581,101 @@ mod tests {
         assert_eq!(stat(&stats, "publish/messages/dropped/queue_full"), 1);
         assert_eq!(stat(&stats, "publish/messages/dropped"), 3);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 3);
+    }
+
+    fn numbered(qos: QoS, n: u8) -> Message {
+        Message {
+            payload: Some(Bytes::from(vec![n; 7])),
+            ..message(qos)
+        }
+    }
+
+    fn queued(queue: &MessageQueue) -> Vec<(u8, QoS)> {
+        let state = queue.state.lock().unwrap();
+        state
+            .messages
+            .iter()
+            .map(|(_, m)| (m.payload.as_ref().unwrap()[0], m.qos))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_dropping_the_oldest_makes_room_in_the_same_class() {
+        let stats = Arc::new(Stats::default());
+        let queue = MessageQueue::new(QueueLimits {
+            max_qos0: 3,
+            max_messages: 4,
+            overflow: Overflow::DropOldest,
+            ..Default::default()
+        })
+        .counted_in(Arc::clone(&stats));
+        let (journal, mut events) = Writer::channel();
+        queue.start_journal(journal, false);
+        queue.push(numbered(QoS::AtMostOnce, 1));
+        queue.push(numbered(QoS::AtLeastOnce, 2));
+        queue.push(numbered(QoS::AtMostOnce, 3));
+
+        // At the QoS 0 limit, the oldest QoS 0 message gives way
+        assert!(queue.push(numbered(QoS::AtMostOnce, 4)));
+        // At the hard limit, the oldest QoS 1 or 2 one does, and leaves the
+        // journal
+        queue.push(numbered(QoS::ExactlyOnce, 5));
+        assert!(queue.push(numbered(QoS::AtLeastOnce, 6)));
+        assert_eq!(
+            queued(&queue),
+            [
+                (3, QoS::AtMostOnce),
+                (4, QoS::AtMostOnce),
+                (5, QoS::ExactlyOnce),
+                (6, QoS::AtLeastOnce)
+            ]
+        );
+        assert_eq!(recorded(&mut events), ["1:1", "4:2", "-1", "5:1"]);
+        assert_eq!(stat(&stats, "publish/messages/dropped/queue_full_qos0"), 1);
+        assert_eq!(stat(&stats, "publish/messages/dropped/queue_full"), 1);
+
+        // With no QoS 0 message to give way, the new one is dropped
+        let full = MessageQueue::new(QueueLimits {
+            max_qos0: 1,
+            overflow: Overflow::DropOldest,
+            ..Default::default()
+        });
+        full.push(numbered(QoS::AtLeastOnce, 1));
+        assert!(!full.push(numbered(QoS::AtMostOnce, 2)));
+        assert_eq!(queued(&full), [(1, QoS::AtLeastOnce)]);
+    }
+
+    #[tokio::test]
+    async fn test_dropping_the_oldest_frees_enough_bytes_or_nothing() {
+        // Room for two 7 byte payloads
+        let queue = MessageQueue::new(QueueLimits {
+            max_bytes: Some(15),
+            overflow: Overflow::DropOldest,
+            ..Default::default()
+        });
+        queue.push(numbered(QoS::AtLeastOnce, 1));
+        queue.push(numbered(QoS::AtLeastOnce, 2));
+        assert!(queue.push(numbered(QoS::AtLeastOnce, 3)));
+        assert_eq!(
+            queued(&queue),
+            [(2, QoS::AtLeastOnce), (3, QoS::AtLeastOnce)]
+        );
+
+        // One that can never fit leaves the others alone
+        let huge = Message {
+            payload: Some(Bytes::from(vec![9; 16])),
+            ..message(QoS::AtLeastOnce)
+        };
+        assert!(!queue.push(huge));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.state.lock().unwrap().bytes, 14);
+
+        // A shared subscription's offer never pushes anything out
+        assert!(!queue.try_push(numbered(QoS::AtLeastOnce, 4)));
+        assert_eq!(
+            queued(&queue),
+            [(2, QoS::AtLeastOnce), (3, QoS::AtLeastOnce)]
+        );
     }
 
     #[tokio::test]

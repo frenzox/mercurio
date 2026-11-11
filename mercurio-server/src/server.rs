@@ -90,7 +90,7 @@ pub struct AuthConfig {
 
 pub use crate::{
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
-    queue::QueueLimits,
+    queue::{Overflow, QueueLimits},
 };
 
 /// Subscriptions a session may hold unless configured otherwise: far more

@@ -9,7 +9,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, QueueLimits, Transport},
+    server::{Limits, Overflow, QueueLimits, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -772,6 +772,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_queued_bytes")]
     pub max_queued_bytes: usize,
 
+    /// Which message a full queue drops
+    #[serde(default)]
+    pub queue_overflow: QueueOverflow,
+
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
     #[serde(default)]
@@ -895,6 +899,7 @@ impl Default for ServerConfig {
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: default_max_queued_bytes(),
+            queue_overflow: QueueOverflow::default(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
@@ -922,6 +927,17 @@ impl Default for ServerConfig {
             tls: TlsServerConfig::default(),
         }
     }
+}
+
+/// Which message a full queue drops.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueOverflow {
+    /// The message arriving
+    #[default]
+    DropNewest,
+    /// The oldest queued messages of the same kind
+    DropOldest,
 }
 
 /// TLS configuration for the server.
@@ -1169,6 +1185,10 @@ impl ServerConfig {
         limits.queue.max_messages = self.max_queued_messages;
         limits.queue.max_bytes = Some(self.max_queued_bytes);
         limits.queue.upgrade_qos = self.upgrade_outgoing_qos;
+        limits.queue.overflow = match self.queue_overflow {
+            QueueOverflow::DropNewest => Overflow::DropNewest,
+            QueueOverflow::DropOldest => Overflow::DropOldest,
+        };
         limits.max_connections = Some(self.max_connections);
         limits.topic_alias_maximum = self.max_topic_alias;
         limits.receive_maximum = self.receive_maximum;
@@ -1656,6 +1676,21 @@ mod tests {
         assert_eq!(config.server.limits().unwrap().max_inflight, 5);
         let config: Config = toml::from_str("[server]\nmax_inflight = 0\n").unwrap();
         assert!(config.server.limits().is_err());
+    }
+
+    #[test]
+    fn test_queue_overflow_reaches_the_limits() {
+        let overflow = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits().unwrap().queue.overflow
+        };
+        use mercurio_server::server::Overflow;
+        assert_eq!(overflow(""), Overflow::DropNewest);
+        assert_eq!(
+            overflow("[server]\nqueue_overflow = \"drop_oldest\"\n"),
+            Overflow::DropOldest
+        );
+        assert!(toml::from_str::<Config>("[server]\nqueue_overflow = \"oldest\"\n").is_err());
     }
 
     #[test]

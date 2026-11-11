@@ -117,6 +117,10 @@ max_queued_qos0_messages = 1000
 # Payload bytes that may wait for one client before further messages are
 # dropped, whatever their QoS
 # max_queued_bytes = 104857600
+# Which message a full queue drops: "drop_newest", the one arriving, or
+# "drop_oldest", the oldest waiting of its kind (QoS 0, or QoS 1 and 2) so
+# a client that falls behind gets the latest ones
+# queue_overflow = "drop_newest"
 
 # Send messages at the QoS of the subscription even when they were published
 # with a lower one; goes beyond the MQTT specification
