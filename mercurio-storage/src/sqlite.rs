@@ -4,6 +4,7 @@
 //! Suitable for single-node deployments requiring persistence across restarts.
 
 use std::{
+    fs::{File, OpenOptions, TryLockError},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -32,34 +33,41 @@ use crate::{
 #[derive(Clone)]
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    /// Holds the lock file of a database on disk while any clone lives
+    _lock: Option<Arc<File>>,
 }
 
 impl SqliteStore {
     /// Create a new SQLite store with the given database path.
     ///
-    /// Creates the database file and tables if they don't exist.
+    /// Creates the database file, readable by its owner only, and the
+    /// tables if they don't exist, and migrates the schema of a database
+    /// from an older version. Fails for a database written by a newer
+    /// version, and while another store uses the database.
     ///
     /// The database is put in WAL mode, so the broker keeps `-wal` and
-    /// `-shm` files next to it while it runs.
+    /// `-shm` files next to it while it runs, and holds a lock on a
+    /// `.lock` file next to it. Other programs may read the database
+    /// meanwhile, such as `sqlite3` making a backup.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open(Connection::open(path))
+        let path = path.as_ref();
+        let lock = lock(path)?;
+        create_private(path)?;
+        Self::open(Connection::open(path), Some(Arc::new(lock)))
     }
 
     /// Create an in-memory SQLite store (useful for testing).
     pub fn in_memory() -> Result<Self> {
-        Self::open(Connection::open_in_memory())
+        Self::open(Connection::open_in_memory(), None)
     }
 
-    fn open(conn: rusqlite::Result<Connection>) -> Result<Self> {
-        let conn = conn
-            .and_then(|conn| {
-                configure(&conn)?;
-                create_schema(&conn)?;
-                Ok(conn)
-            })
-            .map_err(StorageError::database)?;
+    fn open(conn: rusqlite::Result<Connection>, lock: Option<Arc<File>>) -> Result<Self> {
+        let mut conn = conn.map_err(StorageError::database)?;
+        configure(&conn).map_err(StorageError::database)?;
+        migrate(&mut conn)?;
         Ok(SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
+            _lock: lock,
         })
     }
 
@@ -81,6 +89,76 @@ impl SqliteStore {
     }
 }
 
+/// Takes the lock of the database at `path`, which brokers sharing it
+/// would otherwise overwrite each other's sessions in. A lock file of its
+/// own, as SQLite's locks on the database come and go with transactions:
+/// `locking_mode=EXCLUSIVE` would also keep readers out, such as `sqlite3`
+/// making a backup.
+fn lock(path: &Path) -> Result<File> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let file = private_options().open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(StorageError::OperationFailed(format!(
+            "another broker uses the database {}: {} is locked",
+            path.display(),
+            Path::new(&lock_path).display()
+        ))),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Creates or opens files readable and writable by their owner only.
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Creates the database file, if missing, readable by its owner only.
+/// SQLite gives the `-wal` and `-shm` files the database's permissions.
+fn create_private(path: &Path) -> Result<()> {
+    if !path.exists() {
+        private_options().open(path)?;
+    }
+    Ok(())
+}
+
+/// Schema changes, applied in order, each in a transaction of its own; the
+/// database records how many it has in `user_version`. Released entries
+/// never change: a new schema change is a new entry.
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[create_schema];
+
+/// Brings the schema up to date.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(StorageError::database)?;
+    let pending = usize::try_from(version)
+        .ok()
+        .and_then(|version| MIGRATIONS.get(version..).map(|m| (version, m)));
+    let Some((version, pending)) = pending else {
+        return Err(StorageError::OperationFailed(format!(
+            "the database has schema version {version}, newer than this broker's {}; \
+             it was written by a newer version of the broker",
+            MIGRATIONS.len()
+        )));
+    };
+    for (index, migration) in pending.iter().enumerate() {
+        let applied = (|| {
+            let tx = conn.transaction()?;
+            migration(&tx)?;
+            tx.pragma_update(None, "user_version", (version + index + 1) as i64)?;
+            tx.commit()
+        })();
+        applied.map_err(StorageError::database)?;
+    }
+    Ok(())
+}
+
 /// WAL lets readers, such as an operator's `sqlite3` shell, work alongside
 /// the broker's writes. With WAL, NORMAL keeps the database consistent
 /// across a power loss and may lose only the last commits.
@@ -92,7 +170,8 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Creates the tables, and adds the columns databases from older versions
-/// lack.
+/// lack: those from before schema versions, whose layout shows which
+/// version wrote them.
 fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -233,20 +312,16 @@ fn move_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
         .prepare("SELECT client_id, subscriptions FROM sessions WHERE subscriptions != ''")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    if encoded.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
     for (client_id, subscriptions) in encoded {
         for subscription in decode_subscriptions(&subscriptions) {
-            insert_subscription(&tx, &client_id, &subscription, "INSERT OR IGNORE")?;
+            insert_subscription(conn, &client_id, &subscription, "INSERT OR IGNORE")?;
         }
-        tx.execute(
+        conn.execute(
             "UPDATE sessions SET subscriptions = '' WHERE client_id = ?1",
             params![client_id],
         )?;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Inserts one subscription row with `verb`, such as `INSERT OR REPLACE`.
@@ -1174,6 +1249,96 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(saved, ["after"]);
+    }
+
+    fn user_version(path: &TempPath) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_the_schema_version_is_recorded() {
+        let path = TempPath::new("version");
+        drop(SqliteStore::new(&path).unwrap());
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+        // Opening again changes nothing
+        drop(SqliteStore::new(&path).unwrap());
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn test_a_newer_schema_is_refused() {
+        let path = TempPath::new("newer");
+        drop(SqliteStore::new(&path).unwrap());
+        let newer = MIGRATIONS.len() as i64 + 1;
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+
+        let error = SqliteStore::new(&path).err().unwrap().to_string();
+        assert!(error.contains("newer"), "{error}");
+        assert_eq!(user_version(&path), newer);
+    }
+
+    /// A database from before schema versions, at the layout of the
+    /// latest release without one, is migrated and keeps its rows.
+    #[tokio::test]
+    async fn test_an_unversioned_database_is_migrated() {
+        let path = TempPath::new("unversioned");
+        drop(SqliteStore::new(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (client_id, subscriptions, clean_start) VALUES ('c', '', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteStore::new(&path).unwrap();
+        assert!(store.load_session("c").await.unwrap().is_some());
+        drop(store);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn test_two_stores_never_share_a_database() {
+        let path = TempPath::new("exclusive");
+        let first = SqliteStore::new(&path).unwrap();
+        let error = SqliteStore::new(&path).err().unwrap().to_string();
+        assert!(error.contains("another"), "{error}");
+
+        // Readers, such as an operator's sqlite3 shell, still can
+        let reader =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let sessions: i64 = reader
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0);
+        let copy = path.0.with_extension("copy");
+        let _ = std::fs::remove_file(&copy);
+        reader
+            .execute("VACUUM INTO ?1", params![copy.to_str().unwrap()])
+            .unwrap();
+        std::fs::remove_file(&copy).unwrap();
+        drop(reader);
+
+        drop(first);
+        SqliteStore::new(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_new_database_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = TempPath::new("private");
+        drop(SqliteStore::new(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[tokio::test]
