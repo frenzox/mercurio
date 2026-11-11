@@ -10,7 +10,9 @@ use std::{
 
 use argon2::{Argon2, PasswordHasher};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use mercurio_client::{ClientError, ConnectOptions, MqttClient, ReasonCode};
+use mercurio_client::{
+    ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ReasonCode,
+};
 use serde_json::json;
 
 const SECRET: &str = "a secret of at least thirty-two bytes";
@@ -162,6 +164,23 @@ fn refused(result: Result<MqttClient, ClientError>) -> ReasonCode {
     }
 }
 
+/// The reason code of the DISCONNECT the broker sent within `wait`; None
+/// if the client stayed connected.
+async fn disconnected(client: &MqttClient, wait: Duration) -> Option<ReasonCode> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, client.recv()).await {
+            Err(_) => return None,
+            Ok(Some(Event::Disconnected {
+                reason: DisconnectReason::ServerInitiated { reason, .. },
+            })) => return Some(reason),
+            Ok(Some(Event::Disconnected { reason })) => panic!("disconnected: {reason:?}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the client stopped without a Disconnected event"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_valid_token_with_its_user_name_connects() {
     let broker = Broker::start("valid", "", "", "");
@@ -231,6 +250,73 @@ async fn password_file_users_still_log_in_next_to_tokens() {
         refused(broker.connect("c3", "bob", "wrong").await),
         ReasonCode::BadUserNameOrPassword
     );
+}
+
+#[tokio::test]
+async fn a_client_is_disconnected_when_its_token_expires() {
+    let broker = Broker::start("expiry", "", "", "");
+    let client = broker
+        .connect("c1", "alice", &token("alice", now() + 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        disconnected(&client, Duration::from_secs(6)).await,
+        Some(ReasonCode::NotAuthorized)
+    );
+}
+
+#[tokio::test]
+async fn a_client_back_with_a_fresh_token_outlives_the_old_one() {
+    let broker = Broker::start("refresh", "", "", "");
+    let old = broker
+        .connect("c1", "alice", &token("alice", now() + 2))
+        .await
+        .unwrap();
+    // Takes the session over before the old token expires
+    let fresh = broker
+        .connect("c1", "alice", &token("alice", now() + 60))
+        .await
+        .unwrap();
+    assert_eq!(
+        disconnected(&old, Duration::from_secs(2)).await,
+        Some(ReasonCode::SessionTakenOver)
+    );
+    assert_eq!(disconnected(&fresh, Duration::from_secs(4)).await, None);
+}
+
+#[tokio::test]
+async fn a_refused_token_login_does_not_disconnect_the_client_id_owner() {
+    let files = TempDir::new("victim-file");
+    let passwd = files.0.join("passwd");
+    let hash = Argon2::default().hash_password(b"hunter2").unwrap();
+    std::fs::write(&passwd, format!("bob:{hash}\n")).unwrap();
+    let broker = Broker::start(
+        "victim",
+        "",
+        &format!("password_file = \"{}\"", passwd.display()),
+        "",
+    );
+    let victim = broker.connect("bobs", "bob", "hunter2").await.unwrap();
+    // The token is fine, the client id belongs to bob
+    assert_eq!(
+        refused(
+            broker
+                .connect("bobs", "mallory", &token("mallory", now() + 1))
+                .await
+        ),
+        ReasonCode::NotAuthorized
+    );
+    assert_eq!(disconnected(&victim, Duration::from_secs(4)).await, None);
+}
+
+#[tokio::test]
+async fn clients_stay_past_expiry_unless_told_to_leave() {
+    let broker = Broker::start("stay", "", "", "disconnect_on_expiry = false");
+    let client = broker
+        .connect("c1", "alice", &token("alice", now() + 2))
+        .await
+        .unwrap();
+    assert_eq!(disconnected(&client, Duration::from_secs(5)).await, None);
 }
 
 #[test]

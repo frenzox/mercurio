@@ -219,6 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         plugins,
         dynsec,
+        jwt,
         listeners: prepared_listeners,
         reloadable,
         bridges,
@@ -399,16 +400,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = match config.storage {
         StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
     };
     // Removed now, as exiting skips destructors
@@ -439,6 +440,8 @@ struct Prepared {
     auth: ServerAuthConfig,
     plugins: Vec<Arc<dyn Plugin>>,
     dynsec: Option<Arc<DynamicSecurity>>,
+    /// Of `[auth]` and of every listener, which need the broker's `Admin`
+    jwt: Vec<Arc<JwtAuth>>,
     /// In the order of `[[listeners]]`
     listeners: Vec<PreparedListener>,
     reloadable: Vec<Arc<dyn Reload>>,
@@ -477,7 +480,8 @@ async fn prepare(
 
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
     let tls = build_tls(&config.server.tls, &mut reloadable)?;
-    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
+    let mut jwt = Vec::new();
+    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, &mut jwt, true)?;
     let wasm = load_plugins(
         &config.plugins,
         config.server.plugin_timeout(),
@@ -510,7 +514,7 @@ async fn prepare(
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {
             Some(auth) => {
-                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;
+                let (auth, plugins, _) = build_auth(auth, &mut reloadable, &mut jwt, false)?;
                 (Some(auth), Some(chain(&plugins, names)))
             }
             None => (None, names.map(|_| chain(&builtins, names))),
@@ -538,6 +542,7 @@ async fn prepare(
         auth,
         plugins: chain(&builtins, None),
         dynsec,
+        jwt,
         listeners,
         reloadable,
         bridges,
@@ -558,18 +563,22 @@ fn build_tls(
     Ok(Some(tls))
 }
 
-/// Sets the broker up, hands its `Admin` to the daemon's commands and to
-/// dynamic security, and serves until `shutdown`.
+/// Sets the broker up, hands its `Admin` to the daemon's commands, to
+/// dynamic security and to JWT authentication, and serves until `shutdown`.
 async fn serve<St: MqttStore + 'static>(
     builder: ServerBuilder<St>,
     commands: &commands::DaemonCommands,
     dynsec: Option<Arc<DynamicSecurity>>,
+    jwt: Vec<Arc<JwtAuth>>,
     shutdown: impl Future,
 ) -> Result<(), ServerError> {
     let server = builder.build().await?;
     commands.set_admin(server.admin());
     if let Some(dynsec) = dynsec {
         dynsec.set_admin(server.admin());
+    }
+    for jwt in jwt {
+        jwt.set_admin(server.admin());
     }
     // The listeners are bound and the sessions restored: from here on,
     // connections are served
@@ -676,10 +685,11 @@ type Auth = (
 );
 
 /// The authentication and access control of `config`, adding the files it
-/// loads to `reloadable`.
+/// loads to `reloadable` and its JWT authentication to `jwt`.
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
+    jwt: &mut Vec<Arc<JwtAuth>>,
     main: bool,
 ) -> Result<Auth, String> {
     let table = if main { "[auth]" } else { "[listeners.auth]" };
@@ -757,6 +767,7 @@ fn build_auth(
         if auth.has_key_file() {
             reloadable.push(auth.clone());
         }
+        jwt.push(auth.clone());
         plugins.push(auth);
     }
     if let Some(path) = &config.password_file {
@@ -940,7 +951,8 @@ mod tests {
             ),
         ] {
             for main in [true, false] {
-                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
+                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), &mut Vec::new(), main)
+                else {
                     panic!("{toml}: accepted");
                 };
                 assert!(
@@ -956,6 +968,7 @@ mod tests {
         let (value, plugins, _) = build_auth(
             &auth("[http]\nacl_url = \"http://h/acl\"\n"),
             &mut Vec::new(),
+            &mut Vec::new(),
             true,
         )
         .map_err(|e| panic!("{e}"))
@@ -967,6 +980,7 @@ mod tests {
         std::fs::write(&acl, "topic read public/#\n").unwrap();
         let result = build_auth(
             &auth(&format!("acl_file = \"{}\"\n", acl.display())),
+            &mut Vec::new(),
             &mut Vec::new(),
             true,
         );
@@ -980,6 +994,7 @@ mod tests {
     fn test_a_superuser_endpoint_alone_is_used() {
         let (_, plugins, _) = build_auth(
             &auth("enabled = true\n[http]\nsuperuser_url = \"http://h/su\"\n"),
+            &mut Vec::new(),
             &mut Vec::new(),
             true,
         )
@@ -1001,6 +1016,7 @@ mod tests {
                     "enabled = true\n[http]\nuser_url = \"https://h/u\"\n{tls}"
                 )),
                 &mut reloadable,
+                &mut Vec::new(),
                 true,
             )
             .map_err(|e| panic!("{e}"))
@@ -1014,7 +1030,7 @@ mod tests {
     async fn broker_with(toml: &str) -> u16 {
         use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
-        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true)
+        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), &mut Vec::new(), true)
             .map_err(|e| panic!("{e}"))
             .unwrap();
         let mut config = ServerConfig::default();

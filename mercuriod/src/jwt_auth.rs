@@ -1,6 +1,7 @@
 //! JSON Web Tokens given as CONNECT passwords.
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -8,8 +9,10 @@ use base64::Engine;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{Jwk, PublicKeyUse};
 use jsonwebtoken::{decode, decode_header, Algorithm, AlgorithmFamily, DecodingKey, Validation};
+use mercurio_core::reason::ReasonCode;
+use mercurio_server::admin::{Admin, DisconnectOptions, SessionKey};
 use mercurio_server::plugin::{
-    BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
+    ready, BoxFuture, ClientInfo, Credentials, Decision, Event, Plugin, PluginKind, PluginStatus,
 };
 use serde_json::{Map, Value};
 use tracing::warn;
@@ -354,10 +357,108 @@ fn reason(kind: &ErrorKind) -> &'static str {
     }
 }
 
-/// Lets in clients whose CONNECT password is a token for their user name.
+/// Lets in clients whose CONNECT password is a token for their user name,
+/// and disconnects them once it expires.
 pub(crate) struct JwtAuth {
     config: JwtAuthConfig,
     verifier: RwLock<Arc<Verifier>>,
+    expiries: Mutex<Expiries>,
+    admin: OnceLock<Admin>,
+}
+
+/// How long a login stays pending before its client is looked up, well past
+/// any CONNECT that has not ended by then.
+const PENDING_FOR: Duration = Duration::from_secs(30);
+
+/// When the tokens of clients expire, by their session.
+#[derive(Default)]
+struct Expiries {
+    /// Authenticated, not connected yet. A list, as clients whose id is
+    /// given after authentication share the empty one.
+    pending: Vec<Pending>,
+    live: HashMap<SessionKey, SystemTime>,
+}
+
+struct Pending {
+    key: SessionKey,
+    username: String,
+    expires: SystemTime,
+    since: Instant,
+}
+
+impl Expiries {
+    fn authenticated(&mut self, key: SessionKey, username: &str, expires: SystemTime) {
+        self.forget(&key);
+        self.pending.push(Pending {
+            key,
+            username: username.to_string(),
+            expires,
+            since: Instant::now(),
+        });
+    }
+
+    /// Drops the pending login of `key`, which logged in again some other
+    /// way, so it does not inherit that token's expiry.
+    fn forget(&mut self, key: &SessionKey) {
+        if !key.client_id.is_empty() {
+            self.pending.retain(|pending| pending.key != *key);
+        }
+    }
+
+    fn connected(&mut self, client: &ClientInfo) {
+        let key = session_key(client);
+        let username = client.username.as_deref();
+        // The latest login of this user under this client id, or else one
+        // whose id the broker assigned or replaced with the user name after it
+        let found = self
+            .pending
+            .iter()
+            .rposition(|pending| pending.key == key && Some(pending.username.as_str()) == username)
+            .or_else(|| {
+                self.pending.iter().position(|pending| {
+                    pending.key.mount_point == key.mount_point
+                        && Some(pending.username.as_str()) == username
+                        && (pending.key.client_id.is_empty()
+                            || Some(key.client_id.as_str()) == username)
+                })
+            });
+        match found {
+            Some(index) => {
+                let pending = self.pending.remove(index);
+                self.live.insert(key, pending.expires);
+            }
+            // Let in by something else this time
+            None => {
+                self.live.remove(&key);
+            }
+        }
+    }
+
+    /// The logins pending since before `now - PENDING_FOR`, forgotten: their
+    /// CONNECT was refused, or its Connected event was dropped.
+    fn stale(&mut self, now: Instant) -> Vec<Pending> {
+        self.pending
+            .extract_if(.., |pending| {
+                now.duration_since(pending.since) >= PENDING_FOR
+            })
+            .collect()
+    }
+
+    /// The connected clients whose token expired by `now`, forgotten.
+    fn expired(&mut self, now: SystemTime) -> Vec<SessionKey> {
+        self.live
+            .extract_if(|_, expires| *expires <= now)
+            .map(|(key, _)| key)
+            .collect()
+    }
+}
+
+fn session_key(client: &ClientInfo) -> SessionKey {
+    let mount_point = client
+        .connection
+        .as_ref()
+        .and_then(|c| c.mount_point.clone());
+    SessionKey::new(mount_point, client.client_id.clone())
 }
 
 impl JwtAuth {
@@ -365,7 +466,15 @@ impl JwtAuth {
         Ok(Self {
             verifier: RwLock::new(Arc::new(Verifier::from_config(config)?)),
             config: config.clone(),
+            expiries: Mutex::default(),
+            admin: OnceLock::new(),
         })
+    }
+
+    /// Hands over the broker's `Admin`, which exists only once the broker
+    /// does.
+    pub(crate) fn set_admin(&self, admin: Admin) {
+        let _ = self.admin.set(admin);
     }
 
     /// Whether its keys come from a file, which a reload rereads; a key set
@@ -381,7 +490,11 @@ impl Plugin for JwtAuth {
     }
 
     fn status(&self) -> PluginStatus {
-        PluginStatus::new("jwt", PluginKind::Builtin).with_hooks(&["authenticate"])
+        PluginStatus::new("jwt", PluginKind::Builtin).with_hooks(&[
+            "authenticate",
+            "on_event",
+            "on_tick",
+        ])
     }
 
     fn authenticate<'a>(
@@ -394,7 +507,12 @@ impl Plugin for JwtAuth {
             let peer = client
                 .peer
                 .map_or_else(|| "-".to_string(), |peer| peer.to_string());
-            match verifier.check_async(credentials.password).await {
+            let checked = verifier.check_async(credentials.password).await;
+            if !matches!(&checked, Checked::Valid { username, .. } if username == credentials.username)
+            {
+                self.expiries.lock().unwrap().forget(&session_key(client));
+            }
+            match checked {
                 Checked::NotAToken => Decision::Defer,
                 Checked::Invalid(why) => {
                     warn!(
@@ -410,7 +528,70 @@ impl Plugin for JwtAuth {
                     );
                     Decision::Deny
                 }
-                Checked::Valid { .. } => Decision::Allow,
+                Checked::Valid { username, expires } => {
+                    if self.config.disconnect_on_expiry {
+                        // Accepted within the leeway, so kept as long
+                        let expires = expires
+                            .checked_add(Duration::from_secs(self.config.leeway_seconds))
+                            .unwrap_or(expires);
+                        self.expiries.lock().unwrap().authenticated(
+                            session_key(client),
+                            &username,
+                            expires,
+                        );
+                    }
+                    Decision::Allow
+                }
+            }
+        })
+    }
+
+    fn on_event<'a>(&'a self, event: &'a Event) -> BoxFuture<'a, ()> {
+        // A takeover reports the old connection's Disconnected after the
+        // new one authenticated, so only Connected changes anything
+        if let Event::Connected { client, .. } = event {
+            self.expiries.lock().unwrap().connected(client);
+        }
+        ready(())
+    }
+
+    // ponytail: expiry is checked on the plugin tick, so a client outlives its token by up to one tick interval; a timer per client if that matters.
+    // Clients whose id is assigned after authentication are tracked only through their Connected event, best effort.
+    // A login whose Connected event was dropped is looked up after PENDING_FOR, so it can outlive its token by that much.
+    // A fresh-token reconnect landing between the check below and the disconnect is still dropped; it can reconnect.
+    fn on_tick(&self) -> BoxFuture<'_, ()> {
+        let stale = self.expiries.lock().unwrap().stale(Instant::now());
+        Box::pin(async move {
+            let Some(admin) = self.admin.get() else {
+                return;
+            };
+            // Connected events can be dropped, so a client that logged in with
+            // the token and is still there is tracked from now on
+            for pending in stale {
+                if pending.key.client_id.is_empty() {
+                    continue;
+                }
+                let Ok(client) = admin.client(&pending.key).await else {
+                    continue;
+                };
+                if client.connected && client.username.as_deref() == Some(&pending.username) {
+                    self.expiries
+                        .lock()
+                        .unwrap()
+                        .live
+                        .insert(pending.key, pending.expires);
+                }
+            }
+            let expired = self.expiries.lock().unwrap().expired(SystemTime::now());
+            let mut options = DisconnectOptions::default();
+            options.reason = ReasonCode::NotAuthorized;
+            for key in expired {
+                // Back with a fresh token since
+                if self.expiries.lock().unwrap().live.contains_key(&key) {
+                    continue;
+                }
+                // It may have left meanwhile
+                let _ = admin.disconnect(&key, options).await;
             }
         })
     }
@@ -967,5 +1148,199 @@ mod tests {
             let error = Verifier::from_config(&jwks_config(url, 300)).err().unwrap();
             assert!(error.contains("https"), "{error}");
         }
+    }
+
+    fn session(client_id: &str) -> SessionKey {
+        SessionKey::new(None, client_id)
+    }
+
+    fn connected(expiries: &mut Expiries, client_id: &str, username: &str) {
+        expiries.connected(&ClientInfo::new(client_id, Some(username.to_string())));
+    }
+
+    #[test]
+    fn test_a_connected_client_expires_with_its_token() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(10));
+        connected(&mut expiries, "c1", "alice");
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+        assert_eq!(
+            expiries.expired(start + Duration::from_secs(10)),
+            [session("c1")]
+        );
+        assert!(expiries.expired(start + Duration::from_secs(20)).is_empty());
+    }
+
+    #[test]
+    fn test_a_takeover_keeps_the_new_tokens_expiry() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(2));
+        connected(&mut expiries, "c1", "alice");
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(60));
+        connected(&mut expiries, "c1", "alice");
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn test_a_client_back_by_other_means_is_forgotten() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(2));
+        connected(&mut expiries, "c1", "alice");
+        connected(&mut expiries, "c1", "alice");
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn test_a_client_id_given_after_authentication_finds_its_token() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        // Assigned by the broker, or the user name on a listener that uses it
+        expiries.authenticated(session(""), "alice", start + Duration::from_secs(2));
+        expiries.authenticated(session("c2"), "bob", start + Duration::from_secs(2));
+        connected(&mut expiries, "auto-1", "alice");
+        connected(&mut expiries, "bob", "bob");
+        let mut expired = expiries.expired(start + Duration::from_secs(5));
+        expired.sort();
+        assert_eq!(expired, [session("auto-1"), session("bob")]);
+    }
+
+    #[test]
+    fn test_logins_left_pending_are_dropped_after_a_while() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(2));
+        expiries.authenticated(session(""), "bob", start + Duration::from_secs(2));
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+        assert!(expiries.stale(Instant::now()).is_empty());
+        let stale = expiries.stale(Instant::now() + PENDING_FOR);
+        let stale: Vec<_> = stale
+            .iter()
+            .map(|p| (p.key.clone(), p.username.as_str()))
+            .collect();
+        assert_eq!(stale, [(session("c1"), "alice"), (session(""), "bob")]);
+        assert!(expiries.pending.is_empty());
+    }
+
+    #[test]
+    fn test_a_pending_login_of_another_user_is_not_taken_up() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "mallory", start + Duration::from_secs(2));
+        connected(&mut expiries, "c1", "bob");
+        assert!(expiries.live.is_empty());
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn test_a_client_id_has_one_pending_login() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(2));
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(60));
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+        connected(&mut expiries, "c1", "alice");
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+        assert_eq!(
+            expiries.expired(start + Duration::from_secs(60)),
+            [session("c1")]
+        );
+    }
+
+    #[test]
+    fn test_a_login_without_a_token_drops_the_pending_one() {
+        let start = SystemTime::now();
+        let mut expiries = Expiries::default();
+        expiries.authenticated(session("c1"), "alice", start + Duration::from_secs(2));
+        expiries.forget(&session("c1"));
+        connected(&mut expiries, "c1", "alice");
+        assert!(expiries.expired(start + Duration::from_secs(5)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_refused_logins_drop_the_pending_token_of_their_client_id() {
+        let auth = JwtAuth::from_config(&JwtAuthConfig {
+            leeway_seconds: 0,
+            ..hs_config()
+        })
+        .unwrap();
+        let client = ClientInfo::new("c1", Some("alice".to_string()));
+        let valid = hs_token(&json!({ "sub": "alice", "exp": now() + 2 }));
+        let other = hs_token(&json!({ "sub": "bob", "exp": now() + 60 }));
+        let expired = hs_token(&json!({ "sub": "alice", "exp": now() - 60 }));
+        let later = SystemTime::now() + Duration::from_secs(5);
+        for password in ["not a token", other.as_str(), expired.as_str()] {
+            let login = Credentials::new("alice", valid.as_bytes());
+            assert_eq!(auth.authenticate(&client, &login).await, Decision::Allow);
+            let again = Credentials::new("alice", password.as_bytes());
+            assert_ne!(auth.authenticate(&client, &again).await, Decision::Allow);
+            assert!(
+                auth.expiries.lock().unwrap().expired(later).is_empty(),
+                "{password}"
+            );
+        }
+    }
+
+    async fn still_connected(admin: &Admin, client_id: &str) -> bool {
+        for _ in 0..20 {
+            match admin.client(&session(client_id)).await {
+                Ok(client) if client.connected => {}
+                _ => return false,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_client_whose_connected_event_was_lost_is_found_and_expires() {
+        use mercurio_client::{ConnectOptions, MqttClient};
+        use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
+
+        let auth = Arc::new(JwtAuth::from_config(&hs_config()).unwrap());
+        let mut config = ServerConfig::default();
+        config.plugins = vec![auth.clone()];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .storage(Arc::new(mercurio_storage::memory::MemoryStore::new()))
+            .build()
+            .await
+            .unwrap();
+        let admin = server.admin();
+        auth.set_admin(admin.clone());
+        tokio::spawn(server.run(std::future::pending::<()>()));
+
+        let token = hs_token(&json!({ "sub": "alice", "exp": now() + 60 }));
+        let mut clients = Vec::new();
+        for client_id in ["c1", "c2"] {
+            let options = ConnectOptions::new("127.0.0.1", port)
+                .client_id(client_id)
+                .username("alice")
+                .password(token.clone());
+            clients.push(MqttClient::connect(options).await.unwrap());
+        }
+        // As if both Connected events were lost; c2's login is someone else's
+        let past = Instant::now() - PENDING_FOR;
+        {
+            let mut expiries = auth.expiries.lock().unwrap();
+            expiries.live.clear();
+            for (client_id, username) in [("c1", "alice"), ("c2", "mallory")] {
+                expiries.pending.push(Pending {
+                    key: session(client_id),
+                    username: username.to_string(),
+                    expires: SystemTime::now() - Duration::from_secs(1),
+                    since: past,
+                });
+            }
+        }
+        auth.on_tick().await;
+        assert!(auth.expiries.lock().unwrap().pending.is_empty());
+        assert!(!still_connected(&admin, "c1").await);
+        assert!(still_connected(&admin, "c2").await);
     }
 }
