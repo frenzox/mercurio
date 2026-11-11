@@ -101,7 +101,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
 <tr><td><code>manual_acks(bool)</code></td><td>Acknowledge QoS 1 and 2 messages when the application calls <code>ack</code>, not on receipt</td></tr>
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
-<tr><td><code>connector(f)</code></td><td>Open the stream with <code>f</code> instead of TCP</td></tr>
+<tr><td><code>connector(f)</code></td><td>Open the stream with the future <code>f</code> returns instead of TCP, as for a proxy or an in-process broker; the connect timeout bounds it</td></tr>
 <tr><td><code>connect_timeout(Duration)</code></td><td>Longest wait for the connection, CONNACK included, 30 seconds by default</td></tr>
 <tr><td><code>write_timeout(duration)</code></td><td>Longest a packet may take to write before the connection counts as lost; the keep-alive by default, or 30 seconds with a keep-alive of 0</td></tr>
 </table>

@@ -110,11 +110,14 @@ impl MqttClient {
 
     /// Opens the byte stream to the broker, TLS handshake included.
     async fn open_stream(options: &ConnectOptions) -> Result<Box<dyn Stream>> {
+        let connect_timeout = options.connect_timeout;
         if let Some(connector) = &options.connector {
-            return (connector.0)().map_err(ClientError::ConnectionFailed);
+            return timeout(connect_timeout, (connector.0)())
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(ClientError::ConnectionFailed);
         }
 
-        let connect_timeout = options.connect_timeout;
         #[cfg(unix)]
         if let Some(path) = &options.unix_path {
             info!("Connecting to MQTT broker at {}", path.display());

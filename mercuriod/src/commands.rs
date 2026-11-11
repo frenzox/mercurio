@@ -180,7 +180,7 @@ mod tests {
         let connector = connector.clone();
         let options = ConnectOptions::new("localhost", 0)
             .client_id("ctl")
-            .connector(move || connector.connect());
+            .connector(move || std::future::ready(connector.connect()));
         let client = MqttClient::connect(options).await.unwrap();
         client
             .subscribe(&[("$CONTROL/broker/v1/response", QoS::AtMostOnce)])

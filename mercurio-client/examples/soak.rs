@@ -26,24 +26,26 @@ const TOPIC: &str = "soak/sequence";
 /// Connects through each address in turn, so a client reconnecting after a
 /// failover reaches whichever broker serves.
 fn options(addresses: &[SocketAddr], client_id: &str) -> ConnectOptions {
-    let addresses = addresses.to_vec();
-    let next = AtomicUsize::new(0);
+    let addresses: Arc<[SocketAddr]> = addresses.into();
+    let next = Arc::new(AtomicUsize::new(0));
     ConnectOptions::new("localhost", 0)
         .client_id(client_id)
         .reconnect(Duration::from_millis(500))
         .connector(move || {
-            let mut last_error = None;
-            for _ in 0..addresses.len() {
-                let address = addresses[next.fetch_add(1, Ordering::Relaxed) % addresses.len()];
-                match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
-                    Ok(stream) => {
-                        stream.set_nonblocking(true)?;
-                        return tokio::net::TcpStream::from_std(stream);
+            let (addresses, next) = (Arc::clone(&addresses), Arc::clone(&next));
+            async move {
+                let mut last_error = None;
+                for _ in 0..addresses.len() {
+                    let address = addresses[next.fetch_add(1, Ordering::Relaxed) % addresses.len()];
+                    let connecting = tokio::net::TcpStream::connect(address);
+                    match tokio::time::timeout(Duration::from_secs(2), connecting).await {
+                        Ok(Ok(stream)) => return Ok(stream),
+                        Ok(Err(e)) => last_error = Some(e),
+                        Err(_) => last_error = Some(std::io::ErrorKind::TimedOut.into()),
                     }
-                    Err(e) => last_error = Some(e),
                 }
+                Err(last_error.expect("at least one address"))
             }
-            Err(last_error.expect("at least one address"))
         })
 }
 

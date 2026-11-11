@@ -1,7 +1,9 @@
 use std::fmt;
+use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -311,9 +313,12 @@ impl fmt::Debug for SharedAuthenticator {
     }
 }
 
+/// The stream to the broker a connector is opening.
+pub(crate) type Connecting = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Stream>>> + Send>>;
+
 /// Opens the stream to the broker in place of TCP and TLS.
 #[derive(Clone)]
-pub(crate) struct Connector(pub Arc<dyn Fn() -> std::io::Result<Box<dyn Stream>> + Send + Sync>);
+pub(crate) struct Connector(pub Arc<dyn Fn() -> Connecting + Send + Sync>);
 
 impl fmt::Debug for Connector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -715,15 +720,33 @@ impl ConnectOptions {
         self
     }
 
-    /// Open the stream to the broker with `connect`, on every connection
-    /// and reconnection, instead of connecting to the host and port.
-    pub fn connector<S, F>(mut self, connect: F) -> Self
+    /// Open the stream to the broker with the future `connect` returns, on
+    /// every connection and reconnection, instead of connecting to the
+    /// host and port: for transports of your own, such as a proxy or an
+    /// in-process broker. The future has the connect timeout to finish, and
+    /// an error it returns fails the attempt as
+    /// [`ConnectionFailed`](ClientError::ConnectionFailed). The client's
+    /// TLS settings don't apply to the stream.
+    ///
+    /// ```no_run
+    /// use mercurio_client::ConnectOptions;
+    ///
+    /// let options = ConnectOptions::new("broker", 1883)
+    ///     .connector(|| tokio::net::TcpStream::connect("10.0.0.7:1883"));
+    /// ```
+    pub fn connector<S, F, Fut>(mut self, connect: F) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        F: Fn() -> std::io::Result<S> + Send + Sync + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<S>> + Send + 'static,
     {
         self.connector = Some(Connector(Arc::new(move || {
-            connect().map(|stream| Box::new(stream) as Box<dyn Stream>)
+            let connecting = connect();
+            Box::pin(async move {
+                connecting
+                    .await
+                    .map(|stream| Box::new(stream) as Box<dyn Stream>)
+            })
         })));
         self
     }

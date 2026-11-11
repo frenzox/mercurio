@@ -206,9 +206,10 @@ fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String
         .manual_acks(true)
         .receive_maximum(IN_FLIGHT)
         .connector(move || {
-            local
+            let connected = local
                 .connect()
-                .inspect_err(|_| stopped.store(true, Ordering::Relaxed))
+                .inspect_err(|_| stopped.store(true, Ordering::Relaxed));
+            std::future::ready(connected)
         });
 
     let protocol_version = match config.protocol_version {
@@ -852,7 +853,7 @@ mod tests {
             let connector = connector.clone();
             ConnectOptions::new("localhost", 0)
                 .client_id(id)
-                .connector(move || connector.connect())
+                .connector(move || std::future::ready(connector.connect()))
         }
 
         /// Runs a bridge forwarding `a/#` to `port`, its local client

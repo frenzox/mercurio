@@ -182,7 +182,7 @@ tokio::spawn(run_with_config(listener, config, std::future::pending::&lt;()&gt;(
 
 let options = ConnectOptions::new("localhost", 0)
     .client_id("internal")
-    .connector(move || connector.connect());
+    .connector(move || std::future::ready(connector.connect()));
 let client = MqttClient::connect(options).await?;
 client.publish("app/started", "1", QoS::AtLeastOnce).await?;</pre>
 <p>The daemon's bridges and dynamic security work this way.</p>
