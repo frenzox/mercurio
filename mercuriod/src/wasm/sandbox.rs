@@ -9,7 +9,7 @@ use std::{
 };
 
 use http_body_util::BodyExt;
-use wasmtime::{component::ResourceTable, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{component::ResourceTable, ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{sockets::SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
@@ -21,7 +21,7 @@ pub(crate) struct State {
     http: WasiHttpCtx,
     hooks: AllowHttp,
     table: ResourceTable,
-    pub(crate) limits: StoreLimits,
+    pub(crate) limits: Limits,
     kv: Arc<Kv>,
     /// Epoch ticks left for the running call
     pub(crate) ticks_left: u64,
@@ -188,17 +188,70 @@ impl State {
                 name: Arc::clone(&name),
             },
             table,
-            limits: StoreLimitsBuilder::new()
-                .memory_size(memory)
-                .instances(INSTANCES)
-                .tables(TABLES)
-                .memories(MEMORIES)
-                .table_elements(TABLE_ELEMENTS)
-                .build(),
+            limits: Limits {
+                memory,
+                used: 0,
+                tables: StoreLimitsBuilder::new()
+                    .instances(INSTANCES)
+                    .tables(TABLES)
+                    .memories(MEMORIES)
+                    .table_elements(TABLE_ELEMENTS)
+                    .build(),
+            },
             kv,
             ticks_left: 0,
             name,
         }
+    }
+}
+
+/// What one copy may allocate: `memory` bytes across all its linear
+/// memories, where wasmtime's `StoreLimits` caps each memory on its own;
+/// the counts and table sizes are left to `StoreLimits`.
+pub(crate) struct Limits {
+    memory: usize,
+    /// Bytes granted so far. Memories live as long as the copy's store, so
+    /// they only grow; a growth that fails after being granted stays
+    /// counted, which errs on the side of less memory
+    used: usize,
+    tables: StoreLimits,
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let more = desired.saturating_sub(current);
+        let used = self.used.saturating_add(more);
+        if used > self.memory || maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        self.used = used;
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.tables.table_growing(current, desired, maximum)
+    }
+
+    fn instances(&self) -> usize {
+        self.tables.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.tables.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.tables.memories()
     }
 }
 
@@ -413,6 +466,26 @@ mod tests {
         assert!(long.len() <= LOG_MESSAGE + "…".len(), "{}", long.len());
         assert!(long.ends_with('…'));
         assert_eq!(loggable("plain".into()), "plain");
+    }
+
+    #[test]
+    fn test_the_memory_limit_covers_all_memories_of_a_copy() {
+        use wasmtime::{Engine, Memory, MemoryType, Store};
+
+        const PAGE: usize = 64 << 10;
+        let allowed = Allowed::parse(&[], &[]).unwrap();
+        let state = State::new("t".into(), &allowed, 100 * PAGE, Arc::default());
+        let mut store = Store::new(&Engine::default(), state);
+        store.limiter(|state| &mut state.limits);
+
+        let first = Memory::new(&mut store, MemoryType::new(40, None)).unwrap();
+        let second = Memory::new(&mut store, MemoryType::new(40, None)).unwrap();
+        // 80 pages of 100 are taken, whichever memory asks for more
+        assert!(Memory::new(&mut store, MemoryType::new(40, None)).is_err());
+        assert!(second.grow(&mut store, 30).is_err());
+        assert!(first.grow(&mut store, 20).is_ok());
+        assert!(second.grow(&mut store, 1).is_err());
+        assert!(Memory::new(&mut store, MemoryType::new(0, None)).is_ok());
     }
 
     #[test]

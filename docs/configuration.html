@@ -230,7 +230,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may open sockets to, as <code>"address:port"</code>.</td></tr>
 <tr><td><code>instances</code></td><td>number of CPUs</td><td>Copies that run calls at once.</td></tr>
 <tr><td><code>timeout_ms</code></td><td><code>[server]</code> <code>plugin_timeout</code></td><td>Longest one call, or <code>init</code>, may run. No longer than <code>plugin_timeout</code>, which bounds every hook call too.</td></tr>
-<tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Memory each copy may use.</td></tr>
+<tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Linear memory each copy may use, all its memories together.</td></tr>
 </table>
 <p>Only the file at <code>path</code> is reread on SIGHUP; other changes need a restart.</p>
 
