@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.5.0...mercurio-client-v0.6.0) - 2026-11-11
+
+### Added
+
+- *(client)* authenticate with SCRAM-SHA-256-PLUS
+- *(client)* [**breaking**] tell authenticators about the TLS channel
+
+### Fixed
+
+- *(client)* log a failed TLS exporter and fix the channel doc
+
 ## [0.5.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.4.1...mercurio-client-v0.5.0) - 2026-11-11
 
 ### Added

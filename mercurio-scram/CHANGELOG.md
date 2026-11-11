@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-scram-v0.1.0...mercurio-scram-v0.2.0) - 2026-11-11
+
+### Added
+
+- *(scram)* [**breaking**] bind exchanges to the TLS channel with tls-exporter
+
+### Fixed
+
+- *(mercuriod)* key SCRAM credentials by the prepared user name
+- *(scram)* [**breaking**] prepare user names with SASLprep
+
+### Other
+
+- *(scram)* fix stale comments and test order
+- release
+
 ## [0.1.0](https://github.com/frenzox/mercurio/releases/tag/mercurio-scram-v0.1.0) - 2026-11-11
 
 ### Added

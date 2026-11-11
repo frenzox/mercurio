@@ -1,6 +1,6 @@
 [package]
 name = "mercuriod"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version = "1.97"
 description = "Mercurio MQTT broker daemon"
@@ -23,9 +23,9 @@ workspace = true
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.3.0" }
-mercurio-client = { path = "../mercurio-client", version = "0.5.0" }
-mercurio-server = { path = "../mercurio-server", version = "0.6.0" }
-mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
+mercurio-client = { path = "../mercurio-client", version = "0.6.0" }
+mercurio-server = { path = "../mercurio-server", version = "0.7.0" }
+mercurio-scram = { path = "../mercurio-scram", version = "0.2.0" }
 mercurio-storage = { path = "../mercurio-storage", version = "0.4.0", features = ["sqlite", "postgres"] }
 
 argon2 = "0.6"
