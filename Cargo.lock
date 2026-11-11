@@ -1473,6 +1473,7 @@ dependencies = [
  "futures-util",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-scram",
  "mercurio-storage",
  "rand 0.8.8",
  "rustls",
