@@ -227,7 +227,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>name</code></td><td>file name without <code>.wasm</code></td><td>Names the plugin in logs, in <code>$CONTROL/&lt;name&gt;/...</code> and in listener <code>plugins</code>. It can't be empty, contain <code>/</code>, <code>+</code> or <code>#</code>, or be the name of a built-in plugin: <code>dynamic-security</code>, <code>password-file</code>, <code>http-auth</code>, <code>acl-file</code>, <code>plain</code> or <code>credentials</code>.</td></tr>
 <tr><td><code>config</code></td><td><code>{}</code></td><td>Table of strings passed to the plugin's <code>init</code>.</td></tr>
 <tr><td><code>allow_http</code></td><td><code>[]</code></td><td>Hosts it may send HTTP requests to, as <code>"host"</code> (port 443) or <code>"host:port"</code>. The scheme isn't checked, so a plain-HTTP endpoint on the default port needs <code>"host:80"</code>.</td></tr>
-<tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may open sockets to, as <code>"address:port"</code>.</td></tr>
+<tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may connect sockets to, as <code>"address:port"</code>. It can never listen.</td></tr>
 <tr><td><code>instances</code></td><td>number of CPUs</td><td>Copies that run calls at once.</td></tr>
 <tr><td><code>timeout_ms</code></td><td><code>[server]</code> <code>plugin_timeout</code></td><td>Longest one call, or <code>init</code>, may run. No longer than <code>plugin_timeout</code>, which bounds every hook call too.</td></tr>
 <tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Linear memory each copy may use, all its memories together.</td></tr>

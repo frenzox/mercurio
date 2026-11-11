@@ -254,6 +254,22 @@ async fn test_sockets_outside_the_allowlist_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_with_allowed_sockets_cant_listen() {
+    let allowed = free_port().await;
+    let plugin = misbehave(|s| s.allow_sockets = vec![format!("127.0.0.1:{allowed}")]).await;
+    for address in [
+        "0.0.0.0:0".to_string(),
+        format!("127.0.0.1:{allowed}"),
+        format!("0.0.0.0:{allowed}"),
+    ] {
+        let refused = control(&plugin, "listen", address.as_bytes())
+            .await
+            .unwrap();
+        assert!(refused.contains("PermissionDenied"), "{address}: {refused}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_sockets_need_an_allowlist() {
     let plugin = misbehave(|_| ()).await;
     let made = control(&plugin, "sockets", b"20000").await.unwrap();

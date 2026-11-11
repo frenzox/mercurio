@@ -60,6 +60,11 @@ impl Plugin for Misbehave {
                     .map(drop)
                     .map_err(|e| format!("{e} ({:?})", e.kind())),
             )),
+            "listen" => Some(report(
+                std::net::TcpListener::bind(text.as_str())
+                    .map(drop)
+                    .map_err(|e| format!("{e} ({:?})", e.kind())),
+            )),
             "sockets" => {
                 let most: usize = text.parse().ok()?;
                 let mut held = Vec::new();

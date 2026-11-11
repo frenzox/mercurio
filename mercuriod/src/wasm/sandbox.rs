@@ -146,9 +146,15 @@ impl Allowed {
         let sockets = sockets
             .iter()
             .map(|entry| {
-                entry
+                let addr: SocketAddr = entry
                     .parse()
-                    .map_err(|error| anyhow::anyhow!("`{entry}` in allow_sockets: {error}"))
+                    .map_err(|error| anyhow::anyhow!("`{entry}` in allow_sockets: {error}"))?;
+                if addr.ip().is_unspecified() || addr.port() == 0 {
+                    anyhow::bail!(
+                        "`{entry}` in allow_sockets: name the address and port to connect to"
+                    );
+                }
+                Ok(addr)
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(Allowed { http, sockets })
@@ -167,15 +173,7 @@ impl State {
             .allow_tcp(networked)
             .allow_udp(networked)
             .socket_addr_check(move |addr, use_| {
-                let allowed = match use_ {
-                    // A connect binds to the wildcard address first, so
-                    // that bind has to pass for any connect to work
-                    SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
-                        addr.ip().is_unspecified() && addr.port() == 0
-                    }
-                    _ => sockets.contains(&addr),
-                };
-                Box::pin(std::future::ready(allowed))
+                Box::pin(std::future::ready(socket_allowed(&sockets, addr, use_)))
             })
             .build();
         let mut table = ResourceTable::new();
@@ -252,6 +250,22 @@ impl ResourceLimiter for Limits {
 
     fn memories(&self) -> usize {
         self.tables.memories()
+    }
+}
+
+/// Whether a plugin allowed to reach `sockets` may use `addr` as `use_`
+/// says: connect to them and exchange datagrams with them, never listen.
+fn socket_allowed(sockets: &[SocketAddr], addr: SocketAddr, use_: SocketAddrUse) -> bool {
+    match use_ {
+        // A connect binds to the wildcard address first, so that bind has
+        // to pass for any connect to work
+        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
+            addr.ip().is_unspecified() && addr.port() == 0
+        }
+        SocketAddrUse::TcpListen | SocketAddrUse::TcpAccept => false,
+        SocketAddrUse::TcpConnect | SocketAddrUse::UdpSend | SocketAddrUse::UdpReceive => {
+            sockets.contains(&addr)
+        }
     }
 }
 
@@ -412,6 +426,39 @@ mod tests {
     fn test_a_bad_socket_entry_is_named() {
         let error = Allowed::parse(&[], &["localhost".into()]).err().unwrap();
         assert!(error.to_string().contains("`localhost`"), "{error}");
+    }
+
+    #[test]
+    fn test_sockets_may_connect_out_but_never_listen() {
+        let allowed: SocketAddr = "10.0.0.5:6379".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let check = |addr, use_| socket_allowed(&[allowed], addr, use_);
+        assert!(check(wildcard, SocketAddrUse::TcpBind));
+        assert!(check(allowed, SocketAddrUse::TcpConnect));
+        assert!(check(allowed, SocketAddrUse::UdpSend));
+        assert!(check(allowed, SocketAddrUse::UdpReceive));
+        assert!(!check(wildcard, SocketAddrUse::UdpReceive));
+        assert!(!check(
+            "10.0.0.6:6379".parse().unwrap(),
+            SocketAddrUse::TcpConnect
+        ));
+        assert!(!check(
+            "0.0.0.0:1883".parse().unwrap(),
+            SocketAddrUse::TcpBind
+        ));
+        for use_ in [SocketAddrUse::TcpListen, SocketAddrUse::TcpAccept] {
+            assert!(!check(wildcard, use_));
+            assert!(!check(allowed, use_));
+            assert!(!socket_allowed(&[wildcard], wildcard, use_));
+        }
+    }
+
+    #[test]
+    fn test_wildcard_socket_entries_are_refused() {
+        for entry in ["0.0.0.0:0", "0.0.0.0:6379", "[::]:6379", "10.0.0.5:0"] {
+            let error = Allowed::parse(&[], &[entry.into()]).err().unwrap();
+            assert!(error.to_string().contains(&format!("`{entry}`")), "{error}");
+        }
     }
 
     #[test]
