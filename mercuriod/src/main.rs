@@ -857,6 +857,9 @@ fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
 /// Add or update a user in the password file.
 fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
     password_file::check_username(username)?;
+    if mercurio_scram::prepare_username(username).is_none() {
+        return Err("The user name cannot be prepared with SASLprep, for SCRAM-SHA-256".into());
+    }
     let mut users = password_file::read_users(path)?;
     let password = prompt_new_password(username)?;
 

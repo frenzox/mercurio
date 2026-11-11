@@ -452,7 +452,7 @@ impl Data {
                 };
                 let (password, scram) = match args.get("password").and_then(Value::as_str) {
                     Some(password) => {
-                        let (hash, scram) = hash_password(password)?;
+                        let (hash, scram) = hash_password(&username, password)?;
                         (Some(hash), Some(scram))
                     }
                     None => (None, None),
@@ -477,8 +477,9 @@ impl Data {
                 Ok((None, true))
             }
             "setClientPassword" => {
-                let (hash, scram) = hash_password(&text("password")?)?;
-                let client = self.client(&text("username")?)?;
+                let username = text("username")?;
+                let (hash, scram) = hash_password(&username, &text("password")?)?;
+                let client = self.client(&username)?;
                 client.password = Some(hash);
                 client.scram = Some(scram);
                 Ok((None, true))
@@ -502,7 +503,7 @@ impl Data {
                 let password = match present(args, "password") {
                     None => None,
                     Some(Value::String(password)) if password.is_empty() => None,
-                    Some(Value::String(password)) => Some(hash_password(password)?),
+                    Some(Value::String(password)) => Some(hash_password(&username, password)?),
                     Some(_) => return Err("Invalid password".to_string()),
                 };
                 let client = self.client(&username)?;
@@ -880,8 +881,12 @@ fn priority(args: &Value) -> Result<i64, String> {
     }
 }
 
-/// The Argon2 hash of `password` and its SCRAM-SHA-256 credentials.
-fn hash_password(password: &str) -> Result<(String, String), String> {
+/// The Argon2 hash of `password` and its SCRAM-SHA-256 credentials, which
+/// are found by the prepared form of `username`, so one that cannot be
+/// prepared is refused.
+fn hash_password(username: &str, password: &str) -> Result<(String, String), String> {
+    mercurio_scram::prepare_username(username)
+        .ok_or("The user name cannot be prepared with SASLprep, for SCRAM-SHA-256")?;
     credentials::hash_new_password(password)
 }
 
@@ -942,7 +947,7 @@ impl DynamicSecurity {
             priority: 0,
             allow: true,
         };
-        let (hash, scram) = hash_password(password)?;
+        let (hash, scram) = hash_password(admin, password)?;
         let data = Data {
             clients: vec![Client {
                 username: admin.to_string(),
@@ -1494,7 +1499,10 @@ impl ScramCredentialStore for DynamicSecurity {
         let credentials = data
             .clients
             .iter()
-            .find(|c| c.username == username && !c.disabled)
+            .find(|c| {
+                !c.disabled
+                    && mercurio_scram::prepare_username(&c.username).as_deref() == Some(username)
+            })
             .filter(|c| c.clientid.as_ref().is_none_or(|id| *id == client.client_id))
             .and_then(|c| match (&c.password, &c.scram) {
                 (Some(hash), Some(scram)) => {
@@ -2611,6 +2619,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scram_credentials_are_found_by_the_prepared_name() {
+        let fixture = Fixture::new("scram-prepared");
+        fixture.run_ok(json!([
+            { "command": "createClient", "username": "us\u{00AD}er", "password": "pw" },
+        ]));
+        let found = fixture
+            .security
+            .scram_credentials(&ClientInfo::new("any", None), "user")
+            .await;
+        assert!(found.is_some());
+        let refused = run(
+            &fixture.security,
+            json!([
+                { "command": "createClient", "username": "\u{00AD}", "password": "pw" },
+            ]),
+        );
+        assert!(refused[0].get("error").is_some(), "{refused:?}");
+    }
+
+    #[tokio::test]
     async fn test_setting_a_password_sets_scram_credentials() {
         let fixture = Fixture::new("scram");
         let scram = |username: &'static str, client_id: &'static str| {
@@ -2654,7 +2682,7 @@ mod tests {
                 .iter_mut()
                 .find(|c| c.username == "admin")
                 .unwrap();
-            admin.password = Some(hash_password("changed").unwrap().0);
+            admin.password = Some(hash_password("admin", "changed").unwrap().0);
         }
         assert_eq!(scram("admin", "any").await, None);
 

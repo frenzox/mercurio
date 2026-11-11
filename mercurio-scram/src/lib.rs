@@ -215,7 +215,7 @@ fn escape_username(username: &str) -> String {
 }
 
 /// `name` prepared with SASLprep, or None if it is refused or left empty.
-fn prepare_username(name: &str) -> Option<String> {
+pub fn prepare_username(name: &str) -> Option<String> {
     stringprep::saslprep(name)
         .ok()
         .map(|prepared| prepared.into_owned())

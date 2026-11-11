@@ -62,7 +62,9 @@ pub fn load(path: &str) -> Result<Loaded, String> {
             .as_deref()
             .map(|entry| scram_credentials(&user.hash, entry))
         {
-            loaded.scram.insert(username.clone(), credentials);
+            if let Some(prepared) = mercurio_scram::prepare_username(&username) {
+                loaded.scram.insert(prepared, credentials);
+            }
         }
         loaded.hashes.insert(username, user.hash);
     }
@@ -360,6 +362,25 @@ mod tests {
             plain,
             [format!("alice:{hash}").as_str(), "bob:$6$c2FsdA==$aGFzaA=="]
         );
+    }
+
+    #[test]
+    fn test_scram_credentials_are_keyed_by_the_prepared_name() {
+        let dir = TempDir::new("scram-prepared");
+        let path = dir.file("passwd");
+        let (hash, scram) = crate::credentials::hash_new_password("secret").unwrap();
+        let mut users = users(&[]);
+        users.insert(
+            "us\u{00AD}er".into(),
+            User {
+                hash,
+                scram: Some(scram),
+            },
+        );
+        write_users(&path, &users).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.scram.keys().collect::<Vec<_>>(), ["user"]);
+        assert!(loaded.hashes.contains_key("us\u{00AD}er"));
     }
 
     #[test]
