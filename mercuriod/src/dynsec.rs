@@ -16,7 +16,7 @@ use std::{
 use argon2::{Argon2, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
-use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
+use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, SessionKey, MAX_PAGE};
 use mercurio_server::auth::{ScramCredentialStore, StoredCredentials};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
@@ -1064,7 +1064,9 @@ impl DynamicSecurity {
 /// Disconnects the connected clients `affected` names, with Administrative
 /// Action and without their wills, as mosquitto does. Anonymous clients are
 /// those with a network address: in-process clients and those of Unix
-/// sockets, the trusted admin socket among them, are left alone.
+/// sockets, the trusted admin socket among them, are left alone. Each is
+/// addressed by its client id and mount point, so a client of another user
+/// with the same id on another mount point stays connected.
 async fn disconnect(admin: Admin, affected: Affected) {
     let mut query = ClientQuery::default();
     query.connected = Some(true);
@@ -1083,13 +1085,14 @@ async fn disconnect(admin: Admin, affected: Affected) {
                 Some(username) => affected.users.contains(username),
                 None => affected.anonymous && client.address.is_some(),
             });
-        targets.extend(concerned.map(|client| client.client_id));
+        targets
+            .extend(concerned.map(|client| SessionKey::new(client.mount_point, client.client_id)));
     }
     let mut options = DisconnectOptions::default();
     options.send_will = false;
-    for client_id in targets {
+    for key in targets {
         // It may have left meanwhile
-        let _ = admin.disconnect(&client_id, options).await;
+        let _ = admin.disconnect(&key, options).await;
     }
 }
 

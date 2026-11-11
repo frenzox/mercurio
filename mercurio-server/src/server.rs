@@ -50,7 +50,7 @@ use mercurio_packets::{
     pubrel::PubRelPacket,
     ControlPacket,
 };
-use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
+use mercurio_storage::{memory::MemoryStore, MqttStore, SessionKey, SessionOwner};
 
 use crate::{
     acl::Access,
@@ -1372,7 +1372,7 @@ pub struct Server<St: MqttStore + 'static> {
     listener: Listener<St>,
     admin: Admin,
     shutdown_complete_rx: mpsc::Receiver<()>,
-    restored_wills: Vec<(String, WillMessage, Duration)>,
+    restored_wills: Vec<(SessionKey, WillMessage, Duration)>,
     plugins: Vec<Arc<dyn Plugin>>,
     plugin_timeout: Duration,
     plugin_tick_interval: Duration,
@@ -1575,14 +1575,14 @@ impl<St: MqttStore + 'static> Server<St> {
                 bans.sweep().await;
             }
         });
-        for (client_id, will, due) in restored_wills {
+        for (key, will, due) in restored_wills {
             let broker = server.broker.clone();
             let session_manager = session_manager.clone();
             tokio::spawn(async move {
                 time::sleep(due).await;
-                if session_manager.take_restored_will(&client_id).await {
-                    publish_will(&broker, will, &client_id).await;
-                    session_manager.restored_will_published(&client_id).await;
+                if session_manager.take_restored_will(&key).await {
+                    publish_will(&broker, will, &key).await;
+                    session_manager.restored_will_published(&key).await;
                 }
             });
         }
@@ -2154,10 +2154,15 @@ where
         }
 
         // In-process clients don't reconnect, so a network client taking
-        // over their id would end them for good
-        let client_id = &connect_packet.payload.client_id;
-        if !self.local && self.session_manager.is_held_locally(client_id) {
-            warn!("Client id `{}` belongs to an in-process client", client_id);
+        // over their id would end them for good. They have no mount point,
+        // so only clients of listeners without one can collide with them.
+        let mount_point = self.connection.mount_point().map(str::to_string);
+        let key = SessionKey::new(
+            mount_point.clone(),
+            connect_packet.payload.client_id.clone(),
+        );
+        if !self.local && self.session_manager.is_held_locally(&key) {
+            warn!("Client id {} belongs to an in-process client", key);
             return self
                 .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                 .await;
@@ -2181,7 +2186,7 @@ where
 
         let owner = SessionOwner {
             username: verified_user.clone(),
-            mount_point: self.connection.mount_point().map(str::to_string),
+            mount_point: key.mount_point.clone(),
         };
         let client_id = connect_packet.payload.client_id.clone();
         let mut start_result =
@@ -2239,12 +2244,9 @@ where
         start_result.assigned_client_id |= assigned_client_id || renamed;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
-        let held_locally = match self.local {
-            true => Some(session.get_client_id().await),
-            false => None,
-        };
-        if let Some(client_id) = &held_locally {
-            self.session_manager.hold_locally(client_id);
+        let key = lease.key().clone();
+        if self.local {
+            self.session_manager.hold_locally(&key);
         }
 
         session.set_verified_user(verified_user.clone()).await;
@@ -2301,13 +2303,8 @@ where
                 .restore_inflight(start_result.inflight_to_retry)
                 .await;
             let resend = session.pending_retransmissions().await;
-            if !resend.dropped.is_empty() {
-                let client_id = session.get_client_id().await;
-                for packet_id in resend.dropped {
-                    self.session_manager
-                        .remove_inflight(&client_id, packet_id)
-                        .await;
-                }
+            for packet_id in resend.dropped {
+                self.session_manager.remove_inflight(&key, packet_id).await;
             }
             for packet in resend.packets {
                 Box::pin(self.connection.write_packet(packet)).await?;
@@ -2369,8 +2366,7 @@ where
             })
         ) {
             session.clear_will().await;
-            self.session_manager
-                .delete_will(&session.get_client_id().await);
+            self.session_manager.delete_will(&key);
         }
 
         // Publish will message on abnormal disconnect
@@ -2383,6 +2379,7 @@ where
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
             let will_session = session.clone();
+            let will_key = key.clone();
             let pending = will.clone();
 
             let publish = async move {
@@ -2392,9 +2389,8 @@ where
                         return;
                     }
                 }
-                let client_id = will_session.get_client_id().await;
-                publish_will(&broker, will, &client_id).await;
-                session_manager.delete_will(&client_id);
+                publish_will(&broker, will, &will_key).await;
+                session_manager.delete_will(&will_key);
             };
 
             if delay.is_zero() {
@@ -2407,8 +2403,8 @@ where
             }
         }
 
-        if let Some(client_id) = &held_locally {
-            self.session_manager.release_locally(client_id);
+        if self.local {
+            self.session_manager.release_locally(&key);
         }
         self.session_manager.end_connection(lease, expiry).await;
 
@@ -2656,7 +2652,7 @@ where
         tokio::pin!(paused);
         let mut reading = true;
 
-        let client_id = session.get_client_id().await;
+        let key = lease.key().clone();
         while !self.shutdown.is_shutdown() {
             // Every turn of the loop follows a message sent or a packet
             // read, so retained messages are queued as the queue drains
@@ -2685,7 +2681,7 @@ where
                             HotPacket::Publish(p) => Some(p.payload.as_ref().map_or(0, |p| p.len())),
                             _ => None,
                         };
-                        let flow = self.handle_hot(&session, &client_id, packet).await?;
+                        let flow = self.handle_hot(&session, &key, packet).await?;
                         if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
                             reading = false;
                             paused.as_mut().reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
@@ -2703,7 +2699,7 @@ where
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
                 (message, journaled) = session.next_outgoing(window_open) => {
-                    Step::Done(self.send_outgoing(&session, &client_id, message, journaled).await?)
+                    Step::Done(self.send_outgoing(&session, &key, message, journaled).await?)
                 }
                 _ = &mut deadline, if timeout_duration.is_some() && reading => Step::Wake(Wake::KeepAliveExpired),
                 Ok(()) = lease.close.changed() => {
@@ -2720,6 +2716,7 @@ where
                     Box::pin(self.handle_wake(
                         wake,
                         &session,
+                        &key,
                         timeout_duration,
                         protocol_version,
                         expiry,
@@ -2747,7 +2744,7 @@ where
     async fn handle_hot(
         &mut self,
         session: &Session,
-        client_id: &str,
+        key: &SessionKey,
         packet: HotPacket,
     ) -> Result<Flow> {
         let mut session = session.clone();
@@ -2765,7 +2762,7 @@ where
                 if let Some(ControlPacket::PubRec(pubrec)) = &response {
                     if pubrec.reason.code() < 0x80 {
                         self.session_manager
-                            .store_incoming_qos2(client_id, pubrec.packet_id)
+                            .store_incoming_qos2(key, pubrec.packet_id)
                             .await;
                     }
                 }
@@ -2774,24 +2771,20 @@ where
             HotPacket::PubAck(ack) => {
                 let packet_id = ack.packet_id;
                 let response = session.handle_puback(ack).await?;
-                self.session_manager
-                    .remove_inflight(client_id, packet_id)
-                    .await;
+                self.session_manager.remove_inflight(key, packet_id).await;
                 response
             }
             HotPacket::PubRec(rec) => {
                 let (packet_id, failed) = (rec.packet_id, rec.reason.code() >= 0x80);
                 let response = session.handle_pubrec(rec).await?;
                 if failed {
-                    self.session_manager
-                        .remove_inflight(client_id, packet_id)
-                        .await;
+                    self.session_manager.remove_inflight(key, packet_id).await;
                 }
                 // After PUBREC only PUBREL remains to be sent for a QoS 2 message
                 if let Some(ControlPacket::PubRel(pubrel)) = &response {
                     if pubrel.reason == ReasonCode::Success {
                         self.session_manager
-                            .release_inflight(client_id, pubrel.packet_id)
+                            .release_inflight(key, pubrel.packet_id)
                             .await;
                     }
                 }
@@ -2801,22 +2794,20 @@ where
                 let packet_id = rel.packet_id;
                 let response = session.handle_pubrel(rel).await?;
                 self.session_manager
-                    .remove_incoming_qos2(client_id, packet_id)
+                    .remove_incoming_qos2(key, packet_id)
                     .await;
                 response
             }
             HotPacket::PubComp(comp) => {
                 let packet_id = comp.packet_id;
                 let response = session.handle_pubcomp(comp).await?;
-                self.session_manager
-                    .remove_inflight(client_id, packet_id)
-                    .await;
+                self.session_manager.remove_inflight(key, packet_id).await;
                 response
             }
             HotPacket::PingReq => Some(ControlPacket::PingResp(PingRespPacket {})),
         };
         if let Some(response) = response {
-            debug!("Sending {} to client {:?}", describe(&response), client_id);
+            debug!("Sending {} to client {}", describe(&response), key);
             self.connection.write_packet(response).await?;
         }
         Ok(Flow::PacketHandled)
@@ -2827,7 +2818,7 @@ where
     async fn send_outgoing(
         &mut self,
         session: &Session,
-        client_id: &str,
+        key: &SessionKey,
         message: Message,
         journaled: Option<u64>,
     ) -> Result<Flow> {
@@ -2844,7 +2835,7 @@ where
             {
                 session.count_drop(DropCause::NotAuthorized);
                 if let Some(sequence) = journaled {
-                    self.session_manager.dequeue(client_id, sequence).await;
+                    self.session_manager.dequeue(key, sequence).await;
                 }
                 return Ok(Flow::Continue);
             }
@@ -2854,22 +2845,22 @@ where
         let (write, inflight) = {
             let Some(Outgoing { packet, inflight }) = session.prepare_publish(message).await else {
                 if let Some(sequence) = journaled {
-                    self.session_manager.dequeue(client_id, sequence).await;
+                    self.session_manager.dequeue(key, sequence).await;
                 }
                 return Ok(Flow::Continue);
             };
-            debug!("Sending {} to client {:?}", describe(&packet), client_id);
+            debug!("Sending {} to client {}", describe(&packet), key);
             (self.connection.write_packet(packet), inflight)
         };
         match inflight {
             Some(inflight) => {
                 self.session_manager
-                    .store_inflight(client_id, &inflight, journaled)
+                    .store_inflight(key, &inflight, journaled)
                     .await
             }
             None => {
                 if let Some(sequence) = journaled {
-                    self.session_manager.dequeue(client_id, sequence).await;
+                    self.session_manager.dequeue(key, sequence).await;
                 }
             }
         }
@@ -2883,6 +2874,7 @@ where
         &mut self,
         wake: Wake,
         session: &Session,
+        key: &SessionKey,
         timeout_duration: Option<Duration>,
         protocol_version: ProtocolVersion,
         expiry: &mut Option<Duration>,
@@ -2919,8 +2911,7 @@ where
                         // MQTT 3.x has no reason and reads as normal.
                         if disconnect.reason == ReasonCode::NormalDisconnection {
                             session.clear_will().await;
-                            let client_id = session.get_client_id().await;
-                            self.session_manager.delete_will(&client_id);
+                            self.session_manager.delete_will(key);
                         }
                         return Ok(Flow::Close);
                     }
@@ -2950,27 +2941,22 @@ where
 
                 // Persist what subscribe/unsubscribe operations changed
                 if is_subscription_change {
-                    let client_id = session.get_client_id().await;
                     let changes = session.take_subscription_changes().await;
                     self.session_manager
-                        .save_subscription_changes(&client_id, changes)
+                        .save_subscription_changes(key, changes)
                         .await;
                 }
 
                 // Remove inflight message after acknowledgment
                 if let Some(packet_id) = inflight_completed {
-                    let client_id = session.get_client_id().await;
-                    self.session_manager
-                        .remove_inflight(&client_id, packet_id)
-                        .await;
+                    self.session_manager.remove_inflight(key, packet_id).await;
                 }
 
                 // After PUBREC only PUBREL remains to be sent for a QoS 2 message
                 if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
                     if pubrel.reason == ReasonCode::Success {
-                        let client_id = session.get_client_id().await;
                         self.session_manager
-                            .release_inflight(&client_id, pubrel.packet_id)
+                            .release_inflight(key, pubrel.packet_id)
                             .await;
                     }
                 }
@@ -2990,32 +2976,27 @@ where
                             reason: ReasonCode::AdministrativeAction,
                             send_will: false,
                         };
-                        return self.close_for(&session, protocol_version, close).await;
+                        return self.close_for(&session, key, protocol_version, close).await;
                     }
                 }
 
                 if let Some(res) = maybe_res {
-                    debug!(
-                        "Sending {} to client {:?}",
-                        describe(&res),
-                        session.get_client_id().await
-                    );
+                    debug!("Sending {} to client {}", describe(&res), key);
                     self.connection.write_packet(res).await?;
                 }
 
                 Ok(Flow::PacketHandled)
             }
             Wake::KeepAliveExpired => {
-                let client_id = session.get_client_id().await;
                 warn!(
-                    "Keep-alive timeout for client `{}` ({:?} with no packets)",
-                    client_id,
+                    "Keep-alive timeout for client {} ({:?} with no packets)",
+                    key,
                     timeout_duration.unwrap_or_default()
                 );
                 // An abnormal disconnect: the will is published
                 Err(ReasonCode::KeepAliveTimeout.into())
             }
-            Wake::Closed(close) => self.close_for(&session, protocol_version, close).await,
+            Wake::Closed(close) => self.close_for(&session, key, protocol_version, close).await,
         }
     }
 
@@ -3024,23 +3005,20 @@ where
     async fn close_for(
         &mut self,
         session: &Session,
+        key: &SessionKey,
         protocol_version: ProtocolVersion,
         close: Close,
     ) -> Result<Flow> {
-        let client_id = session.get_client_id().await;
         let reason = match close {
             Close::TakenOver => {
-                info!("Client `{}` was taken over by a new connection", client_id);
+                info!("Client {} was taken over by a new connection", key);
                 ReasonCode::SessionTakenOver
             }
             Close::Admin { reason, send_will } => {
-                info!(
-                    "Closing the connection of client `{}`: {}",
-                    client_id, reason
-                );
+                info!("Closing the connection of client {}: {}", key, reason);
                 if !send_will {
                     session.clear_will().await;
-                    self.session_manager.delete_will(&client_id);
+                    self.session_manager.delete_will(key);
                 }
                 reason
             }
@@ -3298,10 +3276,10 @@ fn reason_string(
     fits.then(|| ReasonString::new(text))
 }
 
-async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, client_id: &str) {
+async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, key: &SessionKey) {
     info!(
-        "Publishing will message for client `{}` on topic `{}`",
-        client_id, will.topic
+        "Publishing will message for client {} on topic `{}`",
+        key, will.topic
     );
 
     let topic: Arc<str> = Arc::from(will.topic.as_str());

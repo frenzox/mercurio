@@ -8,6 +8,7 @@
 mod protocol;
 mod types;
 
+pub use mercurio_storage::SessionKey;
 pub(crate) use protocol::handle as handle_request;
 pub use types::{
     Ban, BanKind, BrokerInfo, ClientDetails, ClientSubscription, ClientSummary, ListenerInfo,
@@ -290,17 +291,18 @@ pub(crate) trait Directory: Send + Sync {
     fn storage_health(&self) -> crate::writer::StorageHealth;
     fn set_aside_count(&self) -> BoxFuture<'_, usize>;
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
-    fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
-    fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool>;
+    fn keys_of<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Vec<SessionKey>>;
+    fn entry<'a>(&'a self, key: &'a SessionKey) -> BoxFuture<'a, Option<ClientEntry>>;
+    fn close_connection<'a>(&'a self, key: &'a SessionKey, close: Close) -> BoxFuture<'a, bool>;
     fn close_generation<'a>(
         &'a self,
-        client_id: &'a str,
+        key: &'a SessionKey,
         generation: u64,
         close: Close,
     ) -> BoxFuture<'a, bool>;
     fn delete_session<'a>(
         &'a self,
-        client_id: &'a str,
+        key: &'a SessionKey,
         disconnect: bool,
     ) -> BoxFuture<'a, Result<(), DeleteRefused>>;
 }
@@ -326,31 +328,35 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
         Box::pin(SessionManager::entries(self))
     }
 
-    fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>> {
-        Box::pin(SessionManager::entry(self, client_id))
+    fn keys_of<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Vec<SessionKey>> {
+        Box::pin(SessionManager::keys_of(self, client_id))
     }
 
-    fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool> {
-        Box::pin(SessionManager::close_connection(self, client_id, close))
+    fn entry<'a>(&'a self, key: &'a SessionKey) -> BoxFuture<'a, Option<ClientEntry>> {
+        Box::pin(SessionManager::entry(self, key))
+    }
+
+    fn close_connection<'a>(&'a self, key: &'a SessionKey, close: Close) -> BoxFuture<'a, bool> {
+        Box::pin(SessionManager::close_connection(self, key, close))
     }
 
     fn close_generation<'a>(
         &'a self,
-        client_id: &'a str,
+        key: &'a SessionKey,
         generation: u64,
         close: Close,
     ) -> BoxFuture<'a, bool> {
         Box::pin(SessionManager::close_generation(
-            self, client_id, generation, close,
+            self, key, generation, close,
         ))
     }
 
     fn delete_session<'a>(
         &'a self,
-        client_id: &'a str,
+        key: &'a SessionKey,
         disconnect: bool,
     ) -> BoxFuture<'a, Result<(), DeleteRefused>> {
-        Box::pin(SessionManager::delete_session(self, client_id, disconnect))
+        Box::pin(SessionManager::delete_session(self, key, disconnect))
     }
 }
 
@@ -448,17 +454,20 @@ impl Admin {
         }
     }
 
-    /// Every session, connected or not, sorted by client id: `listClients`.
+    /// Every session, connected or not, sorted by client id, then by mount
+    /// point: `listClients`.
     pub async fn clients(&self, query: &ClientQuery) -> Page<ClientSummary> {
         let mut entries = self.inner.directory.entries().await;
-        entries.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        entries.sort_by(|a, b| {
+            (&a.key.client_id, &a.key.mount_point).cmp(&(&b.key.client_id, &b.key.mount_point))
+        });
         let mut found = Vec::new();
         for entry in entries {
             if query.connected.is_some_and(|c| c != entry.connected)
                 || query
                     .client_id_prefix
                     .as_deref()
-                    .is_some_and(|prefix| !entry.client_id.starts_with(prefix))
+                    .is_some_and(|prefix| !entry.key.client_id.starts_with(prefix))
             {
                 continue;
             }
@@ -480,11 +489,42 @@ impl Admin {
         Page::of(found, query.paging)
     }
 
-    /// Closes the connection of `client_id`; its session stays:
+    /// The session `client_id` names under `mount_point`, an empty one
+    /// meaning none. Without a mount point, the one mount point the client
+    /// id has a session or a connection under; a client id on more than
+    /// one is `invalidArgument`, with their list. A client id on none gives
+    /// its key without a mount point, which the commands then don't find.
+    pub async fn session_key(
+        &self,
+        client_id: &str,
+        mount_point: Option<&str>,
+    ) -> Result<SessionKey, AdminError> {
+        if let Some(mount_point) = mount_point {
+            return Ok(SessionKey::new(Some(mount_point.to_string()), client_id));
+        }
+        let mut keys = self.inner.directory.keys_of(client_id).await;
+        match keys.len() {
+            0 => Ok(SessionKey::unmounted(client_id)),
+            1 => Ok(keys.remove(0)),
+            _ => {
+                let mount_points: Vec<String> = keys
+                    .iter()
+                    .map(|key| format!("\"{}\"", key.stored_mount_point()))
+                    .collect();
+                Err(AdminError::invalid_argument(format!(
+                    "client `{client_id}` is on more than one mount point: {}; name one \
+                     with `mountpoint`, \"\" for none",
+                    mount_points.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Closes the connection of the client of `key`; its session stays:
     /// `disconnectClient`.
     pub async fn disconnect(
         &self,
-        client_id: &str,
+        key: &SessionKey,
         options: DisconnectOptions,
     ) -> Result<(), AdminError> {
         if !DISCONNECT_ERRORS.contains(&options.reason.code()) {
@@ -497,22 +537,17 @@ impl Admin {
             reason: options.reason,
             send_will: options.send_will,
         };
-        if !self
-            .inner
-            .directory
-            .close_connection(client_id, close)
-            .await
-        {
+        if !self.inner.directory.close_connection(key, close).await {
             return Err(AdminError::not_found(format!(
-                "client `{client_id}` isn't connected"
+                "client {key} isn't connected"
             )));
         }
-        info!("Disconnecting client `{}` for the admin API", client_id);
+        info!("Disconnecting client {} for the admin API", key);
         Ok(())
     }
 
-    /// Removes the session of `client_id`, its subscriptions, queue and
-    /// will: `deleteSession`. A connected client is closed first with
+    /// Removes the session of `key`, its subscriptions, queue and will:
+    /// `deleteSession`. A connected client is closed first with
     /// `disconnect`, and is a `conflict` otherwise.
     ///
     /// Closing a client waits for its connection to finish, for 5 seconds
@@ -522,7 +557,7 @@ impl Admin {
     /// session: the connection can't close while it waits.
     pub async fn delete_session(
         &self,
-        client_id: &str,
+        key: &SessionKey,
         disconnect: bool,
     ) -> Result<(), AdminError> {
         // The caller is often a connection's task, which can't close while
@@ -530,7 +565,7 @@ impl Admin {
         // its own task past it: given up half way, it would leave the client
         // id claimed by no connection.
         let directory = Arc::clone(&self.inner.directory);
-        let id = client_id.to_string();
+        let id = key.clone();
         let deletion = tokio::spawn(async move { directory.delete_session(&id, disconnect).await });
         let unavailable = |message: &str| AdminError::new(ErrorCode::Unavailable, message);
         let deleted = match tokio::time::timeout(DELETE_TIMEOUT, deletion).await {
@@ -540,11 +575,11 @@ impl Admin {
         };
         deleted.map_err(|refused| match refused {
             DeleteRefused::NotFound => {
-                AdminError::not_found(format!("no session for client `{client_id}`"))
+                AdminError::not_found(format!("no session for client {key}"))
             }
             DeleteRefused::Connected => AdminError::new(
                 ErrorCode::Conflict,
-                format!("client `{client_id}` is connected; set `disconnect` to close it first"),
+                format!("client {key} is connected; set `disconnect` to close it first"),
             ),
         })
     }
@@ -571,15 +606,16 @@ impl Admin {
                 continue;
             };
             let identity = entry.session.identity().await;
+            // Client id bans hold on every mount point
             let client = Candidate {
-                client_id: &entry.client_id,
+                client_id: &entry.key.client_id,
                 username: identity.username.as_deref(),
                 ip: identity.peer.map(|peer| peer.ip()),
             };
             if ban.matches(&client) {
                 self.inner
                     .directory
-                    .close_generation(&entry.client_id, generation, close)
+                    .close_generation(&entry.key, generation, close)
                     .await;
             }
         }
@@ -603,11 +639,13 @@ impl Admin {
     }
 
     /// One session in detail: `getClient`.
-    pub async fn client(&self, client_id: &str) -> Result<ClientDetails, AdminError> {
-        let entry =
-            self.inner.directory.entry(client_id).await.ok_or_else(|| {
-                AdminError::not_found(format!("no session for client `{client_id}`"))
-            })?;
+    pub async fn client(&self, key: &SessionKey) -> Result<ClientDetails, AdminError> {
+        let entry = self
+            .inner
+            .directory
+            .entry(key)
+            .await
+            .ok_or_else(|| AdminError::not_found(format!("no session for client {key}")))?;
         let s = entry.session.snapshot().await;
         let summary = summary(&entry, &s);
         let now = unix_millis();
@@ -626,6 +664,7 @@ impl Admin {
         subscriptions.sort_by(|a, b| a.filter.cmp(&b.filter));
         Ok(ClientDetails {
             client_id: summary.client_id,
+            mount_point: summary.mount_point,
             username: summary.username,
             connected: summary.connected,
             address: summary.address,
@@ -789,13 +828,13 @@ impl Admin {
         validate_subscribe_filter(filter).map_err(|e| {
             AdminError::invalid_argument(format!("`{filter}` is not a topic filter: {e}"))
         })?;
-        let clients: HashMap<u64, String> = self
+        let clients: HashMap<u64, SessionKey> = self
             .inner
             .directory
             .entries()
             .await
             .into_iter()
-            .map(|entry| (entry.session.subscriber_id(), entry.client_id))
+            .map(|entry| (entry.session.subscriber_id(), entry.key))
             .collect();
         let mut found: Vec<SubscriberInfo> = self
             .inner
@@ -803,8 +842,10 @@ impl Admin {
             .subscribers_of(filter)
             .into_iter()
             .filter_map(|s| {
+                let key = clients.get(&s.session_id)?;
                 Some(SubscriberInfo {
-                    client_id: clients.get(&s.session_id)?.clone(),
+                    client_id: key.client_id.clone(),
+                    mount_point: key.mount_point.clone(),
                     qos: s.granted_qos as u8,
                     no_local: s.no_local,
                     retain_as_published: s.retain_as_published,
@@ -812,14 +853,15 @@ impl Admin {
                 })
             })
             .collect();
-        found.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        found.sort_by(|a, b| (&a.client_id, &a.mount_point).cmp(&(&b.client_id, &b.mount_point)));
         Ok(found)
     }
 }
 
 fn summary(entry: &ClientEntry, s: &SessionSnapshot) -> ClientSummary {
     ClientSummary {
-        client_id: entry.client_id.clone(),
+        client_id: entry.key.client_id.clone(),
+        mount_point: entry.key.mount_point.clone(),
         username: s.username.clone(),
         connected: entry.connected,
         address: s.peer.map(|peer| peer.to_string()),

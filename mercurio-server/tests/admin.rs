@@ -23,7 +23,7 @@ use mercurio_server::{
     },
     server::{ListenerConfig, LocalConnector, Server, ServerConfig, Transport},
 };
-use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore, BanStore};
+use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore, BanStore, SessionKey};
 
 use serde_json::{json, Value};
 #[cfg(unix)]
@@ -961,11 +961,19 @@ async fn refused_delete_leaves_the_connected_client_alone() {
     let mut device = Client::connect_with(addr, persistent("device")).await;
 
     for _ in 0..3 {
-        let refused = admin.delete_session("device", false).await;
+        let refused = admin
+            .delete_session(&SessionKey::unmounted("device"), false)
+            .await;
         assert_eq!(refused.unwrap_err().code, ErrorCode::Conflict);
     }
     assert!(device.receive().await.is_none());
-    assert!(admin.client("device").await.unwrap().connected);
+    assert!(
+        admin
+            .client(&SessionKey::unmounted("device"))
+            .await
+            .unwrap()
+            .connected
+    );
 }
 
 /// Hears of the sessions that expire.
@@ -999,7 +1007,10 @@ async fn a_deleted_session_does_not_expire_later() {
     let mut watcher = admin_client(addr).await;
     wait_for(&mut watcher, "device", |d| d["connected"] == false).await;
 
-    admin.delete_session("device", false).await.unwrap();
+    admin
+        .delete_session(&SessionKey::unmounted("device"), false)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     assert!(recorder.0.lock().unwrap().is_empty());
@@ -1017,7 +1028,10 @@ async fn deleting_a_connected_session_does_not_expire_it_later() {
     });
     let mut device = Client::connect_with(addr, packet).await;
 
-    admin.delete_session("device", true).await.unwrap();
+    admin
+        .delete_session(&SessionKey::unmounted("device"), true)
+        .await
+        .unwrap();
     assert!(matches!(
         device.receive().await,
         Some(ControlPacket::Disconnect(_))
@@ -1026,7 +1040,10 @@ async fn deleting_a_connected_session_does_not_expire_it_later() {
 
     assert!(recorder.0.lock().unwrap().is_empty());
     assert_eq!(admin.info().await.stats["clients/expired"], 0);
-    assert!(admin.client("device").await.is_err());
+    assert!(admin
+        .client(&SessionKey::unmounted("device"))
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -1038,14 +1055,23 @@ async fn disconnect_client_closes_mqtt311_connections() {
     packet.clean_start = false;
     let mut old = Client::connect_with(addr, packet).await;
 
-    admin.disconnect("old", Default::default()).await.unwrap();
+    admin
+        .disconnect(&SessionKey::unmounted("old"), Default::default())
+        .await
+        .unwrap();
 
     let mut rest = BytesMut::new();
     let read = timeout(Duration::from_secs(2), old.stream.read_buf(&mut rest))
         .await
         .expect("the connection should close");
     assert_eq!(read.unwrap(), 0, "no packet before the close");
-    assert!(!admin.client("old").await.unwrap().connected);
+    assert!(
+        !admin
+            .client(&SessionKey::unmounted("old"))
+            .await
+            .unwrap()
+            .connected
+    );
 }
 
 #[tokio::test]
@@ -1864,4 +1890,129 @@ async fn bans_still_apply_on_trusted_unix_listeners() {
         ReasonCode::Banned
     );
     let _ = std::fs::remove_file(&path);
+}
+
+/// A broker with two more listeners, under the mount points `a/` and `b/`;
+/// returns the addresses of those.
+async fn start_mounted() -> (SocketAddr, SocketAddr, SocketAddr, Admin) {
+    let mut config = config(vec![Arc::new(AllowAll)]);
+    let mut addrs = Vec::new();
+    for mount_point in ["a/", "b/"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        let mut listener = ListenerConfig::new(listener, Transport::Mqtt);
+        listener.mount_point = Some(mount_point.into());
+        config.listeners.push(listener);
+    }
+    let (addr, admin) = start(config).await;
+    (addr, addrs[0], addrs[1], admin)
+}
+
+/// Commands naming a client id with sessions on more than one mount point
+/// need the mount point, and act on that session only.
+#[tokio::test]
+async fn commands_name_the_mount_point_of_a_shared_client_id() {
+    let (addr, a, b, admin) = start_mounted().await;
+    let mut tool = admin_client(addr).await;
+    let mut on_a = Client::connect_with(a, persistent("dev")).await;
+    let mut on_b = Client::connect_with(b, persistent("dev")).await;
+
+    let listed = tool
+        .run(json!({"command": "listClients", "clientidPrefix": "dev"}))
+        .await;
+    let mount_points: Vec<&Value> = listed["data"]["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| &c["mountpoint"])
+        .collect();
+    assert_eq!(mount_points, [&json!("a/"), &json!("b/")], "{listed}");
+    let admin_entry = tool
+        .run(json!({"command": "getClient", "clientid": "admin"}))
+        .await;
+    assert_eq!(admin_entry["data"]["mountpoint"], Value::Null);
+
+    for command in ["getClient", "disconnectClient", "deleteSession"] {
+        let ambiguous = tool
+            .run(json!({"command": command, "clientid": "dev"}))
+            .await;
+        assert_eq!(ambiguous["code"], "invalidArgument", "{ambiguous}");
+        let error = ambiguous["error"].as_str().unwrap();
+        assert!(
+            error.contains("\"a/\", \"b/\"") && error.contains("mountpoint"),
+            "{error}"
+        );
+    }
+    let on_a_details = tool
+        .run(json!({"command": "getClient", "clientid": "dev", "mountpoint": "a/"}))
+        .await;
+    assert_eq!(on_a_details["data"]["mountpoint"], "a/", "{on_a_details}");
+    let none = tool
+        .run(json!({"command": "getClient", "clientid": "dev", "mountpoint": ""}))
+        .await;
+    assert_eq!(none["code"], "notFound", "{none}");
+
+    // Disconnecting one leaves the other connected
+    let disconnected = tool
+        .run(json!({"command": "disconnectClient", "clientid": "dev", "mountpoint": "a/"}))
+        .await;
+    assert!(disconnected.get("error").is_none(), "{disconnected}");
+    assert!(matches!(
+        on_a.receive().await,
+        Some(ControlPacket::Disconnect(_))
+    ));
+    let key = |m: &str| SessionKey::new(Some(m.into()), "dev");
+    for _ in 0..100 {
+        if !admin.client(&key("a/")).await.unwrap().connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!admin.client(&key("a/")).await.unwrap().connected);
+    assert!(admin.client(&key("b/")).await.unwrap().connected);
+
+    // Deleting one leaves the other's session
+    let deleted = tool
+        .run(json!({
+            "command": "deleteSession", "clientid": "dev", "mountpoint": "b/", "disconnect": true
+        }))
+        .await;
+    assert!(deleted.get("error").is_none(), "{deleted}");
+    assert!(matches!(
+        on_b.receive().await,
+        Some(ControlPacket::Disconnect(_))
+    ));
+    assert_eq!(
+        admin.client(&key("b/")).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert!(admin.client(&key("a/")).await.is_ok());
+    // With one mount point left, the client id alone names it
+    let alone = tool
+        .run(json!({"command": "getClient", "clientid": "dev"}))
+        .await;
+    assert_eq!(alone["data"]["mountpoint"], "a/", "{alone}");
+    assert_eq!(admin.session_key("dev", None).await.unwrap(), key("a/"));
+}
+
+/// A ban on a client id holds on every mount point.
+#[tokio::test]
+async fn client_id_bans_hold_on_every_mount_point() {
+    let (_, a, b, admin) = start_mounted().await;
+    let mut on_a = Client::connect_with(a, persistent("dev")).await;
+    let mut on_b = Client::connect_with(b, persistent("dev")).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(BanKind::ClientId, "dev")))
+        .await
+        .unwrap();
+    for client in [&mut on_a, &mut on_b] {
+        assert!(matches!(
+            client.receive().await,
+            Some(ControlPacket::Disconnect(_))
+        ));
+    }
+    assert_eq!(
+        connack_reason(a, b"", persistent("dev")).await,
+        ReasonCode::Banned
+    );
 }

@@ -10,7 +10,7 @@ use tracing::info;
 
 use super::{
     check_arguments, Admin, AdminError, BanKey, BanKind, ClientQuery, DisconnectOptions, ErrorCode,
-    NewBan, Page, Paging, MAX_COMMANDS,
+    NewBan, Page, Paging, SessionKey, MAX_COMMANDS,
 };
 use crate::{
     plugin::{Chain, ClientInfo},
@@ -51,9 +51,9 @@ fn arguments_of(command: &str) -> Option<&'static [&'static str]> {
             "offset",
             "count",
         ],
-        "getClient" => &["clientid"],
-        "disconnectClient" => &["clientid", "sendWill", "reasonCode"],
-        "deleteSession" => &["clientid", "disconnect"],
+        "getClient" => &["clientid", "mountpoint"],
+        "disconnectClient" => &["clientid", "mountpoint", "sendWill", "reasonCode"],
+        "deleteSession" => &["clientid", "mountpoint", "disconnect"],
         "addBan" => &["type", "value", "prefix", "duration", "reason"],
         "removeBan" => &["type", "value", "prefix"],
         "listRetained" => &["filter", "offset", "count"],
@@ -80,14 +80,16 @@ fn actor(chain: &Chain, client: &ClientInfo) -> String {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DisconnectArgs {
-    clientid: String,
+    #[serde(flatten)]
+    client: ClientArgs,
     send_will: Option<bool>,
     reason_code: Option<u8>,
 }
 
 #[derive(Deserialize)]
 struct DeleteSessionArgs {
-    clientid: String,
+    #[serde(flatten)]
+    client: ClientArgs,
     disconnect: Option<bool>,
 }
 
@@ -185,9 +187,20 @@ impl ListClientsArgs {
     }
 }
 
+/// The client a command names: its client id, and the mount point of its
+/// listener, `""` for none, needed when the id is on more than one.
 #[derive(Deserialize)]
 struct ClientArgs {
     clientid: String,
+    mountpoint: Option<String>,
+}
+
+impl ClientArgs {
+    async fn key(&self, admin: &Admin) -> Result<SessionKey, AdminError> {
+        admin
+            .session_key(&self.clientid, self.mountpoint.as_deref())
+            .await
+    }
 }
 
 #[derive(Deserialize)]
@@ -320,11 +333,10 @@ async fn run(
             let query = arguments::<ListClientsArgs>(args)?.query()?;
             listing("clients", admin.clients(&query).await)
         }
-        "getClient" => json(
-            admin
-                .client(&arguments::<ClientArgs>(args)?.clientid)
-                .await?,
-        ),
+        "getClient" => {
+            let key = arguments::<ClientArgs>(args)?.key(admin).await?;
+            json(admin.client(&key).await?)
+        }
         "disconnectClient" => {
             let a: DisconnectArgs = arguments(args)?;
             let mut options = DisconnectOptions::default();
@@ -332,21 +344,31 @@ async fn run(
             if let Some(code) = a.reason_code {
                 options.reason = reason_code(code)?;
             }
-            admin.disconnect(&a.clientid, options).await?;
+            admin
+                .disconnect(&a.client.key(admin).await?, options)
+                .await?;
             Value::Null
         }
         "deleteSession" => {
             let a: DeleteSessionArgs = arguments(args)?;
+            let key = a.client.key(admin).await?;
             // The request runs in the client's own connection, which can't
             // close while it waits for itself to
-            if a.clientid == client.client_id {
+            let own = SessionKey::new(
+                client
+                    .connection
+                    .as_ref()
+                    .and_then(|c| c.mount_point.clone()),
+                client.client_id.clone(),
+            );
+            if key == own {
                 return Err(AdminError::new(
                     ErrorCode::Conflict,
                     "a client can't delete its own session",
                 ));
             }
             admin
-                .delete_session(&a.clientid, a.disconnect.unwrap_or(false))
+                .delete_session(&key, a.disconnect.unwrap_or(false))
                 .await?;
             Value::Null
         }
