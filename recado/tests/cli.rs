@@ -428,16 +428,12 @@ async fn json_lines_carry_the_message_and_its_properties() {
         )
         .await;
     let sender = broker.client("sender").await;
-    let properties = MessageProperties {
-        content_type: Some("text/plain".to_string()),
-        response_topic: Some("replies/me".to_string()),
-        correlation_data: Some(Bytes::from_static(&[0x01, 0xff])),
-        user_properties: vec![
-            ("k".to_string(), "v1".to_string()),
-            ("k".to_string(), "v2".to_string()),
-        ],
-        ..Default::default()
-    };
+    let properties = MessageProperties::default()
+        .content_type("text/plain")
+        .response_topic("replies/me")
+        .correlation_data(Bytes::from_static(&[0x01, 0xff]))
+        .user_property("k", "v1")
+        .user_property("k", "v2");
     sender
         .publish_with_properties("json/text", "héllo", QoS::AtLeastOnce, false, properties)
         .await

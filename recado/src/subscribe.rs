@@ -197,7 +197,9 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                         }
                         eprintln!("recado: {}; reconnecting", Failure::disconnected(&reason));
                     }
-                    Some(Event::Reconnected { session_present }) => {
+                    Some(Event::Reconnected {
+                        session_present, ..
+                    }) => {
                         eprintln!("recado: reconnected");
                         // A broker that lost the session lost the
                         // subscriptions with it

@@ -161,11 +161,9 @@ async fn ask(client: &MqttClient, request: &Request) -> Result<Option<Value>, Fa
             message: format!("not allowed to subscribe to {response_topic}"),
         });
     }
-    let properties = MessageProperties {
-        response_topic: Some(response_topic.clone()),
-        correlation_data: Some(correlation.clone()),
-        ..Default::default()
-    };
+    let properties = MessageProperties::default()
+        .response_topic(response_topic.clone())
+        .correlation_data(correlation.clone());
     let payload = json!({ "commands": [&request.command] }).to_string();
     // QoS 1, so a request the broker refuses fails here instead of going
     // unanswered

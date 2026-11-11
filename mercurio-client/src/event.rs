@@ -11,6 +11,7 @@ use crate::options::MessageProperties;
 #[non_exhaustive]
 pub enum Event {
     /// A message was received on a subscribed topic.
+    #[non_exhaustive]
     Message {
         topic: String,
         payload: Bytes,
@@ -32,6 +33,7 @@ pub enum Event {
 
     /// The client reconnected after losing the connection. Without
     /// `session_present` the broker forgot the subscriptions.
+    #[non_exhaustive]
     Reconnected { session_present: bool },
 
     /// Reconnecting failed for good, as when the broker refused the
@@ -39,6 +41,7 @@ pub enum Event {
     /// `None`.
     ///
     /// [`MqttClient::recv`]: crate::MqttClient::recv
+    #[non_exhaustive]
     Stopped { error: Arc<ClientError> },
 }
 
@@ -59,6 +62,7 @@ pub enum DisconnectReason {
     ClientInitiated,
 
     /// The broker sent DISCONNECT, saying why.
+    #[non_exhaustive]
     ServerInitiated {
         reason: ReasonCode,
         /// A human-readable explanation, when the broker sent one
@@ -82,6 +86,7 @@ pub enum DisconnectReason {
 
 /// Result of a subscription request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SubscribeResult {
     pub topic: String,
     /// The QoS the broker granted, which may be lower than requested
@@ -93,6 +98,7 @@ pub struct SubscribeResult {
 
 /// Result of unsubscribing from one topic filter.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UnsubscribeResult {
     pub topic: String,
     pub success: bool,

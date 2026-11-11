@@ -63,8 +63,9 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
             }
             Event::Disconnected { reason } =&gt; eprintln!("disconnected: {reason:?}"),
             Event::Reconnected { .. } =&gt; eprintln!("reconnected"),
-            Event::Stopped { error } =&gt; eprintln!("gave up: {error}"),
-            // Event is non_exhaustive: later versions may add variants
+            Event::Stopped { error, .. } =&gt; eprintln!("gave up: {error}"),
+            // Event and its variants are non_exhaustive: later versions
+            // may add variants and fields
             _ =&gt; {}
         }
     }
@@ -136,18 +137,16 @@ while let Some(event) = client.recv().await {
 <h2>MQTT 5 properties</h2>
 <pre>use mercurio_client::{MessageProperties, QoS};
 
-let properties = MessageProperties {
-    content_type: Some("application/json".into()),
-    response_topic: Some("replies/thermostat".into()),
-    correlation_data: Some("42".into()),
-    message_expiry: Some(60),
-    user_properties: vec![("source".into(), "hall".into())],
-    ..Default::default()
-};
+let properties = MessageProperties::default()
+    .content_type("application/json")
+    .response_topic("replies/thermostat")
+    .correlation_data("42")
+    .message_expiry(60)
+    .user_property("source", "hall");
 client
     .publish_with_properties("requests/lamp", r#"{"on":true}"#, QoS::AtLeastOnce, false, properties)
     .await?;</pre>
-<p>Received messages carry their properties in <code>Event::Message { properties, .. }</code>, along with <code>qos</code>, <code>retain</code> and the <code>subscription_ids</code> they matched.</p>
+<p>Received messages carry their properties in <code>Event::Message { properties, .. }</code>, along with <code>qos</code>, <code>retain</code> and the <code>subscription_ids</code> they matched. <code>MessageProperties</code>, <code>Will</code>, <code>SubscribeResult</code> and <code>UnsubscribeResult</code> are <code>#[non_exhaustive]</code>, as are the struct-like variants of <code>Event</code>, <code>DisconnectReason</code> and <code>ClientError</code> apart from <code>Event::Disconnected</code>: build them with their constructors and setters, and match them with <code>..</code>, so new fields don't break your code.</p>
 
 <h2>Subscription options</h2>
 <pre>use mercurio_client::{QoS, RetainHandling, SubscriptionOptions};

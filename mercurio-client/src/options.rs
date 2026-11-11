@@ -80,7 +80,20 @@ pub(crate) fn check_length(
 }
 
 /// MQTT 5 properties of an application message. MQTT 3.x ignores them.
+///
+/// Start from `MessageProperties::default()` and set what the message has:
+///
+/// ```
+/// use mercurio_client::MessageProperties;
+///
+/// let properties = MessageProperties::default()
+///     .content_type("application/json")
+///     .response_topic("replies/me")
+///     .user_property("source", "sensor-1");
+/// assert_eq!(properties.content_type.as_deref(), Some("application/json"));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageProperties {
     /// The payload is UTF-8 text
     pub payload_is_utf8: bool,
@@ -97,6 +110,42 @@ pub struct MessageProperties {
 }
 
 impl MessageProperties {
+    /// Marks the payload as UTF-8 text, or not.
+    pub fn payload_is_utf8(mut self, utf8: bool) -> Self {
+        self.payload_is_utf8 = utf8;
+        self
+    }
+
+    /// Seconds the broker keeps the message for subscribers yet to get it.
+    pub fn message_expiry(mut self, seconds: u32) -> Self {
+        self.message_expiry = Some(seconds);
+        self
+    }
+
+    /// Describes the payload, such as a MIME type.
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Where a reply to this message should be published.
+    pub fn response_topic(mut self, topic: impl Into<String>) -> Self {
+        self.response_topic = Some(topic.into());
+        self
+    }
+
+    /// Data that ties a reply to its request.
+    pub fn correlation_data(mut self, data: impl Into<Bytes>) -> Self {
+        self.correlation_data = Some(data.into());
+        self
+    }
+
+    /// Adds a user property after those already set; a name may repeat.
+    pub fn user_property(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.user_properties.push((name.into(), value.into()));
+        self
+    }
+
     pub(crate) fn to_publish(&self) -> Option<PublishProperties> {
         if *self == MessageProperties::default() {
             return None;
@@ -152,8 +201,9 @@ impl MessageProperties {
     }
 }
 
-/// Will message configuration.
+/// Will message configuration, built with [`Will::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Will {
     pub topic: String,
     pub payload: Bytes,

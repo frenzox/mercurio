@@ -83,17 +83,16 @@ struct PropertyArgs {
 
 impl From<PropertyArgs> for MessageProperties {
     fn from(args: PropertyArgs) -> Self {
-        MessageProperties {
-            payload_is_utf8: args.utf8,
-            message_expiry: args.message_expiry,
-            content_type: args.content_type,
-            response_topic: args.response_topic,
-            correlation_data: args
-                .correlation_data
-                .map(Bytes::from)
-                .or(args.correlation_data_hex),
-            user_properties: args.user_properties,
-        }
+        let mut properties = MessageProperties::default().payload_is_utf8(args.utf8);
+        properties.message_expiry = args.message_expiry;
+        properties.content_type = args.content_type;
+        properties.response_topic = args.response_topic;
+        properties.correlation_data = args
+            .correlation_data
+            .map(Bytes::from)
+            .or(args.correlation_data_hex);
+        properties.user_properties = args.user_properties;
+        properties
     }
 }
 

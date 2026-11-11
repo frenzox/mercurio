@@ -93,7 +93,9 @@ async fn main() {
                             received.1 += 1;
                         }
                     }
-                    Event::Reconnected { session_present } => {
+                    Event::Reconnected {
+                        session_present, ..
+                    } => {
                         reconnects.fetch_add(1, Ordering::Relaxed);
                         if !session_present {
                             eprintln!("subscriber's session was lost on reconnecting");

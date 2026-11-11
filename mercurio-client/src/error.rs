@@ -24,6 +24,7 @@ pub enum ClientError {
     /// The broker refused the connection and named another server to use
     /// instead, `reason` saying whether the move is for good.
     #[error("Connection refused ({reason:?}), use {server_reference} instead")]
+    #[non_exhaustive]
     Redirected {
         reason: ReasonCode,
         server_reference: String,

@@ -58,7 +58,7 @@ async fn redirection_names_the_other_server() {
     let result = MqttClient::connect(ConnectOptions::new("127.0.0.1", port)).await;
     assert!(matches!(
         result,
-        Err(ClientError::Redirected { reason: ReasonCode::ServerMoved, ref server_reference })
+        Err(ClientError::Redirected { reason: ReasonCode::ServerMoved, ref server_reference, .. })
             if server_reference == "elsewhere:1883"
     ));
 }
