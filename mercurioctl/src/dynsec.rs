@@ -22,7 +22,8 @@ pub enum Dynsec {
     /// Create a client, which logs in with its user name and password
     CreateClient {
         username: String,
-        /// Its password; asked for when left out, and none when left empty
+        /// Its password, which other users can see in `ps`; leave it out to
+        /// be asked, and give an empty one for none
         #[arg(long)]
         password: Option<String>,
         /// A role of its own (can be repeated)
@@ -34,9 +35,11 @@ pub enum Dynsec {
     },
     /// Delete a client
     DeleteClient { username: String },
-    /// Change a client's password; asked for when left out
+    /// Change a client's password
     SetClientPassword {
         username: String,
+        /// The new password, which other users can see in `ps`; leave it out
+        /// to be asked
         password: Option<String>,
     },
     /// Let a disabled client log in again

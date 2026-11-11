@@ -179,7 +179,7 @@ async fn the_exit_status_tells_failures_apart() {
     let refused = mercurioctl(&["-H", "127.0.0.1", "-p", &port, "broker", "info"], &[]).await;
     assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
     assert!(
-        stderr(&refused).contains("NotAuthorized"),
+        stderr(&refused).contains("(notAuthorized)"),
         "{}",
         stderr(&refused)
     );
@@ -270,4 +270,86 @@ async fn dynsec_commands_without_dynamic_security_time_out() {
         "{}",
         stderr(&output)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_options_come_from_the_environment() {
+    let broker = start("env").await;
+    let socket = broker.socket.to_str().unwrap();
+    let output = mercurioctl(
+        &["--json", "broker", "info"],
+        &[("MERCURIOCTL_UNIX", socket)],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let info: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(info["version"].is_string(), "{info}");
+
+    let help = mercurioctl(&["--help"], &[("MERCURIOCTL_PASSWORD", "hunter2")]).await;
+    assert!(!stdout(&help).contains("hunter2"), "{}", stdout(&help));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_and_port_from_the_environment_select_tcp() {
+    let broker = start("tcp-env").await;
+    let port = broker.port.to_string();
+    let output = mercurioctl(
+        &["broker", "info"],
+        &[
+            ("MERCURIOCTL_HOST", "127.0.0.1"),
+            ("MERCURIOCTL_PORT", &port),
+        ],
+    )
+    .await;
+    // The TCP listener doesn't allow admin commands, which the admin socket does
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_variables_are_unset_and_flags_take_boolean_words() {
+    let broker = start("env-empty").await;
+    let socket = broker.socket.to_str().unwrap();
+    // An empty host, port or user would otherwise conflict with the socket
+    let output = mercurioctl(
+        &["--json", "broker", "info"],
+        &[
+            ("MERCURIOCTL_UNIX", socket),
+            ("MERCURIOCTL_HOST", ""),
+            ("MERCURIOCTL_PORT", ""),
+            ("MERCURIOCTL_USERNAME", ""),
+            ("MERCURIOCTL_TLS", ""),
+            ("MERCURIOCTL_INSECURE", ""),
+            ("MERCURIOCTL_TIMEOUT", ""),
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // False words are read, and the TCP listener refuses admin commands
+    let port = broker.port.to_string();
+    for (tls, insecure) in [("0", "no"), ("false", "off")] {
+        let output = mercurioctl(
+            &["broker", "info"],
+            &[
+                ("MERCURIOCTL_HOST", "127.0.0.1"),
+                ("MERCURIOCTL_PORT", &port),
+                ("MERCURIOCTL_TLS", tls),
+                ("MERCURIOCTL_INSECURE", insecure),
+            ],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(1), "{tls}: {}", stderr(&output));
+    }
+
+    // 1 and yes are true: --unix conflicts with --tls
+    for (variable, value) in [("MERCURIOCTL_TLS", "1"), ("MERCURIOCTL_INSECURE", "yes")] {
+        let output = mercurioctl(
+            &["broker", "info"],
+            &[("MERCURIOCTL_UNIX", socket), (variable, value)],
+        )
+        .await;
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "{message}");
+        assert!(message.contains("cannot be used with"), "{message}");
+    }
 }

@@ -1,6 +1,6 @@
 //! Sending one command to the broker and waiting for its answer.
 
-use std::{fmt, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 use bytes::Bytes;
 use mercurio_client::{cli::ConnectArgs, ClientError, Event, MessageProperties, MqttClient, QoS};
@@ -50,6 +50,32 @@ impl fmt::Display for Failure {
     }
 }
 
+/// Where mercuriod serves its admin socket by default.
+pub const ADMIN_SOCKET: &str = "/run/mercurio/admin.sock";
+
+/// With no connection option given, the broker's admin socket when it
+/// exists, which needs no credentials on the broker's host; otherwise what
+/// the options say, `localhost:1883` when they say nothing.
+pub fn resolve(mut args: ConnectArgs, admin_socket: &Path) -> ConnectArgs {
+    #[cfg(unix)]
+    {
+        let none_given = args.host.is_none()
+            && args.port.is_none()
+            && args.unix.is_none()
+            && args.username.is_none()
+            && args.password.is_none()
+            && !args.tls
+            && args.cafile.is_none()
+            && !args.insecure;
+        if none_given && admin_socket.exists() {
+            args.unix = Some(admin_socket.to_path_buf());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = admin_socket;
+    args
+}
+
 /// Sends `request` to the broker `args` name and waits up to `wait`,
 /// connecting included, for its answer: the response's data, if any.
 pub async fn send(
@@ -60,7 +86,16 @@ pub async fn send(
     let outcome = tokio::time::timeout(wait, async {
         let client = MqttClient::connect(args.to_connect_options())
             .await
-            .map_err(|e| Failure::Connection(format!("{}: {e}", target(args))))?;
+            .map_err(|e| {
+                let mut message = format!("{}: {e}", target(args));
+                if message.contains("Permission denied") {
+                    message.push_str(
+                        "; run as root or a member of the mercurio group, or use -H to \
+                         connect over the network",
+                    );
+                }
+                Failure::Connection(message)
+            })?;
         let result = ask(&client, request).await;
         Ok::<_, Failure>((client, result))
     })
@@ -77,6 +112,8 @@ pub async fn send(
             // Nothing answers its topic on a broker without it
             if request.topic == DYNSEC_TOPIC {
                 message.push_str("; is dynamic security enabled?");
+            } else {
+                message.push_str("; is it a Mercurio broker that serves $CONTROL/broker/v1?");
             }
             Err(Failure::Connection(message))
         }
@@ -97,9 +134,7 @@ fn target(args: &ConnectArgs) -> String {
 }
 
 async fn ask(client: &MqttClient, request: &Request) -> Result<Option<Value>, Failure> {
-    // Under `$CONTROL/broker/v1/`, which the administrator `mercuriod
-    // dynsec-init` creates may subscribe to
-    let response_topic = format!("$CONTROL/broker/v1/response/{}", token());
+    let response_topic = response_topic(request.topic, &token());
     let correlation = Bytes::from(token());
     let granted = client
         .subscribe(&[(response_topic.as_str(), QoS::AtLeastOnce)])
@@ -125,7 +160,10 @@ async fn ask(client: &MqttClient, request: &Request) -> Result<Option<Value>, Fa
         .map_err(|e| match e {
             ClientError::PublishRefused(reason) => Failure::Rejected {
                 code: None,
-                message: format!("the broker refused the request: {reason:?}"),
+                message: format!(
+                    "the broker refused the request ({})",
+                    camel_case(&format!("{reason:?}"))
+                ),
             },
             e => Failure::Connection(e.to_string()),
         })?;
@@ -170,6 +208,23 @@ pub fn answer(payload: &[u8]) -> Result<Option<Value>, Failure> {
     Ok(response.get("data").cloned())
 }
 
+/// Under the request's own topic, which any administrator allowed to send
+/// the request may also subscribe to: dynamic security's older administrator
+/// roles grant `$CONTROL/dynamic-security/#` only. The broker consumes
+/// publishes there without routing them to subscribers.
+fn response_topic(request_topic: &str, token: &str) -> String {
+    format!("{request_topic}/response/{token}")
+}
+
+/// `NotAuthorized` as `notAuthorized`, how command errors spell their codes.
+fn camel_case(name: &str) -> String {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// 16 hex digits another run is unlikely to pick: `RandomState`'s keys are
 /// seeded from the operating system for each process.
 fn token() -> String {
@@ -181,9 +236,54 @@ fn token() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
     use serde_json::json;
 
-    use super::{answer, token, Failure};
+    use super::{answer, camel_case, resolve, response_topic, token, Failure};
+    use crate::cli::Cli;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_admin_socket_is_used_when_no_connection_option_is_given() {
+        let connect = |options: &[&str]| {
+            let argv = std::iter::once("mercurioctl")
+                .chain(options.iter().copied())
+                .chain(["broker", "info"]);
+            Cli::try_parse_from(argv).unwrap().connect
+        };
+        // Any path that exists will do
+        let socket = std::env::temp_dir();
+
+        assert_eq!(
+            resolve(connect(&[]), &socket).unix.as_deref(),
+            Some(socket.as_path())
+        );
+        assert_eq!(
+            resolve(connect(&[]), Path::new("/nonexistent/admin.sock")).unix,
+            None
+        );
+        // -i alone still uses the socket
+        assert!(resolve(connect(&["-i", "me"]), &socket).unix.is_some());
+        for options in [
+            &["-H", "broker"][..],
+            &["-p", "1884"],
+            &["-u", "alice"],
+            &["-P", "secret"],
+            &["--tls"],
+            &["--cafile", "ca.pem"],
+            &["--insecure"],
+        ] {
+            assert_eq!(resolve(connect(options), &socket).unix, None, "{options:?}");
+        }
+        assert_eq!(
+            resolve(connect(&["--unix", "/elsewhere.sock"]), &socket)
+                .unix
+                .as_deref(),
+            Some(Path::new("/elsewhere.sock"))
+        );
+    }
 
     #[test]
     fn an_answer_gives_the_data_or_why_the_command_failed() {
@@ -236,6 +336,26 @@ mod tests {
         assert_eq!(rejected.exit_code(), 1);
         assert_eq!(Failure::Connection("refused".to_string()).exit_code(), 2);
         assert_eq!(Failure::Usage("no".to_string()).exit_code(), 3);
+    }
+
+    #[test]
+    fn responses_come_back_under_the_request_topic() {
+        use crate::commands::{BROKER_TOPIC, DYNSEC_TOPIC};
+
+        assert_eq!(
+            response_topic(BROKER_TOPIC, "ab"),
+            "$CONTROL/broker/v1/response/ab"
+        );
+        assert_eq!(
+            response_topic(DYNSEC_TOPIC, "ab"),
+            "$CONTROL/dynamic-security/v1/response/ab"
+        );
+    }
+
+    #[test]
+    fn reason_codes_are_spelled_like_command_errors() {
+        assert_eq!(camel_case("NotAuthorized"), "notAuthorized");
+        assert_eq!(camel_case(""), "");
     }
 
     #[test]

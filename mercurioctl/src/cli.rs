@@ -1,11 +1,17 @@
 //! The command line.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{builder::BoolishValueParser, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use mercurio_client::cli::ConnectArgs;
 
 use crate::dynsec::Dynsec;
 
 const AFTER_HELP: &str = "\
+Without connection options, mercurioctl connects through the broker's admin \
+socket, /run/mercurio/admin.sock, when it exists, with no credentials; \
+otherwise to localhost:1883. Connection options go before the command, and \
+each can also be set with its MERCURIOCTL_ variable. -u without -P asks for \
+the password.
+
 Exit status: 0 on success, 1 when the broker refused the command, 2 when \
 the broker couldn't be reached, refused the login or didn't answer in time, \
 3 on wrong usage.";
@@ -22,11 +28,57 @@ pub struct Cli {
     pub json: bool,
 
     /// Seconds to wait for the broker's answer
-    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 10)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub timeout: u64,
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The command line, with each connection option also read from a
+/// `MERCURIOCTL_*` variable. The options are `mercurio-client`'s, shared
+/// with recado, so the variables are added here.
+pub fn command() -> clap::Command {
+    let mut command = Cli::command();
+    for (id, variable) in [
+        ("host", "MERCURIOCTL_HOST"),
+        ("port", "MERCURIOCTL_PORT"),
+        ("client_id", "MERCURIOCTL_CLIENT_ID"),
+        ("username", "MERCURIOCTL_USERNAME"),
+        ("tls", "MERCURIOCTL_TLS"),
+        ("cafile", "MERCURIOCTL_CAFILE"),
+        ("insecure", "MERCURIOCTL_INSECURE"),
+        ("password", "MERCURIOCTL_PASSWORD"),
+        ("timeout", "MERCURIOCTL_TIMEOUT"),
+        #[cfg(unix)]
+        ("unix", "MERCURIOCTL_UNIX"),
+    ] {
+        // Systemd units and CI often leave variables empty, which means
+        // unset, as for the shell's `${VAR:-}`
+        if std::env::var_os(variable).is_some_and(|value| value.is_empty()) {
+            continue;
+        }
+        command = command.mut_arg(id, |arg| {
+            let arg = arg.env(variable);
+            match id {
+                // --help would show the value otherwise
+                "password" => arg.hide_env_values(true).help(
+                    "Password for authentication; other users can see it in `ps`, \
+                     so leave it out with -u to be asked",
+                ),
+                // 1, 0, yes, no, on and off, as well as true and false
+                "tls" | "insecure" => arg.value_parser(BoolishValueParser::new()),
+                _ => arg,
+            }
+        });
+    }
+    command
 }
 
 #[derive(Subcommand, Debug)]
@@ -237,7 +289,27 @@ fn parse_reason_code(value: &str) -> Result<u8, String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{parse_reason_code, Cli};
+    use super::{command, parse_reason_code, Cli};
+
+    #[test]
+    fn connection_options_name_their_variables() {
+        command().debug_assert();
+        let help = command().render_help().to_string();
+        for variable in [
+            "MERCURIOCTL_HOST",
+            "MERCURIOCTL_PORT",
+            "MERCURIOCTL_UNIX",
+            "MERCURIOCTL_CLIENT_ID",
+            "MERCURIOCTL_USERNAME",
+            "MERCURIOCTL_PASSWORD",
+            "MERCURIOCTL_TLS",
+            "MERCURIOCTL_CAFILE",
+            "MERCURIOCTL_INSECURE",
+            "MERCURIOCTL_TIMEOUT",
+        ] {
+            assert!(help.contains(variable), "{variable} missing from:\n{help}");
+        }
+    }
 
     #[test]
     fn arguments_are_well_formed() {
@@ -274,5 +346,6 @@ mod tests {
         assert!(cli.connect.tls);
         assert_eq!(cli.timeout, 3);
         assert!(Cli::try_parse_from(["mercurioctl", "client", "list", "-H", "broker"]).is_err());
+        assert!(Cli::try_parse_from(["mercurioctl", "--timeout", "0", "client", "list"]).is_err());
     }
 }

@@ -1,9 +1,9 @@
 //! mercurioctl: administers a running Mercurio broker through its
 //! `$CONTROL/broker/v1` API.
 
-use std::{io::Write, process::ExitCode, time::Duration};
+use std::{io::Write, path::Path, process::ExitCode, time::Duration};
 
-use clap::Parser;
+use clap::FromArgMatches;
 
 mod cli;
 mod client;
@@ -20,7 +20,7 @@ const USAGE: u8 = 3;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match parse() {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();
@@ -36,10 +36,18 @@ async fn main() -> ExitCode {
     }
 }
 
+fn parse() -> Result<Cli, clap::Error> {
+    Cli::from_arg_matches(&cli::command().try_get_matches()?)
+}
+
 async fn run(cli: Cli) -> Result<(), Failure> {
     let request = commands::request(cli.command, new_password)?;
+    let mut connect = client::resolve(cli.connect, Path::new(client::ADMIN_SOCKET));
+    if connect.username.is_some() && connect.password.is_none() {
+        connect.password = Some(prompt("Password: ")?);
+    }
     let wait = Duration::from_secs(cli.timeout);
-    let Some(data) = client::send(&cli.connect, &request, wait).await? else {
+    let Some(data) = client::send(&connect, &request, wait).await? else {
         return Ok(());
     };
     // A reader that went away, such as `head`, isn't an error
