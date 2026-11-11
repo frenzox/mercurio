@@ -177,6 +177,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>password_file</code></td><td></td><td>User names and password hashes.</td></tr>
 <tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>
 <tr><td><code>dynamic_security</code></td><td></td><td>Dynamic security state file; replaces <code>password_file</code> and <code>acl_file</code>. Only in <code>[auth]</code>.</td></tr>
+<tr><td><code>scram_secret_file</code></td><td></td><td>File with 32 bytes of the secret that the SCRAM salts of unknown users come from. Created with random bytes and mode 0600 when missing, and the broker refuses to start when it has another length. Set it so the salts, and so the list of users, stay hidden across restarts. <code>--check</code> does not create it.</td></tr>
 </table>
 <h3 id="auth-http">[auth.http]</h3>
 <table>

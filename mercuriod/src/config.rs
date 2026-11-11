@@ -1506,6 +1506,11 @@ pub struct AuthConfig {
     /// `$CONTROL/dynamic-security/v1`; replaces the password and ACL files
     pub dynamic_security: Option<String>,
 
+    /// File holding the 32-byte secret that unknown users' SCRAM salts come
+    /// from. Created with random bytes when missing, so the salts survive
+    /// restarts and don't tell which users exist
+    pub scram_secret_file: Option<String>,
+
     /// Checks delegated to HTTP endpoints
     pub http: Option<HttpAuthConfig>,
 }
@@ -1560,6 +1565,7 @@ impl Default for AuthConfig {
             password_file: None,
             acl_file: None,
             dynamic_security: None,
+            scram_secret_file: None,
             http: None,
         }
     }

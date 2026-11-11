@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
 use mercurio_server::admin::AdminExtension;
-use mercurio_server::auth::ScramAuth;
+use mercurio_server::auth::{ScramAuth, ScramCredentialStore};
 use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
@@ -197,7 +197,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .init();
         // Nothing serves it, so plugins publishing at load get an error
         let (unserved, _) = LocalConnector::new();
-        prepare(&config, &unserved).await?;
+        prepare(&config, &unserved, false).await?;
         println!("{}: the configuration is valid", cli.config.display());
         return Ok(());
     }
@@ -220,7 +220,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         listeners: prepared_listeners,
         reloadable,
         bridges,
-    } = prepare(&config, &connector).await?;
+    } = prepare(&config, &connector, true).await?;
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -459,6 +459,7 @@ struct PreparedListener {
 async fn prepare(
     config: &Config,
     broker: &LocalConnector,
+    create_files: bool,
 ) -> Result<Prepared, Box<dyn std::error::Error>> {
     let limits = config.server.limits()?;
     let mut policy = ConnectPolicy::default();
@@ -475,7 +476,7 @@ async fn prepare(
 
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
     let tls = build_tls(&config.server.tls, &mut reloadable)?;
-    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
+    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true, create_files)?;
     let wasm = load_plugins(
         &config.plugins,
         config.server.plugin_timeout(),
@@ -508,7 +509,7 @@ async fn prepare(
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {
             Some(auth) => {
-                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;
+                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false, create_files)?;
                 (Some(auth), Some(chain(&plugins, names)))
             }
             None => (None, names.map(|_| chain(&builtins, names))),
@@ -673,12 +674,62 @@ type Auth = (
     Option<Arc<DynamicSecurity>>,
 );
 
+/// SCRAM authentication over `store`, with the decoy secret of
+/// `scram_secret_file` when `config` names one.
+fn scram_auth<S: ScramCredentialStore + ?Sized>(
+    store: Arc<S>,
+    config: &config::AuthConfig,
+    create_files: bool,
+) -> Result<ScramAuth<S>, String> {
+    let auth = ScramAuth::new(store);
+    Ok(match &config.scram_secret_file {
+        Some(path) => match load_scram_secret(path, create_files)? {
+            Some(secret) => auth.decoy_secret(secret),
+            None => auth,
+        },
+        None => auth,
+    })
+}
+
+/// The 32 bytes in the file at `path`. A missing file is created with
+/// random bytes when `create` is set, and gives `None` otherwise.
+fn load_scram_secret(path: &str, create: bool) -> Result<Option<[u8; 32]>, String> {
+    use std::io::Write;
+
+    let wrong_length =
+        |len: usize| format!("{path}: the SCRAM secret must be 32 bytes, found {len}");
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            return <[u8; 32]>::try_from(bytes.as_slice())
+                .map(Some)
+                .map_err(|_| wrong_length(bytes.len()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{path}: {e}")),
+    }
+    if !create {
+        return Ok(None);
+    }
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|e| format!("no random bytes for {path}: {e}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(&secret))
+        .map_err(|e| format!("{path}: {e}"))?;
+    Ok(Some(secret))
+}
+
 /// The authentication and access control of `config`, adding the files it
 /// loads to `reloadable`.
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
     main: bool,
+    create_files: bool,
 ) -> Result<Auth, String> {
     let table = if main { "[auth]" } else { "[listeners.auth]" };
     // Without authentication these would be ignored, letting everyone in
@@ -721,7 +772,7 @@ fn build_auth(
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
         // SCRAM-SHA-256 for the clients whose password was set with keys
-        let scram = Arc::new(ScramAuth::new(security.clone()));
+        let scram = Arc::new(scram_auth(security.clone(), config, create_files)?);
         return Ok((value, vec![security.clone(), scram], Some(security)));
     }
 
@@ -747,7 +798,7 @@ fn build_auth(
         info!("Loaded credentials from {}", path);
         reloadable.push(validator.clone());
         plugins.push(validator.clone());
-        plugins.push(Arc::new(ScramAuth::new(validator)));
+        plugins.push(Arc::new(scram_auth(validator, config, create_files)?));
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
@@ -922,7 +973,10 @@ fn delete_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(test)]
 mod tests {
-    use super::{add_or_update_user, address, build_auth, check_prepared_name_is_free, config};
+    use super::{
+        add_or_update_user, address, build_auth, check_prepared_name_is_free, config,
+        load_scram_secret,
+    };
 
     fn auth(toml: &str) -> config::AuthConfig {
         toml::from_str(toml).unwrap()
@@ -944,7 +998,7 @@ mod tests {
             ),
         ] {
             for main in [true, false] {
-                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
+                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main, true) else {
                     panic!("{toml}: accepted");
                 };
                 assert!(
@@ -956,10 +1010,43 @@ mod tests {
     }
 
     #[test]
+    fn test_scram_secret_file_is_created_once_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("mercuriod-scram-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        let name = path.to_str().unwrap();
+
+        // Checking a configuration leaves the file alone
+        assert_eq!(load_scram_secret(name, false).unwrap(), None);
+        assert!(!path.exists());
+
+        let first = load_scram_secret(name, true).unwrap().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(load_scram_secret(name, true).unwrap(), Some(first));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        std::fs::write(&path, b"short").unwrap();
+        for create in [false, true] {
+            let error = load_scram_secret(name, create).unwrap_err();
+            assert!(
+                error.contains(name) && error.contains("32 bytes"),
+                "{error}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn test_access_control_works_without_authentication() {
         let (value, plugins, _) = build_auth(
             &auth("[http]\nacl_url = \"http://h/acl\"\n"),
             &mut Vec::new(),
+            true,
             true,
         )
         .map_err(|e| panic!("{e}"))
@@ -973,6 +1060,7 @@ mod tests {
             &auth(&format!("acl_file = \"{}\"\n", acl.display())),
             &mut Vec::new(),
             true,
+            true,
         );
         std::fs::remove_file(&acl).unwrap();
         let (value, plugins, _) = result.map_err(|e| panic!("{e}")).unwrap();
@@ -985,6 +1073,7 @@ mod tests {
         let (_, plugins, _) = build_auth(
             &auth("enabled = true\n[http]\nsuperuser_url = \"http://h/su\"\n"),
             &mut Vec::new(),
+            true,
             true,
         )
         .map_err(|e| panic!("{e}"))
@@ -1006,6 +1095,7 @@ mod tests {
                 )),
                 &mut reloadable,
                 true,
+                true,
             )
             .map_err(|e| panic!("{e}"))
             .unwrap();
@@ -1018,7 +1108,7 @@ mod tests {
     async fn broker_with(toml: &str) -> u16 {
         use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
-        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true)
+        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true, true)
             .map_err(|e| panic!("{e}"))
             .unwrap();
         let mut config = ServerConfig::default();
