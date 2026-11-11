@@ -65,7 +65,18 @@ impl Broker {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        let storage = Arc::new(SqliteStore::new(db).unwrap());
+        // A crashed broker's runtime lets go of the database in the
+        // background, and its lock with it
+        let opening = std::time::Instant::now();
+        let storage = loop {
+            match SqliteStore::new(db) {
+                Ok(storage) => break Arc::new(storage),
+                Err(_) if opening.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
         let (stop, stopped) = oneshot::channel::<()>();
         let _entered = runtime.enter();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
