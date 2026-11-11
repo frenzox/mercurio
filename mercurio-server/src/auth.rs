@@ -378,7 +378,7 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
                 .unwrap_or_else(|| process_secret());
             StoredCredentials::decoy(secret, &username, self.decoy_iterations)
         });
-        match first.respond(&credentials) {
+        match first.respond(&credentials, None) {
             Ok((server_first, awaiting)) => {
                 self.state = ScramState::AwaitingProof {
                     awaiting,
@@ -403,9 +403,13 @@ fn scram_refusal(error: ServerError) -> AuthResult {
 /// reason string stands in for the RFC's server error.
 fn scram_failure(error: &ServerError) -> AuthResult {
     let (reason, text) = match error {
-        ServerError::ChannelBindingNotSupported => (
+        ServerError::ChannelBindingNotSupported | ServerError::UnsupportedChannelBindingType => (
             ReasonCode::BadAuthenticationMethod,
             "channel binding is not supported",
+        ),
+        ServerError::ServerDoesOfferChannelBinding => (
+            ReasonCode::BadAuthenticationMethod,
+            "channel binding is offered",
         ),
         ServerError::ExtensionsNotSupported => (
             ReasonCode::BadAuthenticationMethod,
