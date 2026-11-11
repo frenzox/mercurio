@@ -1354,6 +1354,18 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             .is_some()
     }
 
+    /// Removes from storage a will `take_restored_will` claimed, now that
+    /// it is published, with its session if that ended meanwhile.
+    pub(crate) async fn restored_will_published(&self, client_id: &str) {
+        let manager = self.shared.state.lock().await;
+        if manager.sessions.contains_key(client_id) || manager.connections.contains_key(client_id) {
+            self.writers.write(client_id, Write::DeleteWill);
+        } else {
+            self.writers.write(client_id, Write::DeleteSession);
+            self.writers.close(client_id);
+        }
+    }
+
     /// Discards the session of `client_id` unless a connection newer than
     /// `generation` has used it since. An expiry timer passes its `timer`
     /// token, and does nothing once deletion or a newer timer retired it.
@@ -1383,10 +1395,14 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         info!(target: CONNECTIONS, "Session for client `{}` ended", client_id);
         let ended = manager.sessions.remove(client_id);
         self.shared.persistent.lock().unwrap().remove(client_id);
-        // Queued while the session is still out of reach, so a connection
-        // reading storage for it finds it removed
-        self.writers.write(client_id, Write::DeleteSession);
-        self.writers.close(client_id);
+        // A will left by a previous run stays stored with its session until
+        // it is published, so stopping before then doesn't lose it
+        if !manager.restored_wills.contains_key(client_id) {
+            // Queued while the session is still out of reach, so a
+            // connection reading storage for it finds it removed
+            self.writers.write(client_id, Write::DeleteSession);
+            self.writers.close(client_id);
+        }
         drop(manager);
         if let Some(ended) = ended {
             ended.session().stop_queue_journal();
@@ -2590,6 +2606,46 @@ mod tests {
             .unwrap();
         assert!(manager.take_restored_will("a").await);
         assert!(!manager.take_restored_will("b").await);
+    }
+
+    #[tokio::test]
+    async fn test_a_restored_will_of_an_expired_session_survives_another_restart() {
+        let storage = create_test_storage();
+        storage
+            .save_session(
+                "a",
+                &SessionState {
+                    client_id: "a".to_string(),
+                    subscriptions: vec![],
+                    expiry_interval: Some(10),
+                    expires_at: Some(unix_millis() - 1000),
+                    owner: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        storage.store_will("a", &stored_will(30)).await.unwrap();
+
+        let broker = crate::broker::Broker::new(storage.clone());
+        let first = SessionManager::new(Arc::clone(&storage));
+        let wills = first.restore_from_storage(&broker).await.unwrap();
+        assert_eq!(wills.len(), 1);
+        // Stopped before the will was published
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        first.flush().await;
+
+        let second = SessionManager::new(Arc::clone(&storage));
+        let wills = second.restore_from_storage(&broker).await.unwrap();
+        assert_eq!(wills.len(), 1, "the will was lost");
+        assert_eq!(wills[0].2, Duration::ZERO);
+
+        // Once published, the will and its ended session are gone
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(second.take_restored_will("a").await);
+        second.restored_will_published("a").await;
+        second.flush().await;
+        assert!(storage.load_session("a").await.unwrap().is_none());
+        assert!(storage.get_will("a").await.unwrap().is_none());
     }
 
     #[tokio::test]

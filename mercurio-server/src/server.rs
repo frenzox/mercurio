@@ -1550,7 +1550,7 @@ impl<St: MqttStore + 'static> Server<St> {
                 time::sleep(due).await;
                 if session_manager.take_restored_will(&client_id).await {
                     publish_will(&broker, will, &client_id).await;
-                    session_manager.delete_will(&client_id);
+                    session_manager.restored_will_published(&client_id).await;
                 }
             });
         }
