@@ -50,6 +50,47 @@ async fn local_connections_skip_authentication() {
     assert_eq!(connack_reason(&mut local).await, 0x00);
 }
 
+/// An in-process bridge is part of the broker's own setup, so a broker
+/// full of network clients still serves it, and it takes no network
+/// client's place.
+#[tokio::test]
+async fn local_connections_skip_the_connection_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (connector, local_listener) = LocalConnector::new();
+    let mut config = ServerConfig::default();
+    config.limits.max_connections = Some(1);
+    config.local_listener = Some(local_listener);
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let mut local = connector.connect().unwrap();
+    assert_eq!(connack_reason(&mut local).await, 0x00);
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let mut connect = CONNECT;
+    connect[15] = b't';
+    tcp.write_all(&connect).await.unwrap();
+    let mut first = [0u8; 1];
+    timeout(Duration::from_secs(2), tcp.read_exact(&mut first))
+        .await
+        .expect("no CONNACK")
+        .expect("network client refused");
+    assert_eq!(first[0], 0x20);
+
+    let mut second = connector.connect().unwrap();
+    let mut connect = CONNECT;
+    connect[15] = b'm';
+    second.write_all(&connect).await.unwrap();
+    timeout(Duration::from_secs(2), second.read_exact(&mut first))
+        .await
+        .expect("no CONNACK")
+        .expect("in-process client refused");
+    assert_eq!(first[0], 0x20);
+}
+
 #[tokio::test]
 async fn control_topics_need_an_explicit_allow() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

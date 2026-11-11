@@ -125,6 +125,7 @@ pub struct Limits {
     /// Messages waiting to be sent to one session.
     pub queue: QueueLimits,
     /// Connections beyond this many are closed right after being accepted.
+    /// In-process connections and those of trusted listeners don't count.
     pub max_connections: Option<usize>,
     /// Highest topic alias MQTT 5 clients may use; 0 disables aliases.
     pub topic_alias_maximum: u16,
@@ -337,8 +338,8 @@ impl ListenerConfig {
 }
 
 /// Opens in-process connections to a broker, for parts of the same program
-/// such as bridges. These connections skip authentication and access
-/// control.
+/// such as bridges. These connections skip authentication, access control
+/// and the connection limit.
 #[derive(Clone)]
 pub struct LocalConnector(mpsc::UnboundedSender<DuplexStream>);
 
@@ -1246,10 +1247,12 @@ impl<St: MqttStore + 'static> Listener<St> {
                 }
             }
 
-            let trusted = endpoint.is_some_and(|i| self.endpoints[i].trusted);
+            // In-process connections, which have no endpoint, are trusted
+            let trusted = endpoint.is_none_or(|i| self.endpoints[i].trusted);
 
             // Held by the connection's task for as long as it runs. Trusted
-            // clients take none, so an operator can reach a full broker.
+            // clients take none, so an operator or an in-process bridge can
+            // reach a full broker.
             let slot = match &self.connection_slots {
                 Some(slots) if !trusted => match Arc::clone(slots).try_acquire_owned() {
                     Ok(permit) => Some(permit),
