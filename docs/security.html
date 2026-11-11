@@ -218,10 +218,11 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <p>A session left by a previous owner blocks the id until it expires. To give the id to someone else sooner, delete the session with <code>mercurioctl client delete-session &lt;clientid&gt;</code>.</p>
 
 <h2 id="reloading">Reloading</h2>
-<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
+<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, and the TLS certificate, key, CA and CRL files, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
 <ul>
 <li>New ACL rules apply to every later publish, subscribe and delivery, connected clients included.</li>
 <li>Password changes apply to later logins.</li>
+<li>TLS changes apply to later connections, so a renewed certificate takes over without a restart. Connected clients keep the session they started with. A certificate whose key does not match, or a file that is missing, keeps the previous certificate, key, CA and CRLs of that listener.</li>
 <li>If a file fails to load, the broker logs the error and keeps the previous version, so a typo never locks everyone out.</li>
 <li>Other settings need a restart.</li>
 </ul>

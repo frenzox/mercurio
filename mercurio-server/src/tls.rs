@@ -1,6 +1,6 @@
 //! TLS support for the MQTT broker.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
@@ -68,8 +68,8 @@ impl TlsConfig {
         self
     }
 
-    /// Build a TLS acceptor from this configuration.
-    pub fn build_acceptor(&self) -> Result<TlsAcceptor, ServerError> {
+    /// Reads the files and builds the rustls configuration they describe.
+    pub fn server_config(&self) -> Result<Arc<ServerConfig>, ServerError> {
         let certificate_options =
             self.crl_path.is_some() || self.username_from_certificate.is_some();
         if self.ca_path.is_none() && certificate_options {
@@ -118,7 +118,53 @@ impl TlsConfig {
             .with_single_cert(certs, key)
             .map_err(|e| ServerError::Tls(format!("Failed to configure TLS: {}", e)))?;
 
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        Ok(Arc::new(config))
+    }
+}
+
+/// The TLS a listener serves. Clones share their settings: a reload
+/// through any of them reaches every listener given one. Connections
+/// already up keep the settings they started with.
+#[derive(Clone)]
+pub struct Tls {
+    current: Arc<RwLock<Arc<ServerConfig>>>,
+    files: Arc<TlsConfig>,
+}
+
+impl std::fmt::Debug for Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tls").field("files", &self.files).finish()
+    }
+}
+
+impl Tls {
+    /// Reads the files of `config`, failing if they can't be used.
+    pub fn new(config: TlsConfig) -> Result<Self, ServerError> {
+        Ok(Self {
+            current: Arc::new(RwLock::new(config.server_config()?)),
+            files: Arc::new(config),
+        })
+    }
+
+    /// Reads the files again, for connections from now on. On error the
+    /// settings in use are kept.
+    pub fn reload(&self) -> Result<(), ServerError> {
+        let config = self.files.server_config()?;
+        *self.current.write().unwrap() = config;
+        Ok(())
+    }
+
+    /// The files read, as given to [`Tls::new`].
+    pub fn files(&self) -> &TlsConfig {
+        &self.files
+    }
+
+    pub(crate) fn username_from_certificate(&self) -> Option<CertificateName> {
+        self.files.username_from_certificate
+    }
+
+    pub(crate) fn acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(Arc::clone(&self.current.read().unwrap()))
     }
 }
 
@@ -221,7 +267,7 @@ mod tests {
     fn test_client_certificate_options_need_a_ca() {
         let mut config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem");
         config.username_from_certificate = Some(CertificateName::CommonName);
-        let Err(ServerError::Tls(message)) = config.build_acceptor() else {
+        let Err(ServerError::Tls(message)) = Tls::new(config) else {
             panic!("accepted identity_as_username without a CA");
         };
         assert!(message.contains("need a CA"), "{message}");

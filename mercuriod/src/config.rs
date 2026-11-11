@@ -1241,7 +1241,7 @@ mod tests {
         ))
         .unwrap();
         let tls = config.server.tls.build().unwrap().unwrap();
-        assert!(tls.build_acceptor().is_ok());
+        assert!(mercurio_server::tls::Tls::new(tls).is_ok());
     }
 
     #[test]

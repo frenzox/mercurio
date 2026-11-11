@@ -7,7 +7,7 @@ use std::{
 
 use mercurio_server::{
     server::{ListenerConfig, ServerConfig, Transport},
-    tls::TlsConfig,
+    tls::{Tls, TlsConfig},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -64,10 +64,13 @@ async fn client_caused_failures_are_not_errors() {
     let tls_addr = tls_listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     let mut tls = ListenerConfig::new(tls_listener, Transport::Mqtt);
-    tls.tls = Some(TlsConfig::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
-    ));
+    tls.tls = Some(
+        Tls::new(TlsConfig::new(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+        ))
+        .unwrap(),
+    );
     config.listeners.push(tls);
     tokio::spawn(mercurio_server::server::run_with_config(
         listener,

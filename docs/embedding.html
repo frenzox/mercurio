@@ -63,13 +63,13 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>run_with_config(listener, config, shutdown)</code></td><td>Your configuration, state in memory</td></tr>
 <tr><td><code>run_with_storage(listener, config, storage, shutdown)</code></td><td>Your configuration and storage</td></tr>
 </table>
-<p>They fail without serving anyone if the configuration can't be used, such as an unreadable TLS certificate.</p>
+<p>They fail without serving anyone if the configuration can't be used, such as a mount point with a wildcard.</p>
 
 <h2>Configuration</h2>
 <p><code>ServerConfig</code> mirrors the daemon's configuration file:</p>
 <table>
 <tr><th>Field</th><th>Holds</th></tr>
-<tr><td><code>tls</code></td><td><code>Option&lt;TlsConfig&gt;</code> for the main listener</td></tr>
+<tr><td><code>tls</code></td><td><code>Option&lt;Tls&gt;</code> for the main listener, see <a href="#tls">below</a></td></tr>
 <tr><td><code>auth</code></td><td><code>AuthConfig</code>: whether authentication is required and anonymous clients are allowed</td></tr>
 <tr><td><code>plugins</code></td><td><code>Vec&lt;Arc&lt;dyn Plugin&gt;&gt;</code>: the plugin chain, see <a href="#auth">below</a></td></tr>
 <tr><td><code>plugin_timeout</code></td><td>Longest a plugin hook may take, 5 seconds by default</td></tr>
@@ -83,16 +83,19 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 </table>
 <pre>use mercurio_server::{
     server::{ListenerConfig, ServerConfig, Transport},
-    tls::TlsConfig,
+    tls::{Tls, TlsConfig},
 };
 use tokio::net::TcpListener;
 
+let tls = Tls::new(TlsConfig::new("server.crt", "server.key"))?;
 let mut tls_listener =
     ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt);
-tls_listener.tls = Some(TlsConfig::new("server.crt", "server.key"));
+tls_listener.tls = Some(tls.clone());
 
 let mut config = ServerConfig::default();
 config.listeners.push(tls_listener);</pre>
+<h3 id="tls">TLS</h3>
+<p><code>Tls::new</code> reads the certificate, key, CA and CRL files a <code>TlsConfig</code> names, and fails if they can't be used. <code>Tls::reload</code> reads them again, for example after a certificate is renewed: connections from then on get the new files, and those already up keep theirs. A reload that fails returns the error and keeps the previous files. Clones of a <code>Tls</code> share it, so one reload reaches every listener given a clone.</p>
 <p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
 
 <h2 id="auth">Plugins</h2>

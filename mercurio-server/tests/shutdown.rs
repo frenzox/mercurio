@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use mercurio_server::{
     server::{ListenerConfig, ServerConfig, Transport},
-    tls::TlsConfig,
+    tls::{Tls, TlsConfig},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,10 +18,13 @@ async fn handshaking_connections_end_with_the_server() {
     let mut config = ServerConfig::default();
     config.limits.connect_timeout = Duration::from_secs(30);
     config.sys_interval = None;
-    config.tls = Some(TlsConfig::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
-    ));
+    config.tls = Some(
+        Tls::new(TlsConfig::new(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+        ))
+        .unwrap(),
+    );
     // Each listener, with the start of its first step: nothing of the TLS
     // handshake, part of CONNECT, of the HTTP upgrade, of the PROXY header
     let mut started = vec![(main.local_addr().unwrap(), &b""[..])];

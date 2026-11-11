@@ -537,10 +537,12 @@ every message is checked. `user_url` replaces `password_file` and
 
 Send `SIGHUP` (`systemctl reload mercuriod`), or run
 `mercurioctl broker reload`, to reread `password_file`,
-`acl_file`, `dynamic_security` and the `.wasm` file of each `[[plugins]]`
+`acl_file`, `dynamic_security`, the TLS `cert_path`, `key_path`, `ca_path`
+and `crl_path` of each listener and the `.wasm` file of each `[[plugins]]`
 entry without dropping connections. New ACL rules apply to every later
 publish and subscribe, including those of connected clients. Password
-changes apply to later logins. A reloaded plugin takes over once its
+and TLS changes apply to later connections; connected clients keep the
+certificate they were served. A reloaded plugin takes over once its
 `init` has run; calls already running finish on the old code. If a file
 fails to load, the broker logs the error and keeps the previous version.
 Other settings, the other `[[plugins]]` keys among them, still need a
