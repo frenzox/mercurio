@@ -117,8 +117,10 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and would build for musl,
+      # which the sanitizers do not support
       - name: Build the fuzz targets
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   # Experimental: this job has not passed yet, so a failure does not fail the
   # build. Remove continue-on-error once it is green. macOS limits Unix
