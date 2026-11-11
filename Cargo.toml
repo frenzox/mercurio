@@ -5,6 +5,7 @@ members = [
     "mercurio-client",
     "mercurio-core",
     "mercurio-packets",
+    "mercurio-scram",
     "mercurio-server",
     "mercurio-storage",
     "mercurio-plugin",
@@ -15,3 +16,11 @@ exclude = ["examples/plugins", "mercuriod/test-plugins"]
 
 [profile.release]
 debug = true  # Enable debug symbols for profiling
+
+# PBKDF2 for SCRAM credentials takes seconds unoptimised, in every test that
+# sets a password
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.mercurio-scram]
+opt-level = 3
