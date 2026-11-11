@@ -68,17 +68,24 @@ impl<T> TopicNode<T> {
         removed
     }
 
-    /// Adds every subscriber of this node to `matches`: all regular ones and
-    /// one member of each share group.
-    fn collect(&self, matches: &mut Matches<T>)
-    where
+    /// Adds every regular subscriber of this node to `matches` and lets
+    /// `choose` pick the member of each share group, given the members and
+    /// the index whose turn it is. The turn then passes to the member after
+    /// the one chosen, so members `choose` skips don't shift the rotation.
+    fn collect(
+        &self,
+        matches: &mut Matches<T>,
+        choose: &mut impl FnMut(&[(u64, T)], usize) -> Option<usize>,
+    ) where
         T: Clone,
     {
         matches.regular.extend(self.subscribers.values().cloned());
         for group in self.shared.values() {
-            let turn = group.next.fetch_add(1, Ordering::Relaxed);
-            let (_, member) = &group.members[turn % group.members.len()];
-            matches.shared.push(member.clone());
+            let len = group.members.len();
+            let turn = group.next.load(Ordering::Relaxed) % len;
+            let next = choose(&group.members, turn).unwrap_or(turn) + 1;
+            group.next.store(next % len, Ordering::Relaxed);
+            matches.shared_groups += 1;
         }
     }
 }
@@ -87,13 +94,13 @@ impl<T> TopicNode<T> {
 #[derive(Debug)]
 pub(crate) struct Matches<T> {
     pub regular: Vec<T>,
-    /// The member chosen in each matching share group
-    pub shared: Vec<T>,
+    /// How many share groups matched
+    pub shared_groups: usize,
 }
 
 impl<T> Matches<T> {
     pub fn len(&self) -> usize {
-        self.regular.len() + self.shared.len()
+        self.regular.len() + self.shared_groups
     }
 
     #[cfg(test)]
@@ -179,15 +186,28 @@ impl<T: Clone> TopicTree<T> {
         removed
     }
 
-    /// Returns the subscribers of every filter matching `topic`, once per
-    /// matching filter.
-    pub fn matching(&self, topic: &str) -> Matches<T> {
+    /// Returns the regular subscribers of every filter matching `topic`,
+    /// once per matching filter. Each matching share group calls `choose`
+    /// with its members and the index whose turn it is; it returns the
+    /// member chosen, if any. Called under the tree's read lock.
+    pub fn matching_with(
+        &self,
+        topic: &str,
+        mut choose: impl FnMut(&[(u64, T)], usize) -> Option<usize>,
+    ) -> Matches<T> {
         let mut matches = Matches {
             regular: Vec::new(),
-            shared: Vec::new(),
+            shared_groups: 0,
         };
-        self.walk(topic, |node| node.collect(&mut matches));
+        self.walk(topic, |node| node.collect(&mut matches, &mut choose));
         matches
+    }
+
+    /// `matching_with` giving each share group's message to the member whose
+    /// turn it is.
+    #[cfg(test)]
+    pub fn matching(&self, topic: &str) -> Matches<T> {
+        self.matching_with(topic, |_, turn| Some(turn))
     }
 
     /// Returns every subscriber accepted by `keep` among those of the
@@ -317,11 +337,26 @@ fn split_shared(filter: &str) -> (Option<&str>, &str) {
 mod tests {
     use super::TopicTree;
 
+    /// The regular subscribers and the member whose turn it is in each
+    /// share group.
     fn matching(tree: &TopicTree<&'static str>, topic: &str) -> Vec<&'static str> {
-        let found = tree.matching(topic);
-        let mut matches = [found.regular, found.shared].concat();
+        let mut chosen = Vec::new();
+        let found = tree.matching_with(topic, |members, turn| {
+            chosen.push(members[turn].1);
+            Some(turn)
+        });
+        let mut matches = [found.regular, chosen].concat();
         matches.sort();
         matches
+    }
+
+    fn shared(tree: &TopicTree<&'static str>, topic: &str) -> Vec<&'static str> {
+        let mut chosen = Vec::new();
+        tree.matching_with(topic, |members, turn| {
+            chosen.push(members[turn].1);
+            Some(turn)
+        });
+        chosen
     }
 
     #[test]
@@ -421,8 +456,8 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(tree.matching_where("a/b", |m| *m == "two"), ["two"]);
         }
-        assert_eq!(tree.matching("a/b").shared, ["one"]);
-        assert_eq!(tree.matching("a/b").shared, ["two"]);
+        assert_eq!(shared(&tree, "a/b"), ["one"]);
+        assert_eq!(shared(&tree, "a/b"), ["two"]);
     }
 
     #[test]

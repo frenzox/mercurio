@@ -1779,7 +1779,16 @@ where
             session
                 .restore_inflight(start_result.inflight_to_retry)
                 .await;
-            for packet in session.pending_retransmissions().await {
+            let resend = session.pending_retransmissions().await;
+            if !resend.dropped.is_empty() {
+                let client_id = session.get_client_id().await;
+                for packet_id in resend.dropped {
+                    self.session_manager
+                        .remove_inflight(&client_id, packet_id)
+                        .await;
+                }
+            }
+            for packet in resend.packets {
                 Box::pin(self.connection.write_packet(packet)).await?;
             }
 
@@ -2110,8 +2119,20 @@ where
 
         let client_id = session.get_client_id().await;
         while !self.shutdown.is_shutdown() {
+            // Every turn of the loop follows a message sent or a packet
+            // read, so retained messages are queued as the queue drains
+            if session.owes_retained() {
+                Box::pin(session.feed_retained(&self.broker, &self.chain)).await;
+            }
             // Re-evaluated after every packet, so acknowledgements reopen it
             let window_open = session.can_send_more().await;
+            // What a resumed session held back goes before anything newer
+            if window_open {
+                if let Some(packet) = session.next_retransmission().await {
+                    Box::pin(self.connection.write_packet(packet)).await?;
+                    continue;
+                }
+            }
 
             // Only waiting happens here, and the work an event brings runs in
             // a boxed future while it lasts: an idle connection holds just

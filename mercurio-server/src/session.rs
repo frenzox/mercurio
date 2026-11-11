@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -258,6 +258,18 @@ pub(crate) fn effective_keepalive(connect_packet: &ConnectPacket, limits: &Limit
 /// Source of unique subscriber ids, one per session.
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Retained messages owed to new subscriptions are queued while fewer than
+/// this many messages wait, so a large set never floods the queue.
+const RETAINED_PAGE: usize = 100;
+
+/// The retained messages a new subscription is owed and not yet queued.
+struct RetainedDelivery {
+    filter: String,
+    subscriber: Subscriber,
+    /// Looked up when the first page is due
+    messages: Option<VecDeque<Message>>,
+}
+
 pub struct SessionDropGuard {
     session: Session,
 }
@@ -277,6 +289,9 @@ struct Shared {
     /// with `state` locked, so checks made under that lock see it settled;
     /// readable without the lock by the session manager.
     generation: AtomicU64,
+    /// Whether `State::retained` holds anything, read without the lock on
+    /// every turn of the connection loop
+    owes_retained: AtomicBool,
 }
 
 struct State {
@@ -287,12 +302,17 @@ struct State {
     subscriptions: HashMap<String, StoredSubscription>,
     /// Where the subscriptions are registered, once there are any
     topics: Option<TopicTree<Subscriber>>,
+    /// Retained messages owed to new subscriptions, in subscription order
+    retained: VecDeque<RetainedDelivery>,
     /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id, with
     /// the sequence they were sent in
     unacknowledged_messages: HashMap<u16, (u64, PublishPacket)>,
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
     /// sequence they were sent in
     pubrecs: HashMap<u16, u64>,
+    /// Unacknowledged messages a resumed session has yet to resend on this
+    /// connection, in order, held back by the client's Receive Maximum
+    unsent: VecDeque<u16>,
     /// Sequence number of the next outgoing QoS 1/2 message
     next_sequence: u64,
     /// Incoming QoS 2 packet ids already delivered and awaiting PUBREL
@@ -405,8 +425,10 @@ impl Session {
                     client_id,
                     subscriptions: HashMap::new(),
                     topics: None,
+                    retained: VecDeque::new(),
                     unacknowledged_messages: HashMap::new(),
                     pubrecs: HashMap::new(),
+                    unsent: VecDeque::new(),
                     next_sequence: 0,
                     incoming_qos2: HashSet::new(),
                     last_packet_id: 0,
@@ -432,6 +454,7 @@ impl Session {
                 queue: Arc::new(MessageQueue::new(queue_limits)),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
                 generation: AtomicU64::new(0),
+                owes_retained: AtomicBool::new(false),
             }),
         }
     }
@@ -1032,6 +1055,7 @@ impl Session {
         expiry: Option<Duration>,
     ) -> Arc<ClientCounters> {
         let counters = Arc::new(ClientCounters::default());
+        self.shared.queue.set_connected(true);
         self.shared.state.lock().await.presence = Presence {
             listener: Some(listener),
             connected_at: Some(unix_millis() / 1000),
@@ -1051,6 +1075,7 @@ impl Session {
         if self.generation() != generation {
             return;
         }
+        self.shared.queue.set_connected(false);
         let now = unix_millis();
         state.presence.disconnected_at = Some(now / 1000);
         state.presence.session_expiry = expiry;
@@ -1133,8 +1158,8 @@ impl Session {
         packet: PubAckPacket,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        // O(1) removal instead of O(n) search + remove
         session.unacknowledged_messages.remove(&packet.packet_id);
+        session.unsent.retain(|id| *id != packet.packet_id);
         Ok(None)
     }
 
@@ -1148,6 +1173,7 @@ impl Session {
             Some((sequence, _)) => Some(sequence),
             None => session.pubrecs.get(&packet_id).copied(),
         };
+        session.unsent.retain(|id| *id != packet_id);
 
         // A failure reason ends the exchange: the client won't take the message
         if packet.reason.get_code() >= 0x80 {
@@ -1221,8 +1247,34 @@ impl Session {
             return Err(ReasonCode::ProtocolError.into());
         }
 
+        // Access control may wait on a plugin, so it runs before the
+        // session state is locked
+        let mut refused = Vec::with_capacity(packet.payload.len());
+        let identity = self.identity().await;
+        for sub in &packet.payload {
+            refused.push(if validate_subscribe_filter(&sub.topic_filter).is_err() {
+                Some(ReasonCode::TopicFilterInvalid)
+            } else if !chain.is_empty() && !chain.is_trusted() {
+                // The share group decides who gets each message, not which
+                // messages flow, so only the topic filter is checked, as
+                // mosquitto does
+                let filter = parse_shared_subscription(&sub.topic_filter)
+                    .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
+                if chain.may(&identity, filter, Access::Subscribe).await {
+                    None
+                } else {
+                    warn!(
+                        "Client `{}` may not subscribe to `{}`",
+                        identity.client_id, sub.topic_filter
+                    );
+                    Some(ReasonCode::NotAuthorized)
+                }
+            } else {
+                None
+            });
+        }
+
         let mut session = self.shared.state.lock().await;
-        // Pre-allocate payload vec based on subscription count
         let mut ack = SubAckPacket {
             protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
@@ -1230,36 +1282,10 @@ impl Session {
             payload: Vec::with_capacity(packet.payload.len()),
         };
 
-        for sub in &packet.payload {
-            // Validate topic filter before subscribing
-            if validate_subscribe_filter(&sub.topic_filter).is_err() {
-                ack.payload.push(SubAckPayload {
-                    reason_code: ReasonCode::TopicFilterInvalid,
-                });
+        for (sub, refused) in packet.payload.iter().zip(refused) {
+            if let Some(reason_code) = refused {
+                ack.payload.push(SubAckPayload { reason_code });
                 continue;
-            }
-
-            if !chain.is_empty() && !chain.is_trusted() {
-                let identity = ClientInfo {
-                    client_id: session.client_id.clone(),
-                    username: session.verified_user.clone(),
-                    peer: session.peer,
-                };
-                // The share group decides who gets each message, not which
-                // messages flow, so only the topic filter is checked, as
-                // mosquitto does
-                let filter = parse_shared_subscription(&sub.topic_filter)
-                    .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
-                if !chain.may(&identity, filter, Access::Subscribe).await {
-                    warn!(
-                        "Client `{}` may not subscribe to `{}`",
-                        identity.client_id, sub.topic_filter
-                    );
-                    ack.payload.push(SubAckPayload {
-                        reason_code: ReasonCode::NotAuthorized,
-                    });
-                    continue;
-                }
             }
 
             let at_limit = session
@@ -1315,13 +1341,23 @@ impl Session {
                     RetainHandling::SendRetainedIfNonExisting => !existed,
                     _ => false,
                 };
+            // Queued a page at a time by the connection loop. A repeated
+            // subscription starts over, or else sends what the earlier one
+            // was still owed with the new options.
             if send_retained {
-                for message in broker.retained(&sub.topic_filter).await? {
-                    if session.check_retain_source && !publisher_may_write(chain, &message).await {
-                        continue;
-                    }
-                    subscriber.deliver_retained(message);
-                }
+                session.retained.retain(|d| d.filter != sub.topic_filter);
+                session.retained.push_back(RetainedDelivery {
+                    filter: sub.topic_filter.clone(),
+                    subscriber,
+                    messages: None,
+                });
+                self.shared.owes_retained.store(true, Ordering::Relaxed);
+            } else if let Some(owed) = session
+                .retained
+                .iter_mut()
+                .find(|d| d.filter == sub.topic_filter)
+            {
+                owed.subscriber = subscriber;
             }
             ack.payload.push(SubAckPayload {
                 reason_code: match granted_qos {
@@ -1363,6 +1399,7 @@ impl Session {
             }
 
             broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
+            session.retained.retain(|d| d.filter != unsub.topic_filter);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
                 ReasonCode::Success
             } else {
@@ -1517,6 +1554,79 @@ impl Session {
             }
         }
         session.subscriptions.clear();
+        session.retained.clear();
+    }
+
+    /// Whether new subscriptions are owed retained messages not yet queued.
+    pub(crate) fn owes_retained(&self) -> bool {
+        self.shared.owes_retained.load(Ordering::Relaxed)
+    }
+
+    /// Queues retained messages owed to new subscriptions while fewer than
+    /// a page of messages wait to be sent. Called from the connection loop
+    /// as the queue drains, so a subscription matching many retained
+    /// messages gets every one of them whatever the queue's limits.
+    pub(crate) async fn feed_retained<S: RetainedMessageStore>(
+        &self,
+        broker: &Broker<S>,
+        chain: &Chain,
+    ) {
+        let queue = &self.shared.queue;
+        while queue.len() < RETAINED_PAGE {
+            let (mut delivery, check_source) = {
+                let mut state = self.shared.state.lock().await;
+                let Some(delivery) = state.retained.pop_front() else {
+                    self.shared.owes_retained.store(false, Ordering::Relaxed);
+                    return;
+                };
+                (delivery, state.check_retain_source)
+            };
+            let messages = match &mut delivery.messages {
+                Some(messages) => messages,
+                None => match broker.retained(&delivery.filter).await {
+                    Ok(found) => delivery.messages.insert(found.into()),
+                    Err(e) => {
+                        warn!(
+                            "Can't look up retained messages for `{}`: {}",
+                            delivery.filter, e
+                        );
+                        continue;
+                    }
+                },
+            };
+
+            while queue.len() < RETAINED_PAGE {
+                let Some(message) = messages.pop_front() else {
+                    break;
+                };
+                if check_source && !publisher_may_write(chain, &message).await {
+                    continue;
+                }
+                if !delivery.subscriber.deliver_retained(message.clone()) {
+                    // An empty queue that refuses it never takes it
+                    if queue.len() == 0 {
+                        warn!(
+                            "Retained message on `{}` doesn't fit the message queue, dropping it",
+                            message.topic
+                        );
+                        continue;
+                    }
+                    messages.push_front(message);
+                    break;
+                }
+            }
+
+            if !messages.is_empty() {
+                // Unless the client unsubscribed or subscribed again meanwhile
+                let mut state = self.shared.state.lock().await;
+                if state.subscriptions.contains_key(&delivery.filter)
+                    && !state.retained.iter().any(|d| d.filter == delivery.filter)
+                {
+                    state.retained.push_front(delivery);
+                }
+                return;
+            }
+        }
     }
 
     /// Whether another QoS 1 or 2 message may be sent without exceeding the
@@ -1524,14 +1634,25 @@ impl Session {
     /// limit.
     pub(crate) async fn can_send_more(&self) -> bool {
         let session = self.shared.state.lock().await;
-        let receive_maximum = session
-            .connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.receive_maximum.as_ref())
-            .map_or(u16::MAX, |r| r.value);
-        let window = receive_maximum.min(session.max_inflight);
-        session.unacknowledged_messages.len() + session.pubrecs.len() < usize::from(window)
+        session.in_flight() < session.window()
+    }
+
+    /// The next unacknowledged message a resumed session holds back, once
+    /// the window has room for it. Resent before anything newer, keeping
+    /// the order messages were first sent in [MQTT-4.6.0-1].
+    pub(crate) async fn next_retransmission(&self) -> Option<ControlPacket> {
+        let mut session = self.shared.state.lock().await;
+        if session.in_flight() >= session.window() {
+            return None;
+        }
+        while let Some(packet_id) = session.unsent.pop_front() {
+            if let Some((_, publish)) = session.unacknowledged_messages.get(&packet_id) {
+                let mut publish = publish.clone();
+                publish.dup = true;
+                return Some(ControlPacket::Publish(publish));
+            }
+        }
+        None
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
@@ -1590,17 +1711,13 @@ impl Session {
 
             // Packets the client can't take are discarded as if delivered
             // [MQTT-3.1.2-25]
-            if let Some(maximum) = session.client_maximum_packet_size() {
-                let mut encoded = BytesMut::new();
-                publish.encode(&mut encoded);
-                if encoded.len() > maximum {
-                    warn!(
-                        "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
-                        publish.topic_name, session.client_id
-                    );
-                    return None;
-                }
-            }
+            let Some(sent) = session.apply_topic_alias(publish.clone()) else {
+                warn!(
+                    "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
+                    publish.topic_name, session.client_id
+                );
+                return None;
+            };
 
             let inflight = packet_id.map(|packet_id| {
                 let sequence = session.next_sequence;
@@ -1622,7 +1739,7 @@ impl Session {
             });
 
             Some(Outgoing {
-                packet: ControlPacket::Publish(session.apply_topic_alias(publish)),
+                packet: ControlPacket::Publish(sent),
                 inflight,
             })
         }
@@ -1658,17 +1775,21 @@ impl Session {
 
     /// Packets to resend when a session resumes: unacknowledged PUBLISH
     /// packets flagged as duplicates and pending PUBRELs, in the order they
-    /// were first sent [MQTT-4.4.0-1].
-    pub(crate) async fn pending_retransmissions(&self) -> Vec<ControlPacket> {
-        let session = self.shared.state.lock().await;
+    /// were first sent [MQTT-4.4.0-1]. Only as many PUBLISH packets as the
+    /// client's Receive Maximum allows are returned [MQTT-3.3.4-9]; the
+    /// rest wait for `next_retransmission`. Those larger than the client's
+    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25].
+    pub(crate) async fn pending_retransmissions(&self) -> Retransmissions {
+        let mut session = self.shared.state.lock().await;
+        let session = &mut *session;
 
-        let mut pending: Vec<(u64, ControlPacket)> = session
+        let mut pending: Vec<(u64, Option<u16>, ControlPacket)> = session
             .unacknowledged_messages
-            .values()
-            .map(|(sequence, publish)| {
+            .iter()
+            .map(|(packet_id, (sequence, publish))| {
                 let mut publish = publish.clone();
                 publish.dup = true;
-                (*sequence, ControlPacket::Publish(publish))
+                (*sequence, Some(*packet_id), ControlPacket::Publish(publish))
             })
             .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
                 let pubrel = PubRelPacket {
@@ -1676,13 +1797,44 @@ impl Session {
                     reason: ReasonCode::Success,
                     properties: None,
                 };
-                (*sequence, ControlPacket::PubRel(pubrel))
+                (*sequence, None, ControlPacket::PubRel(pubrel))
             }))
             .collect();
+        pending.sort_by_key(|(sequence, _, _)| *sequence);
 
-        pending.sort_by_key(|(sequence, _)| *sequence);
-        pending.into_iter().map(|(_, packet)| packet).collect()
+        let mut resend = Retransmissions::default();
+        session.unsent.clear();
+        let mut room = session.window().saturating_sub(session.pubrecs.len());
+        for (_, packet_id, packet) in pending {
+            let (Some(packet_id), ControlPacket::Publish(publish)) = (packet_id, &packet) else {
+                resend.packets.push(packet);
+                continue;
+            };
+            if session.too_big(publish) {
+                warn!(
+                    "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
+                    publish.topic_name, session.client_id
+                );
+                session.unacknowledged_messages.remove(&packet_id);
+                resend.dropped.push(packet_id);
+            } else if room > 0 {
+                room -= 1;
+                resend.packets.push(packet);
+            } else {
+                session.unsent.push_back(packet_id);
+            }
+        }
+        resend
     }
+}
+
+/// What a resumed session resends at once.
+#[derive(Default)]
+pub(crate) struct Retransmissions {
+    pub packets: Vec<ControlPacket>,
+    /// Packet ids of unacknowledged messages discarded as too large for
+    /// the client
+    pub dropped: Vec<u16>,
 }
 
 /// A PUBLISH ready to send.
@@ -1696,8 +1848,12 @@ impl State {
     /// Replaces the topic of an outgoing PUBLISH with an alias where the
     /// client accepts them, assigning new aliases until its maximum is
     /// reached. Only the copy sent is aliased: aliases end with the
-    /// connection, so a retransmission must carry the full topic.
-    fn apply_topic_alias(&mut self, mut publish: PublishPacket) -> PublishPacket {
+    /// connection, so a retransmission must carry the full topic. Returns
+    /// None if the packet is larger than the client accepts. A new alias
+    /// adds its property to a packet that still carries the topic, so it is
+    /// only assigned when that packet fits; otherwise the packet goes
+    /// without one.
+    fn apply_topic_alias(&mut self, publish: PublishPacket) -> Option<PublishPacket> {
         let maximum = self
             .connect_packet
             .properties
@@ -1706,26 +1862,65 @@ impl State {
             .filter(|_| self.send_topic_aliases)
             .map_or(0, |m| m.value);
 
-        let alias = match self.outgoing_aliases.get(&publish.topic_name) {
+        let with_alias = |mut publish: PublishPacket, alias: u16| {
+            publish
+                .properties
+                .get_or_insert_with(Default::default)
+                .topic_alias = Some(TopicAlias::new(alias));
+            publish
+        };
+
+        let sent = match self.outgoing_aliases.get(&publish.topic_name) {
             // Already known to the client: the alias alone stands for it
             Some(&alias) => {
+                let mut publish = with_alias(publish, alias);
                 publish.topic_name.clear();
-                alias
+                publish
             }
             None if self.outgoing_aliases.len() < usize::from(maximum) => {
                 let alias = self.outgoing_aliases.len() as u16 + 1;
-                self.outgoing_aliases
-                    .insert(publish.topic_name.clone(), alias);
-                alias
+                let topic = publish.topic_name.clone();
+                let aliased = with_alias(publish.clone(), alias);
+                if self.too_big(&aliased) {
+                    publish
+                } else {
+                    self.outgoing_aliases.insert(topic, alias);
+                    aliased
+                }
             }
-            None => return publish,
+            None => publish,
         };
+        (!self.too_big(&sent)).then_some(sent)
+    }
 
-        publish
+    /// Most QoS 1 and 2 messages that may be in flight: the client's
+    /// Receive Maximum, capped by the broker's limit.
+    fn window(&self) -> usize {
+        let receive_maximum = self
+            .connect_packet
             .properties
-            .get_or_insert_with(Default::default)
-            .topic_alias = Some(TopicAlias::new(alias));
-        publish
+            .as_ref()
+            .and_then(|p| p.receive_maximum.as_ref())
+            .map_or(u16::MAX, |r| r.value);
+        usize::from(receive_maximum.min(self.max_inflight))
+    }
+
+    /// QoS 1 and 2 messages sent on this connection or an earlier one and
+    /// not yet acknowledged, leaving out those still to be resent.
+    fn in_flight(&self) -> usize {
+        self.unacknowledged_messages
+            .len()
+            .saturating_sub(self.unsent.len())
+            + self.pubrecs.len()
+    }
+
+    /// Whether `publish` is larger than the client accepts.
+    fn too_big(&self, publish: &PublishPacket) -> bool {
+        self.client_maximum_packet_size().is_some_and(|maximum| {
+            let mut encoded = BytesMut::new();
+            publish.encode(&mut encoded);
+            encoded.len() > maximum
+        })
     }
 
     /// The largest packet the client accepts, if it set a limit.
@@ -2458,6 +2653,7 @@ mod tests {
             .handle_subscribe(subscribe_with("h", if_new), &broker, &no_plugins())
             .await
             .unwrap();
+        session.feed_retained(&broker, &no_plugins()).await;
         assert!(next_publish(&mut session).await.retain);
         let if_new = SubscriptionOptions {
             retain_handling: RetainHandling::SendRetainedIfNonExisting,
@@ -2467,6 +2663,7 @@ mod tests {
             .handle_subscribe(subscribe_with("h", if_new), &broker, &no_plugins())
             .await
             .unwrap();
+        session.feed_retained(&broker, &no_plugins()).await;
         assert!(nothing_queued(&session).await);
 
         let never = SubscriptionOptions {
@@ -2478,6 +2675,7 @@ mod tests {
             .handle_subscribe(subscribe_with("h", never), &broker, &no_plugins())
             .await
             .unwrap();
+        session.feed_retained(&broker, &no_plugins()).await;
         assert!(nothing_queued(&session).await);
     }
 
@@ -2680,6 +2878,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            member.feed_retained(&broker, &no_plugins()).await;
             assert!(nothing_queued(member).await);
         }
 
@@ -2830,6 +3029,55 @@ mod tests {
             .all(|(_, p)| !p.topic_name.is_empty()));
     }
 
+    fn encoded_len(packet: &ControlPacket) -> usize {
+        let ControlPacket::Publish(publish) = packet else {
+            panic!("Expected Publish");
+        };
+        let mut encoded = BytesMut::new();
+        publish.encode(&mut encoded);
+        encoded.len()
+    }
+
+    #[tokio::test]
+    async fn test_aliased_publish_stays_within_client_maximum_packet_size() {
+        let full = message("topic", QoS::AtMostOnce, None, false);
+        let unaliased = encoded_len(
+            &Session::new(create_connect_packet_without_will())
+                .prepare_publish(full.clone())
+                .await
+                .unwrap()
+                .packet,
+        );
+
+        let mut connect = create_connect_packet_without_will();
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            topic_alias_maximum: Some(TopicAliasMaximum::new(1)),
+            maximum_packet_size: Some(MaximumPacketSize::new(unaliased as u32)),
+            ..Default::default()
+        });
+        let mut session = Session::new(connect);
+        session.shared.state.lock().await.send_topic_aliases = true;
+
+        // Announcing an alias would take it over the limit, so it goes
+        // without one, and the alias stays free
+        let outgoing = session.prepare_publish(full.clone()).await.unwrap();
+        assert!(encoded_len(&outgoing.packet) <= unaliased);
+        assert!(session
+            .shared
+            .state
+            .lock()
+            .await
+            .outgoing_aliases
+            .is_empty());
+
+        // A smaller message announces it; later ones fit using it alone
+        let mut small = full.clone();
+        small.payload = Some(Bytes::from("x"));
+        session.prepare_publish(small).await.unwrap();
+        let outgoing = session.prepare_publish(full).await.unwrap();
+        assert!(encoded_len(&outgoing.packet) < unaliased);
+    }
+
     fn qos1_publish(topic: &str, payload: &'static [u8], text: bool) -> ControlPacket {
         ControlPacket::Publish(PublishPacket {
             qos_level: QoS::AtLeastOnce,
@@ -2907,6 +3155,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_retained_messages_are_queued_as_the_queue_drains() {
+        let limits = QueueLimits {
+            max_qos0: 2,
+            ..Default::default()
+        };
+        let mut session = Session::with_queue_limits(create_connect_packet_without_will(), limits);
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        for i in 0..5 {
+            let topic = format!("r/{i}");
+            broker
+                .publish(&topic, message(&topic, QoS::AtLeastOnce, Some(1), true))
+                .await
+                .unwrap();
+        }
+
+        session
+            .handle_subscribe(subscribe_with_identifier("r/+", 7), &broker, &no_plugins())
+            .await
+            .unwrap();
+        assert!(session.owes_retained());
+        assert!(nothing_queued(&session).await);
+
+        let mut topics = Vec::new();
+        while session.owes_retained() {
+            session.feed_retained(&broker, &no_plugins()).await;
+            while session.shared.queue.len() > 0 {
+                let publish = next_publish(&mut session).await;
+                // Granted QoS 0, so downgraded, and with the identifier
+                assert_eq!(publish.qos_level, QoS::AtMostOnce);
+                assert!(publish.retain);
+                let identifiers = &publish.properties.unwrap().subscription_identifiers;
+                assert_eq!(identifiers[0].value.0, 7);
+                topics.push(publish.topic_name);
+            }
+        }
+        topics.sort();
+        assert_eq!(topics, ["r/0", "r/1", "r/2", "r/3", "r/4"]);
+    }
+
+    #[tokio::test]
     async fn test_retained_delivery_sets_retain_flag_only_for_retained() {
         let mut session = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
@@ -2923,6 +3211,7 @@ mod tests {
             )
             .await
             .unwrap();
+        session.feed_retained(&broker, &no_plugins()).await;
         assert!(next_publish(&mut session).await.retain);
 
         broker
