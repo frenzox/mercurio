@@ -102,7 +102,7 @@ interface types {
 }
 
 interface host {
-  use types.{level};
+  use types.{level, message};
 
   log: func(level: level, message: string);
 
@@ -114,6 +114,18 @@ interface host {
   kv-set: func(key: string, value: list<u8>) -> result<_, string>;
   kv-delete: func(key: string);
   kv-list: func(prefix: string) -> list<string>;
+
+  /// Publishes `message` as the client `mercurio-plugin-<name>`, inside
+  /// the broker, which skips access control. It returns once the message
+  /// is queued; it reaches subscribers shortly after, once the broker
+  /// serves clients. It fails, and nothing is published, for a topic that
+  /// starts with `$` or isn't a valid topic name, for a message over
+  /// 64 KiB counting its topic, payload and properties, and when the
+  /// plugin publishes faster than its rate limit allows: bursts of 100,
+  /// 100 messages a second on average, for all copies together. The other
+  /// plugins' `on-message` see the message; the publishing plugin's own
+  /// does not.
+  publish: func(message: message) -> result<_, string>;
 }
 
 interface guest {

@@ -13,7 +13,13 @@ use wasmtime::{component::ResourceTable, ResourceLimiter, StoreLimits, StoreLimi
 use wasmtime_wasi::{sockets::SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
-use super::runtime::bindings::mercurio::plugin::{host, types::Level};
+use super::{
+    publish::Publisher,
+    runtime::bindings::mercurio::plugin::{
+        host,
+        types::{Level, Message},
+    },
+};
 
 /// The data of one plugin copy's store.
 pub(crate) struct State {
@@ -23,6 +29,7 @@ pub(crate) struct State {
     table: ResourceTable,
     pub(crate) limits: Limits,
     kv: Arc<Kv>,
+    publisher: Arc<Publisher>,
     /// Epoch ticks left for the running call
     pub(crate) ticks_left: u64,
     name: Arc<str>,
@@ -162,7 +169,13 @@ impl Allowed {
 }
 
 impl State {
-    pub(crate) fn new(name: Arc<str>, allowed: &Allowed, memory: usize, kv: Arc<Kv>) -> State {
+    pub(crate) fn new(
+        name: Arc<str>,
+        allowed: &Allowed,
+        memory: usize,
+        kv: Arc<Kv>,
+        publisher: Arc<Publisher>,
+    ) -> State {
         let sockets = Arc::clone(&allowed.sockets);
         // Creating a socket opens it before any address is checked, so a
         // plugin with no allowed address may not create one at all
@@ -197,6 +210,7 @@ impl State {
                     .build(),
             },
             kv,
+            publisher,
             ticks_left: 0,
             name,
         }
@@ -432,11 +446,19 @@ impl host::Host for State {
     async fn kv_list(&mut self, prefix: String) -> Vec<String> {
         self.kv.list(&prefix)
     }
+
+    async fn publish(&mut self, message: Message) -> Result<(), String> {
+        self.publisher.publish(message)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publisher() -> Arc<Publisher> {
+        Arc::new(Publisher::new("t", None))
+    }
 
     #[test]
     fn test_allowed_http_hosts_get_a_port() {
@@ -519,7 +541,7 @@ mod tests {
     async fn test_kv_list_returns_keys_with_the_prefix_in_order() {
         use host::Host;
         let allowed = Allowed::parse(&[], &[]).unwrap();
-        let mut state = State::new("t".into(), &allowed, 1 << 20, Arc::default());
+        let mut state = State::new("t".into(), &allowed, 1 << 20, Arc::default(), publisher());
         for key in ["b/2", "a", "b/1", "c"] {
             state.kv_set(key.into(), Vec::new()).await.unwrap();
         }
@@ -558,7 +580,13 @@ mod tests {
 
         const PAGE: usize = 64 << 10;
         let allowed = Allowed::parse(&[], &[]).unwrap();
-        let state = State::new("t".into(), &allowed, 100 * PAGE, Arc::default());
+        let state = State::new(
+            "t".into(),
+            &allowed,
+            100 * PAGE,
+            Arc::default(),
+            publisher(),
+        );
         let mut store = Store::new(&Engine::default(), state);
         store.limiter(|state| &mut state.limits);
 

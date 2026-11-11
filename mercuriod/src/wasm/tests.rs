@@ -55,6 +55,7 @@ pub(crate) fn settings(name: &str, config: &[(&str, &str)]) -> PluginSettings {
         instances: 2,
         timeout: Duration::from_secs(5),
         memory: 64 << 20,
+        broker: None,
     }
 }
 
@@ -507,7 +508,12 @@ async fn test_status_reports_hooks_copies_and_failures() {
     assert_eq!(status.kind, PluginKind::Wasm);
     assert_eq!(
         status.hooks,
-        ["begin_auth", "authorize_control", "on_control"]
+        [
+            "begin_auth",
+            "authorize_control",
+            "on_message",
+            "on_control"
+        ]
     );
     assert_eq!(status.interface.as_deref(), Some("0.2.0"));
     assert_eq!(status.instances, Some(1));
@@ -607,7 +613,9 @@ async fn test_a_plugin_built_for_0_1_still_loads() {
         Decision::Defer
     );
     assert_eq!(
-        plugin.authorize_control(&client, "$CONTROL/broker/v1").await,
+        plugin
+            .authorize_control(&client, "$CONTROL/broker/v1")
+            .await,
         Decision::Defer
     );
 
@@ -719,4 +727,192 @@ async fn test_authentication_success_sends_final_data() {
             data: Some(data),
         }
     );
+}
+
+/// Starts a broker serving the in-process connections of `listener`.
+async fn broker_with(
+    plugins: Vec<std::sync::Arc<dyn Plugin>>,
+    listener: mercurio_server::server::LocalListener,
+) {
+    use mercurio_server::server::ServerConfig;
+
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = ServerConfig::default();
+    config.plugins = plugins;
+    config.sys_interval = None;
+    config.local_listener = Some(listener);
+    tokio::spawn(mercurio_server::server::run_with_config(
+        tcp,
+        config,
+        std::future::pending::<()>(),
+    ));
+}
+
+/// misbehave, publishing into a running broker, and a client of that
+/// broker subscribed to `filter`.
+async fn publishing(filter: &str) -> (std::sync::Arc<WasmPlugin>, mercurio_client::MqttClient) {
+    use mercurio_client::{ConnectOptions, MqttClient, QoS};
+    use mercurio_server::server::LocalConnector;
+
+    let (connector, listener) = LocalConnector::new();
+    let broker = connector.clone();
+    let plugin = misbehave(move |s| s.broker = Some(broker)).await;
+    broker_with(vec![plugin.clone()], listener).await;
+    let options = ConnectOptions::new("localhost", 0)
+        .client_id("watcher")
+        .connector(move || std::future::ready(connector.connect()));
+    let watcher = MqttClient::connect(options).await.unwrap();
+    watcher
+        .subscribe(&[(filter, QoS::AtLeastOnce)])
+        .await
+        .unwrap();
+    (plugin, watcher)
+}
+
+/// The topic and payload of the next message `client` receives, if one
+/// comes within half a second.
+async fn next_message(client: &mercurio_client::MqttClient) -> Option<(String, Vec<u8>)> {
+    loop {
+        let event = tokio::time::timeout(Duration::from_millis(500), client.recv())
+            .await
+            .ok()??;
+        if let mercurio_client::Event::Message { topic, payload, .. } = event {
+            return Some((topic, payload.to_vec()));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_publishes_through_the_broker() {
+    let (plugin, watcher) = publishing("out/#").await;
+    assert_eq!(
+        control(&plugin, "publish", b"out/x\nhello").await.unwrap(),
+        "ok"
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), watcher.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mercurio_client::Event::Message {
+        topic,
+        payload,
+        qos,
+        properties,
+        ..
+    } = event
+    else {
+        panic!("expected the message, got {event:?}");
+    };
+    assert_eq!(topic, "out/x");
+    assert_eq!(payload.as_ref(), b"hello");
+    assert_eq!(qos, mercurio_client::QoS::AtLeastOnce);
+    assert_eq!(properties.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(
+        properties.user_properties,
+        [("by".to_string(), "misbehave".to_string())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_never_sees_its_own_messages() {
+    let (plugin, watcher) = publishing("echo/#").await;
+    // As a client would publish it, through the plugin's on_message
+    let mut message = mercurio_server::plugin::PluginMessage::new(
+        "echo/a",
+        bytes::Bytes::new(),
+        mercurio_core::qos::QoS::AtMostOnce,
+        false,
+        Default::default(),
+    );
+    plugin
+        .on_message(&ClientInfo::new("someone", None), &mut message)
+        .await;
+    assert_eq!(
+        next_message(&watcher)
+            .await
+            .map(|(topic, _)| topic)
+            .as_deref(),
+        Some("echo/echo/a")
+    );
+    // The copy reached the plugin's on_message as its own, and stopped
+    assert_eq!(next_message(&watcher).await, None);
+    assert_eq!(plugin.status().failures, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_plugins_may_not_publish_to_dollar_topics() {
+    let (plugin, watcher) = publishing("#").await;
+    for topic in ["$SYS/broker/uptime", "$CONTROL/broker/v1", "$share/g/t"] {
+        let refused = control(&plugin, "publish", format!("{topic}\nx").as_bytes())
+            .await
+            .unwrap();
+        assert!(refused.contains("`$` topics"), "{topic}: {refused}");
+    }
+    let refused = control(&plugin, "publish", b"a/+\nx").await.unwrap();
+    assert!(refused.contains("a/+"), "{refused}");
+    assert_eq!(next_message(&watcher).await, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_an_oversized_publish_is_refused() {
+    let (plugin, watcher) = publishing("big").await;
+    let limit = super::publish::PUBLISH_SIZE;
+    let refused = control(&plugin, "publish-big", (limit + 1).to_string().as_bytes())
+        .await
+        .unwrap();
+    assert!(refused.contains("allowed"), "{refused}");
+    assert_eq!(next_message(&watcher).await, None);
+    // The topic counts too
+    let fits = limit - "big".len();
+    assert_eq!(
+        control(&plugin, "publish-big", fits.to_string().as_bytes())
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let (_, payload) = next_message(&watcher).await.unwrap();
+    assert_eq!(payload.len(), fits);
+    // A refusal is the plugin's to handle, not a failed call
+    assert_eq!(plugin.status().failures, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_publish_flood_is_rate_limited() {
+    use super::publish::{PUBLISH_BURST, PUBLISH_RATE};
+
+    // Messages queue for a broker that never serves them
+    let (connector, _listener) = mercurio_server::server::LocalConnector::new();
+    let plugin = misbehave(|s| s.broker = Some(connector)).await;
+    let flood = control(&plugin, "publish-flood", b"1000").await.unwrap();
+    let (published, error) = flood.split_once(' ').unwrap();
+    assert_eq!(published, PUBLISH_BURST.to_string(), "{flood}");
+    assert!(
+        error.contains(&format!("faster than {PUBLISH_RATE} messages a second")),
+        "{flood}"
+    );
+    // The limit is the plugin's, whichever copy publishes
+    let (a, b) = tokio::join!(
+        control(&plugin, "publish-flood", b"1000"),
+        control(&plugin, "publish-flood", b"1000"),
+    );
+    let count = |flood: Option<String>| -> u32 {
+        flood.unwrap().split_once(' ').unwrap().0.parse().unwrap()
+    };
+    assert!(count(a) + count(b) < PUBLISH_BURST / 2);
+    assert_eq!(plugin.status().failures, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_publishing_without_end_is_stopped() {
+    let (connector, _listener) = mercurio_server::server::LocalConnector::new();
+    let plugin = misbehave(|s| {
+        s.broker = Some(connector);
+        s.timeout = Duration::from_millis(200);
+    })
+    .await;
+    assert_eq!(control_within(&plugin, "publish-spin", b"").await, None);
+    let status = plugin.status();
+    assert_eq!(status.failures, Some(1));
+    assert!(status.last_error.unwrap().contains("on_control"));
+    assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
 }

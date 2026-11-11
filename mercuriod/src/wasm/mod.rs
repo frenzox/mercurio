@@ -4,6 +4,7 @@
 mod convert;
 mod guest;
 mod pool;
+mod publish;
 mod runtime;
 mod sandbox;
 #[cfg(test)]
@@ -25,8 +26,11 @@ use mercurio_server::plugin::{
 use wasmtime::component::Component;
 
 use crate::reload::Reload;
-use pool::{Health, Pool};
 use guest::Pre;
+use mercurio_server::server::LocalConnector;
+use pool::{Health, Pool};
+use publish::Publisher;
+pub use runtime::Runtime;
 use runtime::{
     bindings::{
         self,
@@ -34,7 +38,6 @@ use runtime::{
     },
     bindings_0_1,
 };
-pub use runtime::Runtime;
 use sandbox::{Allowed, Kv, State};
 
 /// The export a plugin implements, before its version.
@@ -62,6 +65,8 @@ pub struct PluginSettings {
     pub timeout: Duration,
     /// Bytes of memory each copy may use
     pub memory: usize,
+    /// Where the plugin's messages go; without it, publishing fails
+    pub broker: Option<LocalConnector>,
 }
 
 /// A WebAssembly plugin in the server's plugin chain.
@@ -72,6 +77,8 @@ pub struct WasmPlugin {
     kv: Arc<Kv>,
     /// Kept across reloads, so failures count since the broker started
     health: Arc<Health>,
+    /// Kept across reloads, with its rate limit
+    publisher: Arc<Publisher>,
 }
 
 struct Loaded {
@@ -87,12 +94,21 @@ impl WasmPlugin {
     pub async fn load(runtime: &Runtime, settings: PluginSettings) -> anyhow::Result<Arc<Self>> {
         let kv = Arc::new(Kv::default());
         let health = Arc::new(Health::default());
-        let loaded = Loaded::new(runtime, &settings, Arc::clone(&kv), Arc::clone(&health)).await?;
+        let publisher = Arc::new(Publisher::new(&settings.name, settings.broker.clone()));
+        let loaded = Loaded::new(
+            runtime,
+            &settings,
+            Arc::clone(&kv),
+            Arc::clone(&health),
+            Arc::clone(&publisher),
+        )
+        .await?;
         Ok(Arc::new(WasmPlugin {
             settings,
             loaded: RwLock::new(Arc::new(loaded)),
             kv,
             health,
+            publisher,
         }))
     }
 
@@ -105,6 +121,7 @@ impl WasmPlugin {
             &self.settings,
             Arc::clone(&self.kv),
             Arc::clone(&self.health),
+            Arc::clone(&self.publisher),
         )
         .await?;
         *self.loaded.write().unwrap() = Arc::new(loaded);
@@ -165,6 +182,7 @@ impl Loaded {
         settings: &PluginSettings,
         kv: Arc<Kv>,
         health: Arc<Health>,
+        publisher: Arc<Publisher>,
     ) -> anyhow::Result<Self> {
         let path = settings.path.clone();
         let engine = runtime.engine.clone();
@@ -194,7 +212,15 @@ impl Loaded {
         let memory = settings.memory;
         let make = {
             let name = Arc::clone(&name);
-            Box::new(move || State::new(Arc::clone(&name), &allowed, memory, Arc::clone(&kv)))
+            Box::new(move || {
+                State::new(
+                    Arc::clone(&name),
+                    &allowed,
+                    memory,
+                    Arc::clone(&kv),
+                    Arc::clone(&publisher),
+                )
+            })
         };
         let pool = Pool::new(
             name,
@@ -394,17 +420,18 @@ impl Plugin for WasmPlugin {
         let Some(loaded) = self.with(Hooks::ON_MESSAGE) else {
             return ready(MessageAction::Continue);
         };
+        if self.publisher.is_own(client) {
+            return ready(MessageAction::Continue);
+        }
         let client = convert::client(client);
         let converted = convert::message(message);
         Box::pin(async move {
             let action = loaded
                 .pool
                 .call("on_message", move |i| {
-                    Box::pin(async move {
-                        i.guest
-                            .on_message(&mut i.store, &client, &converted)
-                            .await
-                    })
+                    Box::pin(
+                        async move { i.guest.on_message(&mut i.store, &client, &converted).await },
+                    )
                 })
                 .await;
             match action {
