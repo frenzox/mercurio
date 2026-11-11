@@ -22,6 +22,7 @@
 <li><a href="bridges.html">Bridges</a></li>
 <li><a href="operations.html">Operations &amp; monitoring</a></li>
 <li><a href="admin.html" aria-current="page">Administration</a></li>
+<li><a href="mercurioctl.html">mercurioctl</a></li>
 </ul>
 <h2>Clients &amp; libraries</h2>
 <ul>
@@ -38,7 +39,7 @@
 <main>
 <h1>Administration</h1>
 <p class="lead">Look at and change a running broker: its clients and sessions, bans, retained messages and subscriptions, its log level and files, without restarting it.</p>
-<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <code>mercurioctl</code> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.</p>
+<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <a href="mercurioctl.html">mercurioctl</a> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.</p>
 
 <h2 id="socket">The admin socket</h2>
 <pre>[admin]
