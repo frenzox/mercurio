@@ -176,3 +176,15 @@ jobs:
           tool: cargo-deny
       - name: Check dependencies
         run: cargo deny check
+
+  # Dependencies declared in a manifest but used nowhere in its crate's
+  # source; reads the sources, without building
+  unused-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-machete
+      - name: Find unused dependencies
+        run: cargo machete
