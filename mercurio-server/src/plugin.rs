@@ -81,6 +81,10 @@ pub struct PluginStatus {
     /// WASM plugins: the last failure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// WASM plugins: the version of the plugin interface it was built for,
+    /// such as `0.2.0`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 impl PluginStatus {
@@ -93,6 +97,7 @@ impl PluginStatus {
             instances: None,
             failures: None,
             last_error: None,
+            interface: None,
         }
     }
 
