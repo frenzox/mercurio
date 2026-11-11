@@ -271,12 +271,22 @@ async fn run<S: BatchStore>(
     let mut dirty = health.dirty.lock().unwrap().contains(&client_id);
     let mut reconcile_delay = RECONCILE_DELAY;
     let mut next_reconcile = Instant::now();
+    // Held by something besides the map, such as a queue's journal, when
+    // last idle
+    let mut held = false;
     loop {
-        let wait = match dirty {
-            true => next_reconcile.saturating_duration_since(Instant::now()),
-            false => LINGER,
+        let received = match (dirty, held) {
+            (true, _) => {
+                let wait = next_reconcile.saturating_duration_since(Instant::now());
+                tokio::time::timeout(wait, ops.recv()).await
+            }
+            // What holds it sends a last change as it lets go, such as the
+            // journal's ClearQueue, so there is no need to look again before
+            (false, true) => Ok(ops.recv().await),
+            (false, false) => tokio::time::timeout(LINGER, ops.recv()).await,
         };
-        let op = match tokio::time::timeout(wait, ops.recv()).await {
+        held = false;
+        let op = match received {
             Ok(Some(op)) => Some(op),
             Ok(None) => {
                 if dirty {
@@ -299,6 +309,7 @@ async fn run<S: BatchStore>(
                     entries.remove(&client_id);
                     break;
                 }
+                held = true;
                 continue;
             }
         };
