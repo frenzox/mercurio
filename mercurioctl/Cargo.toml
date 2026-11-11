@@ -26,3 +26,23 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 [dev-dependencies]
 mercurio-server = { path = "../mercurio-server" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+[package.metadata.deb]
+maintainer = "Guilherme Felipe da Silva <gfsilva.eng@gmail.com>"
+section = "net"
+extended-description = """\
+mercurioctl administers a running Mercurio MQTT broker: clients and
+sessions, bans, retained messages, subscriptions, listeners, bridges,
+plugins, the log level, reloading and dynamic security. On the broker's
+host it connects through the admin socket, with no credentials."""
+depends = "libc6 (>= 2.18), libgcc-s1 | libgcc1"
+assets = [
+    ["target/release/mercurioctl", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mercurioctl/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/mercurioctl", dest = "/usr/bin/mercurioctl", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mercurioctl/README.md", mode = "644", doc = true },
+]
