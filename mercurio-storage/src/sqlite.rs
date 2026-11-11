@@ -20,12 +20,10 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Null, ToSqlOutput, V
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
-    encoding::{
-        decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
-    },
+    encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
     BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage,
-    WillStore, Write,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredSubscription,
+    StoredWillMessage, WillStore, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -159,6 +157,16 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
                 PRIMARY KEY (client_id, sequence)
             );
 
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                client_id TEXT NOT NULL,
+                topic_filter TEXT NOT NULL,
+                qos INTEGER NOT NULL,
+                no_local INTEGER NOT NULL,
+                retain_as_published INTEGER NOT NULL,
+                subscription_identifier INTEGER,
+                PRIMARY KEY (client_id, topic_filter)
+            );
+
             CREATE TABLE IF NOT EXISTS incoming_qos2 (
                 client_id TEXT NOT NULL,
                 packet_id INTEGER NOT NULL,
@@ -202,6 +210,8 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
 
+    move_subscriptions(conn)?;
+
     // Databases created before in-flight messages kept their RETAIN flag
     // and expiry
     let has_inflight_retain = conn
@@ -214,6 +224,55 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// Moves the subscriptions sessions kept encoded in their row, before
+/// subscriptions had a table of their own, to that table.
+fn move_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
+    let encoded: Vec<(String, String)> = conn
+        .prepare("SELECT client_id, subscriptions FROM sessions WHERE subscriptions != ''")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if encoded.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (client_id, subscriptions) in encoded {
+        for subscription in decode_subscriptions(&subscriptions) {
+            insert_subscription(&tx, &client_id, &subscription, "INSERT OR IGNORE")?;
+        }
+        tx.execute(
+            "UPDATE sessions SET subscriptions = '' WHERE client_id = ?1",
+            params![client_id],
+        )?;
+    }
+    tx.commit()
+}
+
+/// Inserts one subscription row with `verb`, such as `INSERT OR REPLACE`.
+fn insert_subscription(
+    conn: &Connection,
+    client_id: &str,
+    subscription: &StoredSubscription,
+    verb: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        &format!(
+            "{verb} INTO subscriptions
+             (client_id, topic_filter, qos, no_local, retain_as_published,
+              subscription_identifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        ),
+        params![
+            client_id,
+            subscription.topic_filter,
+            qos_to_int(subscription.qos),
+            subscription.no_local,
+            subscription.retain_as_published,
+            subscription.subscription_identifier
+        ],
+    )?;
     Ok(())
 }
 
@@ -283,10 +342,9 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 "INSERT OR REPLACE INTO sessions
                  (client_id, subscriptions, clean_start, expiry_interval, expires_at,
                   owner_username, owner_mount_point)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, '', ?2, ?3, ?4, ?5, ?6)",
                 params![
                     client_id,
-                    encode_subscriptions(&session.subscriptions),
                     // No longer used; kept for databases that require it
                     false,
                     session.expiry_interval,
@@ -295,13 +353,26 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                     session.owner.mount_point
                 ],
             )?;
-        }
-        Write::SaveSubscriptions(subscriptions) => {
             conn.execute(
-                "INSERT INTO sessions (client_id, subscriptions, clean_start)
-                 VALUES (?1, ?2, 0)
-                 ON CONFLICT (client_id) DO UPDATE SET subscriptions = excluded.subscriptions",
-                params![client_id, encode_subscriptions(subscriptions)],
+                "DELETE FROM subscriptions WHERE client_id = ?1",
+                params![client_id],
+            )?;
+            for subscription in &session.subscriptions {
+                insert_subscription(conn, client_id, subscription, "INSERT OR REPLACE")?;
+            }
+        }
+        Write::AddSubscription(subscription) => {
+            let stored = conn
+                .prepare_cached("SELECT 1 FROM sessions WHERE client_id = ?1")?
+                .exists(params![client_id])?;
+            if stored {
+                insert_subscription(conn, client_id, subscription, "INSERT OR REPLACE")?;
+            }
+        }
+        Write::RemoveSubscription(topic_filter) => {
+            conn.execute(
+                "DELETE FROM subscriptions WHERE client_id = ?1 AND topic_filter = ?2",
+                params![client_id, topic_filter],
             )?;
         }
         Write::SetExpiry {
@@ -411,6 +482,7 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
         Write::DeleteSession => {
             for table in [
                 "sessions",
+                "subscriptions",
                 "will_messages",
                 "queued_messages",
                 "inflight_messages",
@@ -519,29 +591,44 @@ impl SessionStore for SqliteStore {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
+            let Some(mut session) = conn
+                .query_row(
+                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point
+                     FROM sessions WHERE client_id = ?1",
+                    params![client_id],
+                    |row| {
+                        Ok(SessionState {
+                            client_id: client_id.clone(),
+                            subscriptions: Vec::new(),
+                            expiry_interval: row.get(0)?,
+                            expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
+                            owner: SessionOwner {
+                                username: row.get(2)?,
+                                mount_point: row.get(3)?,
+                            },
+                        })
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
             let mut stmt = conn.prepare(
-                "SELECT subscriptions, clean_start, expiry_interval, expires_at,
-                        owner_username, owner_mount_point
-                 FROM sessions WHERE client_id = ?1",
+                "SELECT topic_filter, qos, no_local, retain_as_published, subscription_identifier
+                 FROM subscriptions WHERE client_id = ?1",
             )?;
-
-            let result = stmt
-                .query_row(params![client_id.clone()], |row| {
-                    let subs: String = row.get(0)?;
-                    Ok(SessionState {
-                        client_id: client_id.clone(),
-                        subscriptions: decode_subscriptions(&subs),
-                        expiry_interval: row.get(2)?,
-                        expires_at: row.get::<_, Option<i64>>(3)?.map(|t| t as u64),
-                        owner: SessionOwner {
-                            username: row.get(4)?,
-                            mount_point: row.get(5)?,
-                        },
+            session.subscriptions = stmt
+                .query_map(params![client_id], |row| {
+                    Ok(StoredSubscription {
+                        topic_filter: row.get(0)?,
+                        qos: int_to_qos(row.get(1)?),
+                        no_local: row.get(2)?,
+                        retain_as_published: row.get(3)?,
+                        subscription_identifier: row.get(4)?,
                     })
-                })
-                .optional()?;
-
-            Ok(result)
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(Some(session))
         })
         .await
     }
@@ -550,11 +637,14 @@ impl SessionStore for SqliteStore {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
-            conn.execute(
-                "DELETE FROM sessions WHERE client_id = ?1",
-                params![client_id],
-            )?;
-            Ok(())
+            let tx = conn.unchecked_transaction()?;
+            for table in ["sessions", "subscriptions"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE client_id = ?1"),
+                    params![client_id],
+                )?;
+            }
+            tx.commit()
         })
         .await
     }
@@ -1106,7 +1196,11 @@ mod tests {
 
         // Save and load
         store.save_session("client1", &session).await.unwrap();
-        let loaded = store.load_session("client1").await.unwrap().unwrap();
+        let mut loaded = store.load_session("client1").await.unwrap().unwrap();
+        // Subscriptions are a set, loaded in no particular order
+        loaded
+            .subscriptions
+            .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
         assert_eq!(loaded.subscriptions, session.subscriptions);
         assert_eq!(loaded.expiry_interval, Some(60));
         assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
@@ -1215,6 +1309,76 @@ mod tests {
     #[tokio::test]
     async fn test_incoming_qos2() {
         crate::testing::incoming_qos2_round_trip(&SqliteStore::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions() {
+        crate::testing::subscriptions_round_trip(&SqliteStore::in_memory().unwrap()).await;
+    }
+
+    /// Sessions of databases from before subscriptions had a table of
+    /// their own keep their subscriptions.
+    #[tokio::test]
+    async fn test_encoded_subscriptions_move_to_their_table() {
+        let path = std::env::temp_dir().join(format!("mercurio-subs-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let subscriptions = vec![
+            StoredSubscription {
+                no_local: true,
+                retain_as_published: true,
+                subscription_identifier: Some(268_435_455),
+                ..StoredSubscription::new("topic/+:x,y", QoS::ExactlyOnce)
+            },
+            StoredSubscription::new("$share/g/a/#", QoS::AtMostOnce),
+        ];
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "CREATE TABLE sessions (
+                    client_id TEXT PRIMARY KEY, subscriptions TEXT NOT NULL,
+                    clean_start INTEGER NOT NULL, expiry_interval INTEGER, expires_at INTEGER,
+                    owner_username TEXT, owner_mount_point TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions VALUES ('old', ?1, 0, 60, NULL, 'alice', NULL),
+                                             ('none', '', 0, 60, NULL, NULL, NULL)",
+                params![crate::encoding::encode_subscriptions(&subscriptions)],
+            )
+            .unwrap();
+
+        let store = SqliteStore::new(&path).unwrap();
+        let mut loaded = store.load_session("old").await.unwrap().unwrap();
+        loaded
+            .subscriptions
+            .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
+        assert_eq!(loaded.subscriptions, subscriptions);
+        assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
+        let none = store.load_session("none").await.unwrap().unwrap();
+        assert!(none.subscriptions.is_empty());
+        drop(store);
+
+        // Moved once: opening again finds them where they were put
+        let store = SqliteStore::new(&path).unwrap();
+        let blobs: i64 = store
+            .blocking(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE subscriptions != ''",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(blobs, 0);
+        let loaded = store.load_session("old").await.unwrap().unwrap();
+        assert_eq!(loaded.subscriptions.len(), 2);
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]

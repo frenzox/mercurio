@@ -64,6 +64,7 @@ use crate::{
 };
 use mercurio_storage::{
     InflightMessage, RetainedMessageStore, SessionOwner, StoredSubscription, StoredWillMessage,
+    Write,
 };
 
 /// Will message to be published on abnormal client disconnect.
@@ -356,6 +357,9 @@ struct State {
     /// Who may resume the session
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
+    max_topic_filter_length: usize,
+    /// What SUBSCRIBE and UNSUBSCRIBE changed since they were last stored
+    subscription_changes: Vec<Write>,
     max_retained_messages: Option<usize>,
     /// What the admin API reports about the connection
     presence: Presence,
@@ -455,6 +459,8 @@ impl Session {
                     peer: None,
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
+                    max_topic_filter_length: usize::MAX,
+                    subscription_changes: Vec::new(),
                     max_retained_messages: None,
                     presence: Presence::default(),
                 }),
@@ -543,6 +549,12 @@ impl Session {
         session.subscriptions.values().cloned().collect()
     }
 
+    /// What SUBSCRIBE and UNSUBSCRIBE packets changed since this was last
+    /// called, as writes to store them.
+    pub(crate) async fn take_subscription_changes(&self) -> Vec<Write> {
+        std::mem::take(&mut self.shared.state.lock().await.subscription_changes)
+    }
+
     /// Restore subscriptions by re-subscribing to the broker.
     /// Called when resuming a persisted session.
     pub(crate) async fn restore_subscriptions<S: RetainedMessageStore>(
@@ -606,6 +618,7 @@ impl Session {
             session.receive_maximum = limits.receive_maximum;
             session.max_inflight = limits.max_inflight.max(1);
             session.max_subscriptions = limits.max_subscriptions;
+            session.max_topic_filter_length = limits.max_topic_filter_length;
             session.max_retained_messages = limits.max_retained_messages;
 
             // Set protocol version from the CONNECT packet
@@ -1281,27 +1294,32 @@ impl Session {
         // session state is locked
         let mut refused = Vec::with_capacity(packet.payload.len());
         let identity = self.identity().await;
+        let max_length = self.shared.state.lock().await.max_topic_filter_length;
         for sub in &packet.payload {
-            refused.push(if validate_subscribe_filter(&sub.topic_filter).is_err() {
-                Some(ReasonCode::TopicFilterInvalid)
-            } else if !chain.is_empty() && !chain.is_trusted() {
-                // The share group decides who gets each message, not which
-                // messages flow, so only the topic filter is checked, as
-                // mosquitto does
-                let filter = parse_shared_subscription(&sub.topic_filter)
-                    .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
-                if chain.may(&identity, filter, Access::Subscribe).await {
-                    None
+            refused.push(
+                if sub.topic_filter.len() > max_length
+                    || validate_subscribe_filter(&sub.topic_filter).is_err()
+                {
+                    Some(ReasonCode::TopicFilterInvalid)
+                } else if !chain.is_empty() && !chain.is_trusted() {
+                    // The share group decides who gets each message, not which
+                    // messages flow, so only the topic filter is checked, as
+                    // mosquitto does
+                    let filter = parse_shared_subscription(&sub.topic_filter)
+                        .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
+                    if chain.may(&identity, filter, Access::Subscribe).await {
+                        None
+                    } else {
+                        warn!(
+                            "Client `{}` may not subscribe to `{}`",
+                            identity.client_id, sub.topic_filter
+                        );
+                        Some(ReasonCode::NotAuthorized)
+                    }
                 } else {
-                    warn!(
-                        "Client `{}` may not subscribe to `{}`",
-                        identity.client_id, sub.topic_filter
-                    );
-                    Some(ReasonCode::NotAuthorized)
-                }
-            } else {
-                None
-            });
+                    None
+                },
+            );
         }
 
         let mut session = self.shared.state.lock().await;
@@ -1399,6 +1417,9 @@ impl Session {
 
             session.topics = Some(broker.topics());
             session
+                .subscription_changes
+                .push(Write::AddSubscription(subscription.clone()));
+            session
                 .subscriptions
                 .insert(sub.topic_filter.clone(), subscription);
         }
@@ -1431,6 +1452,9 @@ impl Session {
             broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
             session.retained.retain(|d| d.filter != unsub.topic_filter);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
+                session
+                    .subscription_changes
+                    .push(Write::RemoveSubscription(unsub.topic_filter.clone()));
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -2189,6 +2213,54 @@ mod tests {
             }
             _ => panic!("Expected UnsubAck packet"),
         }
+    }
+
+    /// Each SUBSCRIBE and UNSUBSCRIBE is stored as what it changed, not
+    /// as every subscription the session holds.
+    #[tokio::test]
+    async fn test_subscription_changes_are_recorded_one_by_one() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        for filter in ["a", "b"] {
+            session
+                .handle_subscribe(
+                    subscribe_packet(filter, QoS::AtLeastOnce),
+                    &broker,
+                    &no_plugins(),
+                )
+                .await
+                .unwrap();
+        }
+        let described = |changes: Vec<Write>| -> Vec<String> {
+            changes
+                .into_iter()
+                .map(|change| match change {
+                    Write::AddSubscription(s) => format!("+{}", s.topic_filter),
+                    Write::RemoveSubscription(filter) => format!("-{filter}"),
+                    _ => "other".into(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            described(session.take_subscription_changes().await),
+            ["+a", "+b"]
+        );
+
+        let unsubscribe = |filter: &str| UnsubscribePacket {
+            packet_id: 2,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: filter.to_string(),
+            }],
+        };
+        for filter in ["a", "never"] {
+            session
+                .handle_unsubscribe(unsubscribe(filter), &broker, &no_plugins())
+                .await
+                .unwrap();
+        }
+        assert_eq!(described(session.take_subscription_changes().await), ["-a"]);
+        assert!(session.take_subscription_changes().await.is_empty());
     }
 
     #[tokio::test]

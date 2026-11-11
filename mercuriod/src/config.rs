@@ -643,6 +643,10 @@ pub struct ServerConfig {
     #[serde(default = "default_max_subscriptions")]
     pub max_subscriptions: usize,
 
+    /// Longest topic filter, in bytes, a SUBSCRIBE may name
+    #[serde(default = "default_max_topic_filter_length")]
+    pub max_topic_filter_length: usize,
+
     /// Seconds a new connection has, in all, to complete its handshakes and
     /// send CONNECT
     #[serde(default = "default_connect_timeout")]
@@ -742,6 +746,7 @@ impl Default for ServerConfig {
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
+            max_topic_filter_length: default_max_topic_filter_length(),
             connect_timeout: default_connect_timeout(),
             write_timeout: default_write_timeout(),
             max_topic_alias: default_max_topic_alias(),
@@ -907,6 +912,10 @@ fn default_max_subscriptions() -> usize {
     mercurio_server::server::DEFAULT_MAX_SUBSCRIPTIONS
 }
 
+fn default_max_topic_filter_length() -> usize {
+    mercurio_server::server::DEFAULT_MAX_TOPIC_FILTER_LENGTH
+}
+
 fn default_connect_timeout() -> u64 {
     Limits::default().connect_timeout.as_secs()
 }
@@ -963,6 +972,7 @@ impl ServerConfig {
             self.persistent_client_expiration.map(Duration::from_secs);
         limits.check_retain_source = self.check_retain_source;
         limits.max_subscriptions = Some(self.max_subscriptions);
+        limits.max_topic_filter_length = self.max_topic_filter_length;
         limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
         limits.max_retained_messages = self.max_retained_messages;
         limits.max_connections_per_ip = self.max_connections_per_ip;

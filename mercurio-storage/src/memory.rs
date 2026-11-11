@@ -486,6 +486,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_subscriptions() {
+        crate::testing::subscriptions_round_trip(&MemoryStore::new()).await;
+    }
+
+    #[tokio::test]
     async fn test_incoming_qos2() {
         crate::testing::incoming_qos2_round_trip(&MemoryStore::new()).await;
     }

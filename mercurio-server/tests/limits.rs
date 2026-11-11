@@ -389,3 +389,43 @@ async fn an_address_holds_its_slots_through_the_tls_handshake() {
     let mut second = TcpStream::connect(addr).await.unwrap();
     assert!(read_until_closed(&mut second).await.is_empty());
 }
+
+#[tokio::test]
+async fn topic_filters_beyond_the_limit_are_refused() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_topic_filter_length = 16;
+        value
+    })
+    .await;
+    let longest = "a".repeat(16);
+    let longer = "a".repeat(17);
+
+    // MQTT 5: Topic Filter Invalid
+    let (mut stream, _) = connect(addr, b'c').await;
+    assert_eq!(
+        subscribe(&mut stream, &[&longer, &longest]).await,
+        [0x8f, 0x00]
+    );
+
+    // MQTT 3.1.1: failure
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x0d, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x04, 0x02, 0x00, 0x3c, 0x00, 0x01,
+            b'd',
+        ])
+        .await
+        .unwrap();
+    common::read_connack(&mut stream).await;
+    let mut packet = vec![0x82, 0x16, 0x00, 0x01, 0x00, 0x11];
+    packet.extend(longer.as_bytes());
+    packet.push(0x00);
+    stream.write_all(&packet).await.unwrap();
+    let mut suback = [0u8; 5];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut suback))
+        .await
+        .expect("no SUBACK")
+        .unwrap();
+    assert_eq!(suback, [0x90, 0x03, 0x00, 0x01, 0x80]);
+}

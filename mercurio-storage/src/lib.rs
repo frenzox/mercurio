@@ -325,8 +325,11 @@ pub trait QueueStore: Send + Sync {
 pub enum Write {
     /// Store the session, replacing what was stored for the client
     SaveSession(SessionState),
-    /// Replace the session's subscriptions, creating the session if needed
-    SaveSubscriptions(Vec<StoredSubscription>),
+    /// Add a subscription to the stored session, replacing the one with the
+    /// same topic filter; nothing if no session is stored
+    AddSubscription(StoredSubscription),
+    /// Remove the stored session's subscription to this topic filter
+    RemoveSubscription(String),
     /// Record when the session expires, if it is stored
     SetExpiry {
         /// Seconds the session outlives its connection
@@ -391,19 +394,22 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
     for write in writes {
         match write {
             Write::SaveSession(state) => store.save_session(client_id, state).await?,
-            Write::SaveSubscriptions(subscriptions) => {
-                let mut state = store
-                    .load_session(client_id)
-                    .await?
-                    .unwrap_or(SessionState {
-                        client_id: client_id.to_string(),
-                        subscriptions: Vec::new(),
-                        expiry_interval: None,
-                        expires_at: None,
-                        owner: SessionOwner::default(),
-                    });
-                state.subscriptions = subscriptions.clone();
-                store.save_session(client_id, &state).await?;
+            Write::AddSubscription(subscription) => {
+                if let Some(mut state) = store.load_session(client_id).await? {
+                    state
+                        .subscriptions
+                        .retain(|s| s.topic_filter != subscription.topic_filter);
+                    state.subscriptions.push(subscription.clone());
+                    store.save_session(client_id, &state).await?;
+                }
+            }
+            Write::RemoveSubscription(topic_filter) => {
+                if let Some(mut state) = store.load_session(client_id).await? {
+                    state
+                        .subscriptions
+                        .retain(|s| s.topic_filter != *topic_filter);
+                    store.save_session(client_id, &state).await?;
+                }
             }
             Write::SetExpiry {
                 interval,
@@ -464,7 +470,98 @@ impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{BanStore, BatchStore, StoredBan, Write};
+    use mercurio_core::qos::QoS;
+
+    use super::{BanStore, BatchStore, SessionState, StoredBan, StoredSubscription, Write};
+
+    /// What every store does with subscriptions: a session saved whole
+    /// replaces them, single ones are added and removed in order, applying
+    /// a batch twice is harmless, and they leave with the session.
+    pub(crate) async fn subscriptions_round_trip(store: &dyn BatchStore) {
+        let sorted = |state: Option<SessionState>| {
+            let mut subscriptions = state.unwrap().subscriptions;
+            subscriptions.sort_by(|a, b| a.topic_filter.cmp(&b.topic_filter));
+            subscriptions
+        };
+        let detailed = StoredSubscription {
+            no_local: true,
+            retain_as_published: true,
+            subscription_identifier: Some(268_435_455),
+            // Commas, colons and wildcards are all valid in topic filters
+            ..StoredSubscription::new("a/+:x,y/#", QoS::ExactlyOnce)
+        };
+        let session = SessionState {
+            client_id: "c".into(),
+            subscriptions: vec![
+                StoredSubscription::new("old", QoS::AtMostOnce),
+                StoredSubscription::new("b", QoS::AtMostOnce),
+            ],
+            expiry_interval: Some(60),
+            expires_at: None,
+            owner: Default::default(),
+        };
+        // Without a stored session there is nothing to add to
+        store
+            .apply("c", &[Write::AddSubscription(detailed.clone())])
+            .await
+            .unwrap();
+        assert!(store.load_session("c").await.unwrap().is_none());
+
+        let batch = [
+            Write::SaveSession(session.clone()),
+            Write::AddSubscription(StoredSubscription::new("b", QoS::AtLeastOnce)),
+            Write::AddSubscription(detailed.clone()),
+            Write::RemoveSubscription("old".into()),
+            Write::AddSubscription(StoredSubscription::new("gone", QoS::AtMostOnce)),
+            Write::RemoveSubscription("gone".into()),
+            // Removing what isn't subscribed is no error
+            Write::RemoveSubscription("never".into()),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                sorted(store.load_session("c").await.unwrap()),
+                [
+                    detailed.clone(),
+                    StoredSubscription::new("b", QoS::AtLeastOnce)
+                ]
+            );
+        }
+
+        // Saving the session whole replaces the subscriptions
+        store
+            .apply("c", &[Write::SaveSession(session.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted(store.load_session("c").await.unwrap()),
+            [
+                StoredSubscription::new("b", QoS::AtMostOnce),
+                StoredSubscription::new("old", QoS::AtMostOnce)
+            ]
+        );
+
+        let mut other = session.clone();
+        other.client_id = "other".into();
+        store
+            .apply("other", &[Write::SaveSession(other)])
+            .await
+            .unwrap();
+        store.apply("c", &[Write::DeleteSession]).await.unwrap();
+        assert!(store.load_session("c").await.unwrap().is_none());
+        store
+            .apply(
+                "c",
+                &[Write::SaveSession(SessionState {
+                    subscriptions: Vec::new(),
+                    ..session
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(sorted(store.load_session("c").await.unwrap()).is_empty());
+        assert_eq!(sorted(store.load_session("other").await.unwrap()).len(), 2);
+    }
 
     /// What every store does with the packet ids of incoming QoS 2
     /// messages: batches apply in order, applying one twice is harmless, and

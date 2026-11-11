@@ -98,6 +98,11 @@ pub use crate::{
 /// than clients need, far fewer than it takes to exhaust the broker.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
+/// Longest topic filter a SUBSCRIBE may name unless configured otherwise,
+/// in bytes: far longer than real filters, far shorter than the 64 KiB the
+/// protocol allows.
+pub const DEFAULT_MAX_TOPIC_FILTER_LENGTH: usize = 1024;
+
 /// Unacknowledged QoS 1 and 2 messages one client may have unless
 /// configured otherwise.
 pub const DEFAULT_MAX_INFLIGHT: u16 = 64;
@@ -154,6 +159,10 @@ pub struct Limits {
     /// Subscriptions one session may hold; further ones are refused with
     /// Quota Exceeded. Each costs memory and work on every message.
     pub max_subscriptions: Option<usize>,
+    /// Longest topic filter, in bytes, a SUBSCRIBE may name; longer ones
+    /// are refused with Topic Filter Invalid. Each filter is kept in memory
+    /// and storage for as long as its session.
+    pub max_topic_filter_length: usize,
     /// Longest a session may outlive its connection. MQTT 5 clients asking
     /// for longer, or for no expiry, are told to use this; it also bounds
     /// `persistent_client_expiration`. Unbounded when unset.
@@ -189,6 +198,7 @@ impl Default for Limits {
             persistent_client_expiration: None,
             check_retain_source: false,
             max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
+            max_topic_filter_length: DEFAULT_MAX_TOPIC_FILTER_LENGTH,
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
@@ -2375,12 +2385,12 @@ where
                     .process_incoming(packet, &self.broker, &self.chain)
                     .await?;
 
-                // Persist subscriptions after subscribe/unsubscribe operations
+                // Persist what subscribe/unsubscribe operations changed
                 if is_subscription_change {
                     let client_id = session.get_client_id().await;
-                    let subscriptions = session.get_subscriptions().await;
+                    let changes = session.take_subscription_changes().await;
                     self.session_manager
-                        .save_subscriptions(&client_id, subscriptions)
+                        .save_subscription_changes(&client_id, changes)
                         .await;
                 }
 

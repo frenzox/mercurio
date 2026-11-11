@@ -59,6 +59,9 @@ max_queued_qos0_messages = 1000
 # check_retain_source = false
 # Subscriptions one session may hold; further ones get Quota Exceeded
 # max_subscriptions = 10000
+# Longest topic filter, in bytes, a SUBSCRIBE may name; longer ones get
+# Topic Filter Invalid
+# max_topic_filter_length = 1024
 
 # Seconds a new connection has, in all, to send its PROXY header, complete
 # the TLS and WebSocket handshakes and send CONNECT

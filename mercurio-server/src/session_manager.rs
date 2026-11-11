@@ -1314,16 +1314,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.storage.is_durable() && self.shared.persistent.lock().unwrap().contains(client_id)
     }
 
-    /// Update persisted session with current subscriptions.
-    pub(crate) async fn save_subscriptions(
-        &self,
-        client_id: &str,
-        subscriptions: Vec<StoredSubscription>,
-    ) {
+    /// Stores the subscriptions added and removed, one write each.
+    pub(crate) async fn save_subscription_changes(&self, client_id: &str, changes: Vec<Write>) {
         if self.is_persistent(client_id) {
-            self.writers
-                .write_paced(client_id, Box::new(Write::SaveSubscriptions(subscriptions)))
-                .await;
+            for change in changes {
+                self.writers.write_paced(client_id, Box::new(change)).await;
+            }
         }
     }
 
@@ -1800,7 +1796,7 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscriptions("c", session.get_subscriptions().await)
+            .save_subscription_changes("c", session.take_subscription_changes().await)
             .await;
         manager.end_connection(started.lease, None).await;
 
@@ -2400,9 +2396,12 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "gw-01");
         manager
-            .save_subscriptions(
+            .save_subscription_changes(
                 "gw-01",
-                vec![StoredSubscription::new("alice/#", QoS::AtMostOnce)],
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "alice/#",
+                    QoS::AtMostOnce,
+                ))],
             )
             .await;
         manager.end_connection(started.lease, None).await;
@@ -2859,7 +2858,13 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscriptions("c", vec![StoredSubscription::new("a", QoS::AtMostOnce)])
+            .save_subscription_changes(
+                "c",
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "a",
+                    QoS::AtMostOnce,
+                ))],
+            )
             .await;
         manager.end_connection(started.lease, None).await;
 

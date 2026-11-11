@@ -18,6 +18,7 @@ use mercurio_packets::{
     publish::{PublishPacket, PublishProperties},
     pubrel::PubRelPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
+    unsubscribe::{UnsubscribePacket, UnsubscribePayload},
     ControlPacket,
 };
 use mercurio_server::server::ServerConfig;
@@ -347,5 +348,53 @@ async fn incoming_qos2_messages_are_forwarded_once_across_a_crash() {
         Some(ControlPacket::PubComp(ref c)) if c.packet_id == 5 && c.reason == ReasonCode::Success
     ));
     assert!(subscriber.receive().await.is_none(), "forwarded twice");
+    broker.stop().await;
+}
+
+/// Subscriptions added and removed one at a time are all in storage after
+/// a crash.
+#[tokio::test]
+async fn subscription_changes_survive_a_crash() {
+    let db = database("subscriptions");
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", Connect::default()).await;
+    for filter in ["a", "b", "c"] {
+        subscriber.subscribe(filter, QoS::AtMostOnce).await;
+    }
+    subscriber
+        .send(ControlPacket::Unsubscribe(UnsubscribePacket {
+            packet_id: 2,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: "b".into(),
+            }],
+        }))
+        .await;
+    assert!(matches!(
+        subscriber.receive().await,
+        Some(ControlPacket::UnsubAck(_))
+    ));
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    let (mut subscriber, resumed) = Client::connect(
+        broker.addr,
+        "s",
+        Connect {
+            clean_start: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resumed);
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    for topic in ["a", "b", "c"] {
+        publisher.publish(message(topic, topic)).await;
+    }
+    let mut received = Vec::new();
+    while let Some(publish) = subscriber.next_publish().await {
+        received.push(publish.topic_name);
+    }
+    assert_eq!(received, ["a", "c"]);
     broker.stop().await;
 }

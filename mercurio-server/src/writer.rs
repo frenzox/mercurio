@@ -355,7 +355,7 @@ impl Retry {
 
 #[cfg(test)]
 mod tests {
-    use mercurio_storage::{memory::MemoryStore, SessionStore, StoredSubscription, WillStore};
+    use mercurio_storage::{memory::MemoryStore, SessionStore, WillStore};
 
     use super::*;
 
@@ -446,10 +446,7 @@ mod tests {
     async fn test_a_new_writer_waits_for_the_previous_one() {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
-        writers.write(
-            "c",
-            Write::SaveSubscriptions(Vec::<StoredSubscription>::new()),
-        );
+        writers.write("c", Write::RemoveSubscription("t".into()));
         writers.close("c");
         writers.write("c", Write::DeleteSession);
         writers.settle("c").await;
@@ -460,7 +457,7 @@ mod tests {
     async fn test_idle_writers_stop_and_start_again() {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
-        writers.write("c", Write::SaveSubscriptions(Vec::new()));
+        writers.write("c", Write::RemoveSubscription("t".into()));
         writers.settle("c").await;
         tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
         assert!(writers.entries.lock().unwrap().is_empty());

@@ -35,12 +35,10 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{info, warn};
 
 use crate::{
-    encoding::{
-        decode_subscriptions, encode_properties, encode_subscriptions, int_to_qos, qos_to_int,
-    },
+    encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
     BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage,
-    WillStore, Write,
+    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredSubscription,
+    StoredWillMessage, WillStore, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -213,7 +211,27 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON incoming_qos2
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
 ",
+    // Followed by `move_subscriptions`
+    "
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        client_id TEXT NOT NULL,
+        topic_filter TEXT NOT NULL,
+        qos INTEGER NOT NULL,
+        no_local BOOLEAN NOT NULL,
+        retain_as_published BOOLEAN NOT NULL,
+        subscription_identifier BIGINT,
+        PRIMARY KEY (client_id, topic_filter)
+    );
+
+    DROP TRIGGER IF EXISTS fence ON subscriptions;
+    CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON subscriptions
+        FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
+",
 ];
+
+/// The migration that creates the subscriptions table, after which
+/// `move_subscriptions` runs.
+const SUBSCRIPTIONS_TABLE: usize = 6;
 
 /// The SQLSTATE the fence triggers refuse a write with.
 const FENCED: &str = "MQ001";
@@ -247,8 +265,11 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
         let pending = MIGRATIONS
             .get(version as usize..)
             .ok_or_else(|| newer_schema(version))?;
-        for migration in pending {
+        for (index, migration) in pending.iter().enumerate() {
             client.batch_execute(migration).await.db()?;
+            if version as usize + index == SUBSCRIPTIONS_TABLE {
+                move_subscriptions(client).await?;
+            }
         }
         client
             .execute(
@@ -265,6 +286,38 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
         .await
         .db()?;
     result
+}
+
+/// Moves the subscriptions sessions kept encoded in their row, before
+/// subscriptions had a table of their own, to that table.
+async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
+    let sessions = client
+        .query(
+            "SELECT client_id, subscriptions FROM sessions WHERE length(subscriptions) > 0",
+            &[],
+        )
+        .await
+        .db()?;
+    for row in sessions {
+        let client_id: String = row.try_get(0).db()?;
+        let encoded = String::from_utf8(row.try_get(1).db()?)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        let subscriptions = decode_subscriptions(&encoded);
+        let (sql, params) = insert_subscriptions(&client_id, &subscriptions, "NOTHING");
+        let params: Vec<&(dyn ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+            .collect();
+        client.execute(sql, &params).await.db()?;
+    }
+    client
+        .execute(
+            "UPDATE sessions SET subscriptions = ''::BYTEA WHERE length(subscriptions) > 0",
+            &[],
+        )
+        .await
+        .db()?;
+    Ok(())
 }
 
 fn newer_schema(version: i32) -> StorageError {
@@ -677,40 +730,85 @@ fn tls(ca_path: Option<&Path>) -> Result<MakeRustlsConnect> {
 
 type Params = Vec<Box<dyn ToSql + Sync + Send>>;
 
+/// Inserts `subscriptions` of `client_id`, doing `on_conflict`, `NOTHING`
+/// or `UPDATE`, for those already stored.
+fn insert_subscriptions(
+    client_id: &str,
+    subscriptions: &[StoredSubscription],
+    on_conflict: &str,
+) -> (&'static str, Params) {
+    let sql = match on_conflict {
+        "NOTHING" => {
+            "INSERT INTO subscriptions
+             (client_id, topic_filter, qos, no_local, retain_as_published,
+              subscription_identifier)
+             SELECT $1, * FROM unnest($2::TEXT[], $3::INTEGER[], $4::BOOLEAN[], $5::BOOLEAN[],
+                                      $6::BIGINT[])
+             ON CONFLICT DO NOTHING"
+        }
+        _ => {
+            "INSERT INTO subscriptions
+             (client_id, topic_filter, qos, no_local, retain_as_published,
+              subscription_identifier)
+             SELECT $1, * FROM unnest($2::TEXT[], $3::INTEGER[], $4::BOOLEAN[], $5::BOOLEAN[],
+                                      $6::BIGINT[])
+             WHERE EXISTS (SELECT 1 FROM sessions WHERE client_id = $1)
+             ON CONFLICT (client_id, topic_filter) DO UPDATE SET
+             qos = EXCLUDED.qos, no_local = EXCLUDED.no_local,
+             retain_as_published = EXCLUDED.retain_as_published,
+             subscription_identifier = EXCLUDED.subscription_identifier"
+        }
+    };
+    (
+        sql,
+        vec![
+            Box::new(client_id.to_string()),
+            column(subscriptions, |s| s.topic_filter.clone()),
+            column(subscriptions, |s| qos_to_int(s.qos)),
+            column(subscriptions, |s| s.no_local),
+            column(subscriptions, |s| s.retain_as_published),
+            column(subscriptions, |s| s.subscription_identifier.map(i64::from)),
+        ],
+    )
+}
+
 /// The statements that apply `write` for `client_id`, other than those
 /// applied in bulk.
 fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
     let id = || -> Box<dyn ToSql + Sync + Send> { Box::new(client_id.to_string()) };
     match write {
-        Write::SaveSession(session) => vec![(
-            "INSERT INTO sessions
-             (client_id, subscriptions, clean_start, expiry_interval, expires_at,
-              owner_username, owner_mount_point)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (client_id) DO UPDATE SET
-             subscriptions = EXCLUDED.subscriptions, clean_start = EXCLUDED.clean_start,
-             expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at,
-             owner_username = EXCLUDED.owner_username,
-             owner_mount_point = EXCLUDED.owner_mount_point",
-            vec![
-                id(),
-                Box::new(encode_subscriptions(&session.subscriptions).into_bytes()),
-                // No longer used; kept for databases that require it
-                Box::new(false),
-                Box::new(session.expiry_interval.map(i64::from)),
-                Box::new(session.expires_at.map(|t| t as i64)),
-                Box::new(session.owner.username.clone()),
-                Box::new(session.owner.mount_point.clone()),
-            ],
+        Write::SaveSession(session) => vec![
+            (
+                "INSERT INTO sessions
+                 (client_id, subscriptions, clean_start, expiry_interval, expires_at,
+                  owner_username, owner_mount_point)
+                 VALUES ($1, ''::BYTEA, $2, $3, $4, $5, $6)
+                 ON CONFLICT (client_id) DO UPDATE SET
+                 subscriptions = EXCLUDED.subscriptions, clean_start = EXCLUDED.clean_start,
+                 expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at,
+                 owner_username = EXCLUDED.owner_username,
+                 owner_mount_point = EXCLUDED.owner_mount_point",
+                vec![
+                    id(),
+                    // No longer used; kept for databases that require it
+                    Box::new(false),
+                    Box::new(session.expiry_interval.map(i64::from)),
+                    Box::new(session.expires_at.map(|t| t as i64)),
+                    Box::new(session.owner.username.clone()),
+                    Box::new(session.owner.mount_point.clone()),
+                ],
+            ),
+            ("DELETE FROM subscriptions WHERE client_id = $1", vec![id()]),
+            insert_subscriptions(client_id, &session.subscriptions, "UPDATE"),
+        ],
+        Write::AddSubscription(subscription) => vec![insert_subscriptions(
+            client_id,
+            std::slice::from_ref(subscription),
+            "UPDATE",
         )],
-        Write::SaveSubscriptions(subscriptions) => vec![(
-            "INSERT INTO sessions (client_id, subscriptions, clean_start)
-             VALUES ($1, $2, FALSE)
-             ON CONFLICT (client_id) DO UPDATE SET subscriptions = EXCLUDED.subscriptions",
-            vec![
-                id(),
-                Box::new(encode_subscriptions(subscriptions).into_bytes()),
-            ],
+        Write::RemoveSubscription(topic_filter) => vec![(
+            "DELETE FROM subscriptions WHERE client_id = $1 AND topic_filter = $2",
+            vec![id(), Box::new(topic_filter.clone())],
         )],
         Write::SetExpiry {
             interval,
@@ -756,6 +854,7 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
         )],
         Write::DeleteSession => vec![
             ("DELETE FROM sessions WHERE client_id = $1", vec![id()]),
+            ("DELETE FROM subscriptions WHERE client_id = $1", vec![id()]),
             ("DELETE FROM will_messages WHERE client_id = $1", vec![id()]),
             (
                 "DELETE FROM queued_messages WHERE client_id = $1",
@@ -1091,22 +1190,41 @@ impl SessionStore for PostgresStore {
     }
 
     async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
+        // One row per subscription, or one without any
         let rows = self
             .query(
-                "SELECT subscriptions, clean_start, expiry_interval, expires_at,
-                        owner_username, owner_mount_point
-                 FROM sessions WHERE client_id = $1",
+                "SELECT s.expiry_interval, s.expires_at, s.owner_username, s.owner_mount_point,
+                        f.topic_filter, f.qos, f.no_local, f.retain_as_published,
+                        f.subscription_identifier
+                 FROM sessions s
+                 LEFT JOIN subscriptions f ON f.client_id = s.client_id
+                 WHERE s.client_id = $1
+                 ORDER BY f.topic_filter",
                 &[&client_id],
             )
             .await?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let subscriptions = String::from_utf8(row.try_get("subscriptions").db()?)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        let mut subscriptions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(topic_filter) = row.try_get::<_, Option<String>>("topic_filter").db()? else {
+                continue;
+            };
+            subscriptions.push(StoredSubscription {
+                topic_filter,
+                qos: int_to_qos(row.try_get("qos").db()?),
+                no_local: row.try_get("no_local").db()?,
+                retain_as_published: row.try_get("retain_as_published").db()?,
+                subscription_identifier: row
+                    .try_get::<_, Option<i64>>("subscription_identifier")
+                    .db()?
+                    .map(|id| id as u32),
+            });
+        }
         Ok(Some(SessionState {
             client_id: client_id.to_string(),
-            subscriptions: decode_subscriptions(&subscriptions),
+            subscriptions,
             expiry_interval: row
                 .try_get::<_, Option<i64>>("expiry_interval")
                 .db()?
@@ -1125,7 +1243,10 @@ impl SessionStore for PostgresStore {
     async fn delete_session(&self, client_id: &str) -> Result<()> {
         let client = self.client().await?;
         let statement = client
-            .prepare_cached("DELETE FROM sessions WHERE client_id = $1")
+            .prepare_cached(
+                "WITH subscriptions AS (DELETE FROM subscriptions WHERE client_id = $1)
+                 DELETE FROM sessions WHERE client_id = $1",
+            )
             .await
             .db()?;
         self.fence(client.execute(&statement, &[&client_id]).await.db())?;
@@ -1510,7 +1631,7 @@ mod tests {
             .unwrap()
             .batch_execute(
                 "TRUNCATE sessions, retained_messages, will_messages, inflight_messages,
-                 queued_messages, bans, incoming_qos2",
+                 queued_messages, bans, incoming_qos2, subscriptions",
             )
             .await
             .unwrap();
@@ -1751,7 +1872,13 @@ mod tests {
             .apply(
                 "c",
                 &[
-                    Write::SaveSubscriptions(vec![StoredSubscription::new("a", QoS::AtMostOnce)]),
+                    Write::SaveSession(SessionState {
+                        client_id: "c".into(),
+                        subscriptions: vec![StoredSubscription::new("a", QoS::AtMostOnce)],
+                        expiry_interval: None,
+                        expires_at: None,
+                        owner: SessionOwner::default(),
+                    }),
                     Write::SetExpiry {
                         interval: 60,
                         expires_at: 5,
@@ -1839,6 +1966,70 @@ mod tests {
         assert!(store.load_session("c").await.unwrap().is_none());
         assert!(store.load_queue("c").await.unwrap().is_empty());
         assert!(store.get_all_inflight("c").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_subscriptions() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        crate::testing::subscriptions_round_trip(&store).await;
+    }
+
+    /// Sessions of a database from before subscriptions had a table of
+    /// their own keep their subscriptions.
+    #[tokio::test]
+    async fn test_migrates_encoded_subscriptions_to_their_table() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let subscriptions = vec![
+            StoredSubscription {
+                no_local: true,
+                retain_as_published: true,
+                subscription_identifier: Some(268_435_455),
+                ..StoredSubscription::new("topic/+:x,y", QoS::ExactlyOnce)
+            },
+            StoredSubscription::new("$share/g/a/#", QoS::AtMostOnce),
+        ];
+        let encoded = crate::encoding::encode_subscriptions(&subscriptions);
+        database_at(
+            &url,
+            SUBSCRIPTIONS_TABLE,
+            &format!(
+                "INSERT INTO sessions (client_id, subscriptions, clean_start, owner_username)
+                 VALUES ('old', decode('{}', 'hex'), FALSE, 'alice'),
+                        ('none', '', FALSE, NULL);",
+                encoded
+                    .bytes()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+        )
+        .await;
+
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let mut loaded = store.load_session("old").await.unwrap().unwrap();
+        loaded
+            .subscriptions
+            .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
+        assert_eq!(loaded.subscriptions, subscriptions);
+        assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
+        let none = store.load_session("none").await.unwrap().unwrap();
+        assert!(none.subscriptions.is_empty());
+        let blobs: i64 = store
+            .client()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT COUNT(*) FROM sessions WHERE length(subscriptions) > 0",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(blobs, 0);
     }
 
     #[tokio::test]
