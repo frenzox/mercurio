@@ -107,7 +107,7 @@ impl Peer {
 
     pub async fn write(&mut self, packet: ControlPacket) {
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer, ProtocolVersion::V5);
+        packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
         self.stream.write_all(&buffer).await.unwrap();
     }
 

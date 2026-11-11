@@ -162,7 +162,7 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
@@ -506,7 +506,9 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
         },
     };
     let mut encoded = BytesMut::new();
-    ControlPacket::Connect(connect).encode(&mut encoded, ProtocolVersion::V5);
+    ControlPacket::Connect(connect)
+        .encode(&mut encoded, ProtocolVersion::V5)
+        .unwrap();
     stream.write_all(&encoded).await.unwrap();
     let mut subscriber = Client {
         stream,

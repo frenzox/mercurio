@@ -6,7 +6,8 @@ use alloc::{string::String, vec::Vec};
 use bytes::{Buf, Bytes, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     error::Error,
     properties::*,
     protocol::ProtocolVersion,
@@ -36,15 +37,16 @@ pub struct PublishProperties {
 }
 
 impl Encoder for PublishProperties {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.payload_format_indicator.encode(buffer);
-        self.message_expiry_interval.encode(buffer);
-        self.topic_alias.encode(buffer);
-        self.response_topic.encode(buffer);
-        self.correlation_data.encode(buffer);
-        self.user_property.encode(buffer);
-        self.subscription_identifiers.encode(buffer);
-        self.content_type.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.payload_format_indicator.encode(buffer)?;
+        self.message_expiry_interval.encode(buffer)?;
+        self.topic_alias.encode(buffer)?;
+        self.response_topic.encode(buffer)?;
+        self.correlation_data.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        self.subscription_identifiers.encode(buffer)?;
+        self.content_type.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -112,8 +114,22 @@ pub struct PublishPacket {
 const PACKET_TYPE: u8 = 0x03;
 
 impl Packet for PublishPacket {
-    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
-        self.encode_inner(buffer, version.supports_properties());
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            match (self.qos_level, self.packet_id) {
+                (QoS::AtMostOnce, None) => {}
+                (QoS::AtMostOnce, Some(_)) | (_, None) => {
+                    return Err(EncodeError::PacketIdMismatch)
+                }
+                (_, Some(0)) => return Err(EncodeError::PacketIdZero),
+                (_, Some(_)) => {}
+            }
+            if self.dup && self.qos_level == QoS::AtMostOnce {
+                return Err(EncodeError::DupAtQoS0);
+            }
+            self.encode_inner(buffer, version.supports_properties())?;
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -136,28 +152,33 @@ impl PublishPacket {
         len + self.payload.as_ref().map_or(0, |payload| payload.len())
     }
 
-    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
+    fn encode_inner(
+        &self,
+        buffer: &mut BytesMut,
+        with_properties: bool,
+    ) -> Result<(), EncodeError> {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= (self.dup as u8) << 3;
         fixed_header |= (self.qos_level as u8) << 1;
         fixed_header |= self.retain as u8;
-        fixed_header.encode(buffer);
+        fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
+        crate::encode_length(self.remaining_len(with_properties), buffer)?;
 
         // Variable header
-        self.topic_name.encode(buffer);
-        self.packet_id.encode(buffer);
+        self.topic_name.encode(buffer)?;
+        self.packet_id.encode(buffer)?;
         if with_properties {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
         }
 
         // Payload. Here it goes raw, shouldn't be encoded
         if let Some(payload) = &self.payload {
             buffer.extend(payload);
         }
+        Ok(())
     }
 
     fn decode_body<T: Buf>(
@@ -232,7 +253,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded, expected);
 

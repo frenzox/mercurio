@@ -72,7 +72,8 @@ async fn retain_many(addr: SocketAddr, qos: QoS) {
             properties: None,
             payload: Some(Bytes::from(i.to_string())),
         }
-        .encode(&mut packets, ProtocolVersion::V5);
+        .encode(&mut packets, ProtocolVersion::V5)
+        .unwrap();
     }
     publisher.write_all(&packets).await.unwrap();
     // PINGREQ, answered once every PUBLISH before it was handled

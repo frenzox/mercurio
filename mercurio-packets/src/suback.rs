@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -22,9 +23,10 @@ pub struct SubAckProperties {
 }
 
 impl Encoder for SubAckProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -65,8 +67,8 @@ pub struct SubAckPayload {
 }
 
 impl Encoder for SubAckPayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.reason_code.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        crate::encode_reason(self.reason_code, PacketType::SubAck, buffer)
     }
 
     fn encoded_size(&self) -> usize {
@@ -97,31 +99,41 @@ pub struct SubAckPacket {
 const PACKET_TYPE: u8 = 0x09;
 
 impl Packet for SubAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
-        // Fixed header
-        let fixed_header: u8 = PACKET_TYPE << 4;
-        fixed_header.encode(buffer);
-
-        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
-
-        self.packet_id.encode(buffer);
-
-        if version.supports_properties() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-            self.payload.encode(buffer);
-        } else {
-            // MQTT 3.x only has the granted QoS return codes and 0x80 for failure
-            for p in &self.payload {
-                let return_code: u8 = match p.reason_code {
-                    ReasonCode::GrantedQoS0 => 0x00,
-                    ReasonCode::GrantedQoS1 => 0x01,
-                    ReasonCode::GrantedQoS2 => 0x02,
-                    _ => 0x80,
-                };
-                return_code.encode(buffer);
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::SubAck));
             }
-        }
+            // Fixed header
+            let fixed_header: u8 = PACKET_TYPE << 4;
+            fixed_header.encode(buffer)?;
+
+            crate::encode_length(self.remaining_len(version), buffer)?;
+
+            crate::encode_packet_id(self.packet_id, buffer)?;
+
+            if version.supports_properties() {
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+                self.payload.encode(buffer)?;
+            } else {
+                // MQTT 3.x only has the granted QoS return codes and 0x80 for failure
+                for p in &self.payload {
+                    let return_code: u8 = match p.reason_code {
+                        ReasonCode::GrantedQoS0 => 0x00,
+                        ReasonCode::GrantedQoS1 => 0x01,
+                        ReasonCode::GrantedQoS2 => 0x02,
+                        _ => 0x80,
+                    };
+                    return_code.encode(buffer)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -198,7 +210,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer, ProtocolVersion::V3_1_1);
+        packet.encode(&mut buffer, ProtocolVersion::V3_1_1).unwrap();
         assert_eq!(&buffer[..], &[0x90, 0x04, 0x00, 0x01, 0x01, 0x80]);
     }
 
@@ -226,7 +238,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

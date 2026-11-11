@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -21,9 +22,10 @@ pub struct PubAckProperties {
 }
 
 impl Encoder for PubAckProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -69,17 +71,20 @@ const FIRST_BYTE: u8 = 0x40;
 impl Packet for PubAckPacket {
     /// In MQTT 3.x only the packet id is written: the reason code and
     /// properties don't exist there.
-    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
-        buffer.put_u8(FIRST_BYTE);
-        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_u8(FIRST_BYTE);
+            crate::encode_length(self.remaining_len(version), buffer)?;
 
-        self.packet_id.encode(buffer);
+            crate::encode_packet_id(self.packet_id, buffer)?;
 
-        if self.has_reason(version) {
-            self.reason.encode(buffer);
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-        }
+            if self.has_reason(version) {
+                crate::encode_reason(self.reason, PacketType::PubAck, buffer)?;
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+            }
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -148,7 +153,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

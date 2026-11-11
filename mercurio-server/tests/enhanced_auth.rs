@@ -99,7 +99,7 @@ async fn start_broker_with(challenge: Arc<Challenge>) -> SocketAddr {
 
 async fn send(stream: &mut TcpStream, packet: ControlPacket) {
     let mut buffer = BytesMut::new();
-    packet.encode(&mut buffer, ProtocolVersion::V5);
+    packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
     stream.write_all(&buffer).await.unwrap();
 }
 

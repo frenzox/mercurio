@@ -12,7 +12,7 @@ let mut input = BytesMut::from(&[0xc0, 0x00][..]); // PINGREQ
 let packet = ControlPacket::parse(&mut input, ProtocolVersion::V3_1_1).unwrap();
 
 let mut output = BytesMut::new();
-packet.encode(&mut output, ProtocolVersion::V3_1_1);
+packet.encode(&mut output, ProtocolVersion::V3_1_1).unwrap();
 assert_eq!(&output[..], &[0xc0, 0x00]);
 ```
 

@@ -657,7 +657,9 @@ fuzz_target!(|input: (Version, Packet)| {
     };
 
     let mut encoded = BytesMut::new();
-    packet.encode(&mut encoded, version);
+    packet
+        .encode(&mut encoded, version)
+        .unwrap_or_else(|e| panic!("{packet:?} fails to encode with {e:?}"));
     assert_eq!(encoded.len(), packet.encoded_size(version), "{packet:?}");
 
     let decoded = ControlPacket::parse(&mut encoded, version)

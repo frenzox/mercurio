@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -21,9 +22,10 @@ pub struct UnsubAckProperties {
 }
 
 impl Encoder for UnsubAckProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -62,8 +64,8 @@ pub struct UnsubAckPayload {
 }
 
 impl Encoder for UnsubAckPayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.reason_code.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        crate::encode_reason(self.reason_code, PacketType::UnsubAck, buffer)
     }
 
     fn encoded_size(&self) -> usize {
@@ -96,21 +98,31 @@ pub struct UnsubAckPacket {
 const PACKET_TYPE: u8 = 0x0b;
 
 impl Packet for UnsubAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
-        // Fixed header
-        let fixed_header: u8 = PACKET_TYPE << 4;
-        fixed_header.encode(buffer);
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if version.supports_reason_codes() && self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::UnsubAck));
+            }
+            // Fixed header
+            let fixed_header: u8 = PACKET_TYPE << 4;
+            fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
+            crate::encode_length(self.remaining_len(version), buffer)?;
 
-        self.packet_id.encode(buffer);
+            crate::encode_packet_id(self.packet_id, buffer)?;
 
-        // Properties and payload reason codes only for MQTT 5.0
-        if version.supports_properties() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-            self.payload.encode(buffer);
-        }
+            // Properties and payload reason codes only for MQTT 5.0
+            if version.supports_properties() {
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+                self.payload.encode(buffer)?;
+            }
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -180,7 +192,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

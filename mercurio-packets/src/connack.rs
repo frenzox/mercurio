@@ -8,7 +8,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BufMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -24,9 +25,10 @@ pub struct ConnAckFlags {
 }
 
 impl Encoder for ConnAckFlags {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
         let flags = 0b0000_0001 & (self.session_present as u8);
         buffer.put_u8(flags);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -90,24 +92,26 @@ pub struct ConnAckProperties {
 }
 
 impl Encoder for ConnAckProperties {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.session_expiry_interval.encode(buffer);
-        self.receive_maximum.encode(buffer);
-        self.maximum_qos.encode(buffer);
-        self.retain_available.encode(buffer);
-        self.maximum_packet_size.encode(buffer);
-        self.assigned_client_id.encode(buffer);
-        self.topic_alias_max.encode(buffer);
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
-        self.wildcard_subscription_available.encode(buffer);
-        self.subscription_identifier_available.encode(buffer);
-        self.shared_subscription_available.encode(buffer);
-        self.server_keepalive.encode(buffer);
-        self.response_information.encode(buffer);
-        self.server_reference.encode(buffer);
-        self.authentication_method.encode(buffer);
-        self.authentication_data.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        crate::check_authentication(&self.authentication_method, &self.authentication_data)?;
+        self.session_expiry_interval.encode(buffer)?;
+        self.receive_maximum.encode(buffer)?;
+        self.maximum_qos.encode(buffer)?;
+        self.retain_available.encode(buffer)?;
+        self.maximum_packet_size.encode(buffer)?;
+        self.assigned_client_id.encode(buffer)?;
+        self.topic_alias_max.encode(buffer)?;
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        self.wildcard_subscription_available.encode(buffer)?;
+        self.subscription_identifier_available.encode(buffer)?;
+        self.shared_subscription_available.encode(buffer)?;
+        self.server_keepalive.encode(buffer)?;
+        self.response_information.encode(buffer)?;
+        self.server_reference.encode(buffer)?;
+        self.authentication_method.encode(buffer)?;
+        self.authentication_data.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -203,8 +207,9 @@ pub enum ConnAckReturnCode {
 }
 
 impl Encoder for ConnAckReturnCode {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
         buffer.put_u8(*self as u8);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -242,22 +247,29 @@ pub struct ConnAckPacket {
 const PACKET_TYPE: u8 = 0x02;
 
 impl Packet for ConnAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
-        // Fixed header
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            // Fixed header
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(version), buffer)?;
 
-        // Variable header
-        self.flags.encode(buffer);
+            // Variable header
+            self.flags.encode(buffer)?;
 
-        if version.supports_properties() {
-            self.reason_code.encode(buffer);
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-        } else {
-            let return_code: ConnAckReturnCode = self.reason_code.into();
-            return_code.encode(buffer);
-        }
+            if version.supports_properties() {
+                crate::encode_reason(self.reason_code, PacketType::ConnAck, buffer)?;
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+            } else {
+                let return_code: ConnAckReturnCode = self.reason_code.into();
+                return_code.encode(buffer)?;
+            }
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -362,7 +374,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded, expected);
 
@@ -394,7 +406,9 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
     }
@@ -426,7 +440,9 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
     }

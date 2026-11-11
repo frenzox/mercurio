@@ -281,8 +281,8 @@ impl TryFrom<u8> for ReasonCode {
 }
 
 impl Encoder for ReasonCode {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.code().encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), crate::error::EncodeError> {
+        self.code().encode(buffer)
     }
 
     fn encoded_size(&self) -> usize {

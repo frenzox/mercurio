@@ -16,7 +16,9 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut encoded = BytesMut::new();
-    properties.encode(&mut encoded);
+    properties
+        .encode(&mut encoded)
+        .expect("decoded properties encode");
     assert_eq!(encoded.len(), properties.encoded_size());
 
     let decoded = MessageProperties::decode(&mut encoded).expect("encoded properties decode");

@@ -19,7 +19,9 @@ fuzz_target!(|data: &[u8]| {
     let mut src = BytesMut::from(bytes);
     while let Ok(packet) = ControlPacket::parse(&mut src, version) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, version);
+        packet
+            .encode(&mut encoded, version)
+            .expect("a decoded packet encodes");
         let decoded =
             ControlPacket::parse(&mut encoded, version).expect("an encoded packet decodes");
         assert_eq!(packet, decoded);

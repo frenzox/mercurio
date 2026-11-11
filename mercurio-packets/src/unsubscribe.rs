@@ -7,7 +7,8 @@ use alloc::{string::String, vec::Vec};
 use bytes::Buf;
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -21,8 +22,9 @@ pub struct UnsubscribeProperties {
 }
 
 impl Encoder for UnsubscribeProperties {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -58,8 +60,9 @@ pub struct UnsubscribePayload {
 }
 
 impl Encoder for UnsubscribePayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.topic_filter.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.topic_filter.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -89,8 +92,18 @@ pub struct UnsubscribePacket {
 const PACKET_TYPE: u8 = 0x0a;
 
 impl Packet for UnsubscribePacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
-        self.encode_inner(buffer, version.supports_properties());
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::Unsubscribe));
+            }
+            self.encode_inner(buffer, version.supports_properties())?;
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -113,20 +126,25 @@ impl UnsubscribePacket {
         len
     }
 
-    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
+    fn encode_inner(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        with_properties: bool,
+    ) -> Result<(), EncodeError> {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
-        fixed_header.encode(buffer);
+        fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
+        crate::encode_length(self.remaining_len(with_properties), buffer)?;
 
-        self.packet_id.encode(buffer);
+        crate::encode_packet_id(self.packet_id, buffer)?;
         if with_properties {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
         }
-        self.payload.encode(buffer);
+        self.payload.encode(buffer)?;
+        Ok(())
     }
 
     fn decode_body<T: Buf>(_: u8, buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
@@ -179,7 +197,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

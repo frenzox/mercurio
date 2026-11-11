@@ -9,7 +9,8 @@ use alloc::{string::String, vec::Vec};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     error::Error,
     properties::*,
     protocol::ProtocolVersion,
@@ -47,7 +48,7 @@ impl ConnectFlags {
 }
 
 impl Encoder for ConnectFlags {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         let mut flags: u8 = 0;
 
         if self.user_name {
@@ -72,6 +73,7 @@ impl Encoder for ConnectFlags {
         }
 
         buffer.put_u8(flags);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -141,16 +143,18 @@ pub struct ConnectProperties {
 }
 
 impl Encoder for ConnectProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.session_expiry_interval.encode(buffer);
-        self.receive_maximum.encode(buffer);
-        self.maximum_packet_size.encode(buffer);
-        self.topic_alias_maximum.encode(buffer);
-        self.request_response_information.encode(buffer);
-        self.request_problem_information.encode(buffer);
-        self.user_property.encode(buffer);
-        self.authentication_method.encode(buffer);
-        self.authentication_data.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        crate::check_authentication(&self.authentication_method, &self.authentication_data)?;
+        self.session_expiry_interval.encode(buffer)?;
+        self.receive_maximum.encode(buffer)?;
+        self.maximum_packet_size.encode(buffer)?;
+        self.topic_alias_maximum.encode(buffer)?;
+        self.request_response_information.encode(buffer)?;
+        self.request_problem_information.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        self.authentication_method.encode(buffer)?;
+        self.authentication_data.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -221,14 +225,15 @@ pub struct WillProperties {
 }
 
 impl Encoder for WillProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.will_delay_interval.encode(buffer);
-        self.payload_format_indicator.encode(buffer);
-        self.message_expiry_interval.encode(buffer);
-        self.content_type.encode(buffer);
-        self.response_topic.encode(buffer);
-        self.correlation_data.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.will_delay_interval.encode(buffer)?;
+        self.payload_format_indicator.encode(buffer)?;
+        self.message_expiry_interval.encode(buffer)?;
+        self.content_type.encode(buffer)?;
+        self.response_topic.encode(buffer)?;
+        self.correlation_data.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -298,21 +303,21 @@ pub struct ConnectPayload {
 
 impl ConnectPayload {
     /// Writes the payload; the will properties only in MQTT 5.
-    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
-        self.client_id.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        self.client_id.encode(buffer)?;
 
         if let Some(will) = &self.will {
             if version.supports_properties() {
                 // Will properties length must be encoded even if 0
-                VariableByteInteger(will.properties.encoded_size() as u32).encode(buffer);
-                will.properties.encode(buffer);
+                crate::encode_length(will.properties.encoded_size(), buffer)?;
+                will.properties.encode(buffer)?;
             }
-            will.topic.encode(buffer);
-            will.payload.encode(buffer);
+            will.topic.encode(buffer)?;
+            will.payload.encode(buffer)?;
         }
 
-        self.user_name.encode(buffer);
-        self.password.encode(buffer);
+        self.user_name.encode(buffer)?;
+        self.password.encode(buffer)
     }
 
     /// Size of what [`Self::encode`] writes.
@@ -391,27 +396,44 @@ const PACKET_TYPE: u8 = 0x01;
 /// A CONNECT names its own protocol version, `protocol_version`; it is
 /// what decoding reads, whatever version is passed in.
 impl Packet for ConnectPacket {
-    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) {
-        let protocol_name = self.protocol_version.protocol_name();
-        let protocol_level = self.protocol_version.protocol_level();
-
-        // Fixed header
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
-
-        // Variable header
-        protocol_name.encode(buffer);
-        protocol_level.encode(buffer);
-        ConnectFlags::of(self).encode(buffer);
-        self.keepalive.encode(buffer);
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
+    /// Fails for a `version` other than the packet's own.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        if version != self.protocol_version {
+            return Err(EncodeError::UnsupportedVersion(
+                PacketType::Connect,
+                version,
+            ));
         }
+        // MQTT 3.x has no password without a user name [MQTT-3.1.2-22]
+        if !version.supports_properties()
+            && self.payload.password.is_some()
+            && self.payload.user_name.is_none()
+        {
+            return Err(EncodeError::PasswordWithoutUserName);
+        }
+        crate::write_packet(buffer, |buffer| {
+            let protocol_name = self.protocol_version.protocol_name();
+            let protocol_level = self.protocol_version.protocol_level();
 
-        self.payload.encode(buffer, self.protocol_version);
+            // Fixed header
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(), buffer)?;
+
+            // Variable header
+            protocol_name.encode(buffer)?;
+            protocol_level.encode(buffer)?;
+            ConnectFlags::of(self).encode(buffer)?;
+            self.keepalive.encode(buffer)?;
+
+            // Properties only for MQTT 5.0
+            if self.protocol_version.supports_properties() {
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+            }
+
+            self.payload.encode(buffer, self.protocol_version)?;
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, _: ProtocolVersion) -> usize {
@@ -492,7 +514,7 @@ mod tests {
             ..Default::default()
         };
         let mut encoded = BytesMut::new();
-        payload.encode(&mut encoded, ProtocolVersion::V5);
+        payload.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         assert_eq!(
             &encoded[..],
             [0x00, 0x01, b'c', 0x00, 0x00, 0x01, b't', 0x00, 0x01, b'p']
@@ -520,7 +542,9 @@ mod tests {
             },
         };
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, packet.protocol_version);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
         // User name, will retain, will QoS 2 and will flag
         assert_eq!(encoded[9], 0b1011_0100);
         assert_eq!(
@@ -551,7 +575,9 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, packet.protocol_version);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded, expected);
 
@@ -606,7 +632,9 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, packet.protocol_version);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded, expected);
 
@@ -641,7 +669,9 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, packet.protocol_version);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

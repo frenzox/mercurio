@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -24,11 +25,13 @@ pub struct AuthProperties {
 }
 
 impl Encoder for AuthProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.auth_method.encode(buffer);
-        self.auth_data.encode(buffer);
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        crate::check_authentication(&self.auth_method, &self.auth_data)?;
+        self.auth_method.encode(buffer)?;
+        self.auth_data.encode(buffer)?;
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -77,13 +80,20 @@ pub struct AuthPacket {
 const PACKET_TYPE: u8 = 0x0f;
 
 impl Packet for AuthPacket {
-    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) {
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+    /// MQTT 3.x has no AUTH packet, so encoding one for it fails.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        if !version.supports_auth_packet() {
+            return Err(EncodeError::UnsupportedVersion(PacketType::Auth, version));
+        }
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(), buffer)?;
 
-        self.reason.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+            crate::encode_reason(self.reason, PacketType::Auth, buffer)?;
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, _: ProtocolVersion) -> usize {
@@ -137,7 +147,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer, ProtocolVersion::V5);
+        packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
         assert_eq!(
             AuthPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap(),
             packet

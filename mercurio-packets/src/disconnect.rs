@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -27,11 +28,12 @@ pub struct DisconnectProperties {
 }
 
 impl Encoder for DisconnectProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.session_expiry_interval.encode(buffer);
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
-        self.server_reference.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.session_expiry_interval.encode(buffer)?;
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        self.server_reference.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -80,17 +82,20 @@ const PACKET_TYPE: u8 = 0x0e;
 impl Packet for DisconnectPacket {
     /// MQTT 3.x has no variable header: the reason and properties are left
     /// out.
-    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(version), buffer)?;
 
-        if version.supports_reason_codes() {
-            self.reason.encode(buffer);
-            if self.properties.is_some() {
-                VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-                self.properties.encode(buffer);
+            if version.supports_reason_codes() {
+                crate::encode_reason(self.reason, PacketType::Disconnect, buffer)?;
+                if self.properties.is_some() {
+                    crate::encode_length(self.properties.encoded_size(), buffer)?;
+                    self.properties.encode(buffer)?;
+                }
             }
-        }
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -163,7 +168,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer, ProtocolVersion::V5);
+        packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
         assert_eq!(
             DisconnectPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap(),
             packet
@@ -179,7 +184,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer, ProtocolVersion::V3_1_1);
+        packet.encode(&mut buffer, ProtocolVersion::V3_1_1).unwrap();
         assert_eq!(&buffer[..], &[0xe0, 0x00]);
     }
 }

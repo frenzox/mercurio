@@ -98,7 +98,7 @@ async fn application_properties_are_forwarded() {
         payload: Some(Bytes::from_static(b"hi")),
     };
     let mut encoded = BytesMut::new();
-    publish.encode(&mut encoded, ProtocolVersion::V5);
+    publish.encode(&mut encoded, ProtocolVersion::V5).unwrap();
     publisher.write_all(&encoded).await.unwrap();
 
     let mut buffer = BytesMut::new();

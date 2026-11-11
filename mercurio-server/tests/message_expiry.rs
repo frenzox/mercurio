@@ -49,7 +49,7 @@ async fn expired_retained_message_is_not_delivered() {
         ..Default::default()
     };
     let mut encoded = BytesMut::new();
-    publish.encode(&mut encoded, ProtocolVersion::V5);
+    publish.encode(&mut encoded, ProtocolVersion::V5).unwrap();
     publisher.write_all(&encoded).await.unwrap();
 
     sleep(Duration::from_millis(1500)).await;

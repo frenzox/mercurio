@@ -48,7 +48,7 @@ fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
 
 async fn send(stream: &mut TcpStream, packet: ControlPacket, version: ProtocolVersion) {
     let mut bytes = BytesMut::new();
-    packet.encode(&mut bytes, version);
+    packet.encode(&mut bytes, version).unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
 

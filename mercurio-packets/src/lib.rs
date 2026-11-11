@@ -29,7 +29,8 @@ use bytes::{buf::Take, Buf, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
+    error::{EncodeError, Error},
+    properties::{AuthenticationData, AuthenticationMethod},
     protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
@@ -173,7 +174,14 @@ impl ControlPacket {
     /// MQTT 3.x has no reason codes or properties: PUBACK, PUBREC, PUBREL,
     /// PUBCOMP and DISCONNECT leave theirs out, CONNACK maps its reason code
     /// to a 3.x return code, and SUBACK writes every failure as 0x80.
-    pub fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
+    ///
+    /// Fails, leaving `buffer` as it was, on a packet MQTT can't carry or
+    /// the receiver would have to refuse; see [`EncodeError`].
+    pub fn encode(
+        &self,
+        buffer: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> core::result::Result<(), EncodeError> {
         use ControlPacket::*;
 
         match self {
@@ -224,7 +232,14 @@ impl ControlPacket {
 /// the same for any packet.
 pub trait Packet: Sized {
     /// Appends the packet in the wire format of `version`.
-    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion);
+    ///
+    /// Fails, leaving `buffer` as it was, on a packet MQTT can't carry or
+    /// the receiver would have to refuse; see [`EncodeError`].
+    fn encode(
+        &self,
+        buffer: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> core::result::Result<(), EncodeError>;
 
     /// Number of bytes [`encode`](Packet::encode) writes for `version`.
     fn encoded_size(&self, version: ProtocolVersion) -> usize;
@@ -315,6 +330,67 @@ pub(crate) fn decode_packet_id<T: Buf>(buffer: &mut T) -> Result<u16> {
     }
 }
 
+/// Runs `write`, which appends one packet to `buffer`, and takes back what
+/// it wrote if it fails, so a refused packet leaves no partial bytes.
+pub(crate) fn write_packet<F>(
+    buffer: &mut BytesMut,
+    write: F,
+) -> core::result::Result<(), EncodeError>
+where
+    F: FnOnce(&mut BytesMut) -> core::result::Result<(), EncodeError>,
+{
+    let start = buffer.len();
+    let written = write(buffer);
+    if written.is_err() {
+        buffer.truncate(start);
+    }
+    written
+}
+
+/// Writes a Remaining Length or property list length.
+pub(crate) fn encode_length(
+    len: usize,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    let len = u32::try_from(len).map_err(|_| EncodeError::TooLarge)?;
+    VariableByteInteger(len).encode(buffer)
+}
+
+/// Writes a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
+pub(crate) fn encode_packet_id(
+    packet_id: u16,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    if packet_id == 0 {
+        return Err(EncodeError::PacketIdZero);
+    }
+    packet_id.encode(buffer)
+}
+
+/// Writes an MQTT 5 reason code that `packet_type` lists.
+pub(crate) fn encode_reason(
+    reason: ReasonCode,
+    packet_type: PacketType,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    if !reason.is_valid_for(packet_type) {
+        return Err(EncodeError::InvalidReasonCode(packet_type, reason));
+    }
+    reason.encode(buffer)
+}
+
+/// Authentication Data means nothing without an Authentication Method, and
+/// the receiver refuses it (section 3.1.2.11.10).
+pub(crate) fn check_authentication(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> core::result::Result<(), EncodeError> {
+    if data.is_some() && method.is_none() {
+        return Err(EncodeError::InvalidProperty(AuthenticationData::ID));
+    }
+    Ok(())
+}
+
 /// Size of a whole packet whose body is `remaining_len` bytes: the first
 /// byte, the Remaining Length and the body.
 pub(crate) fn packet_size(remaining_len: usize) -> usize {
@@ -364,7 +440,9 @@ mod tests {
         assert_eq!(publish.payload, Some(Bytes::from("hi")));
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(&encoded[..], &wire[..]);
     }
 
@@ -406,7 +484,9 @@ mod tests {
             properties: None,
         });
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
     }
 
@@ -442,7 +522,7 @@ mod tests {
         });
         let encode = |version| {
             let mut buffer = BytesMut::new();
-            suback.encode(&mut buffer, version);
+            suback.encode(&mut buffer, version).unwrap();
             buffer
         };
         assert_eq!(
@@ -588,7 +668,7 @@ mod robustness_tests {
         for (bytes, version) in versioned_samples() {
             let packet = ControlPacket::parse(&mut BytesMut::from(&bytes[..]), version).unwrap();
             let mut encoded = BytesMut::new();
-            packet.encode(&mut encoded, version);
+            packet.encode(&mut encoded, version).unwrap();
             assert_eq!(packet.encoded_size(version), encoded.len(), "{packet:?}");
         }
     }
@@ -984,6 +1064,293 @@ mod robustness_tests {
                     Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{name}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use std::{string::String, vec::Vec};
+
+    use bytes::Bytes;
+    use mercurio_core::{
+        properties::{AuthenticationData, ResponseTopic, TopicAlias},
+        qos::QoS,
+    };
+
+    use super::*;
+    use crate::{
+        auth::{AuthPacket, AuthProperties},
+        connect::{ConnectPayload, ConnectProperties},
+        publish::PublishProperties,
+        suback::SubAckPayload,
+        subscribe::{SubscribePayload, SubscriptionOptions},
+        unsuback::UnsubAckPayload,
+        unsubscribe::UnsubscribePayload,
+    };
+
+    fn publish() -> PublishPacket {
+        PublishPacket {
+            dup: false,
+            qos_level: QoS::AtLeastOnce,
+            retain: false,
+            topic_name: "t".into(),
+            packet_id: Some(1),
+            properties: None,
+            payload: Some(Bytes::from_static(b"m")),
+        }
+    }
+
+    fn connect(version: ProtocolVersion) -> ConnectPacket {
+        ConnectPacket {
+            protocol_version: version,
+            clean_start: true,
+            keepalive: 0,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "c".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Encodes `packet` after some bytes already in the buffer, and checks
+    /// it fails with `expected` and leaves those bytes alone.
+    fn assert_refused(packet: ControlPacket, version: ProtocolVersion, expected: EncodeError) {
+        let mut buffer = BytesMut::from(&b"before"[..]);
+        assert_eq!(
+            packet.encode(&mut buffer, version),
+            Err(expected),
+            "{packet:?}"
+        );
+        assert_eq!(&buffer[..], b"before", "{packet:?} left bytes behind");
+    }
+
+    #[test]
+    fn test_packets_the_receiver_refuses_are_not_encoded() {
+        use ControlPacket::*;
+        use ProtocolVersion::{V3_1_1, V5};
+
+        let cases: Vec<(ControlPacket, ProtocolVersion, EncodeError)> = vec![
+            (
+                PubAck(puback::PubAckPacket {
+                    packet_id: 0,
+                    ..Default::default()
+                }),
+                V5,
+                EncodeError::PacketIdZero,
+            ),
+            (
+                PubRel(pubrel::PubRelPacket {
+                    packet_id: 1,
+                    reason: ReasonCode::NoMatchingSubscribers,
+                    properties: None,
+                }),
+                V5,
+                EncodeError::InvalidReasonCode(
+                    PacketType::PubRel,
+                    ReasonCode::NoMatchingSubscribers,
+                ),
+            ),
+            (
+                Subscribe(SubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V3_1_1,
+                EncodeError::EmptyPayload(PacketType::Subscribe),
+            ),
+            (
+                Unsubscribe(UnsubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V5,
+                EncodeError::EmptyPayload(PacketType::Unsubscribe),
+            ),
+            (
+                SubAck(SubAckPacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V3_1_1,
+                EncodeError::EmptyPayload(PacketType::SubAck),
+            ),
+            (
+                UnsubAck(UnsubAckPacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V5,
+                EncodeError::EmptyPayload(PacketType::UnsubAck),
+            ),
+            (
+                Publish(PublishPacket {
+                    topic_name: "a\0b".into(),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::NulInString,
+            ),
+            (
+                Publish(PublishPacket {
+                    properties: Some(PublishProperties {
+                        response_topic: Some(ResponseTopic::new("a/+".into())),
+                        ..Default::default()
+                    }),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::InvalidProperty(ResponseTopic::ID),
+            ),
+            (
+                Publish(PublishPacket {
+                    properties: Some(PublishProperties {
+                        topic_alias: Some(TopicAlias::new(0)),
+                        ..Default::default()
+                    }),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::InvalidProperty(TopicAlias::ID),
+            ),
+            (
+                Publish(PublishPacket {
+                    packet_id: None,
+                    ..publish()
+                }),
+                V3_1_1,
+                EncodeError::PacketIdMismatch,
+            ),
+            (
+                Publish(PublishPacket {
+                    qos_level: QoS::AtMostOnce,
+                    ..publish()
+                }),
+                V5,
+                EncodeError::PacketIdMismatch,
+            ),
+            (
+                Publish(PublishPacket {
+                    packet_id: Some(0),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::PacketIdZero,
+            ),
+            (
+                Publish(PublishPacket {
+                    dup: true,
+                    qos_level: QoS::AtMostOnce,
+                    packet_id: None,
+                    ..publish()
+                }),
+                V5,
+                EncodeError::DupAtQoS0,
+            ),
+            (
+                Publish(PublishPacket {
+                    topic_name: "a".repeat(65_536),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::TooLong,
+            ),
+            (
+                Connect(ConnectPacket {
+                    properties: Some(ConnectProperties {
+                        authentication_data: Some(AuthenticationData::new(Bytes::new())),
+                        ..Default::default()
+                    }),
+                    ..connect(V5)
+                }),
+                V5,
+                EncodeError::InvalidProperty(AuthenticationData::ID),
+            ),
+            (
+                Connect(ConnectPacket {
+                    payload: ConnectPayload {
+                        client_id: "c".into(),
+                        password: Some(Bytes::from_static(b"p")),
+                        ..Default::default()
+                    },
+                    ..connect(V3_1_1)
+                }),
+                V3_1_1,
+                EncodeError::PasswordWithoutUserName,
+            ),
+            (
+                Connect(connect(V5)),
+                V3_1_1,
+                EncodeError::UnsupportedVersion(PacketType::Connect, V3_1_1),
+            ),
+            (
+                Auth(AuthPacket {
+                    reason: ReasonCode::Success,
+                    properties: AuthProperties::default(),
+                }),
+                V3_1_1,
+                EncodeError::UnsupportedVersion(PacketType::Auth, V3_1_1),
+            ),
+        ];
+
+        for (packet, version, expected) in cases {
+            assert_refused(packet, version, expected);
+        }
+    }
+
+    #[test]
+    fn test_packet_too_large_to_frame_is_refused() {
+        // Two filters of 65,535 bytes take 131,076 bytes; enough of them
+        // pass 268,435,455
+        let filter = SubscribePayload {
+            topic_filter: "a".repeat(65_535),
+            subs_opt: SubscriptionOptions::default(),
+        };
+        let subscribe = ControlPacket::Subscribe(SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![filter; 4_100],
+        });
+        assert_refused(subscribe, ProtocolVersion::V5, EncodeError::TooLarge);
+    }
+
+    #[test]
+    fn test_valid_packets_still_encode() {
+        let packets = [
+            ControlPacket::SubAck(SubAckPacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![SubAckPayload {
+                    reason_code: ReasonCode::GrantedQoS0,
+                }],
+            }),
+            ControlPacket::UnsubAck(UnsubAckPacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![UnsubAckPayload {
+                    reason_code: ReasonCode::NoSubscriptionExisted,
+                }],
+            }),
+            ControlPacket::Unsubscribe(UnsubscribePacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![UnsubscribePayload {
+                    topic_filter: String::from("a/#"),
+                }],
+            }),
+        ];
+        for packet in packets {
+            let mut buffer = BytesMut::new();
+            packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
+            assert_eq!(
+                ControlPacket::parse(&mut buffer, ProtocolVersion::V5).unwrap(),
+                packet
             );
         }
     }

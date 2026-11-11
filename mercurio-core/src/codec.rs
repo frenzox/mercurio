@@ -7,7 +7,10 @@ use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{error::Error, reason::ReasonCode};
+use crate::{
+    error::{EncodeError, Error},
+    reason::ReasonCode,
+};
 
 /// A type that can be read from its MQTT wire encoding.
 pub trait Decoder {
@@ -26,7 +29,13 @@ pub trait Decoder {
 /// A type that can be written in its MQTT wire encoding.
 pub trait Encoder {
     /// Appends the encoded value to `buffer`.
-    fn encode(&self, buffer: &mut BytesMut);
+    ///
+    /// Fails, instead of writing bytes the receiver would refuse, when the
+    /// value can't be carried: a string or binary value over 65,535 bytes,
+    /// a string holding U+0000, a Variable Byte Integer over 268,435,455, or
+    /// a value the spec rules out. The packet encoders leave `buffer` as it
+    /// was when they fail; a smaller value may leave part of itself behind.
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError>;
 
     /// Number of bytes [`encode`](Encoder::encode) writes.
     fn encoded_size(&self) -> usize;
@@ -34,16 +43,17 @@ pub trait Encoder {
 
 /// The longest packet MQTT can frame: the fixed header byte, a four-byte
 /// Remaining Length, and the 268,435,455 bytes that length can count.
-pub const MAX_PACKET_SIZE: usize = 1 + 4 + 268_435_455;
+pub const MAX_PACKET_SIZE: usize = 1 + 4 + MAX_VARIABLE_BYTE_INTEGER as usize;
 
-/// Writes the two-byte length of a string or binary value (section 1.5.4).
-///
-/// # Panics
-///
-/// If `len` is above 65,535, which MQTT can't carry.
-fn put_length(len: usize, buffer: &mut BytesMut) {
-    let len = u16::try_from(len).expect("MQTT strings and binary data are at most 65,535 bytes");
+/// The largest value a Variable Byte Integer can carry.
+const MAX_VARIABLE_BYTE_INTEGER: u32 = 268_435_455;
+
+/// Writes the two-byte length of a string or binary value (section 1.5.4),
+/// which can't be over 65,535.
+fn put_length(len: usize, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+    let len = u16::try_from(len).map_err(|_| EncodeError::TooLong)?;
     buffer.put_u16(len);
+    Ok(())
 }
 
 fn encode_var_byte_integer(value: u32, encoded: &mut BytesMut) {
@@ -100,15 +110,16 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 /// before the last byte, and with [`ReasonCode::MalformedPacket`] when a
 /// fourth byte still has its continuation bit set or the value uses more
 /// bytes than it needs [MQTT-1.5.5-1].
-/// Values above 268,435,455 encode to five bytes, which no peer accepts;
-/// packets that large are longer than [`MAX_PACKET_SIZE`].
+/// Encoding refuses values above 268,435,455 with
+/// [`EncodeError::TooLarge`]; packets that large would be longer than
+/// [`MAX_PACKET_SIZE`].
 ///
 /// ```
 /// use bytes::BytesMut;
 /// use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
 ///
 /// let mut buffer = BytesMut::new();
-/// VariableByteInteger(321).encode(&mut buffer);
+/// VariableByteInteger(321).encode(&mut buffer).unwrap();
 /// assert_eq!(&buffer[..], &[0xc1, 0x02]);
 /// assert_eq!(VariableByteInteger::decode(&mut buffer).unwrap().0, 321);
 /// ```
@@ -116,8 +127,12 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 pub struct VariableByteInteger(pub u32);
 
 impl Encoder for VariableByteInteger {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.0 > MAX_VARIABLE_BYTE_INTEGER {
+            return Err(EncodeError::TooLarge);
+        }
         encode_var_byte_integer(self.0, buffer);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -126,8 +141,7 @@ impl Encoder for VariableByteInteger {
             128..=16383 => 2,
             16384..=2097151 => 3,
             2097152..=268435455 => 4,
-            // Too large for MQTT; encode writes five bytes, and the packet
-            // is longer than MAX_PACKET_SIZE
+            // Too large for MQTT; encode refuses it
             _ => 5,
         }
     }
@@ -139,15 +153,13 @@ impl Decoder for VariableByteInteger {
     }
 }
 
-/// Encoding panics when the value is longer than 65,535 bytes.
 impl Encoder for String {
-    fn encode(&self, buffer: &mut BytesMut) {
-        put_length(self.len(), buffer);
-        buffer.put(self.as_bytes());
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.as_str().encode(buffer)
     }
 
     fn encoded_size(&self) -> usize {
-        self.len() + mem::size_of::<u16>()
+        self.as_str().encoded_size()
     }
 }
 
@@ -172,11 +184,15 @@ impl Decoder for String {
     }
 }
 
-/// Encoding panics when the value is longer than 65,535 bytes.
-impl Encoder for &'static str {
-    fn encode(&self, buffer: &mut BytesMut) {
-        put_length(self.len(), buffer);
+/// Refuses a string over 65,535 bytes or holding U+0000 [MQTT-1.5.4-2].
+impl Encoder for str {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        if self.contains('\0') {
+            return Err(EncodeError::NulInString);
+        }
+        put_length(self.len(), buffer)?;
         buffer.put(self.as_bytes());
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -185,8 +201,9 @@ impl Encoder for &'static str {
 }
 
 impl Encoder for u8 {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         buffer.put_u8(*self);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -205,8 +222,9 @@ impl Decoder for u8 {
 }
 
 impl Encoder for u16 {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         buffer.put_u16(*self);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -225,8 +243,9 @@ impl Decoder for u16 {
 }
 
 impl Encoder for u32 {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         buffer.put_u32(*self);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -245,8 +264,9 @@ impl Decoder for u32 {
 }
 
 impl Encoder for bool {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         buffer.put_u8(*self as u8);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -269,11 +289,12 @@ impl Decoder for bool {
     }
 }
 
-/// Encoding panics when the value is longer than 65,535 bytes.
+/// Refuses binary data over 65,535 bytes.
 impl Encoder for Bytes {
-    fn encode(&self, buffer: &mut BytesMut) {
-        put_length(self.len(), buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        put_length(self.len(), buffer)?;
         buffer.extend(self);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -300,9 +321,10 @@ impl<T> Encoder for Option<T>
 where
     T: Encoder,
 {
-    fn encode(&self, buffer: &mut BytesMut) {
-        if let Some(v) = self {
-            v.encode(buffer)
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        match self {
+            Some(v) => v.encode(buffer),
+            None => Ok(()),
         }
     }
 
@@ -318,10 +340,11 @@ impl<T> Encoder for Vec<T>
 where
     T: Encoder,
 {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         for e in self {
-            e.encode(buffer);
+            e.encode(buffer)?;
         }
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -337,14 +360,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{codec::*, error::Error};
+    use crate::{
+        codec::*,
+        error::{EncodeError, Error},
+    };
 
     #[test]
     fn test_codec_encode_decode() -> crate::Result<()> {
         let value: u16 = 325;
         let mut encoded = BytesMut::new();
 
-        VariableByteInteger(value as u32).encode(&mut encoded);
+        VariableByteInteger(value as u32)
+            .encode(&mut encoded)
+            .unwrap();
         assert_eq!(encoded, Bytes::from(vec![0xc5, 0x02]));
 
         let decoded = VariableByteInteger::decode(&mut encoded)?;
@@ -382,15 +410,39 @@ mod tests {
     }
 
     #[test]
-    fn test_oversized_integer_size_matches_what_encode_writes() {
+    fn test_oversized_integer_is_refused() {
         let mut encoded = BytesMut::new();
-        VariableByteInteger(u32::MAX).encode(&mut encoded);
-        assert_eq!(VariableByteInteger(u32::MAX).encoded_size(), encoded.len());
+        assert_eq!(
+            VariableByteInteger(268_435_456).encode(&mut encoded),
+            Err(EncodeError::TooLarge)
+        );
+        assert!(encoded.is_empty());
+        VariableByteInteger(268_435_455)
+            .encode(&mut encoded)
+            .unwrap();
+        assert_eq!(encoded.len(), 4);
     }
 
     #[test]
-    #[should_panic(expected = "at most 65,535 bytes")]
-    fn test_overlong_string_is_never_truncated() {
-        "a".repeat(65_536).encode(&mut BytesMut::new());
+    fn test_overlong_string_or_binary_is_refused() {
+        let mut encoded = BytesMut::new();
+        assert_eq!(
+            "a".repeat(65_536).encode(&mut encoded),
+            Err(EncodeError::TooLong)
+        );
+        assert_eq!(
+            Bytes::from(vec![0; 65_536]).encode(&mut encoded),
+            Err(EncodeError::TooLong)
+        );
+        assert!(encoded.is_empty());
+        "a".repeat(65_535).encode(&mut encoded).unwrap();
+        assert_eq!(encoded.len(), 65_537);
+    }
+
+    #[test]
+    fn test_string_with_nul_is_refused() {
+        let mut encoded = BytesMut::new();
+        assert_eq!("a\0b".encode(&mut encoded), Err(EncodeError::NulInString));
+        assert!(encoded.is_empty());
     }
 }

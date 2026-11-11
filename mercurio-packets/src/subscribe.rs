@@ -9,7 +9,8 @@ use alloc::{string::String, vec::Vec};
 use bytes::{Buf, BufMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     error::Error,
     properties::*,
     protocol::ProtocolVersion,
@@ -29,9 +30,10 @@ pub struct SubscribeProperties {
 }
 
 impl Encoder for SubscribeProperties {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.subscription_id.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.subscription_id.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -108,7 +110,7 @@ pub struct SubscriptionOptions {
 }
 
 impl Encoder for SubscriptionOptions {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
         let mut encoded: u8 = self.qos as u8;
 
         if self.no_local {
@@ -122,6 +124,7 @@ impl Encoder for SubscriptionOptions {
         encoded |= (self.retain_handling as u8) << 4;
 
         buffer.put_u8(encoded);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -160,9 +163,10 @@ pub struct SubscribePayload {
 }
 
 impl Encoder for SubscribePayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.topic_filter.encode(buffer);
-        self.subs_opt.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.topic_filter.encode(buffer)?;
+        self.subs_opt.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -198,8 +202,18 @@ pub struct SubscribePacket {
 const PACKET_TYPE: u8 = 0x08;
 
 impl Packet for SubscribePacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
-        self.encode_inner(buffer, version.supports_properties());
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::Subscribe));
+            }
+            self.encode_inner(buffer, version.supports_properties())?;
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, version: ProtocolVersion) -> usize {
@@ -223,27 +237,32 @@ impl SubscribePacket {
         len
     }
 
-    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
+    fn encode_inner(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        with_properties: bool,
+    ) -> Result<(), EncodeError> {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
-        fixed_header.encode(buffer);
+        fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
+        crate::encode_length(self.remaining_len(with_properties), buffer)?;
 
-        self.packet_id.encode(buffer);
+        crate::encode_packet_id(self.packet_id, buffer)?;
         if with_properties {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-            self.payload.encode(buffer);
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
+            self.payload.encode(buffer)?;
         } else {
             // MQTT 3.x only has the QoS; the other option bits are reserved
             // and must be zero [MQTT-3.8.3-4]
             for sub in &self.payload {
-                sub.topic_filter.encode(buffer);
-                (sub.subs_opt.qos as u8).encode(buffer);
+                sub.topic_filter.encode(buffer)?;
+                (sub.subs_opt.qos as u8).encode(buffer)?;
             }
         }
+        Ok(())
     }
 
     fn decode_body<T: Buf>(_: u8, buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
@@ -309,7 +328,9 @@ mod tests {
             }],
         };
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(
             &encoded[..],
             [0x82, 0x06, 0x00, 0x01, 0x00, 0x01, b't', 0x01]
@@ -326,7 +347,9 @@ mod tests {
 
         let properties = SubscribeProperties {
             user_property: vec![UserProperty::new("key".to_string(), "value".to_string())].into(),
-            subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(32))),
+            subscription_id: Some(SubscriptionIdentifier::new(
+                mercurio_core::codec::VariableByteInteger(32),
+            )),
         };
 
         let subs_opt = SubscriptionOptions {
@@ -346,7 +369,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, ProtocolVersion::V5);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 

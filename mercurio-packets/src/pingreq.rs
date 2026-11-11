@@ -2,7 +2,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use mercurio_core::protocol::ProtocolVersion;
+use mercurio_core::{error::EncodeError, protocol::ProtocolVersion};
 
 use crate::{Packet, PacketType};
 
@@ -10,8 +10,11 @@ use crate::{Packet, PacketType};
 pub struct PingReqPacket {}
 
 impl Packet for PingReqPacket {
-    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) {
-        buffer.put_slice(&[0xc0, 0x00]);
+    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_slice(&[0xc0, 0x00]);
+            Ok(())
+        })
     }
 
     fn encoded_size(&self, _: ProtocolVersion) -> usize {

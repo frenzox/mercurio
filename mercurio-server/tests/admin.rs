@@ -212,7 +212,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded, self.version);
+        packet.encode(&mut encoded, self.version).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
@@ -359,7 +359,9 @@ async fn connack_reason_on<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> ReasonCode {
     let version = packet.protocol_version;
     let mut bytes = BytesMut::from(header);
-    ControlPacket::Connect(packet).encode(&mut bytes, version);
+    ControlPacket::Connect(packet)
+        .encode(&mut bytes, version)
+        .unwrap();
     stream.write_all(&bytes).await.unwrap();
     let mut buffer = BytesMut::new();
     loop {
@@ -1430,7 +1432,9 @@ async fn user_name_bans_match_the_verified_user() {
 async fn closed_unanswered(addr: SocketAddr, header: &[u8], packet: ConnectPacket) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut bytes = BytesMut::from(header);
-    ControlPacket::Connect(packet).encode(&mut bytes, ProtocolVersion::V5);
+    ControlPacket::Connect(packet)
+        .encode(&mut bytes, ProtocolVersion::V5)
+        .unwrap();
     // The broker may have closed already, which is what is checked below
     let _ = stream.write_all(&bytes).await;
     let mut answer = Vec::new();
@@ -1779,7 +1783,9 @@ async fn clients_the_peer_filter_refuses_are_closed_unanswered() {
 
     let mut stream = UnixStream::connect(&path).await.unwrap();
     let mut bytes = BytesMut::new();
-    ControlPacket::Connect(connect_packet("intruder")).encode(&mut bytes, ProtocolVersion::V5);
+    ControlPacket::Connect(connect_packet("intruder"))
+        .encode(&mut bytes, ProtocolVersion::V5)
+        .unwrap();
     // The broker may have closed it already
     let _ = stream.write_all(&bytes).await;
     let mut buffer = [0u8; 16];
