@@ -515,7 +515,8 @@ impl DynamicSecurity {
     }
 
     /// Writes a new state file with an administrator client, `admin`, whose
-    /// role may send every command and read `$SYS`.
+    /// role may send every dynamic security and broker admin command and
+    /// read `$SYS`.
     pub fn init(path: &str, admin: &str, password: &str) -> Result<(), String> {
         if Path::new(path).exists() {
             return Err(format!("{path} already exists"));
@@ -540,6 +541,9 @@ impl DynamicSecurity {
                     acl(AclType::PublishClientSend, "$CONTROL/dynamic-security/#"),
                     acl(AclType::SubscribePattern, "$CONTROL/dynamic-security/#"),
                     acl(AclType::PublishClientReceive, "$CONTROL/dynamic-security/#"),
+                    acl(AclType::PublishClientSend, "$CONTROL/broker/v1/#"),
+                    acl(AclType::SubscribePattern, "$CONTROL/broker/v1/#"),
+                    acl(AclType::PublishClientReceive, "$CONTROL/broker/v1/#"),
                     acl(AclType::SubscribePattern, "$SYS/#"),
                     acl(AclType::PublishClientReceive, "$SYS/#"),
                 ],
@@ -985,6 +989,35 @@ mod tests {
                 "authorize",
                 "on_control"
             ])
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_init_grants_the_broker_admin_api() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-broker-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        for (topic, access) in [
+            ("$CONTROL/broker/v1", Access::Write),
+            ("$CONTROL/broker/v1/listClients", Access::Write),
+            ("$CONTROL/broker/v1/response", Access::Subscribe),
+            ("$CONTROL/broker/v1/response", Access::Read),
+        ] {
+            assert_eq!(
+                security.authorize(&identity("admin"), topic, access).await,
+                Decision::Allow,
+                "{topic} {access:?}"
+            );
+        }
+        assert_eq!(
+            security
+                .authorize(&identity("other"), "$CONTROL/broker/v1", Access::Write)
+                .await,
+            Decision::Deny
         );
         std::fs::remove_file(path).unwrap();
     }
