@@ -237,6 +237,7 @@ impl ScramCredentialStore for HashMap<String, StoredCredentials> {
 pub struct ScramAuth<S: ?Sized> {
     store: Arc<S>,
     decoy_iterations: u32,
+    decoy_secret: Option<[u8; 32]>,
 }
 
 impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
@@ -244,6 +245,7 @@ impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
         ScramAuth {
             store,
             decoy_iterations: DEFAULT_ITERATIONS,
+            decoy_secret: None,
         }
     }
 
@@ -254,11 +256,20 @@ impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
         self.decoy_iterations = iterations;
         self
     }
+
+    /// The secret unknown users' salts are derived from. By default it is
+    /// random and lives as long as the process, so a restart changes those
+    /// salts while the salts of real users stay, which tells the two apart.
+    /// Give the same secret on every start to keep them stable.
+    pub fn decoy_secret(mut self, secret: [u8; 32]) -> Self {
+        self.decoy_secret = Some(secret);
+        self
+    }
 }
 
 /// The secret stand-in salts are derived from. It lives as long as the
 /// process, so a restart changes the salts of unknown users.
-fn decoy_secret() -> &'static [u8; 32] {
+fn process_secret() -> &'static [u8; 32] {
     static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
     SECRET.get_or_init(|| {
         let mut secret = [0u8; 32];
@@ -282,6 +293,7 @@ impl<S: ScramCredentialStore + ?Sized> Plugin for ScramAuth<S> {
                 store: Arc::clone(&self.store),
                 client: client.clone(),
                 decoy_iterations: self.decoy_iterations,
+                decoy_secret: self.decoy_secret,
                 state: ScramState::Start,
             }) as Box<dyn AuthExchange>
         })
@@ -292,6 +304,7 @@ struct ScramExchange<S: ?Sized> {
     store: Arc<S>,
     client: ClientInfo,
     decoy_iterations: u32,
+    decoy_secret: Option<[u8; 32]>,
     state: ScramState,
 }
 
@@ -359,7 +372,11 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
         let stored = self.store.scram_credentials(&self.client, &username).await;
         let known = stored.is_some();
         let credentials = stored.unwrap_or_else(|| {
-            StoredCredentials::decoy(decoy_secret(), &username, self.decoy_iterations)
+            let secret = self
+                .decoy_secret
+                .as_ref()
+                .unwrap_or_else(|| process_secret());
+            StoredCredentials::decoy(secret, &username, self.decoy_iterations)
         });
         match first.respond(&credentials) {
             Ok((server_first, awaiting)) => {
@@ -700,6 +717,17 @@ mod tests {
         let salt = |m: &str| m.split(',').nth(1).unwrap().to_string();
         assert_eq!(salt(&unknown), salt(&again));
         assert_ne!(salt(&unknown), salt(&known));
+    }
+
+    #[tokio::test]
+    async fn test_scram_decoy_salt_follows_the_given_secret() {
+        let salt_of = |secret: [u8; 32]| async move {
+            let auth = scram_auth().decoy_secret(secret);
+            let (first, _, _) = scram_login(&auth, "nobody", "pencil").await;
+            first.split(',').nth(1).unwrap().to_string()
+        };
+        assert_eq!(salt_of([1; 32]).await, salt_of([1; 32]).await);
+        assert_ne!(salt_of([1; 32]).await, salt_of([2; 32]).await);
     }
 
     #[tokio::test]
