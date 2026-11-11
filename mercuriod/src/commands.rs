@@ -1,16 +1,17 @@
 //! The `$CONTROL/broker/v1` commands only the daemon can serve: the ones
 //! about its configuration, files, logs and bridges.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use mercurio_server::{
-    admin::{AdminError, AdminExtension, ErrorCode},
+    admin::{Admin, AdminError, AdminExtension, ErrorCode, Paging},
     plugin::BoxFuture,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use tracing::info;
 
+use crate::bridge::BridgeStatus;
 use crate::logging::LogLevel;
 use crate::reload::{self, Reload};
 
@@ -22,11 +23,30 @@ pub struct DaemonCommands {
     /// The configuration, with its secrets redacted; None when it couldn't
     /// be shown as JSON
     config: Option<Value>,
+    bridges: Vec<Arc<BridgeStatus>>,
+    /// The broker's, once it is set up
+    admin: OnceLock<Admin>,
 }
 
 #[derive(Deserialize)]
 struct LevelArgs {
     level: String,
+}
+
+#[derive(Deserialize)]
+struct PageArgs {
+    offset: Option<usize>,
+    count: Option<usize>,
+}
+
+impl PageArgs {
+    fn paging(&self) -> Result<Paging, AdminError> {
+        let default = Paging::default();
+        Paging::new(
+            self.offset.unwrap_or(default.offset),
+            self.count.unwrap_or(default.count),
+        )
+    }
 }
 
 impl DaemonCommands {
@@ -35,6 +55,8 @@ impl DaemonCommands {
             log_level,
             reloadable: Arc::new([]),
             config: None,
+            bridges: Vec::new(),
+            admin: OnceLock::new(),
         }
     }
 
@@ -48,6 +70,34 @@ impl DaemonCommands {
     pub fn with_config(mut self, config: Option<Value>) -> Self {
         self.config = config;
         self
+    }
+
+    /// Lists `bridges`, in this order, on `listBridges`.
+    pub fn with_bridges(mut self, bridges: Vec<Arc<BridgeStatus>>) -> Self {
+        self.bridges = bridges;
+        self
+    }
+
+    /// Hands over the broker's `Admin`, which exists only once the broker
+    /// this extension is part of is set up.
+    pub fn set_admin(&self, admin: Admin) {
+        let _ = self.admin.set(admin);
+    }
+
+    async fn list_bridges(&self, args: &Value) -> Result<Value, AdminError> {
+        let paging = arguments::<PageArgs>(args)?.paging()?;
+        let mut bridges = Vec::new();
+        for status in self.bridges.iter().skip(paging.offset).take(paging.count) {
+            let queued = match self.admin.get() {
+                Some(admin) => admin
+                    .client(status.client_id())
+                    .await
+                    .map_or(0, |client| client.queued),
+                None => 0,
+            };
+            bridges.push(status.entry(queued));
+        }
+        Ok(json!({ "bridges": bridges, "totalCount": self.bridges.len() }))
     }
 
     fn reload(&self) -> Value {
@@ -71,6 +121,7 @@ impl AdminExtension for DaemonCommands {
     ) -> BoxFuture<'a, Option<Result<Value, AdminError>>> {
         Box::pin(async move {
             Some(match command {
+                "listBridges" => self.list_bridges(args).await,
                 "getLogLevel" => Ok(json!({ "level": self.log_level.get() })),
                 "setLogLevel" => self.set_log_level(args),
                 "reload" => Ok(self.reload()),
@@ -104,6 +155,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::DaemonCommands;
+    use crate::bridge::{self, BridgeStatus};
+    use crate::config::BridgeConfig;
     use crate::logging::LogLevel;
     use crate::reload::{Reload, Reloadable};
 
@@ -111,12 +164,13 @@ mod tests {
     async fn start(commands: Arc<DaemonCommands>, local_listener: LocalListener) {
         let mut config = ServerConfig::default();
         config.local_listener = Some(local_listener);
-        let extension: Arc<dyn AdminExtension> = commands;
+        let extension: Arc<dyn AdminExtension> = commands.clone();
         config.admin_extension = Some(extension);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
             .await
             .unwrap();
+        commands.set_admin(server.admin());
         tokio::spawn(server.run(std::future::pending::<()>()));
     }
 
@@ -239,5 +293,99 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn test_list_bridges_pages_in_configuration_order() {
+        let statuses = vec![
+            Arc::new(BridgeStatus::new("a", "mercurio-bridge-a")),
+            Arc::new(BridgeStatus::new("b", "mercurio-bridge-b")),
+        ];
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let commands = DaemonCommands::new(log_level).with_bridges(statuses);
+        let all = commands
+            .handle("listBridges", &json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all["totalCount"], 2);
+        assert_eq!(all["bridges"][0]["name"], "a");
+        assert_eq!(all["bridges"][1]["queued"], 0);
+        let second = commands
+            .handle("listBridges", &json!({ "offset": 1, "count": 1 }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second["bridges"].as_array().unwrap().len(), 1);
+        assert_eq!(second["bridges"][0]["name"], "b");
+        assert_eq!(second["totalCount"], 2);
+        let error = commands
+            .handle("listBridges", &json!({ "count": 1001 }))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    /// Polls `listBridges` until its first bridge satisfies `done`.
+    async fn bridges_when(commands: &DaemonCommands, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let listed = commands
+                .handle("listBridges", &json!({}))
+                .await
+                .unwrap()
+                .unwrap();
+            if done(&listed["bridges"][0]) {
+                return listed;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out: {listed}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_list_bridges_follows_a_real_bridge() {
+        let remote = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = remote.local_addr().unwrap().port();
+        let (stop_remote, stopped) = tokio::sync::oneshot::channel::<()>();
+        let remote = tokio::spawn(mercurio_server::server::run(remote, async move {
+            let _ = stopped.await;
+        }));
+
+        let config: BridgeConfig = toml::from_str(&format!(
+            "name = \"cloud\"\nhost = \"127.0.0.1\"\nport = {port}\n[[topics]]\npattern = \"a/#\"\n"
+        ))
+        .unwrap();
+        let (connector, local_listener) = LocalConnector::new();
+        let status = bridge::spawn(config, connector.clone()).unwrap();
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let commands = Arc::new(DaemonCommands::new(log_level).with_bridges(vec![status]));
+        start(Arc::clone(&commands), local_listener).await;
+
+        let listed = bridges_when(&commands, |b| b["connected"] == true).await;
+        assert_eq!(listed["totalCount"], 1);
+        let bridge = &listed["bridges"][0];
+        assert_eq!(bridge["name"], "cloud");
+        assert_eq!(bridge["remoteAddress"], format!("127.0.0.1:{port}"));
+        assert!(bridge["connectedSince"].is_u64(), "{bridge}");
+        assert_eq!(bridge["queued"], 0);
+
+        // Also served through the broker
+        let response = request(&connector, json!({ "command": "listBridges" })).await;
+        assert_eq!(
+            response["data"]["bridges"][0]["connected"], true,
+            "{response}"
+        );
+
+        stop_remote.send(()).unwrap();
+        remote.await.unwrap().unwrap();
+        let listed = bridges_when(&commands, |b| b["connected"] == false).await;
+        let bridge = &listed["bridges"][0];
+        assert!(bridge["disconnectedSince"].is_u64(), "{bridge}");
+        assert_eq!(bridge["remoteAddress"], format!("127.0.0.1:{port}"));
     }
 }

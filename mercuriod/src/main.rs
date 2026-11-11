@@ -1,6 +1,7 @@
 //! Mercuriod - MQTT broker daemon
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,14 +12,17 @@ use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
 use mercurio_server::admin::AdminExtension;
+use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
-    ServerConfig, Socket, Transport,
+    Server, ServerConfig, Socket, Transport,
 };
 use mercurio_storage::{
+    memory::MemoryStore,
     postgres::{DatabaseLock, PostgresStore},
     sqlite::SqliteStore,
+    MqttStore,
 };
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
@@ -302,16 +306,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (connector, local_listener) = LocalConnector::new();
     let plugins = chain(&builtins, None);
 
-    for bridge in config.bridges {
-        info!("Starting bridge {}", bridge.name);
-        bridge::spawn(bridge, connector.clone())?;
-    }
+    let bridges = config
+        .bridges
+        .into_iter()
+        .map(|bridge| {
+            info!("Starting bridge {}", bridge.name);
+            bridge::spawn(bridge, connector.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
     let commands = Arc::new(
         commands::DaemonCommands::new(log_level)
             .with_reload(Arc::clone(&reloadable))
-            .with_config(shown_config),
+            .with_config(shown_config)
+            .with_bridges(bridges),
     );
 
     let mut server_config = ServerConfig::default();
@@ -331,18 +340,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match config.storage {
         StorageConfig::Memory => {
-            mercurio_server::server::run_with_config(listener, server_config, shutdown).await
+            let storage = Arc::new(MemoryStore::new());
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
-                .await
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            mercurio_server::server::run_with_storage(listener, server_config, storage, shutdown)
-                .await
+            serve(listener, server_config, storage, &commands, shutdown).await
         }
     };
     // Removed now, as exiting skips destructors
@@ -362,6 +370,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// Sets the broker up, hands its `Admin` to the daemon's commands, and
+/// serves until `shutdown`.
+async fn serve<St: MqttStore + 'static>(
+    listener: TcpListener,
+    config: ServerConfig,
+    storage: Arc<St>,
+    commands: &commands::DaemonCommands,
+    shutdown: impl Future,
+) -> Result<(), ServerError> {
+    let server = Server::new(listener, config, storage).await?;
+    commands.set_admin(server.admin());
+    server.run(shutdown).await
 }
 
 /// `host:port`, with an IPv6 host in brackets.
