@@ -18,7 +18,10 @@ use bytes::Bytes;
 
 use mercurio_core::reason::ReasonCode;
 pub use mercurio_scram::StoredCredentials;
-use mercurio_scram::{AwaitingProof, ClientFirst, ServerError, DEFAULT_ITERATIONS, MECHANISM};
+use mercurio_scram::{
+    AwaitingProof, ClientFirst, RequestedBinding, ServerError, DEFAULT_ITERATIONS, MECHANISM,
+    MECHANISM_PLUS,
+};
 use tracing::warn;
 
 use crate::plugin::{
@@ -222,8 +225,9 @@ impl ScramCredentialStore for HashMap<String, StoredCredentials> {
     }
 }
 
-/// SCRAM-SHA-256 enhanced authentication (RFC 5802, RFC 7677), method
-/// `SCRAM-SHA-256`, without channel binding.
+/// SCRAM-SHA-256 enhanced authentication (RFC 5802, RFC 7677), methods
+/// `SCRAM-SHA-256` and, on TLS 1.3 connections, `SCRAM-SHA-256-PLUS` with
+/// the tls-exporter channel binding (RFC 9266).
 ///
 /// The client proves it knows the password without sending it, and the
 /// broker proves it knows the credentials: its final message, sent as the
@@ -238,6 +242,7 @@ pub struct ScramAuth<S: ?Sized> {
     store: Arc<S>,
     decoy_iterations: u32,
     decoy_secret: Option<[u8; 32]>,
+    require_channel_binding: bool,
 }
 
 impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
@@ -246,7 +251,17 @@ impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
             store,
             decoy_iterations: DEFAULT_ITERATIONS,
             decoy_secret: None,
+            require_channel_binding: false,
         }
+    }
+
+    /// Refuses `SCRAM-SHA-256` on connections that can bind to the channel
+    /// (TLS 1.3), so those clients must use `SCRAM-SHA-256-PLUS`.
+    /// Connections that can't, such as plain TCP, Unix sockets and TLS 1.2,
+    /// are not affected; restricting them is up to the listener.
+    pub fn require_channel_binding(mut self, require: bool) -> Self {
+        self.require_channel_binding = require;
+        self
     }
 
     /// The iteration count announced for unknown users; by default
@@ -288,15 +303,21 @@ impl<S: ScramCredentialStore + ?Sized> Plugin for ScramAuth<S> {
     }
 
     fn begin_auth(&self, client: &ClientInfo, method: &str) -> Option<Box<dyn AuthExchange>> {
-        (method == MECHANISM).then(|| {
-            Box::new(ScramExchange {
-                store: Arc::clone(&self.store),
-                client: client.clone(),
-                decoy_iterations: self.decoy_iterations,
-                decoy_secret: self.decoy_secret,
-                state: ScramState::Start,
-            }) as Box<dyn AuthExchange>
-        })
+        let exporter = client.connection.as_ref().and_then(|c| c.tls_exporter);
+        let plus = match method {
+            MECHANISM => false,
+            MECHANISM_PLUS if exporter.is_some() => true,
+            _ => return None,
+        };
+        Some(Box::new(ScramExchange {
+            store: Arc::clone(&self.store),
+            client: client.clone(),
+            decoy_iterations: self.decoy_iterations,
+            decoy_secret: self.decoy_secret,
+            plus,
+            require_channel_binding: self.require_channel_binding,
+            state: ScramState::Start,
+        }) as Box<dyn AuthExchange>)
     }
 }
 
@@ -305,6 +326,9 @@ struct ScramExchange<S: ?Sized> {
     client: ClientInfo,
     decoy_iterations: u32,
     decoy_secret: Option<[u8; 32]>,
+    /// Whether the method is `SCRAM-SHA-256-PLUS`
+    plus: bool,
+    require_channel_binding: bool,
     state: ScramState,
 }
 
@@ -368,6 +392,20 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
             Ok(first) => first,
             Err(error) => return scram_refusal(error),
         };
+        let exporter = self.client.connection.as_ref().and_then(|c| c.tls_exporter);
+        let binding = first.binding();
+        if self.plus != (binding == RequestedBinding::TlsExporter) {
+            return AuthResult::Failed {
+                reason: ReasonCode::BadAuthenticationMethod,
+                reason_string: Some("the method and the channel binding flag disagree".into()),
+            };
+        }
+        if !self.plus && self.require_channel_binding && exporter.is_some() {
+            return AuthResult::Failed {
+                reason: ReasonCode::BadAuthenticationMethod,
+                reason_string: Some("channel binding is required".into()),
+            };
+        }
         let username = first.username().to_string();
         let stored = self.store.scram_credentials(&self.client, &username).await;
         let known = stored.is_some();
@@ -378,7 +416,7 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
                 .unwrap_or_else(|| process_secret());
             StoredCredentials::decoy(secret, &username, self.decoy_iterations)
         });
-        match first.respond(&credentials, None) {
+        match first.respond(&credentials, exporter.as_ref()) {
             Ok((server_first, awaiting)) => {
                 self.state = ScramState::AwaitingProof {
                     awaiting,
