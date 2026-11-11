@@ -13,7 +13,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
@@ -88,35 +88,27 @@ impl Decoder for SubAckPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubAckPacket {
-    /// Selects the wire format on encode. `decode` sets `V5`, and
-    /// `decode_v3` sets `V3_1_1`.
-    /// [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
-    /// sets the version it is given.
-    pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
+    /// MQTT 5 only.
     pub properties: Option<SubAckProperties>,
     pub payload: Vec<SubAckPayload>,
 }
 
 const PACKET_TYPE: u8 = 0x09;
 
-impl Encoder for SubAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+impl Packet for SubAckPacket {
+    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
         // Fixed header
         let fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header.encode(buffer);
 
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
+        if version.supports_properties() {
             VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
-        }
-
-        if self.protocol_version.supports_reason_codes() {
             self.payload.encode(buffer);
         } else {
             // MQTT 3.x only has the granted QoS return codes and 0x80 for failure
@@ -132,40 +124,43 @@ impl Encoder for SubAckPacket {
         }
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len())
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version))
     }
-}
 
-impl SubAckPacket {
-    fn remaining_len(&self) -> usize {
-        // Every return code is one byte, in MQTT 3.x as in MQTT 5
-        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
-        if self.protocol_version.supports_properties() {
-            len += crate::property_list_size(&self.properties);
-        }
-        len
-    }
-}
-
-impl Decoder for SubAckPacket {
-    /// Decodes a SUBACK packet assuming MQTT 5.0 format.
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::SubAck, version, |_, buffer| {
             let packet_id = crate::decode_packet_id(buffer)?;
-            let properties = crate::present(SubAckProperties::decode(buffer)?);
+            let properties = if version.supports_properties() {
+                crate::present(SubAckProperties::decode(buffer)?)
+            } else {
+                None
+            };
 
+            // One code per filter of the SUBSCRIBE, which has at least one
             if !buffer.has_remaining() {
                 return Err(ReasonCode::ProtocolError.into());
             }
 
             let mut payload = Vec::new();
             while buffer.has_remaining() {
-                payload.push(SubAckPayload::decode(buffer)?);
+                let reason_code = if version.supports_reason_codes() {
+                    crate::decode_reason(buffer, PacketType::SubAck)?
+                } else {
+                    // MQTT 3.x return codes: the granted QoS, or 0x80
+                    match u8::decode(buffer)? {
+                        0x00 => ReasonCode::GrantedQoS0,
+                        0x01 => ReasonCode::GrantedQoS1,
+                        0x02 => ReasonCode::GrantedQoS2,
+                        0x80 => ReasonCode::UnspecifiedError,
+                        // Reserved [MQTT-3.9.3-2]
+                        _ => return Err(ReasonCode::MalformedPacket.into()),
+                    }
+                };
+                payload.push(SubAckPayload { reason_code });
             }
 
             Ok(SubAckPacket {
-                protocol_version: ProtocolVersion::V5,
                 packet_id,
                 properties,
                 payload,
@@ -175,46 +170,13 @@ impl Decoder for SubAckPacket {
 }
 
 impl SubAckPacket {
-    /// Decodes a SUBACK packet in MQTT 3.x format.
-    /// MQTT 3.x SUBACK: packet_id + return codes (no properties)
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
-            Self::decode_v3_body(buffer)
-        })
-    }
-
-    fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let packet_id = crate::decode_packet_id(buffer)?;
-
-        // One return code per filter of the SUBSCRIBE, which has at least
-        // one, as in MQTT 5
-        if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError.into());
+    fn remaining_len(&self, version: ProtocolVersion) -> usize {
+        // Every return code is one byte, in MQTT 3.x as in MQTT 5
+        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
+        if version.supports_properties() {
+            len += crate::property_list_size(&self.properties);
         }
-
-        // No properties in MQTT 3.x
-        // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure
-        let mut payload = Vec::new();
-
-        while buffer.has_remaining() {
-            let return_code = u8::decode(buffer)?;
-            let reason_code = match return_code {
-                0x00 => ReasonCode::GrantedQoS0,
-                0x01 => ReasonCode::GrantedQoS1,
-                0x02 => ReasonCode::GrantedQoS2,
-                0x80 => ReasonCode::UnspecifiedError,
-                // Reserved [MQTT-3.9.3-2]
-                _ => return Err(ReasonCode::MalformedPacket.into()),
-            };
-            payload.push(SubAckPayload { reason_code });
-        }
-
-        Ok(SubAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1,
-            packet_id,
-            properties: None,
-            payload,
-        })
+        len
     }
 }
 
@@ -223,7 +185,6 @@ mod tests {
     #[test]
     fn test_v3_encode_maps_failures_to_0x80() {
         let packet = SubAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1,
             packet_id: 1,
             properties: None,
             payload: vec![
@@ -237,7 +198,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer);
+        packet.encode(&mut buffer, ProtocolVersion::V3_1_1);
         assert_eq!(&buffer[..], &[0x90, 0x04, 0x00, 0x01, 0x01, 0x80]);
     }
 
@@ -248,7 +209,7 @@ mod tests {
     #[test]
     fn test_v5_decode_reads_0x00_as_granted_qos_0() {
         let mut bytes = Bytes::from_static(&[0x90, 0x04, 0x00, 0x01, 0x00, 0x00]);
-        let packet = SubAckPacket::decode(&mut bytes).unwrap();
+        let packet = SubAckPacket::decode(&mut bytes, ProtocolVersion::V5).unwrap();
         assert_eq!(packet.payload[0].reason_code, ReasonCode::GrantedQoS0);
     }
 
@@ -257,7 +218,6 @@ mod tests {
         let expected = vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x01];
 
         let packet = SubAckPacket {
-            protocol_version: ProtocolVersion::V5,
             packet_id: 1,
             properties: None,
             payload: vec![SubAckPayload {
@@ -266,13 +226,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = SubAckPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            SubAckPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

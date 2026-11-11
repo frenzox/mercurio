@@ -17,7 +17,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 /// The Connect Flags byte (section 3.1.2.3). It says which optional fields
 /// of the payload follow, so [`ConnectPacket`] derives it from the payload
@@ -388,8 +388,10 @@ pub struct ConnectPacket {
 
 const PACKET_TYPE: u8 = 0x01;
 
-impl Encoder for ConnectPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
+/// A CONNECT names its own protocol version, `protocol_version`; it is
+/// what decoding reads, whatever version is passed in.
+impl Packet for ConnectPacket {
+    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) {
         let protocol_name = self.protocol_version.protocol_name();
         let protocol_level = self.protocol_version.protocol_level();
 
@@ -412,8 +414,14 @@ impl Encoder for ConnectPacket {
         self.payload.encode(buffer, self.protocol_version);
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, _: ProtocolVersion) -> usize {
         crate::packet_size(self.remaining_len())
+    }
+
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Connect, version, |_, body| {
+            Self::decode_body(body)
+        })
     }
 }
 
@@ -431,17 +439,7 @@ impl ConnectPacket {
 
         len + self.payload.encoded_size(self.protocol_version)
     }
-}
 
-impl Decoder for ConnectPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Connect, |_, body| {
-            Self::decode_body(body)
-        })
-    }
-}
-
-impl ConnectPacket {
     fn decode_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // Parse protocol name and level to determine version
         let protocol_name = String::decode(buffer)?;
@@ -522,11 +520,11 @@ mod tests {
             },
         };
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, packet.protocol_version);
         // User name, will retain, will QoS 2 and will flag
         assert_eq!(encoded[9], 0b1011_0100);
         assert_eq!(
-            ConnectPacket::decode(&mut encoded.freeze()).unwrap(),
+            ConnectPacket::decode(&mut encoded.freeze(), ProtocolVersion::V5).unwrap(),
             packet
         );
     }
@@ -553,13 +551,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, packet.protocol_version);
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -607,13 +606,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, packet.protocol_version);
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -641,12 +641,13 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, packet.protocol_version);
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -665,7 +666,8 @@ mod tests {
         ];
 
         let mut bytes = Bytes::from(input);
-        let packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
 
         assert_eq!(packet.protocol_version, ProtocolVersion::V3_1);
         assert!(packet.clean_start);

@@ -3,8 +3,11 @@ mod common;
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use mercurio_core::{codec::Encoder, properties::MessageExpiryInterval, qos::QoS};
-use mercurio_packets::publish::{PublishPacket, PublishProperties};
+use mercurio_core::{properties::MessageExpiryInterval, protocol::ProtocolVersion, qos::QoS};
+use mercurio_packets::{
+    publish::{PublishPacket, PublishProperties},
+    Packet,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -46,7 +49,7 @@ async fn expired_retained_message_is_not_delivered() {
         ..Default::default()
     };
     let mut encoded = BytesMut::new();
-    publish.encode(&mut encoded);
+    publish.encode(&mut encoded, ProtocolVersion::V5);
     publisher.write_all(&encoded).await.unwrap();
 
     sleep(Duration::from_millis(1500)).await;

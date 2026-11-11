@@ -4,8 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder, properties::SessionExpiryInterval, protocol::ProtocolVersion, qos::QoS,
-    reason::ReasonCode,
+    properties::SessionExpiryInterval, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode,
 };
 use mercurio_packets::{
     connack::ConnAckPacket,
@@ -250,7 +249,7 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
         self.stream.write_all(&encoded).await.unwrap();
     }
 
@@ -258,8 +257,7 @@ impl Client {
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
             if ControlPacket::check(&self.buffer).is_ok() {
-                let packet =
-                    ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5);
+                let packet = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5);
                 return Some(packet.unwrap());
             }
             match timeout(

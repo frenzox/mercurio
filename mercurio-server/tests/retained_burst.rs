@@ -3,8 +3,8 @@ mod common;
 use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use mercurio_core::{codec::Encoder, protocol::ProtocolVersion, qos::QoS};
-use mercurio_packets::{publish::PublishPacket, ControlPacket};
+use mercurio_core::{protocol::ProtocolVersion, qos::QoS};
+use mercurio_packets::{publish::PublishPacket, ControlPacket, Packet};
 use mercurio_server::server::{Limits, QueueLimits, ServerConfig};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -49,7 +49,7 @@ async fn connect(addr: SocketAddr, client_id: u8) -> TcpStream {
 async fn next_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> Option<ControlPacket> {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return Some(ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap());
+            return Some(ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap());
         }
         match timeout(Duration::from_millis(500), stream.read_buf(buffer)).await {
             Ok(read) => assert_ne!(read.unwrap(), 0, "connection closed"),
@@ -72,7 +72,7 @@ async fn retain_many(addr: SocketAddr, qos: QoS) {
             properties: None,
             payload: Some(Bytes::from(i.to_string())),
         }
-        .encode(&mut packets);
+        .encode(&mut packets, ProtocolVersion::V5);
     }
     publisher.write_all(&packets).await.unwrap();
     // PINGREQ, answered once every PUBLISH before it was handled

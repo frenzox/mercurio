@@ -9,10 +9,11 @@ use bytes::{Buf, BufMut, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PubRelProperties {
@@ -64,55 +65,40 @@ pub struct PubRelPacket {
     pub properties: Option<PubRelProperties>,
 }
 
-const PACKET_TYPE: u8 = 0x06;
+const FIRST_BYTE: u8 = 0x62;
 
-impl Encoder for PubRelPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        buffer.put_u8((PACKET_TYPE << 4) | 0x02);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+impl Packet for PubRelPacket {
+    /// In MQTT 3.x only the packet id is written: the reason code and
+    /// properties don't exist there.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
+        buffer.put_u8(FIRST_BYTE);
+        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
-        if self.has_reason() {
+        if self.has_reason(version) {
             self.reason.encode(buffer);
             VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
         }
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len())
-    }
-}
-
-impl PubRelPacket {
-    /// Whether the reason and properties are written: they are left out
-    /// when the reason is `Success` and there are no properties.
-    fn has_reason(&self) -> bool {
-        self.properties.is_some() || self.reason != ReasonCode::Success
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version))
     }
 
-    fn remaining_len(&self) -> usize {
-        let mut len = self.packet_id.encoded_size();
-        if self.has_reason() {
-            len += self.reason.encoded_size() + crate::property_list_size(&self.properties);
-        }
-        len
-    }
-}
-
-impl Decoder for PubRelPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::PubRel, |_, buffer| {
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::PubRel, version, |_, buffer| {
             let packet_id = crate::decode_packet_id(buffer)?;
 
-            // Reason and properties may be left out (section 3.4.2.1)
-            let reason = if buffer.has_remaining() {
+            // Reason and properties may be left out (section 3.6.2.1), and
+            // MQTT 3.x has neither
+            let reason = if version.supports_reason_codes() && buffer.has_remaining() {
                 crate::decode_reason(buffer, PacketType::PubRel)?
             } else {
                 ReasonCode::Success
             };
-            let properties = if buffer.has_remaining() {
+            let properties = if version.supports_properties() && buffer.has_remaining() {
                 crate::present(PubRelProperties::decode(buffer)?)
             } else {
                 None
@@ -126,16 +112,31 @@ impl Decoder for PubRelPacket {
         })
     }
 }
+
+impl PubRelPacket {
+    /// Whether the reason and properties are written: in MQTT 5, unless the
+    /// reason is `Success` and there are no properties.
+    fn has_reason(&self, version: ProtocolVersion) -> bool {
+        version.supports_reason_codes()
+            && (self.properties.is_some() || self.reason != ReasonCode::Success)
+    }
+
+    fn remaining_len(&self, version: ProtocolVersion) -> usize {
+        let mut len = self.packet_id.encoded_size();
+        if self.has_reason(version) {
+            len += self.reason.encoded_size() + crate::property_list_size(&self.properties);
+        }
+        len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
 
-    use mercurio_core::{
-        codec::{Decoder, Encoder},
-        reason::ReasonCode,
-    };
+    use mercurio_core::{protocol::ProtocolVersion, reason::ReasonCode};
 
-    use crate::pubrel::PubRelPacket;
+    use crate::{pubrel::PubRelPacket, Packet};
 
     #[test]
     fn test_pubrel_packet_encode_decode() {
@@ -148,13 +149,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PubRelPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            PubRelPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

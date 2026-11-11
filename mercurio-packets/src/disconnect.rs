@@ -9,10 +9,11 @@ use bytes::{Buf, BufMut, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
@@ -69,58 +70,44 @@ impl Decoder for DisconnectProperties {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
     /// Decodes as `NormalDisconnection` when left out or 0x00. Not encoded in
-    /// MQTT 3.x, see [`Self::encode_v3`].
+    /// MQTT 3.x.
     pub reason: ReasonCode,
     pub properties: Option<DisconnectProperties>,
 }
 
 const PACKET_TYPE: u8 = 0x0e;
 
-impl Encoder for DisconnectPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
+impl Packet for DisconnectPacket {
+    /// MQTT 3.x has no variable header: the reason and properties are left
+    /// out.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
         buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
 
-        self.reason.encode(buffer);
-        if self.properties.is_some() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
+        if version.supports_reason_codes() {
+            self.reason.encode(buffer);
+            if self.properties.is_some() {
+                VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+                self.properties.encode(buffer);
+            }
         }
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len())
-    }
-}
-
-impl DisconnectPacket {
-    fn remaining_len(&self) -> usize {
-        let mut len = self.reason.encoded_size();
-        if self.properties.is_some() {
-            len += crate::property_list_size(&self.properties);
-        }
-        len
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version))
     }
 
-    /// Encodes a DISCONNECT packet in MQTT 3.x format, which has no
-    /// variable header.
-    pub fn encode_v3(&self, buffer: &mut BytesMut) {
-        buffer.put_u8(PACKET_TYPE << 4);
-        buffer.put_u8(0);
-    }
-}
-
-impl Decoder for DisconnectPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Disconnect, |_, buffer| {
-            // A reason left out is a normal disconnection
-            let reason = if buffer.has_remaining() {
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Disconnect, version, |_, buffer| {
+            // A reason left out is a normal disconnection, and MQTT 3.x
+            // never has one
+            let reason = if version.supports_reason_codes() && buffer.has_remaining() {
                 crate::decode_reason(buffer, PacketType::Disconnect)?
             } else {
                 ReasonCode::NormalDisconnection
             };
 
-            let properties = if buffer.has_remaining() {
+            let properties = if version.supports_properties() && buffer.has_remaining() {
                 crate::present(DisconnectProperties::decode(buffer)?)
             } else {
                 None
@@ -131,6 +118,19 @@ impl Decoder for DisconnectPacket {
     }
 }
 
+impl DisconnectPacket {
+    fn remaining_len(&self, version: ProtocolVersion) -> usize {
+        if !version.supports_reason_codes() {
+            return 0;
+        }
+        let mut len = self.reason.encoded_size();
+        if self.properties.is_some() {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,14 +138,10 @@ mod tests {
     #[test]
     fn test_reason_zero_reads_the_same_sent_or_left_out() {
         use crate::ControlPacket;
-        use mercurio_core::protocol::ProtocolVersion;
 
         for encoded in [&[0xe0, 0x00][..], &[0xe0, 0x01, 0x00]] {
-            let packet = ControlPacket::parse_with_version(
-                &mut BytesMut::from(encoded),
-                ProtocolVersion::V5,
-            )
-            .unwrap();
+            let packet =
+                ControlPacket::parse(&mut BytesMut::from(encoded), ProtocolVersion::V5).unwrap();
             assert_eq!(
                 packet,
                 ControlPacket::Disconnect(DisconnectPacket {
@@ -167,20 +163,23 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer);
-        assert_eq!(DisconnectPacket::decode(&mut buffer).unwrap(), packet);
+        packet.encode(&mut buffer, ProtocolVersion::V5);
+        assert_eq!(
+            DisconnectPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap(),
+            packet
+        );
         assert!(buffer.is_empty());
     }
 
     #[test]
     fn test_encode_v3_has_no_variable_header() {
         let packet = DisconnectPacket {
-            reason: ReasonCode::NormalDisconnection,
+            reason: ReasonCode::ServerShuttingDown,
             properties: None,
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode_v3(&mut buffer);
+        packet.encode(&mut buffer, ProtocolVersion::V3_1_1);
         assert_eq!(&buffer[..], &[0xe0, 0x00]);
     }
 }

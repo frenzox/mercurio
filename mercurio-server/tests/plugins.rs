@@ -2,7 +2,6 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder,
     properties::{CorrelationData, ResponseTopic, UserProperty},
     protocol::ProtocolVersion,
     qos::QoS,
@@ -70,15 +69,13 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
         self.stream.write_all(&encoded).await.unwrap();
     }
 
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
-            if let Ok(packet) =
-                ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5)
-            {
+            if let Ok(packet) = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5) {
                 return Some(packet);
             }
             let read = timeout(

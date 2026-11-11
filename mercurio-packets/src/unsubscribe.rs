@@ -9,10 +9,11 @@ use bytes::Buf;
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
@@ -87,33 +88,23 @@ pub struct UnsubscribePacket {
 
 const PACKET_TYPE: u8 = 0x0a;
 
-impl Encoder for UnsubscribePacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.encode_inner(buffer, true);
+impl Packet for UnsubscribePacket {
+    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
+        self.encode_inner(buffer, version.supports_properties());
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len(true))
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version.supports_properties()))
     }
-}
 
-impl Decoder for UnsubscribePacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, true)
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Unsubscribe, version, |flags, body| {
+            Self::decode_body(flags, body, version.supports_properties())
+        })
     }
 }
 
 impl UnsubscribePacket {
-    /// Encodes the packet in MQTT 3.x format (no properties).
-    pub fn encode_v3(&self, buffer: &mut bytes::BytesMut) {
-        self.encode_inner(buffer, false);
-    }
-
-    /// Decodes the packet in MQTT 3.x format (no properties).
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, false)
-    }
-
     fn remaining_len(&self, with_properties: bool) -> usize {
         let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
         if with_properties {
@@ -138,13 +129,7 @@ impl UnsubscribePacket {
         self.payload.encode(buffer);
     }
 
-    fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Unsubscribe, |_, body| {
-            Self::decode_body(body, with_properties)
-        })
-    }
-
-    fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
+    fn decode_body<T: Buf>(_: u8, buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         let packet_id = crate::decode_packet_id(buffer)?;
         let properties = if with_properties {
             crate::present(UnsubscribeProperties::decode(buffer)?)
@@ -194,13 +179,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = UnsubscribePacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            UnsubscribePacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

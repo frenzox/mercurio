@@ -57,7 +57,7 @@ async fn protocol_violation_is_explained_before_closing() {
     assert_eq!(common::disconnect_reason(&disconnect), 0x90);
     let mut buffer = bytes::BytesMut::from(&disconnect[..]);
     let Ok(mercurio_packets::ControlPacket::Disconnect(packet)) =
-        mercurio_packets::ControlPacket::parse_with_version(
+        mercurio_packets::ControlPacket::parse(
             &mut buffer,
             mercurio_core::protocol::ProtocolVersion::V5,
         )

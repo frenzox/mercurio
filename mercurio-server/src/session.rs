@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::CONNECTIONS;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
@@ -18,7 +18,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    codec::{Encoder, VariableByteInteger},
+    codec::VariableByteInteger,
     message::{unix_millis, Message, MessageOrigin, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
@@ -47,7 +47,7 @@ use mercurio_packets::{
     subscribe::RetainHandling,
     unsuback::{UnsubAckPacket, UnsubAckPayload},
     unsubscribe::UnsubscribePacket,
-    ControlPacket,
+    ControlPacket, Packet,
 };
 
 use crate::{
@@ -637,9 +637,6 @@ impl Session {
             session.max_subscriptions = limits.max_subscriptions;
             session.max_topic_filter_length = limits.max_topic_filter_length;
             session.max_retained_messages = limits.max_retained_messages;
-
-            // Set protocol version from the CONNECT packet
-            ack.protocol_version = session.connect_packet.protocol_version;
 
             // CONNACK properties only exist in MQTT 5.0
             if session
@@ -1425,7 +1422,6 @@ impl Session {
 
         let mut session = self.shared.state.lock().await;
         let mut ack = SubAckPacket {
-            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -1536,7 +1532,6 @@ impl Session {
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
-            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -2141,9 +2136,7 @@ impl State {
     /// Whether `publish` is larger than the client accepts.
     fn too_big(&self, publish: &PublishPacket) -> bool {
         self.client_maximum_packet_size().is_some_and(|maximum| {
-            let mut encoded = BytesMut::new();
-            publish.encode(&mut encoded);
-            encoded.len() > maximum
+            publish.encoded_size(self.connect_packet.protocol_version) > maximum
         })
     }
 
@@ -3413,9 +3406,7 @@ mod tests {
         let ControlPacket::Publish(publish) = packet else {
             panic!("Expected Publish");
         };
-        let mut encoded = BytesMut::new();
-        publish.encode(&mut encoded);
-        encoded.len()
+        publish.encoded_size(ProtocolVersion::V5)
     }
 
     #[tokio::test]

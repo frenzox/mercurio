@@ -14,7 +14,7 @@ use arbitrary::Arbitrary;
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, VariableByteInteger},
     properties::*,
     protocol::{PacketType, ProtocolVersion},
     qos::QoS,
@@ -333,7 +333,6 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::ConnAck(ConnAckPacket {
-                protocol_version: version,
                 flags: ConnAckFlags { session_present },
                 reason_code,
                 properties,
@@ -525,7 +524,6 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::SubAck(SubAckPacket {
-                protocol_version: version,
                 packet_id: packet_id(id),
                 properties,
                 payload,
@@ -585,7 +583,6 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::UnsubAck(UnsubAckPacket {
-                protocol_version: version,
                 packet_id: packet_id(id),
                 properties,
                 payload,
@@ -660,12 +657,10 @@ fuzz_target!(|input: (Version, Packet)| {
     };
 
     let mut encoded = BytesMut::new();
-    packet.encode_with_version(&mut encoded, version);
-    if version == ProtocolVersion::V5 {
-        assert_eq!(encoded.len(), packet.encoded_size(), "{packet:?}");
-    }
+    packet.encode(&mut encoded, version);
+    assert_eq!(encoded.len(), packet.encoded_size(version), "{packet:?}");
 
-    let decoded = ControlPacket::parse_with_version(&mut encoded, version)
+    let decoded = ControlPacket::parse(&mut encoded, version)
         .unwrap_or_else(|e| panic!("{packet:?} encodes to a packet that fails with {e:?}"));
     assert_eq!(decoded, packet);
     assert!(encoded.is_empty(), "encoding wrote more than one packet");

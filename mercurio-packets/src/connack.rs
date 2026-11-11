@@ -14,7 +14,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
@@ -231,47 +231,61 @@ impl From<ReasonCode> for ConnAckReturnCode {
 
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
-    /// Selects the wire format on encode: in MQTT 3.x a return code and no
-    /// properties. `decode` sets `V5`, and `decode_v3` sets `V3_1_1` for both
-    /// 3.1 and 3.1.1. [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
-    /// sets the version it is given.
-    pub protocol_version: ProtocolVersion,
     pub flags: ConnAckFlags,
+    /// In MQTT 3.x encoded as the return code [`ConnAckReturnCode`] maps it
+    /// to, and decoded from one.
     pub reason_code: ReasonCode,
+    /// MQTT 5 only.
     pub properties: Option<ConnAckProperties>,
 }
 
 const PACKET_TYPE: u8 = 0x02;
 
-impl Encoder for ConnAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+impl Packet for ConnAckPacket {
+    fn encode(&self, buffer: &mut bytes::BytesMut, version: ProtocolVersion) {
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(version) as u32).encode(buffer);
 
         // Variable header
         self.flags.encode(buffer);
 
-        if self.protocol_version.supports_properties() {
-            // MQTT 5.0
+        if version.supports_properties() {
             self.reason_code.encode(buffer);
             VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
         } else {
-            // MQTT 3.x: encode return code (mapped from reason code)
             let return_code: ConnAckReturnCode = self.reason_code.into();
             return_code.encode(buffer);
         }
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len())
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version))
+    }
+
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::ConnAck, version, |_, buffer| {
+            if version.supports_properties() {
+                let flags = ConnAckFlags::decode(buffer)?;
+                let reason_code = crate::decode_reason(buffer, PacketType::ConnAck)?;
+                let properties = crate::present(ConnAckProperties::decode(buffer)?);
+
+                Ok(ConnAckPacket {
+                    flags,
+                    reason_code,
+                    properties,
+                })
+            } else {
+                Self::decode_v3_body(buffer)
+            }
+        })
     }
 }
 
 impl ConnAckPacket {
-    fn remaining_len(&self) -> usize {
-        if self.protocol_version.supports_properties() {
+    fn remaining_len(&self, version: ProtocolVersion) -> usize {
+        if version.supports_properties() {
             self.flags.encoded_size()
                 + self.reason_code.encoded_size()
                 + crate::property_list_size(&self.properties)
@@ -279,34 +293,6 @@ impl ConnAckPacket {
             // MQTT 3.x: a return code, no properties
             self.flags.encoded_size() + 1
         }
-    }
-}
-
-impl Decoder for ConnAckPacket {
-    /// Decodes a CONNACK packet assuming MQTT 5.0 format.
-    /// For MQTT 3.x decoding, use `decode_v3` instead.
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
-            let flags = ConnAckFlags::decode(buffer)?;
-            let reason_code = crate::decode_reason(buffer, PacketType::ConnAck)?;
-            let properties = crate::present(ConnAckProperties::decode(buffer)?);
-
-            Ok(ConnAckPacket {
-                protocol_version: ProtocolVersion::V5,
-                flags,
-                reason_code,
-                properties,
-            })
-        })
-    }
-}
-
-impl ConnAckPacket {
-    /// Decodes a CONNACK packet in MQTT 3.x format.
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
-            Self::decode_v3_body(buffer)
-        })
     }
 
     fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
@@ -326,7 +312,6 @@ impl ConnAckPacket {
         };
 
         Ok(ConnAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1, // Default to 3.1.1 for v3 decoding
             flags,
             reason_code,
             properties: None,
@@ -371,20 +356,20 @@ mod tests {
         };
 
         let packet = ConnAckPacket {
-            protocol_version: ProtocolVersion::V5,
             flags,
             reason_code,
             properties: properties.into(),
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnAckPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnAckPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
 
         assert_eq!(packet, new_packet);
     }
@@ -401,7 +386,6 @@ mod tests {
         ];
 
         let packet = ConnAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1,
             flags: ConnAckFlags {
                 session_present: false,
             },
@@ -410,7 +394,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
 
         assert_eq!(encoded.to_vec(), expected);
     }
@@ -434,7 +418,6 @@ mod tests {
         ];
 
         let packet = ConnAckPacket {
-            protocol_version: ProtocolVersion::V3_1_1,
             flags: ConnAckFlags {
                 session_present: false,
             },
@@ -443,7 +426,7 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V3_1_1);
 
         assert_eq!(encoded.to_vec(), expected);
     }

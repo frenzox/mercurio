@@ -9,11 +9,12 @@ use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::Error,
     properties::*,
+    protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 /// MQTT 5 only.
@@ -110,33 +111,23 @@ pub struct PublishPacket {
 
 const PACKET_TYPE: u8 = 0x03;
 
-impl Encoder for PublishPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.encode_inner(buffer, true);
+impl Packet for PublishPacket {
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
+        self.encode_inner(buffer, version.supports_properties());
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len(true))
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version.supports_properties()))
     }
-}
 
-impl Decoder for PublishPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, true)
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Publish, version, |flags, body| {
+            Self::decode_body(flags, body, version.supports_properties())
+        })
     }
 }
 
 impl PublishPacket {
-    /// Encodes a PUBLISH packet in MQTT 3.x format (no properties).
-    pub fn encode_v3(&self, buffer: &mut BytesMut) {
-        self.encode_inner(buffer, false);
-    }
-
-    /// Decodes a PUBLISH packet in MQTT 3.x format (no properties).
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, false)
-    }
-
     fn remaining_len(&self, with_properties: bool) -> usize {
         let mut len = self.topic_name.encoded_size() + self.packet_id.encoded_size();
         if with_properties {
@@ -167,12 +158,6 @@ impl PublishPacket {
         if let Some(payload) = &self.payload {
             buffer.extend(payload);
         }
-    }
-
-    fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Publish, |flags, body| {
-            Self::decode_body(flags, body, with_properties)
-        })
     }
 
     fn decode_body<T: Buf>(
@@ -247,13 +232,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = PublishPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            PublishPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -263,7 +249,7 @@ mod tests {
         let mut bytes =
             Bytes::from_static(&[0x30, 0x08, 0x00, 0x01, b't', 0x04, 0x0b, 0x03, 0x0b, 0x09]);
 
-        let packet = PublishPacket::decode(&mut bytes).unwrap();
+        let packet = PublishPacket::decode(&mut bytes, ProtocolVersion::V5).unwrap();
         let identifiers: Vec<u32> = packet
             .properties
             .unwrap()

@@ -106,7 +106,7 @@ async fn next_publish(stream: &mut TcpStream, buffer: &mut bytes::BytesMut) -> O
 
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            let packet = ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap();
+            let packet = ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap();
             let ControlPacket::Publish(publish) = packet else {
                 continue;
             };

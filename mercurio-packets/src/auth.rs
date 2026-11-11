@@ -9,10 +9,11 @@ use bytes::{Buf, BufMut, BytesMut};
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
@@ -75,8 +76,8 @@ pub struct AuthPacket {
 
 const PACKET_TYPE: u8 = 0x0f;
 
-impl Encoder for AuthPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
+impl Packet for AuthPacket {
+    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) {
         buffer.put_u8(PACKET_TYPE << 4);
         VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
@@ -85,20 +86,16 @@ impl Encoder for AuthPacket {
         self.properties.encode(buffer);
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, _: ProtocolVersion) -> usize {
         crate::packet_size(self.remaining_len())
     }
-}
 
-impl AuthPacket {
-    fn remaining_len(&self) -> usize {
-        self.reason.encoded_size() + crate::property_list_size(&self.properties)
-    }
-}
-
-impl Decoder for AuthPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Auth, |_, buffer| {
+    /// MQTT 3.x has no AUTH packet, so there it is malformed.
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        if !version.supports_auth_packet() {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+        crate::decode_packet(buffer, PacketType::Auth, version, |_, buffer| {
             // Both reason and properties may be omitted [MQTT-3.15.2-1]
             let reason = if buffer.has_remaining() {
                 crate::decode_reason(buffer, PacketType::Auth)?
@@ -113,6 +110,12 @@ impl Decoder for AuthPacket {
 
             Ok(AuthPacket { reason, properties })
         })
+    }
+}
+
+impl AuthPacket {
+    fn remaining_len(&self) -> usize {
+        self.reason.encoded_size() + crate::property_list_size(&self.properties)
     }
 }
 
@@ -134,8 +137,11 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer);
-        assert_eq!(AuthPacket::decode(&mut buffer).unwrap(), packet);
+        packet.encode(&mut buffer, ProtocolVersion::V5);
+        assert_eq!(
+            AuthPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap(),
+            packet
+        );
         assert!(buffer.is_empty());
     }
 }

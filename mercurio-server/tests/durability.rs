@@ -10,8 +10,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder, properties::MessageExpiryInterval, protocol::ProtocolVersion, qos::QoS,
-    reason::ReasonCode,
+    properties::MessageExpiryInterval, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode,
 };
 use mercurio_packets::{
     connect::{ConnectPacket, ConnectPayload, ConnectProperties},
@@ -163,7 +162,7 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5);
         self.stream.write_all(&encoded).await.unwrap();
     }
 
@@ -172,8 +171,7 @@ impl Client {
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
             if ControlPacket::check(&self.buffer).is_ok() {
-                let packet =
-                    ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5);
+                let packet = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5);
                 return Some(packet.unwrap());
             }
             match timeout(
@@ -508,7 +506,7 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
         },
     };
     let mut encoded = BytesMut::new();
-    ControlPacket::Connect(connect).encode(&mut encoded);
+    ControlPacket::Connect(connect).encode(&mut encoded, ProtocolVersion::V5);
     stream.write_all(&encoded).await.unwrap();
     let mut subscriber = Client {
         stream,

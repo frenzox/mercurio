@@ -48,14 +48,14 @@ fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
 
 async fn send(stream: &mut TcpStream, packet: ControlPacket, version: ProtocolVersion) {
     let mut bytes = BytesMut::new();
-    packet.encode_with_version(&mut bytes, version);
+    packet.encode(&mut bytes, version);
     stream.write_all(&bytes).await.unwrap();
 }
 
 async fn receive(stream: &mut TcpStream, version: ProtocolVersion) -> ControlPacket {
     let mut buffer = BytesMut::new();
     loop {
-        if let Ok(packet) = ControlPacket::parse_with_version(&mut buffer, version) {
+        if let Ok(packet) = ControlPacket::parse(&mut buffer, version) {
             return packet;
         }
         let read = timeout(Duration::from_secs(2), stream.read_buf(&mut buffer)).await;

@@ -265,7 +265,7 @@ where
             }
         }
 
-        packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
+        packet.encode(&mut self.write_buffer, self.protocol_version);
         // Only a forwarded PUBLISH can grow this large, by the properties
         // added to a message that already filled a whole packet
         if self.write_buffer.len() > MAX_PACKET_SIZE {
@@ -347,10 +347,7 @@ where
 
         match ControlPacket::check(&self.read_buffer) {
             Ok(_) => {
-                let packet = ControlPacket::parse_with_version(
-                    &mut self.read_buffer,
-                    self.protocol_version,
-                )?;
+                let packet = ControlPacket::parse(&mut self.read_buffer, self.protocol_version)?;
                 Ok(Some(packet))
             }
             // Not enough bytes in the buffer to parse a packet

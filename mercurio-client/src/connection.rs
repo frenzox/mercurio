@@ -65,7 +65,7 @@ impl Connection {
     /// [MQTT-3.2.2-15].
     pub async fn write_packet(&mut self, packet: ControlPacket) -> Result<()> {
         let mut buffer = BytesMut::new();
-        packet.encode_with_version(&mut buffer, self.protocol_version);
+        packet.encode(&mut buffer, self.protocol_version);
         let max = self
             .max_packet_size
             .map_or(MAX_PACKET_SIZE, |max| max as usize);
@@ -105,11 +105,8 @@ impl Connection {
                     return Err(ClientError::BrokerViolation(ReasonCode::PacketTooLarge));
                 }
                 Ok(len) if self.read_buffer.len() >= len => {
-                    let packet = ControlPacket::parse_with_version(
-                        &mut self.read_buffer,
-                        self.protocol_version,
-                    )
-                    .map_err(ClientError::Packet)?;
+                    let packet = ControlPacket::parse(&mut self.read_buffer, self.protocol_version)
+                        .map_err(ClientError::Packet)?;
                     return Ok(Some(packet));
                 }
                 Ok(_) | Err(mercurio_core::error::Error::PacketIncomplete) => {}

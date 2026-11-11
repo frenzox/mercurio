@@ -59,7 +59,6 @@ impl Peer {
         properties: ConnAckProperties,
     ) {
         self.write(ControlPacket::ConnAck(ConnAckPacket {
-            protocol_version: ProtocolVersion::V5,
             flags: ConnAckFlags { session_present },
             reason_code,
             properties: Some(properties),
@@ -89,7 +88,7 @@ impl Peer {
     pub async fn next(&mut self, wait: Duration) -> Option<ControlPacket> {
         timeout(wait, async {
             loop {
-                match ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5) {
+                match ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5) {
                     Ok(packet) => return Some(packet),
                     Err(Error::PacketIncomplete) => {}
                     Err(e) => panic!("undecodable packet: {e:?}"),
@@ -108,14 +107,13 @@ impl Peer {
 
     pub async fn write(&mut self, packet: ControlPacket) {
         let mut buffer = BytesMut::new();
-        packet.encode_with_version(&mut buffer, ProtocolVersion::V5);
+        packet.encode(&mut buffer, ProtocolVersion::V5);
         self.stream.write_all(&buffer).await.unwrap();
     }
 
     /// Answers a SUBSCRIBE with these reason codes.
     pub async fn suback(&mut self, packet_id: u16, reasons: &[ReasonCode]) {
         self.write(ControlPacket::SubAck(SubAckPacket {
-            protocol_version: ProtocolVersion::V5,
             packet_id,
             properties: None,
             payload: reasons

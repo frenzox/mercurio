@@ -1605,8 +1605,10 @@ impl<St: MqttStore + 'static> Listener<St> {
                 );
                 // Answered in the MQTT 3.1.1 format, which every version can
                 // read [MQTT-3.1.2-2]
+                handler
+                    .connection
+                    .set_protocol_version(ProtocolVersion::V3_1_1);
                 let connack = ConnAckPacket {
-                    protocol_version: ProtocolVersion::V3_1_1,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -1628,7 +1630,6 @@ impl<St: MqttStore + 'static> Listener<St> {
                     "Refusing invalid CONNECT from {:?}: {:?}", handler.peer, reason
                 );
                 let connack = ConnAckPacket {
-                    protocol_version: ProtocolVersion::V5,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2195,7 +2196,6 @@ where
         Box::pin(async move {
             let connack = if connect_packet.protocol_version.supports_properties() {
                 ConnAckPacket {
-                    protocol_version: connect_packet.protocol_version,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2213,7 +2213,6 @@ where
                 }
             } else {
                 ConnAckPacket {
-                    protocol_version: connect_packet.protocol_version,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2281,7 +2280,6 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let connack = ConnAckPacket {
-                protocol_version,
                 flags: ConnAckFlags {
                     session_present: false,
                 },

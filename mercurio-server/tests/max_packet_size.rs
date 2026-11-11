@@ -38,7 +38,7 @@ async fn connack_advertises_capabilities() {
 
     let mut buffer = BytesMut::from(&connack[..]);
     let ControlPacket::ConnAck(connack) =
-        ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
+        ControlPacket::parse(&mut buffer, ProtocolVersion::V5).unwrap()
     else {
         panic!("Expected ConnAck");
     };
