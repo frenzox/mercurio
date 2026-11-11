@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use crate::error::Error;
 use crate::CONNECTIONS;
 use tokio::{
     sync::{watch, Mutex, OwnedMutexGuard},
@@ -13,7 +14,6 @@ use tracing::info;
 use uuid::Uuid;
 
 use mercurio_core::{
-    error::Error,
     message::{unix_millis, Message},
     protocol::ProtocolVersion,
     reason::ReasonCode,
@@ -582,7 +582,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let persistent = expiry_interval != Some(0);
 
         let storage_error =
-            |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e.to_string()));
+            |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e));
         let key = SessionKey::new(
             owner.mount_point.clone(),
             connect_packet.payload.client_id.clone(),

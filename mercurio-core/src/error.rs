@@ -2,9 +2,6 @@
 
 use core::fmt;
 
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-
 use crate::{
     protocol::{PacketType, ProtocolVersion},
     reason::ReasonCode,
@@ -27,10 +24,6 @@ pub enum Error {
 
     /// A value couldn't be encoded.
     Encode(EncodeError),
-
-    /// A storage backend failed, described by its message. The broker
-    /// carries it through the same results as protocol errors.
-    Storage(String),
 }
 
 impl fmt::Display for Error {
@@ -41,7 +34,6 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O Error: {}", e),
             Error::Reason(e) => write!(f, "MQTT Error: {}", e),
             Error::Encode(e) => write!(f, "Encoding error: {}", e),
-            Error::Storage(s) => write!(f, "Storage error: {}", s),
         }
     }
 }

@@ -2,10 +2,10 @@
 
 use std::fmt;
 
-use thiserror::Error;
+use mercurio_core::reason::ReasonCode;
 
 /// Server-specific errors.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ServerError {
     /// TLS configuration error.
@@ -27,7 +27,7 @@ pub enum ServerError {
 
 /// TLS settings that can't be served, or files they name that can't be
 /// read.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TlsError {
     #[error(
@@ -99,7 +99,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// What is wrong with a listener's settings.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigErrorKind {
     #[error(
@@ -141,4 +141,40 @@ pub enum ConfigErrorKind {
     ProxyFromOnUnix,
     #[error("a peer filter needs a Unix socket listener")]
     PeerFilterOnTcp,
+}
+
+/// Why the broker stopped handling a client, or one of its packets: the
+/// client broke the protocol, its connection failed, or storage did.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    /// The client broke the protocol, or is refused; the reason code is the
+    /// one to tell it
+    #[error("MQTT Error: {0}")]
+    Reason(ReasonCode),
+    #[error("I/O Error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A packet that couldn't be decoded or encoded, other than for a
+    /// reason code or I/O
+    #[error(transparent)]
+    Codec(mercurio_core::error::Error),
+    #[error("Storage error: {0}")]
+    Storage(#[from] mercurio_storage::StorageError),
+}
+
+pub(crate) type Result<T> = std::result::Result<T, Error>;
+
+impl From<ReasonCode> for Error {
+    fn from(reason: ReasonCode) -> Self {
+        Error::Reason(reason)
+    }
+}
+
+impl From<mercurio_core::error::Error> for Error {
+    fn from(error: mercurio_core::error::Error) -> Self {
+        match error {
+            mercurio_core::error::Error::Reason(reason) => Error::Reason(reason),
+            mercurio_core::error::Error::Io(e) => Error::Io(e),
+            other => Error::Codec(other),
+        }
+    }
 }

@@ -14,7 +14,7 @@ use std::{
     task::Poll,
 };
 
-use crate::error::{ConfigError, ConfigErrorKind, ServerError};
+use crate::error::{ConfigError, ConfigErrorKind, Error, Result, ServerError};
 use crate::CONNECTIONS;
 use futures_util::FutureExt;
 #[cfg(unix)]
@@ -29,14 +29,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use mercurio_core::{
-    error::Error,
     message::Message,
     properties::{AuthenticationData, AuthenticationMethod, ReasonString, ServerReference},
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
     topic::validate_publish_topic,
-    Result,
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
@@ -2068,7 +2066,7 @@ impl<St: MqttStore + 'static> Listener<St> {
         };
 
         // Boxed, as it is kept until the connection ends
-        let first_packet = Box::new(first_packet);
+        let first_packet = Box::new(first_packet.map(|read| read.map_err(Error::from)));
         match *first_packet {
             // [MQTT-3.1.0-1]
             // After a Network Connection is established by a Client
@@ -2079,7 +2077,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 // for as long as it runs, the whole connection
                 match handler.run(Box::new(p)).await {
                     // Closed by the broker's own shutdown
-                    Err(mercurio_core::error::Error::Reason(ReasonCode::ServerShuttingDown)) => {
+                    Err(Error::Reason(ReasonCode::ServerShuttingDown)) => {
                         debug!(target: CONNECTIONS, "Connection closed for shutdown")
                     }
                     // Only the broker's own storage failing is its error;

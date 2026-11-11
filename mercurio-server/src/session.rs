@@ -30,8 +30,9 @@ use mercurio_core::{
     qos::QoS,
     reason::ReasonCode,
     topic::{parse_shared_subscription, validate_publish_topic, validate_subscribe_filter},
-    Result,
 };
+
+use crate::error::{Error, Result};
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
     connack::{ConnAckPacket, ConnAckProperties},
@@ -193,7 +194,7 @@ fn publish_properties(
 /// Ends the connection of a client whose PUBLISH couldn't be stored, such
 /// as a retained message, without acknowledging it, so the client sends it
 /// again rather than lose it.
-fn storage_failure(error: mercurio_core::error::Error) -> mercurio_core::error::Error {
+fn storage_failure(error: Error) -> Error {
     warn!("Failed to store a published message: {}", error);
     ReasonCode::ImplementationSpecificError.into()
 }
@@ -2955,9 +2956,7 @@ mod tests {
             .await;
         assert!(matches!(
             failed,
-            Err(mercurio_core::error::Error::Reason(
-                ReasonCode::ImplementationSpecificError
-            ))
+            Err(Error::Reason(ReasonCode::ImplementationSpecificError))
         ));
         assert!(nothing_queued(&subscriber).await);
 
@@ -3376,9 +3375,7 @@ mod tests {
             session
                 .process_incoming(from_client, &broker, &no_plugins())
                 .await,
-            Err(mercurio_core::error::Error::Reason(
-                ReasonCode::ProtocolError
-            ))
+            Err(Error::Reason(ReasonCode::ProtocolError))
         ));
     }
 
@@ -3429,7 +3426,7 @@ mod tests {
                 .process_incoming(aliased_publish(topic, alias), &broker, &no_plugins())
                 .await;
             assert!(
-                matches!(result, Err(mercurio_core::error::Error::Reason(r)) if r == reason),
+                matches!(result, Err(Error::Reason(r)) if r == reason),
                 "alias {alias}"
             );
         }
@@ -3519,9 +3516,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(mercurio_core::error::Error::Reason(
-                ReasonCode::ProtocolError
-            ))
+            Err(Error::Reason(ReasonCode::ProtocolError))
         ));
     }
 
@@ -3551,9 +3546,7 @@ mod tests {
                 .await;
             assert!(matches!(
                 result,
-                Err(mercurio_core::error::Error::Reason(
-                    ReasonCode::ProtocolError
-                ))
+                Err(Error::Reason(ReasonCode::ProtocolError))
             ));
         }
     }
