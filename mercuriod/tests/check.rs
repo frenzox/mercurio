@@ -69,6 +69,8 @@ fn a_valid_configuration_passes_without_binding_or_storage() {
     );
     let acl = dir.write("acl", "user alice\ntopic readwrite #\n");
     let socket = dir.0.join("mqtt.sock");
+    let remote = TcpListener::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
     let config = dir.write(
         "config.toml",
         &format!(
@@ -91,7 +93,17 @@ fn a_valid_configuration_passes_without_binding_or_storage() {
             socket = "{admin}"
             [[listeners]]
             path = "{socket}"
+            [[bridges]]
+            name = "remote"
+            addresses = ["{remote}"]
+            [bridges.tls]
+            ca_path = "{FIXTURES}/cert.pem"
+            cert_path = "{FIXTURES}/cert.pem"
+            key_path = "{FIXTURES}/key.pem"
+            [[bridges.topics]]
+            pattern = "a/#"
             "#,
+            remote = remote.local_addr().unwrap(),
             database = database.display(),
             passwd = passwd.display(),
             acl = acl.display(),
@@ -107,6 +119,7 @@ fn a_valid_configuration_passes_without_binding_or_storage() {
         !dir.0.join("admin.sock").exists(),
         "the admin socket was bound"
     );
+    assert!(remote.accept().is_err(), "the bridge connected");
 }
 
 #[test]
@@ -206,6 +219,36 @@ fn broken(dir: &TempDir) -> Vec<(&'static str, PathBuf, Vec<String>)> {
                 ),
             ),
             vec!["cert_path".into(), "key_path".into()],
+        ),
+        (
+            "missing bridge CA file",
+            config(
+                "bridge-ca.toml",
+                format!(
+                    "[[bridges]]\nname = \"b\"\nhost = \"127.0.0.1\"\ntopics = []\n\
+                     [bridges.tls]\nca_path = \"{}\"\n",
+                    missing_cert.display()
+                ),
+            ),
+            vec!["Bridge b".into(), missing_cert.display().to_string()],
+        ),
+        (
+            "malformed bridge address",
+            config(
+                "bridge-address.toml",
+                "[[bridges]]\nname = \"b\"\naddresses = [\"remote\"]\ntopics = []\n".into(),
+            ),
+            vec!["Bridge b".into(), "`remote`".into()],
+        ),
+        (
+            "bridge route with an invalid QoS",
+            config(
+                "bridge-qos.toml",
+                "[[bridges]]\nname = \"b\"\nhost = \"127.0.0.1\"\n\
+                 [[bridges.topics]]\npattern = \"t/#\"\nqos = 3\n"
+                    .into(),
+            ),
+            vec!["Bridge b".into(), "QoS 3".into()],
         ),
         (
             "unreadable configuration",

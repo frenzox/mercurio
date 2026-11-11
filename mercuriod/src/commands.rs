@@ -394,7 +394,7 @@ mod tests {
         ))
         .unwrap();
         let (connector, local_listener) = LocalConnector::new();
-        let status = bridge::spawn(config, connector.clone()).unwrap();
+        let status = bridge::spawn(bridge::prepare(&config, connector.clone()).unwrap());
         let (log_level, _filter) = LogLevel::new("info", true);
         let commands = Arc::new(DaemonCommands::new(log_level).with_bridges(vec![status]));
         start(Arc::clone(&commands), local_listener).await;

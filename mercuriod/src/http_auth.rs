@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, VecDeque},
     hash::Hash,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -30,7 +30,10 @@ use tokio::sync::{OnceCell, Semaphore};
 use tracing::warn;
 use ureq::tls::{Certificate, ClientCert, PemItem, PrivateKey, RootCerts, TlsConfig};
 
-use crate::config::{redacted_http_url, HttpAuthConfig};
+use crate::{
+    config::{redacted_http_url, HttpAuthConfig},
+    reload::Reload,
+};
 
 /// The `acc` of a request to publish to a `$CONTROL` topic.
 const CONTROL_ACC: u8 = 8;
@@ -55,7 +58,11 @@ type RequestKey = (String, String);
 type Answer = Arc<OnceCell<Option<bool>>>;
 
 pub struct HttpAuth {
-    agent: ureq::Agent,
+    /// Replaced when a reload reads the certificate files again
+    agent: RwLock<ureq::Agent>,
+    timeout: Duration,
+    /// The certificate files the agent was built with, when there are any
+    tls_files: Option<TlsFiles>,
     user_url: Option<String>,
     acl_url: Option<String>,
     superuser_url: Option<String>,
@@ -77,8 +84,14 @@ impl HttpAuth {
             Duration::from_secs(config.timeout_seconds),
             Duration::from_secs(config.cache_seconds),
         );
-        if let Some(tls) = tls_config(config)? {
-            auth.agent = agent(Duration::from_secs(config.timeout_seconds), tls);
+        let files = TlsFiles {
+            ca_path: config.ca_path.clone(),
+            cert_path: config.cert_path.clone(),
+            key_path: config.key_path.clone(),
+        };
+        if let Some(tls) = tls_config(&files)? {
+            auth.agent = RwLock::new(agent(auth.timeout, tls));
+            auth.tls_files = Some(files);
         }
         auth.superuser_url = config.superuser_url.clone();
         Ok(auth)
@@ -100,7 +113,9 @@ impl HttpAuth {
             );
         }
         Self {
-            agent: agent(timeout, TlsConfig::default()),
+            agent: RwLock::new(agent(timeout, TlsConfig::default())),
+            timeout,
+            tls_files: None,
             user_url,
             acl_url,
             superuser_url: None,
@@ -126,7 +141,8 @@ impl HttpAuth {
     async fn request(&self, url: &str, body: String) -> Option<bool> {
         // The semaphore is never closed
         let permit = Arc::clone(&self.requests).acquire_owned().await.ok()?;
-        let (agent, target) = (self.agent.clone(), url.to_string());
+        let agent = self.agent.read().unwrap().clone();
+        let target = url.to_string();
         // The permit goes with the request, which runs on after a check
         // that gave up waiting for it
         let send = move || {
@@ -170,9 +186,16 @@ fn agent(timeout: Duration, tls: TlsConfig) -> ureq::Agent {
         .into()
 }
 
+/// The certificate files `[auth.http]` names.
+struct TlsFiles {
+    ca_path: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+}
+
 /// The TLS settings of `config`'s certificate files, None when it names
 /// none.
-fn tls_config(config: &HttpAuthConfig) -> Result<Option<TlsConfig>, String> {
+fn tls_config(config: &TlsFiles) -> Result<Option<TlsConfig>, String> {
     let mut tls = TlsConfig::builder();
     match &config.ca_path {
         Some(path) => tls = tls.root_certs(RootCerts::new_with_certs(&certificates(path)?)),
@@ -221,6 +244,39 @@ fn private_key(path: &str) -> Result<PrivateKey<'static>, String> {
             _ => None,
         })
         .ok_or_else(|| format!("{path} holds no private key"))
+}
+
+/// The certificate files, read again for the requests that follow; on an
+/// error the previous ones stay in use. Reported by the CA's path, or the
+/// client certificate's.
+impl Reload for HttpAuth {
+    fn reload(&self) -> Result<(), String> {
+        let Some(files) = &self.tls_files else {
+            return Ok(());
+        };
+        if let Some(tls) = tls_config(files)? {
+            *self.agent.write().unwrap() = agent(self.timeout, tls);
+        }
+        Ok(())
+    }
+
+    fn path(&self) -> &str {
+        self.tls_files
+            .as_ref()
+            .and_then(|files| files.ca_path.as_deref().or(files.cert_path.as_deref()))
+            .unwrap_or_default()
+    }
+
+    fn item(&self) -> &str {
+        "http-auth"
+    }
+}
+
+impl HttpAuth {
+    /// Whether `[auth.http]` names certificate files, for a reload to read.
+    pub fn has_tls_files(&self) -> bool {
+        self.tls_files.is_some()
+    }
 }
 
 /// Whether `url` is plain HTTP to a host other than this machine's loopback.
@@ -661,6 +717,55 @@ mod tests {
                 "{files:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_reload_rereads_the_tls_files_and_keeps_them_on_error() {
+        use crate::reload::Reload;
+
+        let url = tls_backend();
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let dir = std::env::temp_dir().join(format!("mercuriod-http-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        // A CA that did not sign the backend's certificate
+        let other_ca = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mercurio-server/tests/fixtures/cert.pem"
+        );
+        std::fs::copy(other_ca, file("ca.pem")).unwrap();
+        for name in ["client.pem", "client-key.pem"] {
+            std::fs::copy(format!("{FIXTURES}/{name}"), file(name)).unwrap();
+        }
+        let mut config = tls_config(&url, [None; 3]);
+        config.ca_path = Some(file("ca.pem"));
+        config.cert_path = Some(file("client.pem"));
+        config.key_path = Some(file("client-key.pem"));
+        let auth = HttpAuth::from_config(&config).unwrap();
+        assert_eq!(
+            (auth.item(), auth.path()),
+            ("http-auth", file("ca.pem").as_str())
+        );
+        assert_eq!(
+            auth.authorize(&alice, "t", Access::Write).await,
+            Decision::Deny
+        );
+
+        std::fs::copy(format!("{FIXTURES}/ca.pem"), file("ca.pem")).unwrap();
+        auth.reload().unwrap();
+        assert_eq!(
+            auth.authorize(&alice, "t", Access::Write).await,
+            Decision::Allow
+        );
+
+        std::fs::write(file("client-key.pem"), "not a key").unwrap();
+        let error = auth.reload().unwrap_err();
+        assert!(error.contains("client-key.pem"), "{error}");
+        assert_eq!(
+            auth.authorize(&alice, "u", Access::Write).await,
+            Decision::Allow
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

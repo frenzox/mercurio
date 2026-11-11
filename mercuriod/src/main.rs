@@ -43,6 +43,7 @@ mod syslog;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+use bridge::Bridge;
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 use dynsec::DynamicSecurity;
@@ -218,6 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dynsec,
         listeners: prepared_listeners,
         reloadable,
+        bridges,
     } = prepare(&config, &connector).await?;
 
     // Determine listen address (CLI overrides config)
@@ -353,12 +355,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let bridges = config
         .bridges
-        .into_iter()
-        .map(|bridge| {
-            info!("Starting bridge {}", bridge.name);
-            bridge::spawn(bridge, connector.clone())
+        .iter()
+        .zip(bridges)
+        .map(|(config, bridge)| {
+            info!("Starting bridge {}", config.name);
+            bridge::spawn(bridge)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
     let commands = Arc::new(
@@ -456,6 +459,8 @@ struct Prepared {
     /// In the order of `[[listeners]]`
     listeners: Vec<PreparedListener>,
     reloadable: Vec<Arc<dyn Reload>>,
+    /// In the order of `[[bridges]]`
+    bridges: Vec<Bridge>,
 }
 
 struct PreparedListener {
@@ -467,8 +472,9 @@ struct PreparedListener {
 
 /// Checks the settings a start needs, loads the files of `[auth]` and of
 /// every listener, the TLS certificates and keys, and the WebAssembly
-/// plugins, binding nothing and leaving storage alone. Plugins publish
-/// through `broker`.
+/// plugins, and sets the bridges up, binding nothing, connecting nowhere
+/// and leaving storage alone. Plugins and bridges reach the broker through
+/// `broker`.
 async fn prepare(
     config: &Config,
     broker: &LocalConnector,
@@ -537,6 +543,11 @@ async fn prepare(
             plugins,
         });
     }
+    let bridges = config
+        .bridges
+        .iter()
+        .map(|bridge| bridge::prepare(bridge, broker.clone()))
+        .collect::<Result<_, _>>()?;
     Ok(Prepared {
         limits,
         policy,
@@ -546,6 +557,7 @@ async fn prepare(
         dynsec,
         listeners,
         reloadable,
+        bridges,
     })
 }
 
@@ -760,6 +772,9 @@ fn build_auth(
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
+        if auth.has_tls_files() {
+            reloadable.push(auth.clone());
+        }
         plugins.push(auth);
     }
     if let Some(path) = &config.acl_file {
@@ -975,6 +990,28 @@ mod tests {
         .map_err(|e| panic!("{e}"))
         .unwrap();
         assert_eq!(plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_http_auth_tls_files_are_reloadable() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/http-auth");
+        for (tls, reloaded) in [
+            (String::new(), false),
+            (format!("ca_path = \"{fixtures}/ca.pem\"\n"), true),
+        ] {
+            let mut reloadable = Vec::new();
+            build_auth(
+                &auth(&format!(
+                    "enabled = true\n[http]\nuser_url = \"https://h/u\"\n{tls}"
+                )),
+                &mut reloadable,
+                true,
+            )
+            .map_err(|e| panic!("{e}"))
+            .unwrap();
+            let items: Vec<_> = reloadable.iter().map(|file| file.item()).collect();
+            assert_eq!(items.contains(&"http-auth"), reloaded, "{tls}: {items:?}");
+        }
     }
 
     /// A broker with the authentication `toml` sets up; its port.

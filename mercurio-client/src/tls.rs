@@ -45,7 +45,7 @@ fn handshake_error(error: std::io::Error) -> ClientError {
 }
 
 /// Build a TLS connector from the given options.
-fn build_tls_connector(
+pub(crate) fn build_tls_connector(
     options: &TlsOptions,
     host: &str,
 ) -> Result<(TlsConnector, ServerName<'static>), ClientError> {
@@ -277,6 +277,25 @@ mod tests {
         assert!(error.to_string().contains("/nonexistent/ca.pem"), "{error}");
         assert!(error.source().is_some(), "{error:?}");
         assert!(!error.is_transient());
+    }
+
+    #[test]
+    fn validating_loads_the_tls_files_without_connecting() {
+        assert!(options()
+            .ca_path(CA)
+            .client_cert(CERT, KEY)
+            .validate()
+            .is_ok());
+        let error = options()
+            .ca_path("/nonexistent/ca.pem")
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("/nonexistent/ca.pem"), "{error}");
+        let error = ConnectOptions::new("not a host name", 8883)
+            .ca_path(CA)
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("not a host name"), "{error}");
     }
 
     #[test]

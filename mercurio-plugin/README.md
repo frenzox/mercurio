@@ -9,6 +9,13 @@ client events, run on a timer and answer control requests.
 This crate generates the bindings for version 0.2 of the broker's WIT
 interface (`wit/plugin.wit` in the repository) and wraps them in the
 [`Plugin`] trait. The broker also loads plugins built for 0.1.
+
+| `mercurio-plugin`    | Interface |
+|----------------------|-----------|
+| 0.1.x and 0.2.0      | 0.1       |
+| releases after 0.2.0 | 0.2       |
+
+This README describes interface 0.2.
 Every hook except `init` has a default, so a plugin implements only the hooks
 it uses. `init` returns the hooks that the broker calls.
 
@@ -19,9 +26,20 @@ Make the plugin crate a `cdylib`:
 ```toml
 [lib]
 crate-type = ["cdylib"]
+```
 
+and add the latest release of this crate:
+
+```sh
+cargo add mercurio-plugin
+```
+
+Until a release after 0.2.0 is on crates.io, take the crate from the
+repository instead, as the releases before it speak interface 0.1:
+
+```toml
 [dependencies]
-mercurio-plugin = "0.1"
+mercurio-plugin = { git = "https://github.com/frenzox/mercurio" }
 ```
 
 Then build it for WASI preview 2:

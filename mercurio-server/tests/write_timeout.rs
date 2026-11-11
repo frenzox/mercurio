@@ -37,7 +37,11 @@ fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
     ConnectPacket {
         protocol_version: version,
         clean_start: true,
-        keepalive: 1,
+        // No keep-alive: the publisher's loop holds the test's runtime while
+        // the socket takes its writes, so the broker can find a keep-alive
+        // long expired, and the stalled subscriber must give its id up
+        // through the write timeout alone
+        keepalive: 0,
         properties: (version == ProtocolVersion::V5).then(ConnectProperties::default),
         payload: ConnectPayload {
             client_id: client_id.into(),

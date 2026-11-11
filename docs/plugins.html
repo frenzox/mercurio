@@ -86,12 +86,14 @@
 <p>Install the target and make a library crate:</p>
 <pre>rustup target add wasm32-wasip2
 cargo new --lib deny-topic</pre>
-<p>In <code>Cargo.toml</code>, build a <code>cdylib</code> and depend on <a href="https://github.com/frenzox/mercurio/tree/master/mercurio-plugin"><code>mercurio-plugin</code></a>, which holds the bindings and the <code>Plugin</code> trait:</p>
+<p>In <code>Cargo.toml</code>, build a <code>cdylib</code>:</p>
 <pre>[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-mercurio-plugin = "0.1"</pre>
+crate-type = ["cdylib"]</pre>
+<p>and add the latest release of <a href="https://github.com/frenzox/mercurio/tree/master/mercurio-plugin"><code>mercurio-plugin</code></a>, which holds the bindings and the <code>Plugin</code> trait:</p>
+<pre>cargo add mercurio-plugin</pre>
+<p><code>mercurio-plugin</code> 0.1.x and 0.2.0 speak interface 0.1; the releases after 0.2.0 speak 0.2, which this page describes. Until a release after 0.2.0 is on crates.io, take the crate from the repository instead:</p>
+<pre>[dependencies]
+mercurio-plugin = { git = "https://github.com/frenzox/mercurio" }</pre>
 <p>This plugin, <code>examples/plugins/deny-topic</code>, refuses publishing under a topic prefix from its configuration and defers every other decision:</p>
 <pre>use std::sync::OnceLock;
 
