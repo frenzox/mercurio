@@ -1186,7 +1186,7 @@ fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
             .try_get::<_, Option<Vec<u8>>>("payload")
             .db()?
             .map(Bytes::from),
-        qos: int_to_qos(row.try_get("qos").db()?),
+        qos: int_to_qos(row.try_get("qos").db()?)?,
         dup: row.try_get("dup").db()?,
         sequence: row.try_get::<_, i64>("sequence").db()? as u64,
         released: row.try_get("released").db()?,
@@ -1233,7 +1233,7 @@ impl SessionStore for PostgresStore {
             };
             subscriptions.push(StoredSubscription {
                 topic_filter,
-                qos: int_to_qos(row.try_get("qos").db()?),
+                qos: int_to_qos(row.try_get("qos").db()?)?,
                 no_local: row.try_get("no_local").db()?,
                 retain_as_published: row.try_get("retain_as_published").db()?,
                 subscription_identifier: row
@@ -1365,7 +1365,7 @@ impl RetainedMessageStore for PostgresStore {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
                 dup: row.try_get("dup").db()?,
-                qos: int_to_qos(row.try_get("qos").db()?),
+                qos: int_to_qos(row.try_get("qos").db()?)?,
                 retain: true,
                 payload: row
                     .try_get::<_, Option<Vec<u8>>>("payload")
@@ -1490,7 +1490,7 @@ impl WillStore for PostgresStore {
         Ok(Some(StoredWillMessage {
             topic: row.try_get("topic").db()?,
             payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").db()?),
-            qos: int_to_qos(row.try_get("qos").db()?),
+            qos: int_to_qos(row.try_get("qos").db()?)?,
             retain: row.try_get("retain").db()?,
             delay_secs: row.try_get::<_, i64>("delay_secs").db()? as u32,
             properties: decode_properties(row.try_get("properties").db()?)?,
@@ -1600,7 +1600,7 @@ impl QueueStore for PostgresStore {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
                 dup: false,
-                qos: int_to_qos(row.try_get("qos").db()?),
+                qos: int_to_qos(row.try_get("qos").db()?)?,
                 retain: row.try_get("retain").db()?,
                 payload: row
                     .try_get::<_, Option<Vec<u8>>>("payload")

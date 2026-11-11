@@ -7,6 +7,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
     properties::*,
     qos::QoS,
     reason::ReasonCode,
@@ -180,14 +181,14 @@ impl PublishPacket {
         with_properties: bool,
     ) -> crate::Result<Self> {
         let dup = (flags & 0b0000_1000) != 0;
-        let qos_level = QoS::from((flags & 0b0000_0110) >> 1);
+        let qos_level = QoS::try_from((flags & 0b0000_0110) >> 1)
+            .map_err(|_| Error::from(ReasonCode::MalformedPacket))?;
         let retain = (flags & 0b0000_0001) != 0;
 
         // Variable header
         let topic_name = String::decode(buffer)?;
         let packet_id = match qos_level {
             QoS::AtMostOnce => None,
-            QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
             _ => Some(crate::decode_packet_id(buffer)?),
         };
         // A QoS 0 message is never retransmitted [MQTT-3.3.1-2]

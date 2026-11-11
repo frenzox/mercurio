@@ -1156,7 +1156,10 @@ impl BrokerLimits {
                 .map(|m| m.value),
             maximum_qos: p
                 .and_then(|p| p.maximum_qos.as_ref())
-                .map_or(QoS::ExactlyOnce, |q| q.value.into()),
+                // The decoder only lets 0 and 1 through
+                .map_or(QoS::ExactlyOnce, |q| {
+                    QoS::try_from(q.value).unwrap_or(QoS::AtMostOnce)
+                }),
             retain_available: p
                 .and_then(|p| p.retain_available.as_ref())
                 .is_none_or(|r| r.value),
@@ -2094,15 +2097,12 @@ impl EventLoop {
                         .iter()
                         .zip(ack.payload)
                         .map(|((topic, _), granted)| {
-                            let code = granted.reason_code.code();
+                            // A failure code is no QoS
                             SubscribeResult {
                                 topic: topic.clone(),
-                                qos: if code < 0x80 {
-                                    code.into()
-                                } else {
-                                    QoS::AtMostOnce
-                                },
-                                success: code < 0x80,
+                                qos: QoS::try_from(granted.reason_code.code())
+                                    .unwrap_or(QoS::AtMostOnce),
+                                success: granted.reason_code.is_success(),
                                 reason: granted.reason_code,
                             }
                         })

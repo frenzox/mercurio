@@ -886,7 +886,6 @@ impl Session {
                     Err(ReasonCode::ProtocolError.into())
                 }
             }
-            QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
         // Recorded as delivered only once the broker took the message, so

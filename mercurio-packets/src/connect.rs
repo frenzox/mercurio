@@ -99,14 +99,11 @@ impl Decoder for ConnectFlags {
 
         if (byte & 0b0000_0100) != 0 {
             flags.will_flag = true;
-            flags.will_qos = ((byte >> 3) & 0b0000_0011).into();
+            flags.will_qos = QoS::try_from((byte >> 3) & 0b0000_0011)
+                .map_err(|_| Error::from(ReasonCode::MalformedPacket))?;
         }
 
-        if flags.will_qos != QoS::Invalid {
-            Ok(flags)
-        } else {
-            Err(ReasonCode::MalformedPacket.into())
-        }
+        Ok(flags)
     }
 }
 

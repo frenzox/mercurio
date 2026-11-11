@@ -10,6 +10,7 @@ use bytes::{Buf, BufMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
     properties::*,
     qos::QoS,
     reason::ReasonCode,
@@ -72,17 +73,19 @@ pub enum RetainHandling {
     /// Send them only if the subscription didn't exist already.
     SendRetainedIfNonExisting = 0x01,
     DoNotSendRetained = 0x02,
-    /// Any value above 2. Decoding rejects it as a protocol error.
-    Invalid = 0xff,
 }
 
-impl From<u8> for RetainHandling {
-    fn from(n: u8) -> Self {
+/// The retain handling of a wire value, or the value itself when it is not
+/// 0, 1 or 2.
+impl TryFrom<u8> for RetainHandling {
+    type Error = u8;
+
+    fn try_from(n: u8) -> Result<Self, u8> {
         match n {
-            0x00 => Self::SendRetained,
-            0x01 => Self::SendRetainedIfNonExisting,
-            0x02 => Self::DoNotSendRetained,
-            _ => Self::Invalid,
+            0x00 => Ok(Self::SendRetained),
+            0x01 => Ok(Self::SendRetainedIfNonExisting),
+            0x02 => Ok(Self::DoNotSendRetained),
+            _ => Err(n),
         }
     }
 }
@@ -134,19 +137,11 @@ impl Decoder for SubscriptionOptions {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let qos: QoS = (opt & 0b0000_0011).into();
-
-        if qos == QoS::Invalid {
-            return Err(ReasonCode::ProtocolError.into());
-        }
-
+        let protocol_error = |_| Error::from(ReasonCode::ProtocolError);
+        let qos = QoS::try_from(opt & 0b0000_0011).map_err(protocol_error)?;
         let no_local = (opt & 0b0000_0100) != 0;
         let retain_as_pub = (opt & 0b0000_1000) != 0;
-        let retain_handling: RetainHandling = (opt >> 4).into();
-
-        if retain_handling == RetainHandling::Invalid {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+        let retain_handling = RetainHandling::try_from(opt >> 4).map_err(protocol_error)?;
 
         Ok(SubscriptionOptions {
             qos,

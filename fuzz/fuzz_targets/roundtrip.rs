@@ -178,7 +178,7 @@ fn packet_id(id: u16) -> u16 {
 }
 
 fn qos(n: u8) -> QoS {
-    QoS::from(n % 3)
+    [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce][usize::from(n % 3)]
 }
 
 /// One of the reason codes `packet_type` lists, picked by `n`.
@@ -461,7 +461,11 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                             qos: qos(options),
                             no_local: options & 0b0000_0100 != 0,
                             retain_as_pub: options & 0b0000_1000 != 0,
-                            retain_handling: RetainHandling::from((options >> 4) % 3),
+                            retain_handling: [
+                                RetainHandling::SendRetained,
+                                RetainHandling::SendRetainedIfNonExisting,
+                                RetainHandling::DoNotSendRetained,
+                            ][usize::from((options >> 4) % 3)],
                         }
                     } else {
                         // MQTT 3.x has only the QoS

@@ -322,7 +322,7 @@ fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
         packet_id: row.get(0)?,
         topic: row.get(1)?,
         payload: payload.map(Bytes::from),
-        qos: int_to_qos(row.get(3)?),
+        qos: int_to_qos(row.get(3)?)?,
         dup: row.get(4)?,
         // SQLite integers are signed; the bit pattern round-trips
         sequence: row.get::<_, i64>(5)? as u64,
@@ -627,7 +627,7 @@ impl SessionStore for SqliteStore {
                 .query_map(params![client_id], |row| {
                     Ok(StoredSubscription {
                         topic_filter: row.get(0)?,
-                        qos: int_to_qos(row.get(1)?),
+                        qos: int_to_qos(row.get(1)?)?,
                         no_local: row.get(2)?,
                         retain_as_published: row.get(3)?,
                         subscription_identifier: row.get(4)?,
@@ -753,7 +753,7 @@ impl RetainedMessageStore for SqliteStore {
                         packet_id: None,
                         topic: Arc::from(topic.as_str()),
                         dup,
-                        qos: int_to_qos(qos),
+                        qos: int_to_qos(qos)?,
                         retain: true,
                         payload: payload.map(Bytes::from),
                         properties: decode_properties(properties)?,
@@ -812,7 +812,7 @@ impl WillStore for SqliteStore {
                     Ok(StoredWillMessage {
                         topic: row.get(0)?,
                         payload: Bytes::from(payload),
-                        qos: int_to_qos(row.get(2)?),
+                        qos: int_to_qos(row.get(2)?)?,
                         retain: row.get(3)?,
                         delay_secs: row.get(4)?,
                         properties: decode_properties(properties)?,
@@ -934,7 +934,7 @@ impl QueueStore for SqliteStore {
                     packet_id: None,
                     topic: Arc::from(topic.as_str()),
                     dup: false,
-                    qos: int_to_qos(row.get(3)?),
+                    qos: int_to_qos(row.get(3)?)?,
                     retain: row.get(4)?,
                     payload: payload.map(Bytes::from),
                     properties: decode_properties(row.get(5)?)?,

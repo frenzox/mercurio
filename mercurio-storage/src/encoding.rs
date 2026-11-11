@@ -3,24 +3,47 @@
 use bytes::BytesMut;
 use mercurio_core::{codec::Encoder, message::MessageProperties, qos::QoS};
 
-use crate::StoredSubscription;
+use crate::{StorageError, StoredSubscription};
 
 pub(crate) fn qos_to_int(qos: QoS) -> i32 {
     match qos {
         QoS::AtMostOnce => 0,
         QoS::AtLeastOnce => 1,
         QoS::ExactlyOnce => 2,
-        QoS::Invalid => -1,
     }
 }
 
-pub(crate) fn int_to_qos(val: i32) -> QoS {
-    match val {
-        0 => QoS::AtMostOnce,
-        1 => QoS::AtLeastOnce,
-        2 => QoS::ExactlyOnce,
-        _ => QoS::Invalid,
+/// A stored QoS column that holds anything but 0, 1 or 2.
+#[derive(Debug)]
+pub(crate) struct InvalidQoS(i32);
+
+impl std::fmt::Display for InvalidQoS {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid stored QoS {}", self.0)
     }
+}
+
+impl std::error::Error for InvalidQoS {}
+
+impl From<InvalidQoS> for StorageError {
+    fn from(e: InvalidQoS) -> Self {
+        StorageError::SerializationError(e.to_string())
+    }
+}
+
+/// Fails like any other unreadable column.
+#[cfg(feature = "sqlite")]
+impl From<InvalidQoS> for rusqlite::Error {
+    fn from(e: InvalidQoS) -> Self {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(e))
+    }
+}
+
+pub(crate) fn int_to_qos(val: i32) -> Result<QoS, InvalidQoS> {
+    u8::try_from(val)
+        .ok()
+        .and_then(|n| QoS::try_from(n).ok())
+        .ok_or(InvalidQoS(val))
 }
 
 pub(crate) fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
@@ -65,11 +88,33 @@ pub(crate) fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
             let flags: Vec<u8> = flags.bytes().map(|b| b.wrapping_sub(b'0')).collect();
             Some(StoredSubscription {
                 topic_filter: topic_filter.to_string(),
-                qos: flags[0].into(),
+                qos: QoS::try_from(flags[0]).ok()?,
                 no_local: flags[1] == 1,
                 retain_as_published: flags[2] == 1,
                 subscription_identifier: identifier.parse().ok(),
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stored_qos_outside_0_to_2_is_an_error() {
+        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
+            assert_eq!(int_to_qos(qos_to_int(qos)).unwrap(), qos);
+        }
+        for stored in [-1, 3, 256] {
+            assert!(int_to_qos(stored).is_err(), "{stored}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_subscription_with_a_bad_qos_is_skipped() {
+        let decoded = decode_subscriptions("100:a\u{0}300:b");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].topic_filter, "a");
+    }
 }
