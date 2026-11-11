@@ -206,6 +206,8 @@ pub struct ClientQuery {
     /// The user the session belongs to, exactly
     pub username: Option<String>,
     pub address: Option<AddressRange>,
+    /// The mount point of the client's listener, exactly; empty for none
+    pub mount_point: Option<String>,
     pub paging: Paging,
 }
 
@@ -468,6 +470,10 @@ impl Admin {
                     .client_id_prefix
                     .as_deref()
                     .is_some_and(|prefix| !entry.key.client_id.starts_with(prefix))
+                || query
+                    .mount_point
+                    .as_deref()
+                    .is_some_and(|mount_point| entry.key.stored_mount_point() != mount_point)
             {
                 continue;
             }

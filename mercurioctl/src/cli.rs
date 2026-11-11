@@ -155,6 +155,9 @@ pub enum ClientCommand {
         /// Only clients from this IP address or CIDR range
         #[arg(long)]
         address: Option<String>,
+        /// Only clients of listeners with this mount point; "" for none
+        #[arg(long)]
+        mount_point: Option<String>,
         #[command(flatten)]
         page: PageArgs,
     },
