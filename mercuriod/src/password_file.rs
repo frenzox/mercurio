@@ -56,17 +56,38 @@ pub fn load(path: &str) -> Result<Loaded, String> {
         hashes: HashMap::with_capacity(users.len()),
         scram: HashMap::new(),
     };
+    // Prepared name -> written names and credentials
+    let mut by_prepared: HashMap<String, Vec<(String, StoredCredentials)>> = HashMap::new();
     for (username, user) in users {
         if let Some(Ok(Some(credentials))) = user
             .scram
             .as_deref()
             .map(|entry| scram_credentials(&user.hash, entry))
         {
-            if let Some(prepared) = mercurio_scram::prepare_username(&username) {
-                loaded.scram.insert(prepared, credentials);
+            match mercurio_scram::prepare_username(&username) {
+                Some(prepared) => by_prepared
+                    .entry(prepared)
+                    .or_default()
+                    .push((username.clone(), credentials)),
+                None => tracing::warn!(
+                    "Password file user `{username}` cannot be prepared with SASLprep; \
+                     it has no SCRAM-SHA-256 login"
+                ),
             }
         }
         loaded.hashes.insert(username, user.hash);
+    }
+    for (prepared, mut entries) in by_prepared {
+        if entries.len() == 1 {
+            loaded.scram.insert(prepared, entries.pop().unwrap().1);
+        } else {
+            let mut names: Vec<_> = entries.into_iter().map(|(name, _)| name).collect();
+            names.sort();
+            tracing::warn!(
+                "Password file users {names:?} are the same user after SASLprep; \
+                 none of them has a SCRAM-SHA-256 login"
+            );
+        }
     }
     Ok(loaded)
 }
@@ -505,5 +526,31 @@ mod tests {
         for good in ["alice", "a.b-c_d@example.com", "ünïcode", "a b"] {
             assert!(check_username(good).is_ok(), "{good:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use super::*;
+
+    #[test]
+    fn test_users_with_one_prepared_name_get_no_scram_login() {
+        let dir = std::env::temp_dir().join(format!("mercuriod-collide-{}", std::process::id()));
+        let path = dir.to_str().unwrap();
+        let (hash, scram) = crate::credentials::hash_new_password("secret").unwrap();
+        let user = || User {
+            hash: hash.clone(),
+            scram: Some(scram.clone()),
+        };
+        let users = [
+            ("us\u{00AD}er".to_string(), user()),
+            ("user".to_string(), user()),
+            ("other".to_string(), user()),
+        ];
+        write_users(path, &users.into_iter().collect()).unwrap();
+        let loaded = load(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.scram.keys().collect::<Vec<_>>(), ["other"]);
+        assert_eq!(loaded.hashes.len(), 3);
     }
 }

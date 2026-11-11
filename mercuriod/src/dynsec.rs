@@ -441,6 +441,13 @@ impl Data {
                 if self.clients.iter().any(|c| c.username == username) {
                     return Err("Client already exists".to_string());
                 }
+                if let Some(prepared) = mercurio_scram::prepare_username(&username) {
+                    if self.clients.iter().any(|c| {
+                        mercurio_scram::prepare_username(&c.username).as_ref() == Some(&prepared)
+                    }) {
+                        return Err("Client is the same user as another after SASLprep".to_string());
+                    }
+                }
                 let roles = self.ranked_roles(args.get("roles"))?;
                 let groups = self.ranked_groups(args.get("groups"))?;
                 // Empty, as mosquitto takes it, binds no client id
@@ -2634,6 +2641,17 @@ mod tests {
             json!([
                 { "command": "createClient", "username": "\u{00AD}", "password": "pw" },
             ]),
+        );
+        assert!(refused[0].get("error").is_some(), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn test_clients_with_one_prepared_name_are_refused() {
+        let fixture = Fixture::new("scram-collide");
+        fixture.run_ok(json!([{ "command": "createClient", "username": "user" }]));
+        let refused = run(
+            &fixture.security,
+            json!([{ "command": "createClient", "username": "us\u{00AD}er" }]),
         );
         assert!(refused[0].get("error").is_some(), "{refused:?}");
     }

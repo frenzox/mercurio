@@ -861,6 +861,7 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
         return Err("The user name cannot be prepared with SASLprep, for SCRAM-SHA-256".into());
     }
     let mut users = password_file::read_users(path)?;
+    check_prepared_name_is_free(&users, username)?;
     let password = prompt_new_password(username)?;
 
     let (hash, scram) = credentials::hash_new_password(&password)?;
@@ -876,6 +877,23 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
     Ok(())
+}
+
+/// Refuses a `username` that is the same user as another one of `users`
+/// after SASLprep, since they would share one SCRAM login.
+fn check_prepared_name_is_free(
+    users: &std::collections::BTreeMap<String, password_file::User>,
+    username: &str,
+) -> Result<(), String> {
+    let prepared = mercurio_scram::prepare_username(username);
+    match users.keys().find(|other| {
+        other.as_str() != username && mercurio_scram::prepare_username(other) == prepared
+    }) {
+        Some(other) => Err(format!(
+            "User `{username}` is the same user as `{other}` after SASLprep"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Asks for a new password twice.
@@ -904,7 +922,7 @@ fn delete_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(test)]
 mod tests {
-    use super::{address, build_auth, config};
+    use super::{add_or_update_user, address, build_auth, check_prepared_name_is_free, config};
 
     fn auth(toml: &str) -> config::AuthConfig {
         toml::from_str(toml).unwrap()
@@ -1049,6 +1067,20 @@ mod tests {
         assert!(!login(port, "nobody", "secret", true).await);
         assert!(login(port, "legacy", "old", false).await);
         assert!(!login(port, "legacy", "old", true).await);
+    }
+
+    #[test]
+    fn test_passwd_refuses_names_scram_cannot_hold_apart() {
+        use crate::password_file::User;
+        let users = [("user".to_string(), User::new("$6$c2FsdA==$aGFzaA=="))]
+            .into_iter()
+            .collect();
+        assert!(check_prepared_name_is_free(&users, "us\u{00AD}er").is_err());
+        assert!(check_prepared_name_is_free(&users, "user").is_ok());
+        assert!(check_prepared_name_is_free(&users, "other").is_ok());
+        let path = std::env::temp_dir().join(format!("mercuriod-passwd-{}", std::process::id()));
+        let error = add_or_update_user(path.to_str().unwrap(), "\u{00AD}").unwrap_err();
+        assert!(error.to_string().contains("SASLprep"), "{error}");
     }
 
     fn argon2_hash(password: &str) -> String {
