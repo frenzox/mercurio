@@ -38,7 +38,7 @@ webpki-roots = { version = "0.26", optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 tracing = "0.1"
-thiserror = "1"
+thiserror = "2"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 rpassword = { version = "7", optional = true }
 
