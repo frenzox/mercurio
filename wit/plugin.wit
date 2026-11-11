@@ -98,10 +98,16 @@ interface types {
   /// Authentication Data in the CONNACK or in the AUTH that ends a
   /// re-authentication.
   record success { username: option<string>, data: option<list<u8>> }
+  /// What `failed` refuses the client with: an MQTT reason code, and a
+  /// short text saying why, sent as the Reason String of the CONNACK, or
+  /// of the DISCONNECT that ends a re-authentication, unless the client
+  /// asked for no problem information or it doesn't fit the client's
+  /// Maximum Packet Size. Anyone connecting can read it, so it must not
+  /// tell, for example, whether a user exists.
+  record failure { reason: u8, reason-string: option<string> }
   /// The result of one step of enhanced authentication. `continue` sends
-  /// a challenge to the client; `success` accepts it; `failed` refuses it
-  /// with an MQTT reason code.
-  variant auth-result { %continue(challenge), success(success), failed(u8) }
+  /// a challenge to the client; `success` accepts it; `failed` refuses it.
+  variant auth-result { %continue(challenge), success(success), failed(failure) }
 }
 
 interface host {

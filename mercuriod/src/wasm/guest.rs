@@ -325,7 +325,10 @@ fn auth_result(result: old::AuthResult) -> wit::AuthResult {
             username,
             data: None,
         }),
-        old::AuthResult::Failed(code) => wit::AuthResult::Failed(code),
+        old::AuthResult::Failed(code) => wit::AuthResult::Failed(wit::Failure {
+            reason: code,
+            reason_string: None,
+        }),
     }
 }
 
@@ -369,6 +372,15 @@ mod tests {
         };
         let back = new_message(old_message(message.clone()));
         assert_eq!(format!("{back:?}"), format!("{message:?}"));
+    }
+
+    #[test]
+    fn test_0_1_authentication_failures_have_no_reason_string() {
+        let wit::AuthResult::Failed(failure) = auth_result(old::AuthResult::Failed(0x8c)) else {
+            panic!("expected a failure");
+        };
+        assert_eq!(failure.reason, 0x8c);
+        assert_eq!(failure.reason_string, None);
     }
 
     #[test]

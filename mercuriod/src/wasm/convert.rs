@@ -175,7 +175,13 @@ pub(crate) fn auth_result(result: wit::AuthResult) -> (AuthResult, Option<Vec<u8
             },
             None,
         ),
-        wit::AuthResult::Failed(code) => (AuthResult::Failed(failure(code)), None),
+        wit::AuthResult::Failed(failed) => (
+            AuthResult::Failed {
+                reason: failure(failed.reason),
+                reason_string: failed.reason_string,
+            },
+            None,
+        ),
     }
 }
 
@@ -259,5 +265,21 @@ mod tests {
         }));
         assert_eq!(result, AuthResult::Continue(Bytes::from_static(b"nonce")));
         assert_eq!(state.as_deref(), Some(&b"s"[..]));
+    }
+
+    #[test]
+    fn test_failed_authentication_keeps_its_reason_string() {
+        let (result, state) = auth_result(wit::AuthResult::Failed(wit::Failure {
+            reason: 0x87,
+            reason_string: Some("token expired".into()),
+        }));
+        assert_eq!(
+            result,
+            AuthResult::Failed {
+                reason: ReasonCode::NotAuthorized,
+                reason_string: Some("token expired".into()),
+            }
+        );
+        assert_eq!(state, None);
     }
 }

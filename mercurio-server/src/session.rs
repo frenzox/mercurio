@@ -274,6 +274,9 @@ struct ClientSettings {
     maximum_packet_size: Option<u32>,
     topic_alias_maximum: Option<u16>,
     request_response_information: bool,
+    /// Whether the client takes reason strings beyond the reason code's
+    /// own: true unless it sent Request Problem Information 0
+    request_problem_information: bool,
     /// The enhanced authentication method, which every AUTH must name
     authentication_method: Option<String>,
 }
@@ -300,6 +303,9 @@ impl From<&ConnectPacket> for ClientSettings {
             request_response_information: properties
                 .and_then(|p| p.request_response_information.as_ref())
                 .is_some_and(|r| r.value == 1),
+            request_problem_information: properties
+                .and_then(|p| p.request_problem_information.as_ref())
+                .is_none_or(|r| r.value != 0),
             authentication_method: properties
                 .and_then(|p| p.authentication_method.as_ref())
                 .map(|m| m.value.clone()),
@@ -401,6 +407,9 @@ struct State {
     pending_will: Option<(AbortHandle, WillMessage, u64)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
+    /// Why the last re-authentication failed, in the method's words, for
+    /// the DISCONNECT that follows
+    auth_failure: Option<String>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
     /// The client's address, None for in-process clients
@@ -545,6 +554,7 @@ impl Session {
                     will_message,
                     pending_will: None,
                     auth_exchange: None,
+                    auth_failure: None,
                     verified_user: None,
                     peer: None,
                     connection_info: None,
@@ -1363,6 +1373,12 @@ impl Session {
         self.shared.queue.restore(messages);
     }
 
+    /// Why the last re-authentication failed, in the method's words, if
+    /// it gave some and the client takes them.
+    pub(crate) async fn take_auth_failure(&self) -> Option<String> {
+        self.shared.state.lock().await.auth_failure.take()
+    }
+
     /// The largest packet the client accepts, if it set a limit.
     pub(crate) async fn client_maximum_packet_size(&self) -> Option<u32> {
         let session = self.shared.state.lock().await;
@@ -1726,8 +1742,13 @@ impl Session {
                     ..Default::default()
                 },
             }))),
-            AuthResult::Failed(reason) => {
+            AuthResult::Failed {
+                reason,
+                reason_string,
+            } => {
                 session.auth_exchange = None;
+                session.auth_failure =
+                    reason_string.filter(|_| session.client.request_problem_information);
                 Err(reason.into())
             }
         }

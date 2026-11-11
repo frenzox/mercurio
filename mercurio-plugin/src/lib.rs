@@ -16,8 +16,8 @@ pub mod bindings {
 pub use bindings::exports::mercurio::plugin::guest::Guest;
 pub use bindings::mercurio::plugin::host;
 pub use bindings::mercurio::plugin::types::{
-    Access, AuthResult, Challenge, ClientInfo, Connection, Decision, Disconnected, Event, Hooks,
-    Level, Message, MessageAction, Qos, Registration, SessionExpired, Subscribed, Success,
+    Access, AuthResult, Challenge, ClientInfo, Connection, Decision, Disconnected, Event, Failure,
+    Hooks, Level, Message, MessageAction, Qos, Registration, SessionExpired, Subscribed, Success,
     Unsubscribed,
 };
 
@@ -119,7 +119,10 @@ pub trait Plugin {
         _state: Option<Vec<u8>>,
         _data: Option<Vec<u8>>,
     ) -> AuthResult {
-        AuthResult::Failed(0x8C)
+        AuthResult::Failed(Failure {
+            reason: 0x8C,
+            reason_string: None,
+        })
     }
 
     /// Whether `client` may have `access` to `topic`, a topic filter when

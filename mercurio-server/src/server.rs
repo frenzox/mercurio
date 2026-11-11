@@ -2386,10 +2386,11 @@ where
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::Reason(reason)) = &result {
             if protocol_version.supports_reason_codes() && reason.code() >= 0x80 {
+                let text = session.take_auth_failure().await;
                 let disconnect = ControlPacket::Disconnect(DisconnectPacket {
                     reason: *reason,
                     properties: Some(DisconnectProperties {
-                        reason_string: reason_string(*reason, client_maximum_packet_size),
+                        reason_string: explained(*reason, text, client_maximum_packet_size),
                         ..Default::default()
                     }),
                 });
@@ -2492,10 +2493,35 @@ where
         loop {
             let challenge = match result {
                 AuthResult::Success { username, data } => return Ok(Some((username, data))),
-                AuthResult::Failed(reason) => {
+                AuthResult::Failed {
+                    reason,
+                    reason_string: text,
+                } => {
                     warn!("Enhanced authentication with `{}` failed", method);
                     self.login_failed().await;
-                    self.reject_connect(connect_packet, reason).await?;
+                    let properties = connect_packet.properties.as_ref();
+                    let text = text.filter(|_| {
+                        properties
+                            .and_then(|p| p.request_problem_information.as_ref())
+                            .is_none_or(|r| r.value != 0)
+                    });
+                    let client_maximum = properties
+                        .and_then(|p| p.maximum_packet_size.as_ref())
+                        .map(|m| m.value);
+                    let connack = ConnAckPacket {
+                        flags: ConnAckFlags {
+                            session_present: false,
+                        },
+                        reason_code: reason,
+                        properties: Some(ConnAckProperties {
+                            reason_string: explained(reason, text, client_maximum),
+                            ..Default::default()
+                        }),
+                    };
+                    let _ = self
+                        .connection
+                        .write_packet(ControlPacket::ConnAck(connack))
+                        .await;
                     return Ok(None);
                 }
                 AuthResult::Continue(challenge) => challenge,
@@ -3347,7 +3373,23 @@ fn reason_string(
     reason: ReasonCode,
     client_maximum_packet_size: Option<u32>,
 ) -> Option<ReasonString> {
-    let text = reason.to_string();
+    fitting(reason.to_string(), client_maximum_packet_size)
+}
+
+/// Explains `reason` to the client in `text`, as `reason_string` does
+/// without it or when it would make the packet too large.
+fn explained(
+    reason: ReasonCode,
+    text: Option<String>,
+    client_maximum_packet_size: Option<u32>,
+) -> Option<ReasonString> {
+    text.and_then(|text| fitting(text, client_maximum_packet_size))
+        .or_else(|| reason_string(reason, client_maximum_packet_size))
+}
+
+/// `text` as a reason string, unless it would make the packet larger than
+/// the client accepts.
+fn fitting(text: String, client_maximum_packet_size: Option<u32>) -> Option<ReasonString> {
     // Room for the rest of a CONNACK or DISCONNECT around the string
     let fits = client_maximum_packet_size.is_none_or(|max| text.len() + 16 <= max as usize);
     fits.then(|| ReasonString::new(text))
@@ -3426,6 +3468,19 @@ mod tests {
         // One message too many, and 1000 bytes too many
         assert_eq!(pacing.publish(1500), Some(Duration::from_secs(1)));
         assert_eq!(Pacing::new(&Limits::default()).publish(usize::MAX), None);
+    }
+
+    #[test]
+    fn test_reason_strings_fit_the_client_maximum_packet_size() {
+        let text = || Some("the token expired an hour ago".to_string());
+        let explain = |max| explained(ReasonCode::NotAuthorized, text(), max).map(|r| r.value);
+        assert_eq!(
+            explain(None).as_deref(),
+            Some("the token expired an hour ago")
+        );
+        // The method's text is longer than the reason code's own
+        assert_eq!(explain(Some(40)).as_deref(), Some("Not authorized"));
+        assert_eq!(explain(Some(20)), None);
     }
 
     #[test]

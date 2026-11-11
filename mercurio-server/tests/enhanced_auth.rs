@@ -9,7 +9,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    properties::{AuthenticationData, AuthenticationMethod},
+    properties::{AuthenticationData, AuthenticationMethod, RequestProblemInformation},
     protocol::ProtocolVersion,
     reason::ReasonCode,
 };
@@ -75,7 +75,10 @@ impl AuthExchange for ChallengeExchange {
                     data: Some(Bytes::from(format!("{nonce}-countersigned"))),
                 }
             }
-            _ => AuthResult::Failed(ReasonCode::NotAuthorized),
+            _ => AuthResult::Failed {
+                reason: ReasonCode::NotAuthorized,
+                reason_string: Some("wrong signature".into()),
+            },
         })
     }
 }
@@ -128,6 +131,15 @@ fn auth(reason: ReasonCode, data: Bytes) -> ControlPacket {
 }
 
 async fn connect_with(addr: SocketAddr, method: &str) -> (TcpStream, BytesMut) {
+    connect_asking(addr, method, None).await
+}
+
+/// Connects with `method`, sending Request Problem Information if given.
+async fn connect_asking(
+    addr: SocketAddr,
+    method: &str,
+    problem_information: Option<u8>,
+) -> (TcpStream, BytesMut) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let connect = ConnectPacket {
         protocol_version: ProtocolVersion::V5,
@@ -135,6 +147,7 @@ async fn connect_with(addr: SocketAddr, method: &str) -> (TcpStream, BytesMut) {
         keepalive: 60,
         properties: Some(ConnectProperties {
             authentication_method: Some(AuthenticationMethod::new(method.into())),
+            request_problem_information: problem_information.map(RequestProblemInformation::new),
             ..Default::default()
         }),
         payload: ConnectPayload {
@@ -223,6 +236,46 @@ async fn wrong_answer_is_not_authorized() {
         panic!("Expected CONNACK");
     };
     assert_eq!(connack.reason_code, ReasonCode::NotAuthorized);
+    // In the method's words
+    let reason_string = connack.properties.unwrap().reason_string.unwrap();
+    assert_eq!(reason_string.value, "wrong signature");
+}
+
+#[tokio::test]
+async fn clients_not_asking_for_problem_information_get_the_reason_code_alone() {
+    let addr = start_broker().await;
+    let (mut stream, mut buffer) = connect_asking(addr, "CHALLENGE", Some(0)).await;
+
+    answer_challenge(&mut stream, &mut buffer, false).await;
+
+    let ControlPacket::ConnAck(connack) = receive(&mut stream, &mut buffer).await else {
+        panic!("Expected CONNACK");
+    };
+    assert_eq!(connack.reason_code, ReasonCode::NotAuthorized);
+    let reason_string = connack.properties.unwrap().reason_string;
+    assert_ne!(
+        reason_string.map(|r| r.value),
+        Some("wrong signature".to_string())
+    );
+}
+
+#[tokio::test]
+async fn failed_reauthentication_disconnects_with_the_reason_string() {
+    let addr = start_broker().await;
+    let (mut stream, mut buffer) = connect_with(addr, "CHALLENGE").await;
+    answer_challenge(&mut stream, &mut buffer, true).await;
+    let ControlPacket::ConnAck(_) = receive(&mut stream, &mut buffer).await else {
+        panic!("Expected CONNACK");
+    };
+
+    send(&mut stream, auth(ReasonCode::ReAuthenticate, Bytes::new())).await;
+    answer_challenge(&mut stream, &mut buffer, false).await;
+    let ControlPacket::Disconnect(disconnect) = receive(&mut stream, &mut buffer).await else {
+        panic!("Expected DISCONNECT");
+    };
+    assert_eq!(disconnect.reason, ReasonCode::NotAuthorized);
+    let reason_string = disconnect.properties.unwrap().reason_string.unwrap();
+    assert_eq!(reason_string.value, "wrong signature");
 }
 
 #[tokio::test]
