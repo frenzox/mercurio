@@ -41,13 +41,13 @@
 <p class="lead">Install a package or build the binaries, start the broker, and run it as a systemd service.</p>
 
 <h2>Packages</h2>
-<p>Each <a href="https://github.com/frenzox/mercurio/releases">release</a> of <code>mercuriod</code>, the broker, and <code>recado</code>, the command-line client, has <code>.deb</code> and <code>.rpm</code> packages and a plain <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. They need glibc 2.18 or later. Download the one for your system and install it:</p>
+<p>Each <a href="https://github.com/frenzox/mercurio/releases">release</a> of <code>mercuriod</code>, the broker, <code>mercurioctl</code>, its administration tool, and <code>recado</code>, the command-line client, has <code>.deb</code> and <code>.rpm</code> packages and a plain <code>.tar.gz</code> for x86_64, aarch64 and armv7 Linux. They need glibc 2.18 or later. Download the ones for your system and install them:</p>
 <pre><span class="comment"># Debian, Ubuntu, Raspberry Pi OS</span>
-sudo apt install ./mercuriod_*.deb ./recado_*.deb
+sudo apt install ./mercuriod_*.deb ./mercurioctl_*.deb ./recado_*.deb
 
 <span class="comment"># Fedora, RHEL, openSUSE</span>
-sudo dnf install ./mercuriod-*.rpm ./recado-*.rpm</pre>
-<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, and create a <code>mercurio</code> system user for the service. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
+sudo dnf install ./mercuriod-*.rpm ./mercurioctl-*.rpm ./recado-*.rpm</pre>
+<p>The <code>mercuriod</code> packages install the broker as <code>/usr/bin/mercuriod</code>, the sample configuration as <code>/etc/mercurio/config.toml</code> and the <a href="#systemd">systemd unit</a>, create a <code>mercurio</code> system user and group for the service, and recommend <code>mercurioctl</code>. Members of the group may run <a href="mercurioctl.html">mercurioctl</a> on the broker's host. Edits to the configuration are kept across upgrades. The Debian package enables and starts the service. With the RPM, start it yourself:</p>
 <pre>sudo systemctl enable --now mercuriod</pre>
 <p>The service runs as <code>mercurio</code>, so files it reads that aren't readable by everyone, such as TLS keys and password files, must belong to that user or its group:</p>
 <pre>sudo chown root:mercurio /etc/mercurio/server.key
@@ -64,8 +64,9 @@ cargo build --release --package mercuriod
 
 <span class="comment"># Or install the binaries into ~/.cargo/bin</span>
 cargo install --path mercuriod
+cargo install --path mercurioctl
 cargo install --path recado</pre>
-<p>The binaries end up in <code>target/release/</code>: <code>mercuriod</code>, the broker, and <code>recado</code>, the command-line client.</p>
+<p>The binaries end up in <code>target/release/</code>: <code>mercuriod</code>, the broker, <code>mercurioctl</code>, its administration tool, and <code>recado</code>, the command-line client.</p>
 
 <h2>Running the broker</h2>
 <pre>mercuriod [OPTIONS]
@@ -99,12 +100,12 @@ mercuriod -v</pre>
 <table>
 <tr><th>Signal</th><th>Effect</th></tr>
 <tr><td><code>SIGTERM</code>, Ctrl+C</td><td>Graceful shutdown: every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close.</td></tr>
-<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>. <code>mercurioctl broker reload</code> does the same and reports each file.</td></tr>
 </table>
 <p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
 
 <h2 id="systemd">Running as a systemd service</h2>
-<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
+<p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code> as its only writable directory, which suits the SQLite database, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
 <pre><span class="comment"># Binary, configuration and unit</span>
 sudo cp target/release/mercuriod /usr/bin/
 sudo mkdir -p /etc/mercurio
@@ -139,6 +140,7 @@ password_file = "/etc/mercurio/passwd"</pre>
 <li><a href="configuration.html">Configuration reference</a> for every option.</li>
 <li><a href="security.html">Authentication &amp; access</a> to lock the broker down.</li>
 <li><a href="listeners.html">Listeners</a> to add TLS or WebSocket.</li>
+<li><a href="admin.html">Administration</a> to look at and change the running broker.</li>
 </ul>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>

@@ -125,8 +125,9 @@ level = "info"
 <li>Under systemd, standard output goes to the journal: <code>journalctl -u mercuriod -f</code>.</li>
 <li><code>file</code> appends to a file. Rotate it with logrotate's <code>copytruncate</code>, as the file stays open.</li>
 <li><code>syslog</code> sends each line to the local syslog daemon through <code>/dev/log</code>, with facility <code>daemon</code> and a severity from the level.</li>
-<li><code>connection_messages = false</code> drops the lines logged for every connection and disconnection, which dominate the log of a busy broker.</li>
-<li><code>level</code> can be set per module: <code>"info,mercurio_server::session=warn"</code>. <code>mercuriod -v</code> logs at debug level.</li>
+<li><code>connection_messages = false</code> drops the lines logged for every connection and disconnection, which dominate the log of a busy broker. They are logged under <code>mercurio::connections</code>, and a <code>level</code> naming it, such as <code>"info,mercurio::connections=info"</code>, turns them back on, in the configuration or with <a href="admin.html#broker"><code>mercurioctl broker log-level</code></a>.</li>
+<li><code>level</code> can be set per module: <code>"info,mercurio_server::session=warn"</code>. An empty or invalid level means <code>info</code>. <code>mercuriod -v</code> logs at debug level.</li>
+<li><code>mercurioctl broker log-level debug</code> changes the level of a running broker until it restarts; see <a href="admin.html">Administration</a>.</li>
 </ul>
 
 <h2 id="shutdown">Shutdown</h2>

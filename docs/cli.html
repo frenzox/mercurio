@@ -39,6 +39,7 @@
 <main>
 <h1>Command-line client</h1>
 <p class="lead"><code>recado pub</code> publishes a message, <code>recado sub</code> prints messages until interrupted. Both work with any MQTT broker.</p>
+<p>To administer a broker, use <a href="mercurioctl.html">mercurioctl</a>.</p>
 
 <h2>Publishing</h2>
 <pre><span class="comment"># A message, at QoS 1</span>
@@ -99,6 +100,7 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 <tr><th>Option</th><th>Meaning</th><th>Default</th></tr>
 <tr><td><code>-H, --host</code></td><td>Broker host name</td><td><code>localhost</code></td></tr>
 <tr><td><code>-p, --port</code></td><td>Broker port</td><td><code>1883</code></td></tr>
+<tr><td><code>--unix PATH</code></td><td>Connect through this Unix socket instead of TCP; not with <code>-H</code>, <code>-p</code> or the TLS options</td><td></td></tr>
 <tr><td><code>-i, --client-id</code></td><td>Client id</td><td>generated</td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials</td><td></td></tr>
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
@@ -114,7 +116,10 @@ recado sub -t 'cmd/#' --will-topic status/monitor --will-message offline --will-
 recado sub -H broker.example.com -p 8883 --tls --cafile ca.crt -u alice -P secret -t '#'
 
 <span class="comment"># MQTT 3.1.1</span>
-recado pub -V 311 -t test -m hello</pre>
+recado pub -V 311 -t test -m hello
+
+<span class="comment"># Through a <a href="listeners.html#unix">Unix socket listener</a></span>
+recado sub --unix /run/mercurio/mqtt.sock -t 'sensors/#' -T</pre>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>
 </body>
