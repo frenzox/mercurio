@@ -58,13 +58,23 @@ impl StorageError {
     pub(crate) fn database(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
         #[cfg(feature = "sqlite")]
-        if let Some(rusqlite::Error::SqliteFailure(failure, _)) = error.downcast_ref() {
-            if matches!(
-                failure.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            ) {
+        match error.downcast_ref() {
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
                 return StorageError::Transient(error);
             }
+            // A stored value that can't be read as what it stands for
+            Some(
+                rusqlite::Error::FromSqlConversionFailure(..)
+                | rusqlite::Error::InvalidColumnType(..)
+                | rusqlite::Error::IntegralValueOutOfRange(..)
+                | rusqlite::Error::Utf8Error(..),
+            ) => return StorageError::SerializationError(error.to_string()),
+            _ => {}
         }
         StorageError::Database(error)
     }

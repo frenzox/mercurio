@@ -288,7 +288,9 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
 }
 
 /// Moves the subscriptions sessions kept encoded in their row, before
-/// subscriptions had a table of their own, to that table.
+/// subscriptions had a table of their own, to that table. Those that can't
+/// be read stay where they are, and the session with them, for an operator
+/// to look at; see `load_session`.
 async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
     let sessions = client
         .query(
@@ -299,23 +301,27 @@ async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
         .db()?;
     for row in sessions {
         let client_id: String = row.try_get(0).db()?;
-        let encoded = String::from_utf8(row.try_get(1).db()?)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
-        let subscriptions = decode_subscriptions(&encoded);
+        let encoded: Vec<u8> = row.try_get(1).db()?;
+        let Some(subscriptions) = String::from_utf8(encoded)
+            .ok()
+            .and_then(|encoded| decode_subscriptions(&encoded).ok())
+        else {
+            continue;
+        };
         let (sql, params) = insert_subscriptions(&client_id, &subscriptions, "NOTHING");
         let params: Vec<&(dyn ToSql + Sync)> = params
             .iter()
             .map(|p| p.as_ref() as &(dyn ToSql + Sync))
             .collect();
         client.execute(sql, &params).await.db()?;
+        client
+            .execute(
+                "UPDATE sessions SET subscriptions = ''::BYTEA WHERE client_id = $1",
+                &[&client_id],
+            )
+            .await
+            .db()?;
     }
-    client
-        .execute(
-            "UPDATE sessions SET subscriptions = ''::BYTEA WHERE length(subscriptions) > 0",
-            &[],
-        )
-        .await
-        .db()?;
     Ok(())
 }
 
@@ -361,6 +367,25 @@ impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
     fn db(self) -> Result<T> {
         self.map_err(classify)
     }
+}
+
+/// Turns the errors of reading a column into the crate's: a stored value
+/// that can't be read as what it stands for.
+trait Col<T> {
+    fn col(self) -> Result<T>;
+}
+
+impl<T> Col<T> for std::result::Result<T, tokio_postgres::Error> {
+    fn col(self) -> Result<T> {
+        self.map_err(|e| StorageError::SerializationError(crate::error_chain(&e)))
+    }
+}
+
+/// `value` read as a narrower integer, failing for one out of its range.
+fn narrow<T: TryFrom<i64>>(value: impl Into<i64>, what: &str) -> Result<T> {
+    let value = value.into();
+    T::try_from(value)
+        .map_err(|_| StorageError::SerializationError(format!("{value} is not a valid {what}")))
 }
 
 fn classify(error: tokio_postgres::Error) -> StorageError {
@@ -1088,6 +1113,7 @@ impl BatchStore for PostgresStore {
         let rows = self
             .query(
                 "SELECT s.expiry_interval, s.expires_at, s.owner_username, s.owner_mount_point,
+                        length(s.subscriptions) > 0 AS unmoved,
                         f.topic_filter, f.qos, f.no_local, f.retain_as_published,
                         f.subscription_identifier
                  FROM sessions s
@@ -1100,20 +1126,28 @@ impl BatchStore for PostgresStore {
         let Some(row) = rows.first() else {
             return Ok(None);
         };
+        // Subscriptions an older version kept in the session's row that the
+        // move to their table couldn't read
+        if row.try_get("unmoved").col()? {
+            return Err(StorageError::SerializationError(
+                "subscriptions left in the session's row can't be read".into(),
+            ));
+        }
         let mut subscriptions = Vec::with_capacity(rows.len());
         for row in &rows {
-            let Some(topic_filter) = row.try_get::<_, Option<String>>("topic_filter").db()? else {
+            let Some(topic_filter) = row.try_get::<_, Option<String>>("topic_filter").col()? else {
                 continue;
             };
             subscriptions.push(StoredSubscription {
                 topic_filter,
-                qos: int_to_qos(row.try_get("qos").db()?),
-                no_local: row.try_get("no_local").db()?,
-                retain_as_published: row.try_get("retain_as_published").db()?,
+                qos: int_to_qos(row.try_get("qos").col()?)?,
+                no_local: row.try_get("no_local").col()?,
+                retain_as_published: row.try_get("retain_as_published").col()?,
                 subscription_identifier: row
                     .try_get::<_, Option<i64>>("subscription_identifier")
-                    .db()?
-                    .map(|id| id as u32),
+                    .col()?
+                    .map(|id| narrow(id, "subscription identifier"))
+                    .transpose()?,
             });
         }
         Ok(Some(SessionState {
@@ -1121,15 +1155,16 @@ impl BatchStore for PostgresStore {
             subscriptions,
             expiry_interval: row
                 .try_get::<_, Option<i64>>("expiry_interval")
-                .db()?
-                .map(|i| i as u32),
+                .col()?
+                .map(|i| narrow(i, "session expiry interval"))
+                .transpose()?,
             expires_at: row
                 .try_get::<_, Option<i64>>("expires_at")
-                .db()?
+                .col()?
                 .map(|t| t as u64),
             owner: SessionOwner {
-                username: row.try_get("owner_username").db()?,
-                mount_point: row.try_get("owner_mount_point").db()?,
+                username: row.try_get("owner_username").col()?,
+                mount_point: row.try_get("owner_mount_point").col()?,
             },
         }))
     }
@@ -1138,7 +1173,7 @@ impl BatchStore for PostgresStore {
         self.query("SELECT client_id FROM sessions", &[])
             .await?
             .iter()
-            .map(|row| row.try_get(0).db())
+            .map(|row| row.try_get(0).col())
             .collect()
     }
 
@@ -1154,12 +1189,12 @@ impl BatchStore for PostgresStore {
             return Ok(None);
         };
         Ok(Some(StoredWillMessage {
-            topic: row.try_get("topic").db()?,
-            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").db()?),
-            qos: int_to_qos(row.try_get("qos").db()?),
-            retain: row.try_get("retain").db()?,
-            delay_secs: row.try_get::<_, i64>("delay_secs").db()? as u32,
-            properties: decode_properties(row.try_get("properties").db()?)?,
+            topic: row.try_get("topic").col()?,
+            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").col()?),
+            qos: int_to_qos(row.try_get("qos").col()?)?,
+            retain: row.try_get("retain").col()?,
+            delay_secs: narrow(row.try_get::<_, i64>("delay_secs").col()?, "will delay")?,
+            properties: decode_properties(row.try_get("properties").col()?)?,
         }))
     }
 
@@ -1181,7 +1216,7 @@ impl BatchStore for PostgresStore {
         )
         .await?
         .iter()
-        .map(|row| Ok(row.try_get::<_, i32>(0).db()? as u16))
+        .map(|row| narrow(row.try_get::<_, i32>(0).col()?, "packet id"))
         .collect()
     }
 
@@ -1193,28 +1228,28 @@ impl BatchStore for PostgresStore {
         .await?
         .iter()
         .map(|row| {
-            let topic: String = row.try_get("topic").db()?;
+            let topic: String = row.try_get("topic").col()?;
             let message = Message {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
                 dup: false,
-                qos: int_to_qos(row.try_get("qos").db()?),
-                retain: row.try_get("retain").db()?,
+                qos: int_to_qos(row.try_get("qos").col()?)?,
+                retain: row.try_get("retain").col()?,
                 payload: row
                     .try_get::<_, Option<Vec<u8>>>("payload")
-                    .db()?
+                    .col()?
                     .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").db()?)?,
+                properties: decode_properties(row.try_get("properties").col()?)?,
                 expires_at: row
                     .try_get::<_, Option<i64>>("expires_at")
-                    .db()?
+                    .col()?
                     .map(|t| t as u64),
                 subscription_identifiers: decode_identifiers(
-                    row.try_get("subscription_identifiers").db()?,
+                    row.try_get("subscription_identifiers").col()?,
                 )?,
                 origin: None,
             };
-            Ok((row.try_get::<_, i64>("sequence").db()? as u64, message))
+            Ok((row.try_get::<_, i64>("sequence").col()? as u64, message))
         })
         .collect()
     }
@@ -1315,24 +1350,24 @@ fn topic_prefix_pattern(filter: &str) -> String {
 
 fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
     Ok(InflightMessage {
-        packet_id: row.try_get::<_, i32>("packet_id").db()? as u16,
-        topic: row.try_get("topic").db()?,
+        packet_id: narrow(row.try_get::<_, i32>("packet_id").col()?, "packet id")?,
+        topic: row.try_get("topic").col()?,
         payload: row
             .try_get::<_, Option<Vec<u8>>>("payload")
-            .db()?
+            .col()?
             .map(Bytes::from),
-        qos: int_to_qos(row.try_get("qos").db()?),
-        dup: row.try_get("dup").db()?,
-        sequence: row.try_get::<_, i64>("sequence").db()? as u64,
-        released: row.try_get("released").db()?,
-        properties: decode_properties(row.try_get("properties").db()?)?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        dup: row.try_get("dup").col()?,
+        sequence: row.try_get::<_, i64>("sequence").col()? as u64,
+        released: row.try_get("released").col()?,
+        properties: decode_properties(row.try_get("properties").col()?)?,
         subscription_identifiers: decode_identifiers(
-            row.try_get("subscription_identifiers").db()?,
+            row.try_get("subscription_identifiers").col()?,
         )?,
-        retain: row.try_get("retain").db()?,
+        retain: row.try_get("retain").col()?,
         expires_at: row
             .try_get::<_, Option<i64>>("expires_at")
-            .db()?
+            .col()?
             .map(|t| t as u64),
     })
 }
@@ -1402,34 +1437,34 @@ impl RetainedMessageStore for PostgresStore {
 
         let mut messages = Vec::new();
         for row in rows {
-            let topic: String = row.try_get("topic").db()?;
+            let topic: String = row.try_get("topic").col()?;
             if !topic_matches_filter(&topic, topic_filter) {
                 continue;
             }
             let origin = row
                 .try_get::<_, Option<String>>("origin_client_id")
-                .db()?
+                .col()?
                 .map(|client_id| -> Result<_> {
                     Ok(Arc::new(MessageOrigin {
                         client_id,
-                        username: row.try_get("origin_username").db()?,
+                        username: row.try_get("origin_username").col()?,
                     }))
                 })
                 .transpose()?;
             messages.push(Message {
                 packet_id: None,
                 topic: Arc::from(topic.as_str()),
-                dup: row.try_get("dup").db()?,
-                qos: int_to_qos(row.try_get("qos").db()?),
+                dup: row.try_get("dup").col()?,
+                qos: int_to_qos(row.try_get("qos").col()?)?,
                 retain: true,
                 payload: row
                     .try_get::<_, Option<Vec<u8>>>("payload")
-                    .db()?
+                    .col()?
                     .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").db()?)?,
+                properties: decode_properties(row.try_get("properties").col()?)?,
                 expires_at: row
                     .try_get::<_, Option<i64>>("expires_at")
-                    .db()?
+                    .col()?
                     .map(|t| t as u64),
                 subscription_identifiers: Vec::new(),
                 origin,
@@ -1681,7 +1716,8 @@ mod tests {
             &format!(
                 "INSERT INTO sessions (client_id, subscriptions, clean_start, owner_username)
                  VALUES ('old', decode('{}', 'hex'), FALSE, 'alice'),
-                        ('none', '', FALSE, NULL);",
+                        ('none', '', FALSE, NULL),
+                        ('bad', '9xx:a', FALSE, NULL);",
                 encoded
                     .bytes()
                     .map(|b| format!("{b:02x}"))
@@ -1701,6 +1737,11 @@ mod tests {
         assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
         let none = store.load_session("none").await.unwrap().unwrap();
         assert!(none.subscriptions.is_empty());
+        // Those that can't be read stay, and their session fails to load
+        assert!(matches!(
+            store.load_session("bad").await,
+            Err(StorageError::SerializationError(_))
+        ));
         let blobs: i64 = store
             .client()
             .await
@@ -1712,7 +1753,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(blobs, 0);
+        assert_eq!(blobs, 1);
     }
 
     #[tokio::test]
@@ -1753,6 +1794,52 @@ mod tests {
             .await
             .is_err());
         assert!(store.load_session("c").await.unwrap().is_some());
+    }
+
+    /// Rows that can't be read fail to load as undecodable, each in the
+    /// loads of its own client only, and stay in the database.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_rows_that_cannot_be_read_are_an_error() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        for client_id in ["bad", "good"] {
+            store
+                .apply(
+                    client_id,
+                    &[
+                        Write::SaveSession(crate::testing::session(client_id)),
+                        Write::StoreInflight(crate::testing::inflight_message(1)),
+                        Write::Enqueue(1, crate::testing::message("q", "1")),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .client()
+            .await
+            .unwrap()
+            .batch_execute(
+                "UPDATE subscriptions SET qos = 7 WHERE client_id = 'bad';
+                 UPDATE inflight_messages SET packet_id = 70000 WHERE client_id = 'bad';
+                 UPDATE queued_messages SET properties = '\\xff' WHERE client_id = 'bad';",
+            )
+            .await
+            .unwrap();
+        let undecodable =
+            |result: Result<_>| matches!(result, Err(StorageError::SerializationError(_)));
+
+        assert!(undecodable(store.load_session("bad").await.map(|_| ())));
+        assert!(undecodable(store.load_inflight("bad").await.map(|_| ())));
+        assert!(undecodable(store.load_queue("bad").await.map(|_| ())));
+        assert!(store.load_session("good").await.unwrap().is_some());
+        assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
+        assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
+
+        store.delete_session("bad").await.unwrap();
+        assert!(store.load_session("bad").await.unwrap().is_none());
     }
 
     /// `url` with `user` and `password` in place of its credentials.

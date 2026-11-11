@@ -15,6 +15,7 @@ use bytes::Bytes;
 use mercurio_core::{
     codec::Decoder,
     message::{unix_millis, Message, MessageOrigin, MessageProperties},
+    qos::QoS,
     topic::topic_matches_filter,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Null, ToSqlOutput, ValueRef};
@@ -306,14 +307,19 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Moves the subscriptions sessions kept encoded in their row, before
-/// subscriptions had a table of their own, to that table.
+/// subscriptions had a table of their own, to that table. Those that can't
+/// be read stay where they are, and the session with them, for an operator
+/// to look at; see `load_session`.
 fn move_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
     let encoded: Vec<(String, String)> = conn
         .prepare("SELECT client_id, subscriptions FROM sessions WHERE subscriptions != ''")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (client_id, subscriptions) in encoded {
-        for subscription in decode_subscriptions(&subscriptions) {
+        let Ok(subscriptions) = decode_subscriptions(&subscriptions) else {
+            continue;
+        };
+        for subscription in subscriptions {
             insert_subscription(conn, &client_id, &subscription, "INSERT OR IGNORE")?;
         }
         conn.execute(
@@ -358,6 +364,34 @@ fn decode_properties(encoded: Vec<u8>) -> rusqlite::Result<MessageProperties> {
     })
 }
 
+/// Fails for a session whose subscriptions an older version kept in its row
+/// and the move to their table couldn't read.
+fn unmoved_subscriptions(encoded: String) -> rusqlite::Result<()> {
+    if encoded.is_empty() {
+        return Ok(());
+    }
+    let error = decode_subscriptions(&encoded).err().unwrap_or_else(|| {
+        StorageError::SerializationError("subscriptions left in the session's row".into())
+    });
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        4,
+        rusqlite::types::Type::Text,
+        Box::new(error),
+    ))
+}
+
+/// A stored QoS, which fails to read for a value no version stores.
+struct Qos(QoS);
+
+impl FromSql for Qos {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = i32::column_result(value)?;
+        int_to_qos(value)
+            .map(Qos)
+            .map_err(|_| FromSqlError::OutOfRange(value.into()))
+    }
+}
+
 /// The subscription identifiers of a stored message, as comma-separated
 /// text, or no value when there are none.
 struct Identifiers(Vec<u32>);
@@ -396,7 +430,7 @@ fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
         packet_id: row.get(0)?,
         topic: row.get(1)?,
         payload: payload.map(Bytes::from),
-        qos: int_to_qos(row.get(3)?),
+        qos: row.get::<_, Qos>(3)?.0,
         dup: row.get(4)?,
         // SQLite integers are signed; the bit pattern round-trips
         sequence: row.get::<_, i64>(5)? as u64,
@@ -610,10 +644,12 @@ impl BatchStore for SqliteStore {
         self.blocking(move |conn| {
             let Some(mut session) = conn
                 .query_row(
-                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point
+                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point,
+                            subscriptions
                      FROM sessions WHERE client_id = ?1",
                     params![client_id],
                     |row| {
+                        unmoved_subscriptions(row.get(4)?)?;
                         Ok(SessionState {
                             client_id: client_id.clone(),
                             subscriptions: Vec::new(),
@@ -638,7 +674,7 @@ impl BatchStore for SqliteStore {
                 .query_map(params![client_id], |row| {
                     Ok(StoredSubscription {
                         topic_filter: row.get(0)?,
-                        qos: int_to_qos(row.get(1)?),
+                        qos: row.get::<_, Qos>(1)?.0,
                         no_local: row.get(2)?,
                         retain_as_published: row.get(3)?,
                         subscription_identifier: row.get(4)?,
@@ -673,7 +709,7 @@ impl BatchStore for SqliteStore {
                     Ok(StoredWillMessage {
                         topic: row.get(0)?,
                         payload: Bytes::from(payload),
-                        qos: int_to_qos(row.get(2)?),
+                        qos: row.get::<_, Qos>(2)?.0,
                         retain: row.get(3)?,
                         delay_secs: row.get(4)?,
                         properties: decode_properties(properties)?,
@@ -723,7 +759,7 @@ impl BatchStore for SqliteStore {
                     packet_id: None,
                     topic: Arc::from(topic.as_str()),
                     dup: false,
-                    qos: int_to_qos(row.get(3)?),
+                    qos: row.get::<_, Qos>(3)?.0,
                     retain: row.get(4)?,
                     payload: payload.map(Bytes::from),
                     properties: decode_properties(row.get(5)?)?,
@@ -853,7 +889,7 @@ impl RetainedMessageStore for SqliteStore {
             let rows = stmt.query_map([], |row| {
                 let topic: String = row.get(0)?;
                 let payload: Option<Vec<u8>> = row.get(1)?;
-                let qos: i32 = row.get(2)?;
+                let qos = row.get::<_, Qos>(2)?.0;
                 let dup: bool = row.get(3)?;
                 let properties: Vec<u8> = row.get(4)?;
                 let expires_at: Option<i64> = row.get(5)?;
@@ -877,7 +913,7 @@ impl RetainedMessageStore for SqliteStore {
                         packet_id: None,
                         topic: Arc::from(topic.as_str()),
                         dup,
-                        qos: int_to_qos(qos),
+                        qos,
                         retain: true,
                         payload: payload.map(Bytes::from),
                         properties: decode_properties(properties)?,
@@ -1249,6 +1285,98 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(saved, ["after"]);
+    }
+
+    fn is_undecodable<T: std::fmt::Debug>(result: Result<T>) -> bool {
+        matches!(result, Err(StorageError::SerializationError(_)))
+    }
+
+    /// Rows that can't be read fail to load as undecodable, each in the
+    /// loads of its own client only, and stay in the database.
+    #[tokio::test]
+    async fn test_rows_that_cannot_be_read_are_an_error() {
+        let path = TempPath::new("undecodable");
+        let store = SqliteStore::new(&path).unwrap();
+        for client_id in ["bad", "good"] {
+            store
+                .apply(
+                    client_id,
+                    &[
+                        Write::SaveSession(crate::testing::session(client_id)),
+                        Write::StoreInflight(crate::testing::inflight_message(1)),
+                        Write::Enqueue(1, message("q", "1")),
+                        Write::StoreWill(StoredWillMessage {
+                            topic: "w".into(),
+                            payload: Bytes::new(),
+                            qos: QoS::AtMostOnce,
+                            retain: false,
+                            delay_secs: 0,
+                            properties: Default::default(),
+                        }),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE subscriptions SET qos = 7 WHERE client_id = 'bad';
+                 UPDATE inflight_messages SET subscription_identifiers = 'x' WHERE client_id = 'bad';
+                 UPDATE queued_messages SET properties = x'ff' WHERE client_id = 'bad';
+                 UPDATE will_messages SET qos = 'text' WHERE client_id = 'bad';",
+            )
+            .unwrap();
+
+        assert!(is_undecodable(store.load_session("bad").await));
+        assert!(is_undecodable(store.load_inflight("bad").await));
+        assert!(is_undecodable(store.load_queue("bad").await));
+        assert!(is_undecodable(store.load_will("bad").await));
+        assert!(store.load_session("good").await.unwrap().is_some());
+        assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
+        assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
+        assert!(store.load_will("good").await.unwrap().is_some());
+
+        // Deleting the session removes the rows that can't be read too
+        store.delete_session("bad").await.unwrap();
+        assert!(store.load_session("bad").await.unwrap().is_none());
+        assert!(store.load_queue("bad").await.unwrap().is_empty());
+    }
+
+    /// Subscriptions an older version kept in the session's row that can't
+    /// be read stay there, and the session fails to load.
+    #[tokio::test]
+    async fn test_encoded_subscriptions_that_cannot_be_read_stay() {
+        let path = TempPath::new("bad-subs");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                client_id TEXT PRIMARY KEY, subscriptions TEXT NOT NULL,
+                clean_start INTEGER NOT NULL, expiry_interval INTEGER, expires_at INTEGER,
+                owner_username TEXT, owner_mount_point TEXT
+            );
+            INSERT INTO sessions VALUES ('bad', '9xx:a', 0, 60, NULL, NULL, NULL),
+                                        ('good', '100:a', 0, 60, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteStore::new(&path).unwrap();
+        assert!(is_undecodable(store.load_session("bad").await));
+        let good = store.load_session("good").await.unwrap().unwrap();
+        assert_eq!(
+            good.subscriptions,
+            [StoredSubscription::new("a", QoS::AtLeastOnce)]
+        );
+        let kept: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT subscriptions FROM sessions WHERE client_id = 'bad'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "9xx:a");
     }
 
     fn user_version(path: &TempPath) -> i64 {
