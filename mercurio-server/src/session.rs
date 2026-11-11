@@ -1709,13 +1709,13 @@ impl Session {
 
             // Packets the client can't take are discarded as if delivered
             // [MQTT-3.1.2-25]
-            if session.too_big(&publish) {
+            let Some(sent) = session.apply_topic_alias(publish.clone()) else {
                 warn!(
                     "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
                     publish.topic_name, session.client_id
                 );
                 return None;
-            }
+            };
 
             let inflight = packet_id.map(|packet_id| {
                 let sequence = session.next_sequence;
@@ -1737,7 +1737,7 @@ impl Session {
             });
 
             Some(Outgoing {
-                packet: ControlPacket::Publish(session.apply_topic_alias(publish)),
+                packet: ControlPacket::Publish(sent),
                 inflight,
             })
         }
@@ -1846,8 +1846,12 @@ impl State {
     /// Replaces the topic of an outgoing PUBLISH with an alias where the
     /// client accepts them, assigning new aliases until its maximum is
     /// reached. Only the copy sent is aliased: aliases end with the
-    /// connection, so a retransmission must carry the full topic.
-    fn apply_topic_alias(&mut self, mut publish: PublishPacket) -> PublishPacket {
+    /// connection, so a retransmission must carry the full topic. Returns
+    /// None if the packet is larger than the client accepts. A new alias
+    /// adds its property to a packet that still carries the topic, so it is
+    /// only assigned when that packet fits; otherwise the packet goes
+    /// without one.
+    fn apply_topic_alias(&mut self, publish: PublishPacket) -> Option<PublishPacket> {
         let maximum = self
             .connect_packet
             .properties
@@ -1856,26 +1860,35 @@ impl State {
             .filter(|_| self.send_topic_aliases)
             .map_or(0, |m| m.value);
 
-        let alias = match self.outgoing_aliases.get(&publish.topic_name) {
+        let with_alias = |mut publish: PublishPacket, alias: u16| {
+            publish
+                .properties
+                .get_or_insert_with(Default::default)
+                .topic_alias = Some(TopicAlias::new(alias));
+            publish
+        };
+
+        let sent = match self.outgoing_aliases.get(&publish.topic_name) {
             // Already known to the client: the alias alone stands for it
             Some(&alias) => {
+                let mut publish = with_alias(publish, alias);
                 publish.topic_name.clear();
-                alias
+                publish
             }
             None if self.outgoing_aliases.len() < usize::from(maximum) => {
                 let alias = self.outgoing_aliases.len() as u16 + 1;
-                self.outgoing_aliases
-                    .insert(publish.topic_name.clone(), alias);
-                alias
+                let topic = publish.topic_name.clone();
+                let aliased = with_alias(publish.clone(), alias);
+                if self.too_big(&aliased) {
+                    publish
+                } else {
+                    self.outgoing_aliases.insert(topic, alias);
+                    aliased
+                }
             }
-            None => return publish,
+            None => publish,
         };
-
-        publish
-            .properties
-            .get_or_insert_with(Default::default)
-            .topic_alias = Some(TopicAlias::new(alias));
-        publish
+        (!self.too_big(&sent)).then_some(sent)
     }
 
     /// Most QoS 1 and 2 messages that may be in flight: the client's
@@ -3012,6 +3025,55 @@ mod tests {
             .unacknowledged_messages
             .values()
             .all(|(_, p)| !p.topic_name.is_empty()));
+    }
+
+    fn encoded_len(packet: &ControlPacket) -> usize {
+        let ControlPacket::Publish(publish) = packet else {
+            panic!("Expected Publish");
+        };
+        let mut encoded = BytesMut::new();
+        publish.encode(&mut encoded);
+        encoded.len()
+    }
+
+    #[tokio::test]
+    async fn test_aliased_publish_stays_within_client_maximum_packet_size() {
+        let full = message("topic", QoS::AtMostOnce, None, false);
+        let unaliased = encoded_len(
+            &Session::new(create_connect_packet_without_will())
+                .prepare_publish(full.clone())
+                .await
+                .unwrap()
+                .packet,
+        );
+
+        let mut connect = create_connect_packet_without_will();
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            topic_alias_maximum: Some(TopicAliasMaximum::new(1)),
+            maximum_packet_size: Some(MaximumPacketSize::new(unaliased as u32)),
+            ..Default::default()
+        });
+        let mut session = Session::new(connect);
+        session.shared.state.lock().await.send_topic_aliases = true;
+
+        // Announcing an alias would take it over the limit, so it goes
+        // without one, and the alias stays free
+        let outgoing = session.prepare_publish(full.clone()).await.unwrap();
+        assert!(encoded_len(&outgoing.packet) <= unaliased);
+        assert!(session
+            .shared
+            .state
+            .lock()
+            .await
+            .outgoing_aliases
+            .is_empty());
+
+        // A smaller message announces it; later ones fit using it alone
+        let mut small = full.clone();
+        small.payload = Some(Bytes::from("x"));
+        session.prepare_publish(small).await.unwrap();
+        let outgoing = session.prepare_publish(full).await.unwrap();
+        assert!(encoded_len(&outgoing.packet) < unaliased);
     }
 
     fn qos1_publish(topic: &str, payload: &'static [u8], text: bool) -> ControlPacket {
