@@ -28,7 +28,7 @@ mercurio-server = { path = "../mercurio-server", version = "0.5.0" }
 mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
 mercurio-storage = { path = "../mercurio-storage", version = "0.3.3", features = ["sqlite", "postgres"] }
 
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = "0.6"
 clap.workspace = true
 rpassword.workspace = true
 serde.workspace = true

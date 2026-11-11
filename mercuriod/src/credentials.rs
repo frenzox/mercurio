@@ -46,11 +46,10 @@ impl ScramCredentialStore for HashedCredentialValidator {
 /// A new password's Argon2 hash, for user name and password logins, and
 /// its SCRAM-SHA-256 credentials, as [`scram_entry`] stores them.
 pub fn hash_new_password(password: &str) -> Result<(String, String), String> {
-    use argon2::{password_hash::SaltString, PasswordHasher};
+    use argon2::PasswordHasher;
 
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| format!("Failed to hash password: {e}"))?
         .to_string();
     let scram = StoredCredentials::generate(password, mercurio_scram::DEFAULT_ITERATIONS)
@@ -104,7 +103,7 @@ impl HashedCredentialValidator {
 /// [`check_hash`] accepts; never for any other.
 pub(crate) fn verify(stored: &str, password: &[u8]) -> bool {
     match Hash::parse(stored) {
-        Ok(Hash::Argon2(hash)) => Argon2::default().verify_password(password, &hash).is_ok(),
+        Ok(Hash::Argon2(hash)) => Argon2::default().verify_password(password, &*hash).is_ok(),
         Ok(Hash::Mosquitto {
             iterations,
             salt,
@@ -115,8 +114,8 @@ pub(crate) fn verify(stored: &str, password: &[u8]) -> bool {
 }
 
 /// A password hash of the formats the password file may hold.
-enum Hash<'a> {
-    Argon2(PasswordHash<'a>),
+enum Hash {
+    Argon2(Box<PasswordHash>),
     /// Written by `mosquitto_passwd`: PBKDF2-HMAC-SHA512 with `iterations`,
     /// its default since 2.0, or one SHA-512 of the password and salt
     /// without, the default before
@@ -127,11 +126,11 @@ enum Hash<'a> {
     },
 }
 
-impl<'a> Hash<'a> {
+impl Hash {
     /// Parses `$argon2id$...` (or `argon2i`, `argon2d`) PHC strings,
     /// `$7$<iterations>$<salt>$<hash>` and `$6$<salt>$<hash>`, whose salts
     /// and hashes are base64. The error does not repeat `stored`.
-    fn parse(stored: &'a str) -> Result<Hash<'a>, &'static str> {
+    fn parse(stored: &str) -> Result<Hash, &'static str> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         let fields: Vec<&str> = stored.split('$').collect();
@@ -148,7 +147,7 @@ impl<'a> Hash<'a> {
             ["", algorithm, ..] if algorithm.starts_with("argon2") => {
                 return match PasswordHash::new(stored) {
                     Ok(hash) if hash.salt.is_some() && hash.hash.is_some() => {
-                        Ok(Hash::Argon2(hash))
+                        Ok(Hash::Argon2(Box::new(hash)))
                     }
                     _ => Err("the Argon2 hash is malformed"),
                 }
@@ -238,29 +237,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// An argon2 hash of a password no one has, checked for unknown users.
-pub(crate) fn unknown_user_hash() -> PasswordHash<'static> {
-    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let hash = HASH.get_or_init(|| {
-        use argon2::{password_hash::SaltString, PasswordHasher};
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+pub(crate) fn unknown_user_hash() -> PasswordHash {
+    static HASH: std::sync::OnceLock<PasswordHash> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use argon2::PasswordHasher;
         Argon2::default()
-            .hash_password(b"unknown user", &salt)
+            .hash_password(b"unknown user")
             .expect("argon2 hashes with its default parameters")
-            .to_string()
-    });
-    PasswordHash::new(hash).expect("a hash argon2 wrote parses")
+    })
+    .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::SaltString;
     use argon2::PasswordHasher;
 
     fn hash_password(password: &str) -> String {
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .unwrap()
             .to_string()
     }
@@ -314,6 +309,39 @@ mod tests {
         assert!(!validator.check("truncated", b""));
         assert!(check_hash("plainpass").is_err());
         assert!(check_hash("").is_err());
+    }
+
+    #[test]
+    fn test_hashes_written_by_argon2_0_5_still_verify() {
+        // Written by `mercuriod passwd` with argon2 0.5
+        let stored = "$argon2id$v=19$m=19456,t=2,p=1$YKsXpDe9ltkVh711Fl4iog$ydtCozrDCyoytDHGftjr2OpfsgsPHDjY8g9KtBTM4Yc";
+        assert!(check_hash(stored).is_ok());
+        assert!(verify(stored, b"stored before argon2 0.6"));
+        assert!(!verify(stored, b"stored before argon2 0.7"));
+    }
+
+    /// The parameters of a PHC string: everything before the salt.
+    fn parameters(hash: &str) -> &str {
+        let salt = hash
+            .rfind('$')
+            .and_then(|end| hash[..end].rfind('$'))
+            .unwrap();
+        &hash[..salt]
+    }
+
+    #[test]
+    fn test_new_hashes_keep_their_parameters() {
+        let (hash, _) = hash_new_password("secret").unwrap();
+        assert_eq!(parameters(&hash), "$argon2id$v=19$m=19456,t=2,p=1");
+    }
+
+    #[test]
+    fn test_unknown_users_cost_as_much_as_known_ones() {
+        let (hash, _) = hash_new_password("secret").unwrap();
+        assert_eq!(
+            parameters(&unknown_user_hash().to_string()),
+            parameters(&hash)
+        );
     }
 
     #[test]
