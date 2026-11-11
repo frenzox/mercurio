@@ -1324,6 +1324,13 @@ mod tests {
                 .password(token.clone());
             clients.push(MqttClient::connect(options).await.unwrap());
         }
+        // The real Connected events arrive through the event queue
+        for _ in 0..100 {
+            if auth.expiries.lock().unwrap().pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         // As if both Connected events were lost; c2's login is someone else's
         let past = Instant::now() - PENDING_FOR;
         {
