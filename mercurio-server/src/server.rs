@@ -2331,8 +2331,11 @@ where
                                 .then(|| Duration::from_secs(interval.into()));
                         }
 
-                        // Reason 0x04 asks for the will to be published anyway
-                        if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
+                        // Only a normal disconnection discards the will
+                        // [MQTT-3.14.4-3]: 0x04 asks for it, and an error
+                        // code means the client didn't end as it meant to.
+                        // MQTT 3.x has no reason and reads as normal.
+                        if disconnect.reason == ReasonCode::NormalDisconnection {
                             session.clear_will().await;
                             let client_id = session.get_client_id().await;
                             self.session_manager.delete_will(&client_id);
