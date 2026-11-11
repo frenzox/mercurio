@@ -1480,7 +1480,6 @@ dependencies = [
 name = "mercurioctl"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "clap",
  "clap_complete",
  "mercurio-client",
@@ -1925,11 +1924,9 @@ name = "recado"
 version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
- "bytes",
  "clap",
  "clap_complete",
  "mercurio-client",
- "mercurio-core",
  "mercurio-server",
  "serde_json",
  "tokio",

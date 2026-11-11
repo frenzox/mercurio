@@ -1,8 +1,7 @@
 //! Shared utilities for recado.
 
 use clap::{Args, ValueEnum};
-use mercurio_client::{cli::ConnectArgs, ConnectOptions, QoS, Will};
-use mercurio_core::protocol::ProtocolVersion;
+use mercurio_client::{cli::ConnectArgs, ConnectOptions, ProtocolVersion, QoS, Will};
 
 /// Common connection arguments shared between pub and sub tools.
 #[derive(Args, Debug, Clone)]
@@ -167,7 +166,7 @@ pub fn init_logging(verbose: bool) {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use mercurio_core::protocol::ProtocolVersion;
+    use mercurio_client::ProtocolVersion;
 
     use super::ConnectionArgs;
 

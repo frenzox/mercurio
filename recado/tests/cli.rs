@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
+use mercurio_client::Bytes;
 use mercurio_client::{ConnectOptions, MessageProperties, MqttClient, QoS};
 use mercurio_server::{
     auth::SimpleCredentialValidator,

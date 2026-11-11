@@ -2,7 +2,7 @@
 
 use std::{fmt, io, path::Path, time::Duration};
 
-use bytes::Bytes;
+use mercurio_client::Bytes;
 use mercurio_client::{cli::ConnectArgs, ClientError, Event, MessageProperties, MqttClient, QoS};
 use serde_json::{json, Value};
 

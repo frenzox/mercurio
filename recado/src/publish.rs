@@ -3,8 +3,8 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use bytes::Bytes;
 use clap::Args;
+use mercurio_client::Bytes;
 use mercurio_client::{MessageProperties, MqttClient, QoS};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -171,8 +171,8 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use clap::Parser;
+    use mercurio_client::Bytes;
     use mercurio_client::MessageProperties;
 
     use super::PropertyArgs;
