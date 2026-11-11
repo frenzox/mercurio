@@ -18,7 +18,7 @@ use mercurio_core::topic::{validate_publish_topic, validate_subscribe_filter};
 use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
-use mercurio_packets::disconnect::DisconnectPacket;
+use mercurio_packets::disconnect::{DisconnectPacket, DisconnectProperties};
 use mercurio_packets::pingreq::PingReqPacket;
 use mercurio_packets::puback::PubAckPacket;
 use mercurio_packets::pubcomp::PubCompPacket;
@@ -58,6 +58,7 @@ enum Command {
         response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
     },
     Disconnect {
+        packet: DisconnectPacket,
         response: oneshot::Sender<Result<()>>,
     },
     Reauthenticate {
@@ -77,6 +78,10 @@ pub struct MqttClient {
     client_id: String,
     /// What the latest CONNACK settled, replaced on reconnecting
     connack: Arc<RwLock<ConnAckInfo>>,
+    /// MQTT 5, whose DISCONNECT carries a reason and properties
+    reports_reasons: bool,
+    /// The session expiry CONNECT asked for
+    session_expiry: u32,
 }
 
 impl MqttClient {
@@ -88,6 +93,8 @@ impl MqttClient {
         options.client_id = Some(session.client_id.clone());
         let client_id = session.client_id.clone();
         let connack = Arc::new(RwLock::new(session.connack.clone()));
+        let reports_reasons = options.protocol_version.supports_reason_codes();
+        let session_expiry = options.session_expiry;
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
@@ -105,6 +112,8 @@ impl MqttClient {
             event_rx: Mutex::new(event_rx),
             client_id,
             connack,
+            reports_reasons,
+            session_expiry,
         })
     }
 
@@ -426,18 +435,12 @@ impl MqttClient {
         }
     }
 
-    /// Handle a disconnect command.
-    async fn handle_disconnect(connection: &mut Connection) -> Result<()> {
-        let disconnect = DisconnectPacket {
+    /// A normal DISCONNECT, after which the broker discards the will.
+    fn normal_disconnect() -> DisconnectPacket {
+        DisconnectPacket {
             reason: ReasonCode::NormalDisconnection,
             properties: None,
-        };
-
-        connection
-            .write_packet(ControlPacket::Disconnect(disconnect))
-            .await?;
-
-        Ok(())
+        }
     }
 
     /// Publish a message to a topic. For QoS 1 and 2 this waits until the
@@ -589,11 +592,65 @@ impl MqttClient {
             .map_err(|_| ClientError::Closed)
     }
 
-    /// Disconnect from the broker gracefully.
+    /// Disconnect from the broker gracefully, with a normal DISCONNECT:
+    /// the broker discards the will.
     pub async fn disconnect(&self) -> Result<()> {
+        self.send_disconnect(Self::normal_disconnect()).await
+    }
+
+    /// Disconnect from the broker with an MQTT 5 `reason`, such as
+    /// `DisconnectWithWillMessage` to have the broker publish the will
+    /// anyway, and, with `session_expiry`, a new number of seconds the
+    /// broker keeps the session. Reasons only a broker sends are refused,
+    /// as is a non-zero session expiry when CONNECT asked for none
+    /// [MQTT-3.14.2-2]; MQTT 3.x supports neither.
+    pub async fn disconnect_with(
+        &self,
+        reason: ReasonCode,
+        session_expiry: Option<u32>,
+    ) -> Result<()> {
+        let code = reason.get_code();
+        if !self.reports_reasons {
+            if code != 0 || session_expiry.is_some() {
+                return Err(ClientError::NotSupported(
+                    "DISCONNECT reasons and session expiry before MQTT 5",
+                ));
+            }
+            return self.disconnect().await;
+        }
+        // Table 2-4 of MQTT 5: the reasons a client may send
+        if !matches!(
+            code,
+            0x00 | 0x04 | 0x80..=0x83 | 0x90 | 0x93..=0x97 | 0x99
+        ) {
+            return Err(ClientError::InvalidArgument(format!(
+                "a client doesn't disconnect with {reason}"
+            )));
+        }
+        if self.session_expiry == 0 && session_expiry.is_some_and(|s| s > 0) {
+            return Err(ClientError::InvalidArgument(
+                "a session that CONNECT ended with the connection can't be kept".into(),
+            ));
+        }
+        self.send_disconnect(DisconnectPacket {
+            reason: if code == 0 {
+                ReasonCode::NormalDisconnection
+            } else {
+                reason
+            },
+            properties: session_expiry.map(|seconds| DisconnectProperties {
+                session_expiry_interval: Some(SessionExpiryInterval::new(seconds)),
+                ..Default::default()
+            }),
+        })
+        .await
+    }
+
+    async fn send_disconnect(&self, packet: DisconnectPacket) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Disconnect {
+                packet,
                 response: response_tx,
             })
             .await
@@ -942,7 +999,8 @@ impl EventLoop {
                     let Some(cmd) = cmd else {
                         // Every handle is gone: nobody can read events or
                         // send requests any more
-                        let _ = MqttClient::handle_disconnect(&mut self.connection).await;
+                        let disconnect = ControlPacket::Disconnect(MqttClient::normal_disconnect());
+                        let _ = self.connection.write_packet(disconnect).await;
                         return DisconnectReason::ClientInitiated;
                     };
                     match cmd {
@@ -957,8 +1015,11 @@ impl EventLoop {
                             self.reauthenticate(response).await;
                         }
                         Command::Ack(token) => self.acknowledge(token).await,
-                        Command::Disconnect { response } => {
-                            let result = MqttClient::handle_disconnect(&mut self.connection).await;
+                        Command::Disconnect { packet, response } => {
+                            let result = self
+                                .connection
+                                .write_packet(ControlPacket::Disconnect(packet))
+                                .await;
                             let _ = response.send(result);
                             return DisconnectReason::ClientInitiated;
                         }
@@ -1149,7 +1210,7 @@ impl EventLoop {
                         }
                         // Delivered on a connection that is gone
                         Command::Ack(_) => {}
-                        Command::Disconnect { response } => {
+                        Command::Disconnect { response, .. } => {
                             let _ = response.send(Ok(()));
                             return Err(None);
                         }
