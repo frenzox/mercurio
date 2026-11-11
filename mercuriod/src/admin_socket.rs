@@ -148,6 +148,42 @@ fn bind(path: &Path, group_name: &str) -> Result<(ListenerConfig, AdminSocket), 
     Ok((config, socket))
 }
 
+/// Binds the Unix socket of a `[[listeners]]` entry at `path`, born
+/// owner-only and then given `group` and `mode`; `mode` defaults to 0660
+/// with a group and 0600 without. A socket left there by a broker that
+/// stopped is replaced, one another process serves is refused.
+pub fn bind_listener(
+    path: &Path,
+    mode: Option<u32>,
+    group: Option<&str>,
+) -> Result<UnixListener, String> {
+    let failed = |e: &dyn std::fmt::Display| format!("Failed to listen on {}: {e}", path.display());
+    if in_use(path) {
+        return Err(failed(&"another process serves this socket"));
+    }
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+        fs::remove_file(path).map_err(|e| failed(&e))?;
+    }
+    let gid = match group {
+        Some(name) => Some(
+            lookup_group(name)
+                .map_err(|e| failed(&format!("can't read group `{name}`: {e}")))?
+                .ok_or_else(|| failed(&format!("group `{name}` doesn't exist")))?
+                .gid,
+        ),
+        None => None,
+    };
+    let listener = bind_owner_only(path).map_err(|e| failed(&e))?;
+    let mode = mode.unwrap_or(if gid.is_some() { 0o660 } else { 0o600 });
+    let opened = std::os::unix::fs::lchown(path, None, gid)
+        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(mode)));
+    if let Err(e) = opened {
+        let _ = fs::remove_file(path);
+        return Err(failed(&e));
+    }
+    Ok(listener)
+}
+
 /// Binds a Unix socket at `path` whose file is born owner-only, so no one
 /// else can connect before its group and mode are set. Linux creates the
 /// file with the socket's own mode minus the umask, so the mode is set on
@@ -430,6 +466,35 @@ mod tests {
         let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
         live.set_nonblocking(true).unwrap();
         assert!(live.accept().is_ok(), "the first process still serves");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_sockets_get_their_mode_and_group() {
+        let dir = private_dir("listener");
+        let path = dir.join("mqtt.sock");
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o777;
+
+        let listener = bind_listener(&path, None, None).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // A second broker would take the socket from the first
+        assert!(bind_listener(&path, None, None).is_err());
+        drop(listener);
+        let _listener = bind_listener(&path, Some(0o666), None).unwrap();
+        assert_eq!(mode(&path), 0o666);
+        let _client = UnixStream::connect(&path).await.unwrap();
+
+        if let Some(name) = own_group_name() {
+            let grouped = dir.join("grouped.sock");
+            let _listener = bind_listener(&grouped, None, Some(&name)).unwrap();
+            let meta = fs::symlink_metadata(&grouped).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o660);
+            assert_eq!(meta.gid(), unsafe { libc::getgid() });
+        }
+        let unknown = dir.join("unknown.sock");
+        let error = bind_listener(&unknown, None, Some("mercurio-no-such-group")).unwrap_err();
+        assert!(error.contains("mercurio-no-such-group"), "{error}");
+        assert!(!unknown.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -185,6 +185,8 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>host</code></td><td><code>"127.0.0.1"</code></td><td>Address to listen on.</td></tr>
 <tr><td><code>port</code></td><td></td><td>TCP port. Either this or <code>path</code>.</td></tr>
 <tr><td><code>path</code></td><td></td><td>Unix domain socket. Either this or <code>port</code>.</td></tr>
+<tr><td><code>group</code></td><td></td><td>With <code>path</code>, the group the socket belongs to. The broker's user must be a member, or root. Linux only.</td></tr>
+<tr><td><code>mode</code></td><td><code>"0660"</code> with <code>group</code>, <code>"0600"</code> without</td><td>With <code>path</code>, the socket's permission bits in octal. Clients need write permission to connect, so the default lets only the broker's user, and the members of <code>group</code>, in; <code>"0666"</code> lets in every local user. The socket is created owner-only and opened up once its group is set. A socket left by a broker that stopped is replaced; one another process serves stops the broker with an error. Linux only.</td></tr>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>

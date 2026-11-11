@@ -180,6 +180,13 @@ pub struct ListenerConfig {
     /// Unix domain socket to listen on; either this or `port`
     pub path: Option<String>,
 
+    /// With `path`, the socket's mode in octal, such as `"0660"`; 0660 with
+    /// `group` and 0600 without by default (Linux)
+    pub mode: Option<String>,
+
+    /// With `path`, the group the socket belongs to (Linux)
+    pub group: Option<String>,
+
     #[serde(default)]
     pub protocol: Protocol,
 
@@ -252,6 +259,21 @@ pub struct PluginConfig {
     /// Memory each copy may use
     #[serde(default = "default_plugin_memory_mb")]
     pub memory_mb: usize,
+}
+
+impl ListenerConfig {
+    /// `mode`, as permission bits.
+    pub fn socket_mode(&self) -> Result<Option<u32>, String> {
+        let Some(mode) = &self.mode else {
+            return Ok(None);
+        };
+        match u32::from_str_radix(mode, 8) {
+            Ok(bits) if bits <= 0o777 => Ok(Some(bits)),
+            _ => Err(format!(
+                "[[listeners]] `mode` = \"{mode}\" is not permission bits in octal, such as \"0660\""
+            )),
+        }
+    }
 }
 
 impl PluginConfig {
@@ -484,6 +506,17 @@ impl Config {
     /// Refuses settings that parse but would be unsafe.
     fn check(&self) -> Result<(), String> {
         for listener in &self.listeners {
+            listener.socket_mode()?;
+            if listener.path.is_none() {
+                if let Some(key) = [("mode", &listener.mode), ("group", &listener.group)]
+                    .into_iter()
+                    .find_map(|(key, value)| value.as_ref().map(|_| key))
+                {
+                    return Err(format!(
+                        "[[listeners]] `{key}` applies to a Unix socket `path`, not to a TCP `port`"
+                    ));
+                }
+            }
             // `tenantA` would also let clients reach `tenantAB/...`
             if let Some(mount_point) = &listener.mount_point {
                 if !mount_point.ends_with('/') {
@@ -1368,6 +1401,31 @@ mod tests {
         // A file name counts as the name too
         let file: Config = toml::from_str("[[plugins]]\npath = \"http-auth.wasm\"\n").unwrap();
         assert!(file.check().is_err());
+    }
+
+    #[test]
+    fn test_unix_listeners_take_an_octal_mode_and_a_group() {
+        let config = |extra: &str| -> Config {
+            toml::from_str(&format!("[[listeners]]\n{extra}\n")).unwrap()
+        };
+        let set = config("path = \"/run/m.sock\"\nmode = \"0660\"\ngroup = \"mqtt\"");
+        assert!(set.check().is_ok());
+        assert_eq!(set.listeners[0].socket_mode().unwrap(), Some(0o660));
+        assert_eq!(set.listeners[0].group.as_deref(), Some("mqtt"));
+        assert_eq!(
+            config("path = \"/run/m.sock\"").listeners[0].socket_mode(),
+            Ok(None)
+        );
+        for (extra, key) in [
+            ("path = \"/run/m.sock\"\nmode = \"0999\"", "mode"),
+            ("path = \"/run/m.sock\"\nmode = \"1777\"", "mode"),
+            ("path = \"/run/m.sock\"\nmode = \"rw\"", "mode"),
+            ("port = 1884\nmode = \"0660\"", "mode"),
+            ("port = 1884\ngroup = \"mqtt\"", "group"),
+        ] {
+            let error = config(extra).check().unwrap_err();
+            assert!(error.contains(&format!("`{key}`")), "{extra}: {error}");
+        }
     }
 
     #[test]

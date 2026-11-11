@@ -300,9 +300,15 @@ group = "mercurio"
 # port = 8080
 # protocol = "websocket"
 #
-# Unix domain socket, for clients on the same machine
+# Unix domain socket, for clients on the same machine. It belongs to the
+# broker's user with mode 0600, so only that user may connect, unless
+# `group` and `mode` open it to others (Linux only)
 # [[listeners]]
 # path = "/run/mercurio/mqtt.sock"
+# Group the socket belongs to; the mode is then 0660 unless set
+# group = "mqtt"
+# Permission bits in octal
+# mode = "0660"
 #
 # Any TCP listener may also set max_connections, on top of the broker-wide
 # limit, and bind_interface

@@ -474,9 +474,23 @@ async fn bind_listener(listener: &config::ListenerConfig) -> Result<(Socket, Str
             let socket = bind_tcp(&addr, listener.bind_interface.as_deref()).await?;
             Ok((socket.into(), addr))
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        (None, Some(path)) => {
+            let socket = admin_socket::bind_listener(
+                std::path::Path::new(path),
+                listener.socket_mode()?,
+                listener.group.as_deref(),
+            )?;
+            Ok((socket.into(), path.clone()))
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
         (None, Some(path)) => {
             use std::os::unix::fs::FileTypeExt;
+            if listener.mode.is_some() || listener.group.is_some() {
+                return Err(format!(
+                    "{path}: [[listeners]] `mode` and `group` need Linux"
+                ));
+            }
             // Left behind by a broker that did not stop cleanly
             if std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
                 let _ = std::fs::remove_file(path);
