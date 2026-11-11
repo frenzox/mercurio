@@ -637,7 +637,8 @@ impl Config {
 }
 
 fn read_table(path: &Path) -> Result<toml::Table, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     toml::from_str(&content).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
@@ -1650,8 +1651,8 @@ mod tests {
         std::fs::write(conf_d.join("auth.toml"), "[auth]\nenable = true\n").unwrap();
         let error = Config::from_file(&main).unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
-        // main prints the error with Debug
-        let shown = format!("{error:?}");
+        // As main prints it
+        let shown = error.to_string();
         assert!(shown.contains("`enable`"), "{shown}");
         assert!(shown.contains("main.toml"), "{shown}");
         assert!(shown.contains("auth"), "{shown}");

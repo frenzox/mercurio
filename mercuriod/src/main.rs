@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,9 +14,10 @@ use mercurio_server::admin::AdminExtension;
 use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
-    AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
-    Server, ServerConfig, Socket, Transport,
+    AddressRange, AuthConfig as ServerAuthConfig, ConnectPolicy, Limits, ListenerConfig,
+    LocalConnector, Redirect, Server, ServerConfig, Socket, Transport,
 };
+use mercurio_server::tls::TlsConfig;
 use mercurio_storage::{
     memory::MemoryStore,
     postgres::{DatabaseLock, PostgresStore},
@@ -47,6 +49,8 @@ use dynsec::DynamicSecurity;
 use http_auth::HttpAuth;
 use reload::{Reload, Reloadable};
 
+const DEFAULT_CONFIG: &str = "/etc/mercurio/config.toml";
+
 #[derive(Parser, Debug)]
 #[command(name = "mercuriod")]
 #[command(about = "Mercurio MQTT broker daemon")]
@@ -56,8 +60,13 @@ struct Cli {
     command: Option<Commands>,
 
     /// Path to configuration file
-    #[arg(short = 'c', long, default_value = "/etc/mercurio/config.toml")]
+    #[arg(short = 'c', long, default_value = DEFAULT_CONFIG)]
     config: PathBuf,
+
+    /// Check the configuration, the files it names and the plugins, then
+    /// exit, without listening or opening storage
+    #[arg(long)]
+    check: bool,
 
     /// Override listen address (e.g., 0.0.0.0:1883)
     #[arg(short = 'l', long)]
@@ -96,7 +105,7 @@ enum Commands {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
     // glibc gives each thread that allocates an arena of its own and keeps
     // the memory freed there, so under load the broker's memory grew by
     // tens of megabytes and stayed; two arenas keep it flat, with no
@@ -106,10 +115,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("Failed to start the async runtime: {e}").into()
+        })
+        .and_then(|runtime| runtime.block_on(run()));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -146,22 +165,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     let hangup = signal::unix::signal(signal::unix::SignalKind::hangup())?;
 
-    // Load configuration
     let config = if cli.config.exists() {
         Config::from_file(&cli.config)?
-    } else {
-        if cli.config.to_str() != Some("/etc/mercurio/config.toml") {
-            eprintln!("Config file not found: {}", cli.config.display());
-            std::process::exit(1);
-        }
+    } else if cli.config.to_str() == Some(DEFAULT_CONFIG) {
         Config::default()
+    } else {
+        return Err(format!("Config file not found: {}", cli.config.display()).into());
     };
+
+    if cli.check {
+        // Warnings only, on standard error, leaving the configured log file
+        // or syslog alone
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter("warn")
+            .init();
+        prepare(&config).await?;
+        println!("{}: the configuration is valid", cli.config.display());
+        return Ok(());
+    }
 
     let log_level = logging::init(&config.logging, cli.verbose)?;
     // Now, before parts of the configuration are moved out
     let shown_config = serde_json::to_value(&config)
         .inspect_err(|e| tracing::warn!("getConfig will be unavailable: {}", e))
         .ok();
+
+    let Prepared {
+        limits,
+        policy,
+        tls: tls_config,
+        auth: auth_config,
+        plugins,
+        dynsec,
+        listeners: prepared_listeners,
+        reloadable,
+    } = prepare(&config).await?;
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -224,20 +263,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
-    // Build TLS configuration if enabled
-    let limits = config.server.limits()?;
-    let mut policy = ConnectPolicy::default();
-    policy.response_information = config.server.response_information.clone();
-    policy.redirect = config
-        .server
-        .redirect
-        .clone()
-        .map(|r| Redirect::new(r.server_reference, r.permanent));
-    policy.require_client_id = !config.server.allow_zero_length_clientid;
-    policy.auto_id_prefix = config.server.auto_id_prefix.clone();
-    policy.client_id_prefixes = config.server.clientid_prefixes.clone();
-
-    let tls_config = config.server.tls.build()?;
     // The WebSocket listener shares the main listener's TLS settings
     let mut listeners: Vec<_> = websocket_listener
         .map(|listener| {
@@ -248,24 +273,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .into_iter()
         .collect();
-    let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
-    let (auth_config, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
-    let wasm = load_plugins(
-        &config.plugins,
-        config.server.plugin_timeout(),
-        &mut reloadable,
-    )
-    .await?;
-    // Listeners naming plugins share these copies of `[auth]`'s built-ins
-    // and of the plugins with the broker's chain
-    let chain = |builtins: &[Arc<dyn Plugin>], names: Option<&[String]>| {
-        let named = wasm
-            .iter()
-            .filter(|(name, _)| names.is_none_or(|names| names.contains(name)))
-            .map(|(_, plugin)| Arc::clone(plugin));
-        builtins.iter().cloned().chain(named).collect::<Vec<_>>()
-    };
-    for extra in &config.listeners {
+    for (extra, prepared) in config.listeners.iter().zip(prepared_listeners) {
         let (listener, addr) = bind_listener(extra).await?;
         info!(
             "Serving {:?}{} on {}",
@@ -273,28 +281,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if extra.tls.enabled { " with TLS" } else { "" },
             addr
         );
-        listeners.push({
-            let mut value = ListenerConfig::new(listener, extra.protocol.into());
-            value.tls = extra.tls.build()?;
-            value.proxy_protocol = extra.proxy_protocol;
-            value.proxy_from = extra
-                .proxy_from
-                .iter()
-                .map(|range| range.parse())
-                .collect::<Result<_, _>>()?;
-            value.mount_point = extra.mount_point.clone();
-            value.max_connections = extra.max_connections;
-            value.http_dir = extra.http_dir.clone().map(Into::into);
-            let names = extra.plugins.as_deref();
-            if let Some(auth) = &extra.auth {
-                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;
-                value.auth = Some(auth);
-                value.plugins = Some(chain(&plugins, names));
-            } else if names.is_some() {
-                value.plugins = Some(chain(&builtins, names));
-            }
-            value
-        });
+        let mut value = ListenerConfig::new(listener, extra.protocol.into());
+        value.tls = prepared.tls;
+        value.proxy_protocol = extra.proxy_protocol;
+        value.proxy_from = prepared.proxy_from;
+        value.mount_point = extra.mount_point.clone();
+        value.max_connections = extra.max_connections;
+        value.http_dir = extra.http_dir.clone().map(Into::into);
+        value.auth = prepared.auth;
+        value.plugins = prepared.plugins;
+        listeners.push(value);
     }
 
     #[cfg(target_os = "linux")]
@@ -313,7 +309,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (connector, local_listener) = LocalConnector::new();
-    let plugins = chain(&builtins, None);
 
     let bridges = config
         .bridges
@@ -405,6 +400,108 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("Mercurio MQTT broker stopped");
 
     Ok(())
+}
+
+/// What a start sets up from the configuration before it binds a listener
+/// or opens storage, all that `--check` checks.
+struct Prepared {
+    limits: Limits,
+    policy: ConnectPolicy,
+    tls: Option<TlsConfig>,
+    auth: ServerAuthConfig,
+    plugins: Vec<Arc<dyn Plugin>>,
+    dynsec: Option<Arc<DynamicSecurity>>,
+    /// In the order of `[[listeners]]`
+    listeners: Vec<PreparedListener>,
+    reloadable: Vec<Arc<dyn Reload>>,
+}
+
+struct PreparedListener {
+    tls: Option<TlsConfig>,
+    proxy_from: Vec<AddressRange>,
+    auth: Option<ServerAuthConfig>,
+    plugins: Option<Vec<Arc<dyn Plugin>>>,
+}
+
+/// Checks the settings a start needs, loads the files of `[auth]` and of
+/// every listener, the TLS certificates and keys, and the WebAssembly
+/// plugins, binding nothing and leaving storage alone.
+async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>> {
+    let limits = config.server.limits()?;
+    let mut policy = ConnectPolicy::default();
+    policy.response_information = config.server.response_information.clone();
+    policy.redirect = config
+        .server
+        .redirect
+        .clone()
+        .map(|r| Redirect::new(r.server_reference, r.permanent));
+    policy.require_client_id = !config.server.allow_zero_length_clientid;
+    policy.auto_id_prefix = config.server.auto_id_prefix.clone();
+    policy.client_id_prefixes = config.server.clientid_prefixes.clone();
+    config.storage.postgres_options()?;
+
+    let tls = build_tls(&config.server.tls)?;
+    let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
+    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
+    let wasm = load_plugins(
+        &config.plugins,
+        config.server.plugin_timeout(),
+        &mut reloadable,
+    )
+    .await?;
+    // Listeners naming plugins share these copies of `[auth]`'s built-ins
+    // and of the plugins with the broker's chain
+    let chain = |builtins: &[Arc<dyn Plugin>], names: Option<&[String]>| {
+        let named = wasm
+            .iter()
+            .filter(|(name, _)| names.is_none_or(|names| names.contains(name)))
+            .map(|(_, plugin)| Arc::clone(plugin));
+        builtins.iter().cloned().chain(named).collect::<Vec<_>>()
+    };
+    let mut listeners = Vec::new();
+    for extra in &config.listeners {
+        if extra.port.is_some() == extra.path.is_some() {
+            return Err("Each [[listeners]] entry needs either `port` or `path`".into());
+        }
+        let names = extra.plugins.as_deref();
+        let (auth, plugins) = match &extra.auth {
+            Some(auth) => {
+                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false)?;
+                (Some(auth), Some(chain(&plugins, names)))
+            }
+            None => (None, names.map(|_| chain(&builtins, names))),
+        };
+        listeners.push(PreparedListener {
+            tls: build_tls(&extra.tls)?,
+            proxy_from: extra
+                .proxy_from
+                .iter()
+                .map(|range| range.parse())
+                .collect::<Result<_, _>>()?,
+            auth,
+            plugins,
+        });
+    }
+    Ok(Prepared {
+        limits,
+        policy,
+        tls,
+        auth,
+        plugins: chain(&builtins, None),
+        dynsec,
+        listeners,
+        reloadable,
+    })
+}
+
+/// The TLS settings of `config`, with its certificate, key and CA files
+/// loaded once to check them.
+fn build_tls(config: &config::TlsServerConfig) -> Result<Option<TlsConfig>, String> {
+    let tls = config.build()?;
+    if let Some(tls) = &tls {
+        tls.build_acceptor().map_err(|e| e.to_string())?;
+    }
+    Ok(tls)
 }
 
 /// Sets the broker up, hands its `Admin` to the daemon's commands and to

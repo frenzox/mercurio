@@ -41,6 +41,11 @@
 <p class="lead">Every option of <code>mercuriod</code>'s TOML configuration file, with its default. Every option is optional. An option or table the broker does not know, such as a misspelled one, stops it from starting with an error that names it.</p>
 <p>The broker reads <code>/etc/mercurio/config.toml</code>, or the file given with <code>-c</code>. A commented file with every option is provided as <code>mercuriod/contrib/config.toml</code>.</p>
 
+<h2 id="check">Checking a configuration</h2>
+<p><code>mercuriod --check</code> does what a start does short of listening and opening storage: it reads the configuration and its <code>include_dir</code>, checks the settings that depend on each other, loads the password, ACL and dynamic security files of <code>[auth]</code> and of every listener, loads the TLS certificates and keys, and compiles and initialises the WebAssembly plugins. It then exits with status 0. A problem makes it exit with status 1 and print the error a start would. It does not connect to PostgreSQL, bind ports or sockets, or contact bridges.</p>
+<pre><span class="comment"># As the broker's user, so files are read with its permissions</span>
+sudo -u mercurio mercuriod --check -c /etc/mercurio/config.toml &amp;&amp; sudo systemctl restart mercuriod</pre>
+
 <h2 id="include-dir">Top level</h2>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>

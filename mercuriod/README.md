@@ -43,9 +43,22 @@ mercuriod dynsec-init -f <FILE> [-u <USER>]
 | `-c, --config <FILE>` | Path to configuration file | `/etc/mercurio/config.toml` |
 | `-l, --listen <ADDR>` | Override the listen address, such as `0.0.0.0:1883` | - |
 | `-v, --verbose` | Log at debug level | - |
+| `--check` | Check the configuration and exit | - |
 
 Without a configuration file at the default path, the broker starts with
 the defaults below. A missing file at a path given with `-c` is an error.
+
+`mercuriod --check` does what a start does short of listening and opening
+storage: it reads the configuration and its `include_dir`, loads the
+password, ACL and dynamic security files, the TLS certificates and keys,
+and the WebAssembly plugins, then exits with status 0. A problem makes it
+exit with status 1 and the error a start would print. Run it as the
+broker's user, so it reads the files as the broker would, before
+restarting the broker after a change:
+
+```bash
+sudo -u mercurio mercuriod --check && sudo systemctl restart mercuriod
+```
 
 ## Configuration
 
