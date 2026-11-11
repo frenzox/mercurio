@@ -2,6 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS};
 use mercurio_core::reason::ReasonCode;
+use mercurio_server::server::ServerConfig;
 use tokio::{net::TcpListener, time::timeout};
 
 async fn start_broker() -> SocketAddr {
@@ -59,14 +60,20 @@ async fn qos2_is_delivered_exactly_once_in_both_directions() {
 
 #[tokio::test]
 async fn subscribe_reports_what_the_broker_granted() {
-    let addr = start_broker().await;
+    // One subscription per session, so the second filter is refused
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.limits.max_subscriptions = Some(1);
+    tokio::spawn(mercurio_server::server::run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
     let subscriber = client(addr, "sub").await;
 
     let results = subscriber
-        .subscribe(&[
-            ("ok/+", QoS::AtLeastOnce),
-            ("bad/#/filter", QoS::AtLeastOnce),
-        ])
+        .subscribe(&[("ok/+", QoS::AtLeastOnce), ("other", QoS::AtLeastOnce)])
         .await
         .unwrap();
 

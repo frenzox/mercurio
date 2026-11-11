@@ -60,7 +60,10 @@ qos = 1
 pattern = "commands/#"
 direction = "in"
 qos = 1</pre>
-<p>The bridge connects to the central broker as an MQTT client with the id <code>mercurio-bridge-central</code>. Messages published here on <code>sensors/#</code> are published there, and messages published there on <code>commands/#</code> are published here.</p>
+<p>The bridge connects to the central broker as an MQTT client with the id <code>mercurio-bridge-central</code>, or <code>client_id</code> when set. Each bridge needs its own <code>name</code> and client id, or the two would keep taking over each other's session; with <code>notifications</code> on, the client id is a level of the state topic, so it can't hold <code>/</code>, <code>+</code> or <code>#</code>. Messages published here on <code>sensors/#</code> are published there, and messages published there on <code>commands/#</code> are published here.</p>
+
+<h2>Delivery</h2>
+<p>A bridge forwards with up to 100 messages in flight in each direction, within the Receive Maximum of the broker receiving them, so a long link doesn't cost a round trip per message. Messages keep their order in each direction. QoS 1 and 2 messages are delivered at least once: see below for what happens when a connection drops.</p>
 
 <h2>Topics and prefixes</h2>
 <p>Each <code>[[bridges.topics]]</code> entry forwards <code>pattern</code> <code>out</code> (the default), <code>in</code> or <code>both</code> ways. The prefixes place the pattern in each broker's topic tree, so topics are renamed on the way:</p>
@@ -76,7 +79,7 @@ remote_prefix = "plants/plant1/"</pre>
 <p>With MQTT 5, retained messages keep their retain flag across the bridge, and properties such as user properties and response topics travel with the message. MQTT 3.1.1 carries neither; there, only the retained messages a broker sends when the bridge subscribes arrive as retained.</p>
 
 <h2>Both directions without loops</h2>
-<p>With <code>direction = "both"</code>, a message forwarded one way could come back the other. With MQTT 5, the bridge subscribes with No Local, so the brokers never send it its own messages. Each message arrives exactly once on each side.</p>
+<p>With <code>direction = "both"</code>, a message forwarded one way could come back the other. With MQTT 5, the bridge subscribes with No Local, so the brokers never send it its own messages. A message crosses once, or twice when a connection drops while it is under way.</p>
 
 <h2>MQTT 3.1.1 brokers</h2>
 <pre>[[bridges]]
@@ -89,7 +92,7 @@ protocol_version = "mqttv311"</pre>
 <pre>[[bridges]]
 name = "cloud"
 addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]</pre>
-<p>When a broker can't be reached or the connection is lost, the bridge waits five seconds and tries the next address, round and round.</p>
+<p>When a broker can't be reached or the connection is lost, the bridge waits and tries the next address, round and round. The first wait is about a second; each failed attempt doubles it, up to a minute, and a randomised share keeps bridges that lost the same broker from all coming back at once. A successful connection starts the waits over.</p>
 
 <h2>TLS and client certificates</h2>
 <pre>[[bridges]]
@@ -103,6 +106,7 @@ ca_path = "/etc/mercurio/cloud-ca.crt"
 <span class="comment"># Authenticate with a client certificate</span>
 cert_path = "/etc/mercurio/site1.crt"
 key_path = "/etc/mercurio/site1.key"</pre>
+<p><code>enabled = true</code> alone verifies the remote broker with the system's root certificates. A <code>ca_path</code> or a client certificate turns TLS on even without <code>enabled</code>, as <code>--cafile</code> does for recado and mercurioctl, so the password never crosses the network in the clear by mistake. <code>cert_path</code> and <code>key_path</code> go together; the broker refuses to start with only one.</p>
 
 <h2>Monitoring</h2>
 <p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost.</p>
@@ -112,6 +116,7 @@ key_path = "/etc/mercurio/site1.key"</pre>
 <h2>When the remote broker is down</h2>
 <ul>
 <li>Messages to forward wait in the bridge's queue on this broker, up to <code>max_queued_messages</code>, and are sent once the bridge reconnects.</li>
+<li>A QoS 1 or 2 message is acknowledged to the broker it came from only once the other broker accepted it. Messages under way when a connection drops are sent again over the next one, so none is lost; one may arrive twice. A message the receiving broker refuses, for instance for want of permission, is logged and dropped.</li>
 <li>The bridge's session on the remote broker lasts a day, so messages for <code>in</code> topics wait there across short outages.</li>
 <li>The bridge retries forever; the broker starts even if every remote broker is down.</li>
 <li>If this broker closes the bridge's own connection, for instance when another client takes its client id, the bridge connects again.</li>

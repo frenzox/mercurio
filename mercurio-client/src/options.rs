@@ -1,4 +1,5 @@
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,56 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::connection::Stream;
 use crate::error::ClientError;
+
+/// Largest packet accepted from the broker unless set otherwise, as
+/// Mercurio's own default `max_packet_size`
+const DEFAULT_MAXIMUM_PACKET_SIZE: u32 = 1024 * 1024;
+
+const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+/// Exponential backoff with jitter: the waits between attempts to reach a
+/// broker, doubling from `min` up to `max`.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    min: Duration,
+    max: Duration,
+    attempt: u32,
+}
+
+impl Backoff {
+    /// Waits from `min` up to `max`, or `min` if `max` is shorter.
+    pub fn new(min: Duration, max: Duration) -> Self {
+        Backoff {
+            min,
+            max: max.max(min),
+            attempt: 0,
+        }
+    }
+
+    /// The wait before the next attempt: somewhere between half of and the
+    /// full doubled wait, and within `min` and `max`.
+    pub fn next_delay(&mut self) -> Duration {
+        let ceiling = self
+            .min
+            .saturating_mul(1 << self.attempt.min(30))
+            .saturating_mul(2)
+            .min(self.max);
+        self.attempt = self.attempt.saturating_add(1);
+        let floor = (ceiling / 2).max(self.min);
+        // A fresh RandomState is seeded randomly, which is all the
+        // randomness jitter needs
+        let random = RandomState::new().hash_one(self.attempt);
+        floor + (ceiling - floor).mul_f64(random as f64 / u64::MAX as f64)
+    }
+
+    /// Starts over from `min`, after an attempt succeeded.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+/// How long a write may take without a keep-alive to bound it
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MQTT strings and binary data have a two-byte length (section 1.5.4).
 pub(crate) fn check_length(
@@ -252,6 +303,9 @@ pub struct ConnectOptions {
     pub(crate) connect_timeout_secs: u64,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
+    pub(crate) reconnect_max: Option<Duration>,
+    pub(crate) write_timeout: Option<Duration>,
+    pub(crate) manual_acks: bool,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
@@ -281,6 +335,9 @@ impl std::fmt::Debug for ConnectOptions {
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("tls", &self.tls)
             .field("reconnect_delay", &self.reconnect_delay)
+            .field("reconnect_max", &self.reconnect_max)
+            .field("write_timeout", &self.write_timeout)
+            .field("manual_acks", &self.manual_acks)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
@@ -341,6 +398,9 @@ impl ConnectOptions {
             connect_timeout_secs: 30,
             tls: TlsOptions::default(),
             reconnect_delay: None,
+            reconnect_max: None,
+            write_timeout: None,
+            manual_acks: false,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
@@ -450,26 +510,73 @@ impl ConnectOptions {
         self
     }
 
-    /// Reconnect after losing the connection, waiting `delay` between
-    /// attempts. Combine with `clean_start(false)` and a session expiry so
+    /// Reconnect after losing the connection, waiting `delay` before the
+    /// first attempt and doubling the wait after each failed one, up to
+    /// [`reconnect_max`](Self::reconnect_max), each wait randomised by up
+    /// to half so clients that lost the same broker don't all return at
+    /// once. Combine with `clean_start(false)` and a session expiry so
     /// the broker keeps subscriptions and messages in flight meanwhile.
     pub fn reconnect(mut self, delay: Duration) -> Self {
         self.reconnect_delay = Some(delay);
         self
     }
 
-    /// Most QoS 2 messages the broker may have in flight to this client at
-    /// once. MQTT 5 only.
+    /// Longest wait between reconnection attempts, 60 seconds unless set.
+    pub fn reconnect_max(mut self, max: Duration) -> Self {
+        self.reconnect_max = Some(max);
+        self
+    }
+
+    /// The waits between reconnection attempts, if reconnecting is on.
+    pub(crate) fn reconnect_backoff(&self) -> Option<Backoff> {
+        let min = self.reconnect_delay?;
+        Some(Backoff::new(
+            min,
+            self.reconnect_max.unwrap_or(DEFAULT_RECONNECT_MAX),
+        ))
+    }
+
+    /// Most QoS 2 messages, and with manual acknowledgement QoS 1 ones too,
+    /// the broker may have in flight to this client at once. MQTT 5 only.
     pub fn receive_maximum(mut self, maximum: u16) -> Self {
         self.receive_maximum = Some(maximum);
         self
     }
 
-    /// Largest packet the broker may send; it drops larger messages
-    /// instead. MQTT 5 only.
+    /// Acknowledge QoS 1 and 2 messages only when the application calls
+    /// [`MqttClient::ack`] with the token each `Event::Message` carries,
+    /// rather than on receipt. A message counts against
+    /// [`receive_maximum`](Self::receive_maximum) until acknowledged, so
+    /// an MQTT 5 broker holds further messages back while the application
+    /// works on as many as it allows.
+    ///
+    /// A message that is never acknowledged, as when its event is dropped,
+    /// keeps its place under Receive Maximum and holds back the
+    /// acknowledgements of every later message, which go out in order,
+    /// until the connection ends. Messages unacknowledged when the
+    /// connection ends are forgotten; their tokens do nothing any more,
+    /// and a broker that kept the session sends them again after
+    /// reconnecting, as new events with new tokens. Processing then
+    /// acknowledging gives at-least-once delivery, for QoS 2 too.
+    ///
+    /// [`MqttClient::ack`]: crate::MqttClient::ack
+    pub fn manual_acks(mut self, manual: bool) -> Self {
+        self.manual_acks = manual;
+        self
+    }
+
+    /// Largest packet the broker may send, 1 MiB unless set, the broker's
+    /// own default limit. An MQTT 5 broker is told and drops larger
+    /// messages; one that sends a larger packet anyway, as an MQTT 3.x
+    /// broker may, is disconnected.
     pub fn maximum_packet_size(mut self, bytes: u32) -> Self {
         self.maximum_packet_size = Some(bytes);
         self
+    }
+
+    pub(crate) fn incoming_packet_limit(&self) -> u32 {
+        self.maximum_packet_size
+            .unwrap_or(DEFAULT_MAXIMUM_PACKET_SIZE)
     }
 
     /// Let the broker replace topic names with up to this many aliases,
@@ -514,6 +621,23 @@ impl ConnectOptions {
         self
     }
 
+    /// Longest a packet may take to write before the connection counts as
+    /// lost, which with reconnection on starts a reconnect. Defaults to the
+    /// keep-alive interval the broker settled on, or to 30 seconds with a
+    /// keep-alive of 0.
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
+    pub(crate) fn write_timeout_for(&self, keep_alive: u16) -> Duration {
+        self.write_timeout.unwrap_or(if keep_alive > 0 {
+            Duration::from_secs(keep_alive.into())
+        } else {
+            DEFAULT_WRITE_TIMEOUT
+        })
+    }
+
     /// Set the connection timeout in seconds.
     pub fn connect_timeout(mut self, seconds: u64) -> Self {
         self.connect_timeout_secs = seconds;
@@ -524,6 +648,28 @@ impl ConnectOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_backoff_doubles_up_to_the_maximum_with_jitter() {
+        let ms = Duration::from_millis;
+        let mut backoff = Backoff::new(ms(100), ms(1000));
+        let waits: Vec<Duration> = (0..8).map(|_| backoff.next_delay()).collect();
+        assert!((ms(100)..=ms(200)).contains(&waits[0]), "{waits:?}");
+        assert!((ms(200)..=ms(400)).contains(&waits[1]), "{waits:?}");
+        assert!((ms(400)..=ms(800)).contains(&waits[2]), "{waits:?}");
+        for wait in &waits[3..] {
+            assert!((ms(500)..=ms(1000)).contains(wait), "{waits:?}");
+        }
+        backoff.reset();
+        assert!(backoff.next_delay() <= ms(200));
+
+        let spread: std::collections::HashSet<Duration> = (0..20)
+            .map(|_| Backoff::new(ms(100), ms(1000)).next_delay())
+            .collect();
+        assert!(spread.len() > 1, "no jitter");
+        // A maximum below the minimum gives way
+        assert_eq!(Backoff::new(ms(100), ms(10)).next_delay(), ms(100));
+    }
 
     #[test]
     fn test_debug_output_hides_the_password() {

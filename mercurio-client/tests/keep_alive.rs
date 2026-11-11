@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use mercurio_client::{ConnectOptions, DisconnectReason, Event, MqttClient};
+use bytes::Bytes;
+use mercurio_client::{Authenticator, ConnectOptions, DisconnectReason, Event, MqttClient};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     time::timeout,
 };
 
@@ -44,6 +45,154 @@ async fn unanswered_pings_end_the_connection() {
             reason: DisconnectReason::KeepAliveTimeout
         })
     ));
+}
+
+/// Takes over a second to answer a challenge, stalling the client.
+struct Slow;
+
+impl Authenticator for Slow {
+    fn method(&self) -> String {
+        "SLOW".into()
+    }
+
+    fn start(&mut self) -> Option<Bytes> {
+        None
+    }
+
+    fn respond(&mut self, _: Option<Bytes>) -> Result<Option<Bytes>, String> {
+        std::thread::sleep(Duration::from_millis(1300));
+        Ok(None)
+    }
+}
+
+/// Reads one packet whose remaining length fits in a byte.
+async fn read_packet(socket: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut header = [0u8; 2];
+    socket.read_exact(&mut header).await.ok()?;
+    let mut body = vec![0u8; header[1] as usize];
+    socket.read_exact(&mut body).await.ok()?;
+    Some([header.to_vec(), body].concat())
+}
+
+/// Stalls the client for longer than its ping interval during a
+/// re-authentication, `ping_first` with a PINGREQ already sent, whose
+/// PINGRESP only comes once the client is back.
+async fn stall(ping_first: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await.unwrap();
+        // Server Keep Alive of 1 second
+        socket
+            .write_all(&[0x20, 0x06, 0x00, 0x00, 0x03, 0x13, 0x00, 0x01])
+            .await
+            .unwrap();
+        let mut challenged = false;
+        let mut held_ping = false;
+        while let Some(packet) = read_packet(&mut socket).await {
+            let answer: &[u8] = match packet[0] {
+                0xc0 if ping_first && !challenged => {
+                    held_ping = true;
+                    continue;
+                }
+                0xc0 => &[0xd0, 0x00],
+                0xf0 if !challenged => {
+                    challenged = true;
+                    &[0xf0, 0x02, 0x18, 0x00]
+                }
+                0xf0 if held_ping => &[0xf0, 0x02, 0x00, 0x00, 0xd0, 0x00],
+                0xf0 => &[0xf0, 0x02, 0x00, 0x00],
+                _ => continue,
+            };
+            socket.write_all(answer).await.unwrap();
+        }
+    });
+
+    let client = MqttClient::connect(ConnectOptions::new("127.0.0.1", port).authenticator(Slow))
+        .await
+        .unwrap();
+    if ping_first {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    timeout(Duration::from_secs(3), client.reauthenticate())
+        .await
+        .unwrap()
+        .unwrap();
+    let event = timeout(Duration::from_secs(2), client.recv()).await;
+    assert!(
+        event.is_err(),
+        "connection ended after the stall: {event:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_write_ends_the_connection_and_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let broker = tokio::spawn(async move {
+        // Stops reading after CONNACK, as a half-open connection would
+        let (mut stuck, _) = listener.accept().await.unwrap();
+        read_packet(&mut stuck).await.unwrap();
+        stuck
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_packet(&mut socket).await.unwrap();
+        socket
+            .write_all(&[0x20, 0x03, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+        (stuck, socket)
+    });
+
+    let client = MqttClient::connect(
+        ConnectOptions::new("127.0.0.1", port)
+            .keep_alive(1)
+            .reconnect(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+    // Far more than the socket buffers take. Encoding it is slow in a
+    // debug build on a busy machine, hence the long timeout.
+    let published = timeout(
+        Duration::from_secs(15),
+        client.publish("t", vec![0u8; 32 << 20], mercurio_client::QoS::AtMostOnce),
+    )
+    .await
+    .expect("the write never gave up");
+    assert!(published.is_err());
+    let event = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            event,
+            Some(Event::Disconnected {
+                reason: DisconnectReason::ConnectionLost
+            })
+        ),
+        "{event:?}"
+    );
+    let event = timeout(Duration::from_secs(5), client.recv())
+        .await
+        .unwrap();
+    assert!(
+        matches!(event, Some(Event::Reconnected { .. })),
+        "{event:?}"
+    );
+    let _sockets = broker.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_does_not_fire_missed_pings_in_a_burst() {
+    stall(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stall_does_not_count_against_an_outstanding_ping() {
+    stall(true).await;
 }
 
 #[tokio::test]

@@ -14,7 +14,9 @@ pub enum ClientError {
     ConnectionFailed(String),
 
     /// The broker answered CONNECT with this failure, such as bad
-    /// credentials. Reconnecting doesn't retry after it.
+    /// credentials. Reconnecting retries after Server Unavailable, Server
+    /// Busy, Quota Exceeded and Connection Rate Exceeded, and stops after
+    /// any other.
     #[error("Connection refused: {0:?}")]
     ConnectionRefused(ReasonCode),
 
@@ -36,6 +38,11 @@ pub enum ClientError {
     /// can carry; nothing was sent.
     #[error("{0} is longer than 65,535 bytes")]
     TooLong(&'static str),
+
+    /// The request is invalid on its face, such as a topic name with
+    /// wildcards or an empty list of filters; nothing was sent.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 
     /// The broker announced it lacks what the request needs: a QoS above
     /// its maximum, retained messages, or subscription identifiers.
@@ -65,7 +72,8 @@ pub enum ClientError {
     #[error("Packet error: {0}")]
     Packet(#[from] mercurio_core::error::Error),
 
-    /// Connecting took longer than `connect_timeout`.
+    /// Connecting took longer than `connect_timeout`, or writing a packet
+    /// longer than `write_timeout`, which ends the connection.
     #[error("Timeout")]
     Timeout,
 

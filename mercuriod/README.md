@@ -342,10 +342,14 @@ group = "mercurio"
 # protocol_version = "mqttv5"
 # Publish "1"/"0", retained, to $SYS/broker/connection/<client id>/state
 # notifications = true
+# Each bridge needs its own name and client id; with notifications, the
+# client id must be a single topic level, without `/`, `+` or `#`
 # [bridges.tls]
+# TLS with the system's root certificates
 # enabled = true
+# A CA, or a client certificate, turns TLS on even without `enabled`
 # ca_path = "/etc/mercurio/cloud-ca.crt"
-# Client certificate, for brokers that require mutual TLS
+# Client certificate, for brokers that require mutual TLS; both or neither
 # cert_path = "/etc/mercurio/site1.crt"
 # key_path = "/etc/mercurio/site1.key"
 #
@@ -578,10 +582,20 @@ remote broker just after one was forwarded is dropped too. With
 `addresses`, the bridge moves on to the next broker whenever it can't
 connect or loses the connection. With `notifications`, the bridge's state
 is published, retained, to `$SYS/broker/connection/<client id>/state`:
-`1` while connected, `0` otherwise. The bridge
+`1` while connected, `0` otherwise. Two bridges may not share a `name` or a
+client id, as each would take over the other's session; with
+`notifications`, the client id must be a single topic level. `tls.ca_path`
+or a client certificate turns TLS on even without `tls.enabled`, as
+`--cafile` does for recado, and `cert_path` and `key_path` go together. The
+bridge
 connects to this broker in-process, so authentication and `acl_file` don't
-apply to it. If the remote broker is unreachable, the bridge retries every
-five seconds, and messages to forward wait in the bridge's queue on this
+apply to it. A QoS 1 or 2 message is acknowledged to the broker it came
+from only once the other broker accepted it, so a connection lost on either
+side never loses it; it may arrive twice instead. Up to 100 messages are in
+flight in each direction, within the receiving broker's Receive Maximum, and
+keep their order. If the remote broker is unreachable, the bridge retries after
+one second, doubling the wait after each failed attempt up to a minute, with
+some randomness, and messages to forward wait in the bridge's queue on this
 broker, up to `max_queued_messages`. Its session there lasts a day, so messages for `in` topics
 wait for the bridge across short outages.
 

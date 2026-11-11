@@ -93,17 +93,32 @@ pub struct BridgeConfig {
     pub topics: Vec<BridgeTopic>,
 }
 
+impl BridgeConfig {
+    /// Client id on both brokers.
+    pub fn client_id(&self) -> String {
+        self.client_id
+            .clone()
+            .unwrap_or_else(|| format!("mercurio-bridge-{}", self.name))
+    }
+}
+
+/// TLS to the remote broker. A CA or a client certificate turns it on
+/// whatever `enabled` says, as `--cafile` does for recado and mercurioctl,
+/// so credentials never cross the network in the clear by mistake.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeTlsConfig {
+    /// TLS verified with the system's root certificates, unless the keys
+    /// below set otherwise
     #[serde(default)]
     pub enabled: bool,
 
     /// CA certificate to verify the remote broker with, instead of the
-    /// system's root certificates
+    /// system's root certificates; turns TLS on
     pub ca_path: Option<String>,
 
-    /// Client certificate and key (PEM) to authenticate with
+    /// Client certificate and key (PEM) to authenticate with, both or
+    /// neither; turn TLS on
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
 }
@@ -503,6 +518,41 @@ impl Config {
         {
             if !names.contains(name.as_str()) {
                 return Err(format!("No [[plugins]] entry is named `{name}`"));
+            }
+        }
+        self.check_bridges()
+    }
+
+    fn check_bridges(&self) -> Result<(), String> {
+        let mut names = HashSet::new();
+        let mut client_ids = HashSet::new();
+        for bridge in &self.bridges {
+            let name = &bridge.name;
+            if !names.insert(name) {
+                return Err(format!(
+                    "Two [[bridges]] are named `{name}`; give one a different `name`"
+                ));
+            }
+            // The same client id makes each bridge take over the other's
+            // session on both brokers
+            let client_id = bridge.client_id();
+            if !client_ids.insert(client_id.clone()) {
+                return Err(format!(
+                    "Two [[bridges]] use the client id `{client_id}`; set a different `client_id` or `name`"
+                ));
+            }
+            // The id is a topic level of `$SYS/broker/connection/<id>/state`
+            if bridge.notifications
+                && (client_id.is_empty() || client_id.contains(['/', '+', '#', '\0']))
+            {
+                return Err(format!(
+                    "Bridge {name}: client id `{client_id}` must be a non-empty topic level, without `/`, `+` or `#`, for its state topic; set another `client_id` or `notifications = false`"
+                ));
+            }
+            if bridge.tls.cert_path.is_some() != bridge.tls.key_path.is_some() {
+                return Err(format!(
+                    "Bridge {name}: tls.cert_path and tls.key_path go together"
+                ));
             }
         }
         Ok(())
@@ -1118,6 +1168,50 @@ mod tests {
         };
         assert!(config("tenantA").check().is_err());
         assert!(config("tenantA/").check().is_ok());
+    }
+
+    #[test]
+    fn test_bridges_are_checked() {
+        let check = |bridges: &[&str]| -> Result<(), String> {
+            let toml: String = bridges
+                .iter()
+                .map(|extra| format!("[[bridges]]\nhost = \"h\"\ntopics = []\n{extra}\n"))
+                .collect();
+            toml::from_str::<Config>(&toml).unwrap().check()
+        };
+        assert!(check(&["name = \"a\"", "name = \"b\""]).is_ok());
+        // Each bridge's session takes over the other's
+        let error = check(&["name = \"a\"", "name = \"a\""]).unwrap_err();
+        assert!(error.contains("`a`"), "{error}");
+        let error = check(&[
+            "name = \"a\"\nclient_id = \"edge\"",
+            "name = \"b\"\nclient_id = \"edge\"",
+        ])
+        .unwrap_err();
+        assert!(error.contains("`edge`"), "{error}");
+        assert!(check(&[
+            "name = \"a\"",
+            "name = \"b\"\nclient_id = \"mercurio-bridge-a\""
+        ])
+        .is_err());
+
+        // Not a single level of the state topic
+        for invalid in [
+            "name = \"a/b\"",
+            "name = \"a\"\nclient_id = \"c+\"",
+            "name = \"#\"",
+        ] {
+            assert!(check(&[invalid]).is_err(), "{invalid}");
+        }
+        assert!(check(&["name = \"a/b\"\nnotifications = false"]).is_ok());
+
+        // Half a client certificate
+        assert!(check(&["name = \"a\"\n[bridges.tls]\ncert_path = \"c.pem\""]).is_err());
+        assert!(check(&["name = \"a\"\n[bridges.tls]\nkey_path = \"k.pem\""]).is_err());
+        assert!(check(&[
+            "name = \"a\"\n[bridges.tls]\ncert_path = \"c.pem\"\nkey_path = \"k.pem\""
+        ])
+        .is_ok());
     }
 
     #[test]

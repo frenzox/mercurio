@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,6 +14,7 @@ use mercurio_core::properties::{
 };
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
+use mercurio_core::topic::{validate_publish_topic, validate_subscribe_filter};
 use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
@@ -33,8 +38,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::Connection;
 use crate::error::{ClientError, Result};
-use crate::event::{DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
-use crate::options::{check_length, ConnectOptions, MessageProperties, SharedAuthenticator, Will};
+use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
+use crate::options::{
+    check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
+};
 use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
@@ -55,6 +62,7 @@ enum Command {
     Reauthenticate {
         response: oneshot::Sender<Result<()>>,
     },
+    Ack(AckToken),
 }
 
 /// An MQTT client for connecting to brokers.
@@ -99,11 +107,7 @@ impl MqttClient {
         if let Some(connector) = &options.connector {
             let stream =
                 (connector.0)().map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            );
+            let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
         }
@@ -116,11 +120,7 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            );
+            let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
         }
@@ -140,17 +140,9 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
-            Connection::new(
-                tls_stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            )
+            Connection::new(tls_stream, options)
         } else {
-            Connection::new(
-                stream,
-                options.protocol_version,
-                options.maximum_packet_size,
-            )
+            Connection::new(stream, options)
         };
 
         let session = Self::perform_connect(&mut connection, options).await?;
@@ -207,6 +199,16 @@ impl MqttClient {
                         None => ClientError::ConnectionRefused(ack.reason_code),
                     });
                 }
+                // A clean start leaves no session to resume [MQTT-3.2.2-4]
+                if ack.flags.session_present && options.clean_start {
+                    let _ = connection
+                        .write_packet(ControlPacket::Disconnect(DisconnectPacket {
+                            reason: ReasonCode::ProtocolError,
+                            properties: None,
+                        }))
+                        .await;
+                    return Err(ClientError::BrokerViolation(ReasonCode::ProtocolError));
+                }
                 let assigned_id = ack
                     .properties
                     .as_ref()
@@ -248,6 +250,7 @@ impl MqttClient {
         );
 
         connection.set_max_packet_size(limits.maximum_packet_size);
+        connection.set_write_timeout(options.write_timeout_for(keep_alive));
         Ok(Session {
             client_id,
             keep_alive,
@@ -293,7 +296,7 @@ impl MqttClient {
                 session_expiry_interval: (options.session_expiry > 0)
                     .then(|| SessionExpiryInterval::new(options.session_expiry)),
                 receive_maximum: options.receive_maximum.map(ReceiveMaximum::new),
-                maximum_packet_size: options.maximum_packet_size.map(MaximumPacketSize::new),
+                maximum_packet_size: Some(MaximumPacketSize::new(options.incoming_packet_limit())),
                 topic_alias_maximum: (options.topic_alias_maximum > 0)
                     .then(|| TopicAliasMaximum::new(options.topic_alias_maximum)),
                 request_response_information: options
@@ -338,25 +341,39 @@ impl MqttClient {
             authenticator: options.authenticator.clone(),
             reauthentication: None,
             pending_events: VecDeque::new(),
+            manual_acks: options.manual_acks,
+            unacknowledged: VecDeque::new(),
+            next_delivery: 0,
         };
         let mut keep_alive = session.keep_alive;
+        let mut backoff = options.reconnect_backoff();
 
         loop {
             let reason = state.run(&mut command_rx, keep_alive).await;
-            let reconnect = options
-                .reconnect_delay
-                .filter(|_| should_reconnect(&reason));
+            let reconnect = backoff.as_mut().filter(|_| should_reconnect(&reason));
             state.deliver(Event::Disconnected { reason });
-            let Some(delay) = reconnect else { break };
+            let Some(backoff) = reconnect else { break };
 
+            // Their acknowledgements can't go out any more; the broker
+            // sends the messages again if it kept the session
+            state.unacknowledged.clear();
             // Requests the broker never answered can't be answered now
             state.subscribes.clear();
             state.unsubscribes.clear();
-            let Some((connection, session)) =
-                state.reconnect(&mut command_rx, &options, delay).await
-            else {
-                break;
-            };
+            if let Some(response) = state.reauthentication.take() {
+                let _ = response.send(Err(ClientError::Disconnected));
+            }
+            let (connection, session) =
+                match state.reconnect(&mut command_rx, &options, backoff).await {
+                    Ok(opened) => opened,
+                    Err(Some(error)) => {
+                        state.deliver(Event::Stopped {
+                            error: Arc::new(error),
+                        });
+                        break;
+                    }
+                    Err(None) => break,
+                };
             state.connection = connection;
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
@@ -422,7 +439,26 @@ impl MqttClient {
         retain: bool,
         properties: MessageProperties,
     ) -> Result<()> {
+        self.start_publish(topic, payload, qos, retain, properties)
+            .await?
+            .await
+    }
+
+    /// Hands a message to the client and returns once it is queued, with
+    /// a [`PendingPublish`] that completes as `publish_with_properties`
+    /// would. Messages started one after another go out in that order, so
+    /// many can be in flight at once without reordering them.
+    pub async fn start_publish(
+        &self,
+        topic: &str,
+        payload: impl Into<Bytes>,
+        qos: QoS,
+        retain: bool,
+        properties: MessageProperties,
+    ) -> Result<PendingPublish> {
         check_length("topic", topic)?;
+        validate_publish_topic(topic)
+            .map_err(|e| ClientError::InvalidArgument(format!("topic `{topic}`: {e}")))?;
         properties.check()?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -436,8 +472,7 @@ impl MqttClient {
             }))
             .await
             .map_err(|_| ClientError::SendError)?;
-
-        response_rx.await.map_err(|_| ClientError::Disconnected)?
+        Ok(PendingPublish(response_rx))
     }
 
     /// Subscribe to one or more topics.
@@ -462,8 +497,12 @@ impl MqttClient {
         topics: &[(&str, SubscriptionOptions)],
         subscription_id: Option<u32>,
     ) -> Result<Vec<SubscribeResult>> {
-        for (topic, _) in topics {
-            check_length("topic filter", topic)?;
+        check_filters(topics.iter().map(|(t, _)| *t))?;
+        // A Variable Byte Integer from 1 [MQTT-3.8.2.1.2]
+        if subscription_id.is_some_and(|id| !(1..=268_435_455).contains(&id)) {
+            return Err(ClientError::InvalidArgument(
+                "subscription identifiers range from 1 to 268,435,455".into(),
+            ));
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -481,9 +520,7 @@ impl MqttClient {
     /// Unsubscribe from one or more topics. MQTT 3.x brokers report
     /// success for every topic.
     pub async fn unsubscribe(&self, topics: &[&str]) -> Result<Vec<UnsubscribeResult>> {
-        for topic in topics {
-            check_length("topic filter", topic)?;
-        }
+        check_filters(topics.iter().copied())?;
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Unsubscribe {
@@ -509,6 +546,19 @@ impl MqttClient {
             .map_err(|_| ClientError::SendError)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
+    }
+
+    /// Acknowledges a message received with
+    /// [`manual_acks`](ConnectOptions::manual_acks) on: QoS 1 gets its
+    /// PUBACK and QoS 2 its PUBREC, which also frees its place under the
+    /// Receive Maximum this client announced. Acknowledgements go out in
+    /// the order the messages came, so one waits for those of earlier
+    /// messages. A token from a connection that has ended does nothing.
+    pub async fn ack(&self, token: AckToken) -> Result<()> {
+        self.command_tx
+            .send(Command::Ack(token))
+            .await
+            .map_err(|_| ClientError::SendError)
     }
 
     /// Disconnect from the broker gracefully.
@@ -542,11 +592,30 @@ impl MqttClient {
     /// subscription, an unsubscription, a re-authentication) waits for the
     /// broker's answer, it reads on and holds the messages that arrive
     /// before the answer, so awaiting a publish between two calls to `recv`
-    /// can't deadlock. No message is dropped while the client lives.
+    /// can't deadlock. No message is dropped while the client lives. With
+    /// [`manual_acks`](ConnectOptions::manual_acks), the QoS 1 and 2
+    /// messages held that way stay within the Receive Maximum the client
+    /// announced, as the broker sends no more before some are acknowledged.
     pub async fn recv(&self) -> Option<Event> {
         let mut rx = self.event_rx.lock().await;
         rx.recv().await
     }
+}
+
+/// SUBSCRIBE and UNSUBSCRIBE need at least one filter [MQTT-3.8.3-2,
+/// MQTT-3.10.3-2], each well formed.
+fn check_filters<'a>(filters: impl ExactSizeIterator<Item = &'a str>) -> Result<()> {
+    if filters.len() == 0 {
+        return Err(ClientError::InvalidArgument(
+            "at least one topic filter is needed".into(),
+        ));
+    }
+    for filter in filters {
+        check_length("topic filter", filter)?;
+        validate_subscribe_filter(filter)
+            .map_err(|e| ClientError::InvalidArgument(format!("topic filter `{filter}`: {e}")))?;
+    }
+    Ok(())
 }
 
 fn auth_data(data: Option<Bytes>) -> Result<Option<AuthenticationData>> {
@@ -574,6 +643,22 @@ fn auth_answer(
     }))
 }
 
+/// A publish handed to the client, completing once the broker has
+/// acknowledged it (QoS 1 and 2) or it was written (QoS 0). Dropping it
+/// doesn't cancel the publish.
+#[must_use = "a publish's outcome is only known by awaiting it"]
+pub struct PendingPublish(oneshot::Receiver<Result<()>>);
+
+impl Future for PendingPublish {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|answer| answer.unwrap_or(Err(ClientError::Disconnected)))
+    }
+}
+
 /// What CONNACK settled for a connection.
 struct Session {
     client_id: String,
@@ -594,6 +679,23 @@ fn should_reconnect(reason: &DisconnectReason) -> bool {
             ReasonCode::SessionTakenOver | ReasonCode::UseAnotherServer | ReasonCode::ServerMoved
         ),
         _ => true,
+    }
+}
+
+/// Whether a failed reconnection attempt means the broker won't take the
+/// client back. Refusals for want of capacity pass and are retried; bad
+/// credentials, a ban, an unsupported version or a redirection don't.
+fn refused_for_good(error: &ClientError) -> bool {
+    match error {
+        ClientError::Redirected { .. } => true,
+        ClientError::ConnectionRefused(reason) => !matches!(
+            reason,
+            ReasonCode::ServerUnavailable
+                | ReasonCode::ServerBusy
+                | ReasonCode::QuotaExceeded
+                | ReasonCode::ConnectionRateExceeded
+        ),
+        _ => false,
     }
 }
 
@@ -639,6 +741,23 @@ struct EventLoop {
     reauthentication: Option<oneshot::Sender<Result<()>>>,
     /// Events that didn't fit in the event channel, oldest first
     pending_events: VecDeque<Event>,
+    /// QoS 1 and 2 messages are acknowledged when the application says
+    manual_acks: bool,
+    /// With manual acknowledgement, the QoS 1 and 2 messages delivered on
+    /// this connection and not acknowledged to the broker yet, in the
+    /// order they came
+    unacknowledged: VecDeque<Unacknowledged>,
+    /// Numbers deliveries, so a token never matches a later message that
+    /// reuses its packet identifier
+    next_delivery: u64,
+}
+
+/// A message delivered to the application, awaiting its acknowledgement.
+struct Unacknowledged {
+    token: AckToken,
+    qos: QoS,
+    /// The application acknowledged it, but an earlier message still waits
+    acknowledged: bool,
 }
 
 /// A message the application asked to publish.
@@ -714,7 +833,10 @@ impl EventLoop {
         // arrive; a keep-alive of 0 means no pings at all
         let ping_interval =
             (keep_alive > 0).then(|| Duration::from_millis(u64::from(keep_alive) * 500));
-        let mut ping_timer = time::interval(ping_interval.unwrap_or(Duration::from_secs(3600)));
+        let period = ping_interval.unwrap_or(Duration::from_secs(3600));
+        let mut ping_timer = time::interval(period);
+        // Ticks missed while the loop was busy don't fire in a burst
+        ping_timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         ping_timer.tick().await; // Skip the first immediate tick
         let mut awaiting_pingresp = false;
         // Reading stopped at some point since the last PINGREQ, so its
@@ -724,6 +846,9 @@ impl EventLoop {
         let event_tx = self.event_tx.clone();
 
         loop {
+            if self.connection.is_broken() {
+                return DisconnectReason::ConnectionLost;
+            }
             let reading = self.pending_events.is_empty() || self.waits_for_broker();
             paused_since_ping |= !reading;
             tokio::select! {
@@ -794,6 +919,7 @@ impl EventLoop {
                         Command::Reauthenticate { response } => {
                             self.reauthenticate(response).await;
                         }
+                        Command::Ack(token) => self.acknowledge(token).await,
                         Command::Disconnect { response } => {
                             let result = MqttClient::handle_disconnect(&mut self.connection).await;
                             let _ = response.send(result);
@@ -803,10 +929,14 @@ impl EventLoop {
                 }
 
                 // Send PINGREQ for keep-alive
-                _ = ping_timer.tick(), if ping_interval.is_some() => {
+                scheduled = ping_timer.tick(), if ping_interval.is_some() => {
+                    // A late tick means the loop itself was stalled, by a
+                    // slow authenticator or a starved runtime, and couldn't
+                    // read the PINGRESP that may be waiting
+                    let stalled = scheduled.elapsed() > period / 2;
                     // The previous PINGREQ went unanswered: the broker or the
                     // network is gone
-                    if awaiting_pingresp && !paused_since_ping {
+                    if awaiting_pingresp && !paused_since_ping && !stalled {
                         warn!("No PINGRESP from the broker, closing the connection");
                         return DisconnectReason::KeepAliveTimeout;
                     }
@@ -943,18 +1073,20 @@ impl EventLoop {
         DisconnectReason::ProtocolError(reason.to_string())
     }
 
-    /// Waits `delay` between attempts to reopen the connection. Meanwhile
+    /// Waits as `backoff` says between attempts to reopen the connection,
+    /// starting it over once one succeeds. Meanwhile
     /// QoS 1 and 2 publishes queue up, and other requests fail. Gives up
-    /// when the broker refuses the client or the application disconnects.
+    /// with the error when the broker refuses the client for good, or
+    /// without one when the application disconnects.
     async fn reconnect(
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
         options: &ConnectOptions,
-        delay: Duration,
-    ) -> Option<(Connection, Session)> {
+        backoff: &mut Backoff,
+    ) -> std::result::Result<(Connection, Session), Option<ClientError>> {
         let event_tx = self.event_tx.clone();
         loop {
-            let wait = time::sleep(delay);
+            let wait = time::sleep(backoff.next_delay());
             tokio::pin!(wait);
             loop {
                 tokio::select! {
@@ -962,7 +1094,7 @@ impl EventLoop {
                     permit = event_tx.reserve(), if !self.pending_events.is_empty() => {
                         self.hand_over(permit);
                     }
-                    command = command_rx.recv() => match command? {
+                    command = command_rx.recv() => match command.ok_or(None)? {
                         Command::Publish(request) if request.qos != QoS::AtMostOnce => {
                             self.waiting.push_back(request);
                         }
@@ -978,19 +1110,24 @@ impl EventLoop {
                         Command::Reauthenticate { response } => {
                             let _ = response.send(Err(ClientError::Disconnected));
                         }
+                        // Delivered on a connection that is gone
+                        Command::Ack(_) => {}
                         Command::Disconnect { response } => {
                             let _ = response.send(Ok(()));
-                            return None;
+                            return Err(None);
                         }
                     },
                 }
             }
 
             match MqttClient::open(options).await {
-                Ok(opened) => return Some(opened),
-                Err(e @ (ClientError::ConnectionRefused(_) | ClientError::Redirected { .. })) => {
+                Ok(opened) => {
+                    backoff.reset();
+                    return Ok(opened);
+                }
+                Err(e) if refused_for_good(&e) => {
                     error!("Broker refused to reconnect: {}", e);
-                    return None;
+                    return Err(Some(e));
                 }
                 Err(e) => warn!("Reconnecting failed: {}", e),
             }
@@ -1065,21 +1202,6 @@ impl EventLoop {
     /// the broker has acknowledged them, and wait their turn if the broker's
     /// Receive Maximum is reached [MQTT-3.3.4-7].
     async fn publish(&mut self, request: PublishRequest) {
-        // Features the broker doesn't support are refused here rather than
-        // sent [MQTT-3.2.2-11, MQTT-3.2.2-14]
-        if (request.qos as u8) > (self.limits.maximum_qos as u8) {
-            let _ = request
-                .response
-                .send(Err(ClientError::NotSupported("this QoS")));
-            return;
-        }
-        if request.retain && !self.limits.retain_available {
-            let _ = request
-                .response
-                .send(Err(ClientError::NotSupported("retained messages")));
-            return;
-        }
-
         if request.qos != QoS::AtMostOnce && self.in_flight() >= self.window() {
             self.waiting.push_back(request);
             return;
@@ -1105,11 +1227,19 @@ impl EventLoop {
                 .iter_mut()
                 .filter(|(_, o)| !o.sent)
                 .min_by_key(|(_, o)| o.seq);
-            if let Some((_, outgoing)) = resumed {
+            if let Some((&packet_id, outgoing)) = resumed {
                 outgoing.sent = true;
                 let packet = ControlPacket::Publish(outgoing.packet.clone());
-                if self.connection.write_packet(packet).await.is_err() {
-                    return;
+                match self.connection.write_packet(packet).await {
+                    Ok(()) => {}
+                    // The broker lowered its Maximum Packet Size since the
+                    // message was first sent
+                    Err(ClientError::PacketTooLarge) => {
+                        if let Some(outgoing) = self.outgoing.remove(&packet_id) {
+                            let _ = outgoing.response.send(Err(ClientError::PacketTooLarge));
+                        }
+                    }
+                    Err(_) => return,
                 }
                 continue;
             }
@@ -1129,6 +1259,17 @@ impl EventLoop {
             properties,
             response,
         } = request;
+        // Features the broker doesn't support are refused here rather than
+        // sent [MQTT-3.2.2-11, MQTT-3.2.2-14]. A publish that waited may
+        // meet the limits of a later connection.
+        if (qos as u8) > (self.limits.maximum_qos as u8) {
+            let _ = response.send(Err(ClientError::NotSupported("this QoS")));
+            return;
+        }
+        if retain && !self.limits.retain_available {
+            let _ = response.send(Err(ClientError::NotSupported("retained messages")));
+            return;
+        }
         let packet_id = match qos {
             QoS::AtMostOnce => None,
             _ => match self.next_packet_id() {
@@ -1430,33 +1571,71 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Acknowledges a message the application is done with, and any later
+    /// ones it acknowledged before: acknowledgements go out in the order
+    /// the messages came [MQTT-4.6.0-2, MQTT-4.6.0-3]. A token from an
+    /// earlier connection, or used already, matches nothing.
+    async fn acknowledge(&mut self, token: AckToken) {
+        let Some(entry) = self.unacknowledged.iter_mut().find(|u| u.token == token) else {
+            return;
+        };
+        entry.acknowledged = true;
+        while self.unacknowledged.front().is_some_and(|u| u.acknowledged) {
+            let entry = self.unacknowledged.pop_front().expect("checked above");
+            // A failed write ends the connection, and the broker sends the
+            // messages again
+            if self
+                .send_acknowledgement(entry.token.packet_id, entry.qos)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// PUBACK for QoS 1; PUBREC for QoS 2, which then awaits PUBREL.
+    async fn send_acknowledgement(&mut self, packet_id: u16, qos: QoS) -> Result<()> {
+        let packet = if qos == QoS::ExactlyOnce {
+            self.incoming_qos2.insert(packet_id);
+            ControlPacket::PubRec(PubRecPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            })
+        } else {
+            ControlPacket::PubAck(PubAckPacket {
+                packet_id,
+                reason: ReasonCode::Success,
+                properties: None,
+            })
+        };
+        self.connection.write_packet(packet).await
+    }
+
+    /// QoS 1 and 2 messages the broker has sent and this client hasn't
+    /// fully acknowledged.
+    fn incoming_in_flight(&self) -> usize {
+        self.unacknowledged.len() + self.incoming_qos2.len()
+    }
+
     async fn handle_publish(&mut self, mut publish: PublishPacket) -> Result<()> {
         self.resolve_topic_alias(&mut publish)?;
         debug!("Received PUBLISH on topic: {}", publish.topic_name);
 
+        let mut ack = None;
         let deliver = match (publish.qos_level, publish.packet_id) {
-            (QoS::AtLeastOnce, Some(packet_id)) => {
-                self.connection
-                    .write_packet(ControlPacket::PubAck(PubAckPacket {
-                        packet_id,
-                        reason: ReasonCode::Success,
-                        properties: None,
-                    }))
-                    .await?;
-                true
+            (QoS::AtLeastOnce | QoS::ExactlyOnce, Some(packet_id))
+                if self
+                    .unacknowledged
+                    .iter()
+                    .any(|u| u.token.packet_id == packet_id) =>
+            {
+                // Sent again before the application acknowledged it
+                false
             }
-            (QoS::ExactlyOnce, Some(packet_id)) => {
-                // The broker must stay within this client's Receive Maximum
-                // [MQTT-3.3.4-9]
-                if !self.incoming_qos2.contains(&packet_id)
-                    && self.incoming_qos2.len() >= usize::from(self.receive_maximum)
-                {
-                    return Err(ClientError::BrokerViolation(
-                        ReasonCode::ReceiveMaximumExceeded,
-                    ));
-                }
-                // A retransmission before PUBREL was already delivered once
-                let first_delivery = self.incoming_qos2.insert(packet_id);
+            (QoS::ExactlyOnce, Some(packet_id)) if self.incoming_qos2.contains(&packet_id) => {
+                // Delivered once already; only the PUBREC went missing
                 self.connection
                     .write_packet(ControlPacket::PubRec(PubRecPacket {
                         packet_id,
@@ -1464,7 +1643,33 @@ impl EventLoop {
                         properties: None,
                     }))
                     .await?;
-                first_delivery
+                false
+            }
+            (qos @ (QoS::AtLeastOnce | QoS::ExactlyOnce), Some(packet_id)) => {
+                // The broker must stay within this client's Receive Maximum
+                // [MQTT-3.3.4-9]; QoS 1 messages count while unacknowledged
+                let counted = self.manual_acks || qos == QoS::ExactlyOnce;
+                if counted && self.incoming_in_flight() >= usize::from(self.receive_maximum) {
+                    return Err(ClientError::BrokerViolation(
+                        ReasonCode::ReceiveMaximumExceeded,
+                    ));
+                }
+                if self.manual_acks {
+                    self.next_delivery += 1;
+                    let token = AckToken {
+                        delivery: self.next_delivery,
+                        packet_id,
+                    };
+                    self.unacknowledged.push_back(Unacknowledged {
+                        token,
+                        qos,
+                        acknowledged: false,
+                    });
+                    ack = Some(token);
+                } else {
+                    self.send_acknowledgement(packet_id, qos).await?;
+                }
+                true
             }
             _ => true,
         };
@@ -1487,6 +1692,7 @@ impl EventLoop {
                 retain: publish.retain,
                 properties: MessageProperties::from_publish(publish.properties),
                 subscription_ids,
+                ack,
             });
         }
         Ok(())

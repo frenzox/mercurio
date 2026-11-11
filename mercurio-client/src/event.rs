@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use mercurio_core::{qos::QoS, reason::ReasonCode};
 
+use crate::error::ClientError;
 use crate::options::MessageProperties;
 
 /// Events received from the MQTT broker.
@@ -16,15 +19,36 @@ pub enum Event {
         properties: MessageProperties,
         /// Identifiers of the matching subscriptions that have one
         subscription_ids: Vec<u32>,
+        /// With [`manual_acks`](crate::ConnectOptions::manual_acks) on, what
+        /// to pass to [`MqttClient::ack`](crate::MqttClient::ack) once the
+        /// message is taken care of; `None` for QoS 0 and otherwise.
+        ack: Option<AckToken>,
     },
 
     /// The connection ended. With reconnection on, the client tries again
-    /// and reports `Reconnected`; otherwise no more events follow.
+    /// and reports `Reconnected`, or `Stopped` if the broker refuses it
+    /// for good; otherwise no more events follow.
     Disconnected { reason: DisconnectReason },
 
     /// The client reconnected after losing the connection. Without
     /// `session_present` the broker forgot the subscriptions.
     Reconnected { session_present: bool },
+
+    /// Reconnecting failed for good, as when the broker refused the
+    /// credentials; the last event before [`MqttClient::recv`] returns
+    /// `None`.
+    ///
+    /// [`MqttClient::recv`]: crate::MqttClient::recv
+    Stopped { error: Arc<ClientError> },
+}
+
+/// Identifies a received message to acknowledge, with manual
+/// acknowledgement on. Only the connection it came on can acknowledge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckToken {
+    /// Counts deliveries for the whole life of the client
+    pub(crate) delivery: u64,
+    pub(crate) packet_id: u16,
 }
 
 /// Reason for disconnection.
