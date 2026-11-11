@@ -139,6 +139,13 @@ max_inflight = 64
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
 # max_connections_per_ip = 100
+# Failed logins from one address (IPv6 by /64) within login_failure_window
+# seconds that get it banned for login_failure_ban seconds. The ban is
+# listed by `mercurioctl ban list` and lifted like any other; loopback
+# addresses and the admin socket are never banned. 0 attempts turns it off
+# login_failure_attempts = 10
+# login_failure_window = 60
+# login_failure_ban = 300
 # Seconds one call of a plugin hook may take, for built-in authentication
 # and access control as for [[plugins]]; a slower call denies, or drops the
 # message. [auth.http] timeout_seconds and a plugin's timeout_ms may not

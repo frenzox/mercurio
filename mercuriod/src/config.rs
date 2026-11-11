@@ -9,7 +9,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, Overflow, QueueLimits, ShareStrategy, Transport},
+    server::{Limits, LoginFailures, Overflow, QueueLimits, ShareStrategy, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -890,6 +890,19 @@ pub struct ServerConfig {
     /// or not; unbounded when unset
     pub max_sessions: Option<usize>,
 
+    /// Failed logins from one address within `login_failure_window` that
+    /// get it banned for `login_failure_ban`; 0 turns this off
+    #[serde(default = "default_login_failure_attempts")]
+    pub login_failure_attempts: u32,
+
+    /// Seconds over which failed logins are counted
+    #[serde(default = "default_login_failure_window")]
+    pub login_failure_window: u64,
+
+    /// Seconds an address is banned for once it failed too often
+    #[serde(default = "default_login_failure_ban")]
+    pub login_failure_ban: u64,
+
     /// Topics that may hold a retained message at once, the broker's own
     /// `$SYS` topics not counted; unbounded when unset
     pub max_retained_messages: Option<usize>,
@@ -951,6 +964,9 @@ impl Default for ServerConfig {
             persistent_client_expiration: None,
             max_session_expiry: default_max_session_expiry(),
             max_sessions: None,
+            login_failure_attempts: default_login_failure_attempts(),
+            login_failure_window: default_login_failure_window(),
+            login_failure_ban: default_login_failure_ban(),
             max_retained_messages: None,
             max_connections_per_ip: None,
             plugin_timeout: default_plugin_timeout(),
@@ -982,6 +998,18 @@ impl ExpiryBound {
             ExpiryBound::Unlimited(_) => None,
         }
     }
+}
+
+fn default_login_failure_attempts() -> u32 {
+    10
+}
+
+fn default_login_failure_window() -> u64 {
+    60
+}
+
+fn default_login_failure_ban() -> u64 {
+    300
 }
 
 /// A week: sessions of clients that never return don't pile up forever,
@@ -1285,6 +1313,18 @@ impl ServerConfig {
         limits.max_topic_filter_length = self.max_topic_filter_length;
         limits.max_session_expiry = self.max_session_expiry.duration();
         limits.max_sessions = self.max_sessions;
+        if self.login_failure_attempts > 0 {
+            if self.login_failure_window == 0 || self.login_failure_ban == 0 {
+                return Err(
+                    "login_failure_window and login_failure_ban must be at least 1 second".into(),
+                );
+            }
+            limits.login_failures = Some(LoginFailures::new(
+                self.login_failure_attempts,
+                Duration::from_secs(self.login_failure_window),
+                Duration::from_secs(self.login_failure_ban),
+            ));
+        }
         limits.max_retained_messages = self.max_retained_messages;
         limits.max_connections_per_ip = self.max_connections_per_ip;
         Ok(limits)
@@ -1799,6 +1839,30 @@ mod tests {
             toml::from_str::<Config>("[server]\nshared_subscription_strategy = \"first\"\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_failed_logins_ban_after_ten_a_minute_unless_off() {
+        use mercurio_server::server::LoginFailures;
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        assert_eq!(
+            limits("").unwrap().login_failures,
+            Some(LoginFailures::new(
+                10,
+                Duration::from_secs(60),
+                Duration::from_secs(300)
+            ))
+        );
+        assert_eq!(
+            limits("[server]\nlogin_failure_attempts = 0\n")
+                .unwrap()
+                .login_failures,
+            None
+        );
+        assert!(limits("[server]\nlogin_failure_ban = 0\n").is_err());
     }
 
     #[test]

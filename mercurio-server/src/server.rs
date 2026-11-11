@@ -55,7 +55,7 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 use crate::{
     acl::Access,
     admin::{Admin, AdminExtension, AdminParts, ListenerInfo},
-    bans::{Bans, Candidate},
+    bans::{Bans, Candidate, FailedLogins},
     broker::Broker,
     connection::Connection,
     http,
@@ -89,6 +89,7 @@ pub struct AuthConfig {
 }
 
 pub use crate::{
+    bans::LoginFailures,
     broker::ShareStrategy,
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
     queue::{Overflow, QueueLimits},
@@ -181,6 +182,12 @@ pub struct Limits {
     /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
+    /// Failed logins that get a client address banned for a while,
+    /// through the same bans as the admin API's, listed with their expiry
+    /// and the reason `automatic: …`. Addresses count as for
+    /// `max_connections_per_ip`; loopback addresses, in-process clients and
+    /// those of trusted listeners are never banned. Off when unset.
+    pub login_failures: Option<LoginFailures>,
     /// Sessions that outlive their connection the broker may hold,
     /// connected or not; a CONNECT that would start one more is refused
     /// with Quota Exceeded (Server Unavailable for MQTT 3.x). Resuming a
@@ -214,6 +221,7 @@ impl Default for Limits {
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
+            login_failures: None,
             max_sessions: None,
         }
     }
@@ -741,6 +749,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     listener: Arc<str>,
     bans: Arc<Bans>,
     use_username_as_clientid: bool,
+    /// Where its failed logins are counted; None when they aren't
+    failed_logins: Option<Arc<FailedLogins>>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -1015,6 +1025,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             listener: self.listener,
             bans: self.bans,
             use_username_as_clientid: self.use_username_as_clientid,
+            failed_logins: self.failed_logins,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -1084,6 +1095,7 @@ struct Listener<St: MqttStore + 'static> {
     address_slots: Arc<AddressSlots>,
     connection_slots: Option<Arc<Semaphore>>,
     bans: Arc<Bans>,
+    failed_logins: Option<Arc<FailedLogins>>,
 }
 
 struct Handler<St, S>
@@ -1110,6 +1122,7 @@ where
     listener: Arc<str>,
     bans: Arc<Bans>,
     use_username_as_clientid: bool,
+    failed_logins: Option<Arc<FailedLogins>>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1341,6 +1354,7 @@ impl<St: MqttStore + 'static> Server<St> {
             limits,
             stats,
             bans,
+            failed_logins: limits.login_failures.map(|l| Arc::new(FailedLogins::new(l))),
         };
 
         session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
@@ -1566,6 +1580,8 @@ impl<St: MqttStore + 'static> Listener<St> {
                 listener: Arc::from("local"),
                 bans: Arc::clone(&self.bans),
                 use_username_as_clientid: false,
+                // Trusted clients skip authentication altogether
+                failed_logins: self.failed_logins.clone().filter(|_| !trusted),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1882,6 +1898,7 @@ where
             };
 
             if !authenticated {
+                self.login_failed().await;
                 return self
                     .reject_connect(&connect_packet, ReasonCode::BadUserNameOrPassword)
                     .await;
@@ -2260,6 +2277,7 @@ where
                 AuthResult::Success { username, data } => return Ok(Some((username, data))),
                 AuthResult::Failed(reason) => {
                     warn!("Enhanced authentication with `{}` failed", method);
+                    self.login_failed().await;
                     self.reject_connect(connect_packet, reason).await?;
                     return Ok(None);
                 }
@@ -2354,6 +2372,14 @@ where
                 .await;
             Ok(())
         })
+    }
+
+    /// Counts a failed login against the client's address, which may get
+    /// it banned.
+    async fn login_failed(&self) {
+        if let (Some(failed_logins), Some(peer)) = (&self.failed_logins, self.peer) {
+            failed_logins.failed(peer.ip(), &self.bans).await;
+        }
     }
 
     /// Whether a ban refuses this client, connecting with `client_id` as
@@ -2853,7 +2879,7 @@ struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
 /// IPv6 socket counts as its IPv4 address. An IPv6 client counts as its
 /// /64, the block one subscriber is usually given, so it can't take a new
 /// address from it for every connection.
-fn address_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn address_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
