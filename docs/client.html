@@ -220,8 +220,8 @@ impl Authenticator for Token {
         "TOKEN".into()
     }
 
-    fn start(&amp;mut self) -&gt; Option&lt;Bytes&gt; {
-        Some(Bytes::from(self.0.clone()))
+    fn start(&amp;mut self) -&gt; Result&lt;Option&lt;Bytes&gt;, String&gt; {
+        Ok(Some(Bytes::from(self.0.clone())))
     }
 
     fn respond(&amp;mut self, _challenge: Option&lt;Bytes&gt;) -&gt; Result&lt;Option&lt;Bytes&gt;, String&gt; {

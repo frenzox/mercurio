@@ -25,15 +25,12 @@ use crate::Authenticator;
 #[derive(Debug, Clone)]
 pub struct ScramSha256 {
     client: ScramClient,
-    /// Why the exchange could not start, reported at the first challenge
-    failed: Option<String>,
 }
 
 impl ScramSha256 {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             client: ScramClient::new(username, password),
-            failed: None,
         }
     }
 }
@@ -43,23 +40,14 @@ impl Authenticator for ScramSha256 {
         MECHANISM.to_string()
     }
 
-    fn start(&mut self) -> Option<Bytes> {
-        match self.client.start() {
-            Ok(first) => {
-                self.failed = None;
-                Some(Bytes::from(first))
-            }
-            Err(e) => {
-                self.failed = Some(e.to_string());
-                None
-            }
-        }
+    fn start(&mut self) -> Result<Option<Bytes>, String> {
+        self.client
+            .start()
+            .map(|first| Some(Bytes::from(first)))
+            .map_err(|e| e.to_string())
     }
 
     fn respond(&mut self, challenge: Option<Bytes>) -> Result<Option<Bytes>, String> {
-        if let Some(failed) = self.failed.take() {
-            return Err(failed);
-        }
         let challenge = challenge.ok_or("the broker sent no SCRAM challenge")?;
         self.client
             .respond(&challenge)

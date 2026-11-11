@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use mercurio_scram::{TLS_EXPORTER_LABEL, TLS_EXPORTER_LEN};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -15,23 +16,33 @@ use crate::error::ClientError;
 use crate::options::{ConnectOptions, TlsOptions};
 
 /// Runs the TLS handshake with the broker over `stream`, within the
-/// connect timeout.
+/// connect timeout, returning the stream with its tls-exporter channel
+/// binding data (RFC 9266), which only TLS 1.3 has.
 pub(crate) async fn handshake<S>(
     options: &ConnectOptions,
     stream: S,
-) -> Result<TlsStream<S>, ClientError>
+) -> Result<(TlsStream<S>, Option<[u8; 32]>), ClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     info!("Establishing TLS connection");
     let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
-    timeout(
+    let stream = timeout(
         options.connect_timeout,
         connector.connect(server_name, stream),
     )
     .await
     .map_err(|_| ClientError::Timeout)?
-    .map_err(handshake_error)
+    .map_err(handshake_error)?;
+    let connection = stream.get_ref().1;
+    let exporter = (connection.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3))
+        .then(|| {
+            connection
+                .export_keying_material([0u8; TLS_EXPORTER_LEN], TLS_EXPORTER_LABEL, Some(&[]))
+                .ok()
+        })
+        .flatten();
+    Ok((stream, exporter))
 }
 
 /// A TLS handshake that failed over the certificate or the TLS settings,
@@ -262,7 +273,9 @@ mod tests {
         options: ConnectOptions,
         address: SocketAddr,
     ) -> Result<TlsStream<TcpStream>, ClientError> {
-        handshake(&options, TcpStream::connect(address).await.unwrap()).await
+        handshake(&options, TcpStream::connect(address).await.unwrap())
+            .await
+            .map(|(stream, _)| stream)
     }
 
     #[test]

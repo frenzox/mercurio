@@ -220,19 +220,22 @@ impl MqttClient {
 
     /// Opens the transport and performs the CONNECT handshake.
     async fn open_once(options: &ConnectOptions) -> Result<(Connection, Session)> {
-        let mut connection = Connection::new(Self::open_stream(options).await?, options);
+        let (stream, tls_exporter) = Self::open_stream(options).await?;
+        let mut connection = Connection::new(stream, tls_exporter, options);
         let session = Self::perform_connect(&mut connection, options).await?;
         Ok((connection, session))
     }
 
-    /// Opens the byte stream to the broker, TLS handshake included.
-    async fn open_stream(options: &ConnectOptions) -> Result<Box<dyn Stream>> {
+    /// Opens the byte stream to the broker, TLS handshake included, with
+    /// its TLS 1.3 tls-exporter channel binding data.
+    async fn open_stream(options: &ConnectOptions) -> Result<(Box<dyn Stream>, Option<[u8; 32]>)> {
         let connect_timeout = options.connect_timeout;
         if let Some(connector) = &options.connector {
-            return timeout(connect_timeout, (connector.0)())
+            let stream = timeout(connect_timeout, (connector.0)())
                 .await
                 .map_err(|_| ClientError::Timeout)?
-                .map_err(ClientError::ConnectionFailed);
+                .map_err(ClientError::ConnectionFailed)?;
+            return Ok((stream, None));
         }
 
         #[cfg(unix)]
@@ -242,7 +245,7 @@ impl MqttClient {
                 .await
                 .map_err(|_| ClientError::Timeout)?
                 .map_err(ClientError::ConnectionFailed)?;
-            return Ok(Box::new(stream));
+            return Ok((Box::new(stream), None));
         }
 
         let addr = format!("{}:{}", options.host, options.port);
@@ -256,20 +259,20 @@ impl MqttClient {
         let _ = stream.set_nodelay(true);
 
         #[cfg(feature = "tls")]
-        let stream: Box<dyn Stream> = if options.tls.enabled {
-            Box::new(crate::tls::handshake(options, stream).await?)
+        let (stream, tls_exporter): (Box<dyn Stream>, _) = if options.tls.enabled {
+            let (stream, exporter) = crate::tls::handshake(options, stream).await?;
+            (Box::new(stream), exporter)
         } else {
-            Box::new(stream)
+            (Box::new(stream), None)
         };
         #[cfg(not(feature = "tls"))]
-        let stream: Box<dyn Stream> = Box::new(stream);
+        let (stream, tls_exporter): (Box<dyn Stream>, _) = (Box::new(stream), None);
         #[cfg(feature = "websocket")]
         if let Some(path) = &options.websocket_path {
-            return Ok(Box::new(
-                crate::websocket::handshake(options, stream, path).await?,
-            ));
+            let websocket = crate::websocket::handshake(options, stream, path).await?;
+            return Ok((Box::new(websocket), tls_exporter));
         }
-        Ok(stream)
+        Ok((stream, tls_exporter))
     }
 
     /// Perform the MQTT CONNECT handshake.
@@ -277,7 +280,7 @@ impl MqttClient {
         connection: &mut Connection,
         options: &ConnectOptions,
     ) -> Result<Session> {
-        let connect_packet = Self::build_connect_packet(options)?;
+        let connect_packet = Self::build_connect_packet(options, connection.tls_exporter())?;
         connection
             .write_packet(ControlPacket::Connect(connect_packet))
             .await?;
@@ -398,11 +401,21 @@ impl MqttClient {
     }
 
     /// Build a CONNECT packet from options.
-    fn build_connect_packet(options: &ConnectOptions) -> Result<ConnectPacket> {
-        let authentication = options.authenticator.as_ref().map(|a| {
-            let mut authenticator = a.lock();
-            (authenticator.method(), authenticator.start())
-        });
+    fn build_connect_packet(
+        options: &ConnectOptions,
+        tls_exporter: Option<[u8; 32]>,
+    ) -> Result<ConnectPacket> {
+        let authentication = match &options.authenticator {
+            Some(authenticator) => {
+                let mut authenticator = authenticator.lock();
+                authenticator.channel(tls_exporter);
+                let data = authenticator
+                    .start()
+                    .map_err(ClientError::AuthenticationFailed)?;
+                Some((authenticator.method(), data))
+            }
+            None => None,
+        };
         let payload = ConnectPayload {
             client_id: options.client_id.clone().unwrap_or_default(),
             will: options.will.as_ref().map(|w| connect::Will {
@@ -1494,7 +1507,11 @@ impl EventLoop {
         }
         let packet = {
             let mut authenticator = authenticator.lock();
-            let auth_data = match auth_data(authenticator.start()) {
+            authenticator.channel(self.connection.tls_exporter());
+            let started = authenticator
+                .start()
+                .map_err(ClientError::AuthenticationFailed);
+            let auth_data = match started.and_then(auth_data) {
                 Ok(data) => data,
                 Err(e) => {
                     let _ = response.send(Err(e));

@@ -32,12 +32,18 @@ pub struct Connection {
     /// A write failed or timed out, maybe halfway through a packet, so
     /// nothing more can go over this connection
     broken: bool,
+    /// The TLS 1.3 tls-exporter channel binding data
+    tls_exporter: Option<[u8; 32]>,
 }
 
 impl Connection {
     /// A connection still to be set up, writes bounded by the connect
     /// timeout until CONNACK settles the keep-alive.
-    pub fn new(stream: impl Stream + 'static, options: &ConnectOptions) -> Self {
+    pub fn new(
+        stream: impl Stream + 'static,
+        tls_exporter: Option<[u8; 32]>,
+        options: &ConnectOptions,
+    ) -> Self {
         Self {
             stream: Box::new(stream),
             read_buffer: BytesMut::with_capacity(4096),
@@ -46,7 +52,12 @@ impl Connection {
             max_incoming_size: options.incoming_packet_limit(),
             write_timeout: options.connect_timeout,
             broken: false,
+            tls_exporter,
         }
+    }
+
+    pub fn tls_exporter(&self) -> Option<[u8; 32]> {
+        self.tls_exporter
     }
 
     pub fn set_write_timeout(&mut self, write_timeout: Duration) {

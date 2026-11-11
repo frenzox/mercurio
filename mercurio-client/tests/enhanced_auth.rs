@@ -68,8 +68,8 @@ impl Authenticator for Signer {
         "CHALLENGE".into()
     }
 
-    fn start(&mut self) -> Option<Bytes> {
-        Some(Bytes::from_static(b"hello"))
+    fn start(&mut self) -> Result<Option<Bytes>, String> {
+        Ok(Some(Bytes::from_static(b"hello")))
     }
 
     fn respond(&mut self, challenge: Option<Bytes>) -> Result<Option<Bytes>, String> {
@@ -153,7 +153,7 @@ impl Authenticator for Suspicious {
         self.0.method()
     }
 
-    fn start(&mut self) -> Option<Bytes> {
+    fn start(&mut self) -> Result<Option<Bytes>, String> {
         self.0.start()
     }
 
