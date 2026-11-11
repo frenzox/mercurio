@@ -53,6 +53,14 @@ impl Default for QueueLimits {
     }
 }
 
+setters!(QueueLimits {
+    with_max_qos0 => max_qos0: usize,
+    with_max_messages => max_messages: usize,
+    with_max_bytes => max_bytes: Option<usize>,
+    with_upgrade_qos => upgrade_qos: bool,
+    with_overflow => overflow: Overflow,
+});
+
 /// Which message a full queue loses to stay within its limits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]

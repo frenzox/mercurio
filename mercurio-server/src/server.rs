@@ -92,6 +92,11 @@ pub struct AuthConfig {
     pub allow_anonymous: bool,
 }
 
+setters!(AuthConfig {
+    with_require_auth => require_auth: bool,
+    with_allow_anonymous => allow_anonymous: bool,
+});
+
 pub use crate::{
     bans::LoginFailures,
     broker::{ShareRedelivery, ShareStrategy},
@@ -251,6 +256,34 @@ impl Default for Limits {
         }
     }
 }
+
+setters!(Limits {
+    with_connect_timeout => connect_timeout: Duration,
+    with_write_timeout => write_timeout: Duration,
+    with_max_packet_size => max_packet_size: usize,
+    with_max_connect_packet_size => max_connect_packet_size: usize,
+    with_queue => queue: QueueLimits,
+    with_max_connections => max_connections: Some(usize),
+    with_topic_alias_maximum => topic_alias_maximum: u16,
+    with_receive_maximum => receive_maximum: u16,
+    with_max_inflight => max_inflight: u16,
+    with_max_keepalive => max_keepalive: Some(u16),
+    with_send_topic_aliases => send_topic_aliases: bool,
+    with_maximum_qos => maximum_qos: QoS,
+    with_retain_available => retain_available: bool,
+    with_persistent_client_expiration => persistent_client_expiration: Some(Duration),
+    with_check_retain_source => check_retain_source: bool,
+    with_max_subscriptions => max_subscriptions: Option<usize>,
+    with_max_topic_filter_length => max_topic_filter_length: usize,
+    with_max_session_expiry => max_session_expiry: Some(Duration),
+    with_max_retained_messages => max_retained_messages: Some(usize),
+    with_max_connections_per_ip => max_connections_per_ip: Some(usize),
+    with_max_publish_rate => max_publish_rate: Some(Rate),
+    with_max_publish_bytes_rate => max_publish_bytes_rate: Some(Rate),
+    with_publish_rate_grace => publish_rate_grace: Some(Duration),
+    with_login_failures => login_failures: Some(LoginFailures),
+    with_max_sessions => max_sessions: Some(usize),
+});
 
 /// A rate of so many a second, with a burst allowance: up to `burst` may
 /// come at once after a quiet spell, and `per_second` on average.
@@ -420,6 +453,19 @@ impl Default for ServerConfig {
         }
     }
 }
+
+setters!(ServerConfig {
+    with_auth => auth: AuthConfig,
+    with_limits => limits: Limits,
+    with_policy => policy: ConnectPolicy,
+    with_sys_interval => sys_interval: Option<Duration>,
+    with_plugins => plugins: Vec<Arc<dyn Plugin>>,
+    with_plugin_timeout => plugin_timeout: Duration,
+    with_plugin_tick_interval => plugin_tick_interval: Duration,
+    with_admin_extension => admin_extension: Some(Arc<dyn AdminExtension>),
+    with_share_strategy => share_strategy: ShareStrategy,
+    with_share_redelivery => share_redelivery: ShareRedelivery,
+});
 
 /// A socket to accept connections on.
 #[non_exhaustive]
@@ -608,6 +654,29 @@ impl ListenerConfig {
         None
     }
 }
+
+setters!(ListenerConfig {
+    with_tls => tls: Some(Tls),
+    with_proxy_protocol => proxy_protocol: bool,
+    with_proxy_from => proxy_from: Vec<AddressRange>,
+    with_mount_point => mount_point: Some(String),
+    with_auth => auth: Some(AuthConfig),
+    with_plugins => plugins: Some(Vec<Arc<dyn Plugin>>),
+    with_max_connections => max_connections: Some(usize),
+    with_http_dir => http_dir: Some(PathBuf),
+    with_health => health: bool,
+    with_metrics => metrics: bool,
+    with_allowed_origins => allowed_origins: Some(Vec<String>),
+    with_trusted => trusted: bool,
+    #[cfg(unix)]
+    with_peer_filter => peer_filter: Some(PeerFilter),
+    with_max_connection_rate => max_connection_rate: Some(Rate),
+    with_max_packet_size => max_packet_size: Some(usize),
+    with_max_connect_packet_size => max_connect_packet_size: Some(usize),
+    with_max_keepalive => max_keepalive: Some(u16),
+    with_connect_timeout => connect_timeout: Some(Duration),
+    with_use_username_as_clientid => use_username_as_clientid: bool,
+});
 
 /// Opens in-process connections to a broker, for parts of the same program
 /// such as bridges. These connections skip authentication, access control
@@ -1198,6 +1267,14 @@ pub struct ConnectPolicy {
     /// accepted.
     pub client_id_prefixes: Vec<String>,
 }
+
+setters!(ConnectPolicy {
+    with_response_information => response_information: Some(String),
+    with_redirect => redirect: Some(Redirect),
+    with_require_client_id => require_client_id: bool,
+    with_auto_id_prefix => auto_id_prefix: String,
+    with_client_id_prefixes => client_id_prefixes: Vec<String>,
+});
 
 /// Where clients are sent instead of being served.
 #[derive(Debug, Clone)]

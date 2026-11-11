@@ -62,6 +62,15 @@ pub enum TlsVersion {
     Tls13,
 }
 
+setters!(TlsConfig {
+    with_require_certificate => require_certificate: bool,
+    with_crl_path => crl_path: Some(String),
+    with_crl_end_entity_only => crl_end_entity_only: bool,
+    with_crl_allow_unknown => crl_allow_unknown: bool,
+    with_min_version => min_version: TlsVersion,
+    with_username_from_certificate => username_from_certificate: Some(CertificateName),
+});
+
 impl TlsConfig {
     /// Create a new TLS configuration.
     pub fn new(cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
