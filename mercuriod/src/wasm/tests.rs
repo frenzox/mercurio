@@ -170,6 +170,13 @@ async fn test_a_rust_plugin_panic_is_logged() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
     let plugin = misbehave(|_| ()).await;
+    // Tracing caches whether a log line has a subscriber when its line
+    // first runs. A test on another thread that ran the plugin's log line
+    // first, as this subscriber was being set, can leave "none" cached for
+    // it, since rebuilding the cache for a new subscriber skips lines still
+    // being registered. By now they are registered, so this rebuild sees
+    // them.
+    tracing::callsite::rebuild_interest_cache();
     assert_eq!(control(&plugin, "panic", b"ouch").await, None);
     let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(logged.contains("misbehaving on purpose: ouch"), "{logged}");
