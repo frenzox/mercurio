@@ -16,12 +16,12 @@ workspace = true
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
 smallvec = "1.11"
-rand = "0.8"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "sync", "time", "macros", "io-util", "fs"] }
 socket2.workspace = true
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+getrandom.workspace = true
 futures-util = { workspace = true, features = ["sink", "std"] }
 rustls.workspace = true
 serde.workspace = true

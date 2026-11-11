@@ -9,6 +9,14 @@ use mercurio_core::{message::Message, Result};
 use mercurio_storage::RetainedMessageStore;
 use tracing::warn;
 
+/// A random number for spreading shares; not for secrets. Each
+/// `RandomState` hashes with its own keys, seeded once per thread from the
+/// operating system and stepped for every new one.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one(0u8)
+}
+
 /// Message broker that handles pub/sub routing.
 ///
 /// The broker maintains a topic tree for efficient message routing with wildcard support.
@@ -217,7 +225,7 @@ impl<S: RetainedMessageStore> Broker<S> {
             let len = members.len();
             // `turn` follows the member chosen last
             let start = match (strategy, publisher) {
-                (ShareStrategy::Random, _) => rand::random::<usize>() % len,
+                (ShareStrategy::Random, _) => (random_u64() % len as u64) as usize,
                 (ShareStrategy::Sticky, _) => (turn + len - 1) % len,
                 (ShareStrategy::Hash, Some(publisher)) => (publisher.key % len as u64) as usize,
                 _ => turn,

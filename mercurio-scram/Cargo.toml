@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 base64.workspace = true
-getrandom = "0.4"
+getrandom.workspace = true
 hmac = "0.13"
 pbkdf2.workspace = true
 sha2.workspace = true

@@ -1069,11 +1069,10 @@ mod tests {
     }
 
     fn argon2_hash(password: &str) -> String {
-        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+        use argon2::{Argon2, PasswordHasher};
 
-        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
         Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .unwrap()
             .to_string()
     }
