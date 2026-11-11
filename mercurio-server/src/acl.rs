@@ -139,10 +139,21 @@ impl AclFile {
             {
                 continue;
             }
-            let filter = pattern
-                .filter
-                .replace("%c", &client.client_id)
-                .replace("%u", username);
+            // In one pass, so an identity that itself reads `%u` or `%c`
+            // isn't substituted in turn, past the check above
+            let mut filter = String::with_capacity(pattern.filter.len());
+            let mut rest = pattern.filter.as_str();
+            while let Some(at) = rest.find('%') {
+                filter.push_str(&rest[..at]);
+                let (identity, skip) = match rest.as_bytes().get(at + 1) {
+                    Some(b'c') => (client.client_id.as_str(), 2),
+                    Some(b'u') => (username, 2),
+                    _ => ("%", 1),
+                };
+                filter.push_str(identity);
+                rest = &rest[at + skip..];
+            }
+            filter.push_str(rest);
             rules.push(Rule {
                 grant: pattern.grant,
                 filter,
@@ -295,6 +306,21 @@ mod tests {
             AclFile::parse("topic readwrite devices/#\npattern deny devices/%c/secret").unwrap();
         assert!(!acl.allows(&client("+", None), "devices/dev8/secret", Access::Read));
         assert!(acl.allows(&client("+", None), "devices/dev8/status", Access::Read));
+    }
+
+    #[test]
+    fn test_a_substituted_identity_is_not_substituted_again() {
+        let acl = AclFile::parse(ACL).unwrap();
+
+        // A client id of `%u` names no user's topics
+        let bob = client("%u", Some("bob"));
+        assert!(acl.allows(&bob, "devices/%u/status", Access::Write));
+        assert!(!acl.allows(&bob, "devices/bob/status", Access::Write));
+        let wide = client("%u", Some("+"));
+        assert!(!acl.allows(&wide, "devices/dev8/status", Access::Write));
+        // Nor does a user name of `%c` name a client's
+        let carol = client("dev8", Some("%c"));
+        assert!(!acl.allows(&carol, "users/dev8/inbox", Access::Read));
     }
 
     #[test]
