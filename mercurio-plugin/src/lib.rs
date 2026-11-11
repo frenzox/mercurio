@@ -75,6 +75,9 @@ pub trait Plugin {
     /// The first plugin to answer [`Decision::Allow`] or [`Decision::Deny`]
     /// decides; [`Decision::Defer`], the default, leaves the decision to the
     /// next plugin.
+    ///
+    /// Publishing to `$CONTROL/...`, which administers the broker, isn't
+    /// asked here: a WebAssembly plugin can't grant it.
     fn authorize(_client: ClientInfo, _topic: String, _access: Access) -> Decision {
         Decision::Defer
     }

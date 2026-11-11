@@ -62,6 +62,10 @@ impl Plugin for AllowAll {
         "allow-all"
     }
 
+    fn authorize_control<'a>(&'a self, _: &'a ClientInfo, _: &'a str) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+
     fn authorize<'a>(
         &'a self,
         _: &'a ClientInfo,
@@ -122,6 +126,10 @@ impl Plugin for BansDuringConnect {
             }
             Decision::Allow
         })
+    }
+
+    fn authorize_control<'a>(&'a self, _: &'a ClientInfo, _: &'a str) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
     }
 }
 
@@ -443,6 +451,39 @@ async fn each_command_needs_its_own_permission() {
     let reply = admin.request(Bytes::from(envelope.to_string())).await;
     assert!(reply["responses"][0].get("error").is_none());
     assert_eq!(reply["responses"][1]["code"], "notAuthorized");
+}
+
+/// Allows every login and every topic, and says nothing about `$CONTROL`.
+struct AllowTopics;
+
+impl Plugin for AllowTopics {
+    fn name(&self) -> &str {
+        "allow-topics"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a str,
+        _: Access,
+    ) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+}
+
+#[tokio::test]
+async fn allowing_every_topic_grants_no_admin_commands() {
+    let (addr, _) = start(config(vec![Arc::new(AllowTopics)])).await;
+    let mut client = admin_client(addr).await;
+    let request = br#"{"commands":[{"command":"listClients"}]}"#;
+    assert_eq!(
+        client.publish("$CONTROL/broker/v1", request, false).await,
+        ReasonCode::NotAuthorized
+    );
+    assert_eq!(
+        client.publish("$CONTROL/other/v1", b"x", false).await,
+        ReasonCode::NotAuthorized
+    );
 }
 
 #[tokio::test]
@@ -1108,7 +1149,7 @@ async fn plugins_are_listed_in_chain_order() {
     assert_eq!(
         listed["data"]["plugins"],
         json!([
-            {"name": "acl-file", "kind": "builtin", "hooks": ["authorize"]},
+            {"name": "acl-file", "kind": "builtin", "hooks": ["authorize", "authorize_control"]},
             {"name": "custom", "kind": "rust", "hooks": []},
         ])
     );

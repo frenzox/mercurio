@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use mercurio_server::{
-    plugin::{ready, Access, BoxFuture, ClientInfo, Decision, Plugin},
+    plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin},
     server::{LocalConnector, ServerConfig},
 };
 use tokio::{
@@ -78,17 +78,12 @@ async fn control_topics_open_to_clients_a_plugin_allows() {
         fn name(&self) -> &str {
             "allow-control"
         }
-        fn authorize<'a>(
+        fn authorize_control<'a>(
             &'a self,
             _: &'a ClientInfo,
-            topic: &'a str,
-            _: Access,
+            _: &'a str,
         ) -> BoxFuture<'a, Decision> {
-            ready(if topic.starts_with("$CONTROL/") {
-                Decision::Allow
-            } else {
-                Decision::Defer
-            })
+            ready(Decision::Allow)
         }
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

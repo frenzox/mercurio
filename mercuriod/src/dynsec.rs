@@ -44,8 +44,9 @@ struct Data {
 }
 
 /// Access of clients no ACL decides for, anonymous ones included; by
-/// default, as in mosquitto, only receiving is allowed. It never applies to
-/// `$CONTROL` topics, which stay closed unless an ACL opens them.
+/// default, as in mosquitto, only receiving is allowed. It never lets a
+/// client publish to `$CONTROL` topics, which stay closed unless an ACL
+/// opens them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct DefaultAccess {
@@ -176,17 +177,36 @@ impl Data {
     }
 
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
+        self.decide(username, topic, access)
+            .unwrap_or(match access {
+                Access::Write => self.default_acl_access.publish_client_send,
+                Access::Read => self.default_acl_access.publish_client_receive,
+                Access::Subscribe => self.default_acl_access.subscribe,
+                // A kind of access added later is denied until handled
+                _ => false,
+            })
+    }
+
+    /// Whether the client may publish to `$CONTROL` topic `topic`: only an
+    /// ACL opens it, never the default access, which may be permissive for
+    /// ordinary topics.
+    fn authorize_control(&self, username: Option<&str>, topic: &str) -> bool {
+        self.decide(username, topic, Access::Write).unwrap_or(false)
+    }
+
+    /// What the client's ACLs say about `access` to `topic`, None when no
+    /// ACL applies.
+    fn decide(&self, username: Option<&str>, topic: &str, access: Access) -> Option<bool> {
         // A client disabled or deleted while connected loses its access at
         // once; a user name from elsewhere, such as a client certificate,
         // needs a client of that name, as in mosquitto
         if let Some(username) = username {
             match self.clients.iter().find(|c| c.username == username) {
                 Some(client) if !client.disabled => {}
-                _ => return false,
+                _ => return Some(false),
             }
         }
-        let decision = self
-            .roles_of(username)
+        self.roles_of(username)
             .into_iter()
             .filter_map(|rolename| self.roles.iter().find(|r| r.rolename == rolename))
             .flat_map(|role| &role.acls)
@@ -195,21 +215,8 @@ impl Data {
             .fold(None::<&Acl>, |best, acl| match best {
                 Some(best) if best.priority >= acl.priority => Some(best),
                 _ => Some(acl),
-            });
-        // $CONTROL administers the broker: only an ACL opens it, never the
-        // default access, which may be permissive for ordinary topics
-        let control = topic == "$CONTROL" || topic.starts_with("$CONTROL/");
-        match decision {
-            Some(acl) => acl.allow,
-            None if control => false,
-            None => match access {
-                Access::Write => self.default_acl_access.publish_client_send,
-                Access::Read => self.default_acl_access.publish_client_receive,
-                Access::Subscribe => self.default_acl_access.subscribe,
-                // A kind of access added later is denied until handled
-                _ => false,
-            },
-        }
+            })
+            .map(|acl| acl.allow)
     }
 
     /// The clients whose access `command` may change, to disconnect once it
@@ -901,6 +908,7 @@ impl Plugin for DynamicSecurity {
         PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&[
             "authenticate",
             "authorize",
+            "authorize_control",
             "on_control",
         ])
     }
@@ -956,6 +964,20 @@ impl Plugin for DynamicSecurity {
     ) -> BoxFuture<'a, Decision> {
         let data = self.data.read().unwrap();
         let allowed = data.authorize(client.username.as_deref(), topic, access);
+        ready(if allowed {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        })
+    }
+
+    fn authorize_control<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        let data = self.data.read().unwrap();
+        let allowed = data.authorize_control(client.username.as_deref(), topic);
         ready(if allowed {
             Decision::Allow
         } else {
@@ -1097,7 +1119,7 @@ mod tests {
         );
         assert_eq!(
             security
-                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .authorize_control(&identity("admin"), COMMAND_TOPIC)
                 .await,
             Decision::Allow
         );
@@ -1121,7 +1143,7 @@ mod tests {
         assert!(security.check_password("admin", b"secret", "c"));
         assert_eq!(
             security
-                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .authorize_control(&identity("admin"), COMMAND_TOPIC)
                 .await,
             Decision::Allow
         );
@@ -1167,7 +1189,7 @@ mod tests {
             Decision::Deny
         );
         assert_eq!(
-            security.authorize(&s1, COMMAND_TOPIC, Access::Write).await,
+            security.authorize_control(&s1, COMMAND_TOPIC).await,
             Decision::Deny
         );
 
@@ -1265,6 +1287,7 @@ mod tests {
             PluginStatus::new("dynamic-security", PluginKind::Builtin).with_hooks(&[
                 "authenticate",
                 "authorize",
+                "authorize_control",
                 "on_control"
             ])
         );
@@ -1303,29 +1326,21 @@ mod tests {
                 "$CONTROL/broker/v1",
                 "$CONTROL/dynamic-security/v1/response",
             ] {
-                for access in [Access::Write, Access::Read, Access::Subscribe] {
-                    assert_eq!(
-                        security.authorize(client, topic, access).await,
-                        Decision::Deny,
-                        "{:?} {topic} {access:?}",
-                        client.username
-                    );
-                }
+                assert_eq!(
+                    security.authorize_control(client, topic).await,
+                    Decision::Deny,
+                    "{:?} {topic}",
+                    client.username
+                );
             }
             assert_eq!(
                 security.authorize(client, "anything", Access::Write).await,
                 Decision::Allow
             );
-            assert_eq!(
-                security
-                    .authorize(client, "$CONTROLLER", Access::Write)
-                    .await,
-                Decision::Allow
-            );
         }
         assert_eq!(
             security
-                .authorize(&identity("admin"), COMMAND_TOPIC, Access::Write)
+                .authorize_control(&identity("admin"), COMMAND_TOPIC)
                 .await,
             Decision::Allow
         );
@@ -1793,9 +1808,14 @@ mod tests {
         let _ = std::fs::remove_file(path);
         DynamicSecurity::init(path, "admin", "secret").unwrap();
         let security = DynamicSecurity::load(path).unwrap();
+        for topic in ["$CONTROL/broker/v1", "$CONTROL/broker/v1/listClients"] {
+            assert_eq!(
+                security.authorize_control(&identity("admin"), topic).await,
+                Decision::Allow,
+                "{topic}"
+            );
+        }
         for (topic, access) in [
-            ("$CONTROL/broker/v1", Access::Write),
-            ("$CONTROL/broker/v1/listClients", Access::Write),
             ("$CONTROL/broker/v1/response", Access::Subscribe),
             ("$CONTROL/broker/v1/response", Access::Read),
         ] {
@@ -1807,7 +1827,7 @@ mod tests {
         }
         assert_eq!(
             security
-                .authorize(&identity("other"), "$CONTROL/broker/v1", Access::Write)
+                .authorize_control(&identity("other"), "$CONTROL/broker/v1")
                 .await,
             Decision::Deny
         );

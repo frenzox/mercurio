@@ -11,7 +11,7 @@ use super::{
     Paging,
 };
 use crate::{
-    plugin::{Access, Chain, ClientInfo, Decision},
+    plugin::{Chain, ClientInfo},
     server::AddressRange,
 };
 
@@ -237,7 +237,7 @@ async fn run(
     }
     // A trusted chain allows every topic
     let topic = format!("$CONTROL/broker/v1/{command}");
-    if chain.authorize(client, &topic, Access::Write).await != Decision::Allow {
+    if !chain.may_control(client, &topic).await {
         return Err(AdminError::new(
             ErrorCode::NotAuthorized,
             format!("not allowed to run {command}"),

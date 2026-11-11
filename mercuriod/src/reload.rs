@@ -131,6 +131,15 @@ impl<T: Plugin> Plugin for Reloadable<T> {
         let current = self.get();
         Box::pin(async move { current.authorize(client, topic, access).await })
     }
+
+    fn authorize_control<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        let current = self.get();
+        Box::pin(async move { current.authorize_control(client, topic).await })
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +204,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             Plugin::status(&acl),
-            PluginStatus::new("acl-file", PluginKind::Builtin).with_hooks(&["authorize"])
+            PluginStatus::new("acl-file", PluginKind::Builtin)
+                .with_hooks(&["authorize", "authorize_control"])
         );
         std::fs::remove_file(&path).unwrap();
     }

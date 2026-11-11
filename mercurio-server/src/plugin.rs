@@ -10,8 +10,10 @@
 //!   whenever a client sends them, even when authentication isn't
 //!   required. When every plugin defers, a client with credentials is
 //!   refused if authentication is required and let in unverified if not, an
-//!   anonymous one follows `allow_anonymous`, and access is allowed, except
-//!   publishing to `$CONTROL`, which needs an explicit `Allow`.
+//!   anonymous one follows `allow_anonymous`, and access is allowed.
+//! - [`Plugin::authorize_control`]: as `authorize`, but when every plugin
+//!   defers the client is refused, so only an explicit `Allow` lets a
+//!   client publish to `$CONTROL`.
 //! - [`Plugin::on_message`]: every plugin, each seeing the changes of the
 //!   ones before; the first [`MessageAction::Drop`] drops the message.
 //! - [`Plugin::on_event`] and [`Plugin::on_tick`]: every plugin.
@@ -304,6 +306,24 @@ pub trait Plugin: Send + Sync + 'static {
         ready(Decision::Defer)
     }
 
+    /// Whether `client` may publish to `topic`, a `$CONTROL/...` topic,
+    /// which administers the broker or a plugin. A request to
+    /// `$CONTROL/broker/v1` is asked about twice: for that topic, then for
+    /// each of its commands as `$CONTROL/broker/v1/<command>`.
+    ///
+    /// The broker asks this instead of [`Plugin::authorize`] for such
+    /// publishes, so a plugin that allows every topic doesn't make every
+    /// client an administrator. When every plugin defers, the client is
+    /// refused. Receiving and subscribing to `$CONTROL` topics go through
+    /// `authorize`, as responses go only to the client that asked.
+    fn authorize_control<'a>(
+        &'a self,
+        _client: &'a ClientInfo,
+        _topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        ready(Decision::Defer)
+    }
+
     /// Sees each message a client publishes, once it may publish it and
     /// before it is retained or sent on. It may change the message or
     /// drop it.
@@ -359,6 +379,11 @@ pub trait Plugin: Send + Sync + 'static {
     ) -> BoxFuture<'a, Option<Bytes>> {
         ready(None)
     }
+}
+
+/// Whether `topic` is `$CONTROL` or a topic below it.
+pub(crate) fn is_control(topic: &str) -> bool {
+    topic == "$CONTROL" || topic.starts_with("$CONTROL/")
 }
 
 /// Runs a hook within `limit`. None, logged, if it ran out of time or
@@ -532,6 +557,26 @@ impl Chain {
 
     pub(crate) async fn may(&self, client: &ClientInfo, topic: &str, access: Access) -> bool {
         self.authorize(client, topic, access).await != Decision::Deny
+    }
+
+    /// Whether `client` may publish to the `$CONTROL` topic `topic`: only
+    /// when a plugin allows it.
+    pub(crate) async fn may_control(&self, client: &ClientInfo, topic: &str) -> bool {
+        if self.trusted {
+            return true;
+        }
+        for plugin in self.plugins.iter() {
+            match guarded(plugin.name(), "authorize_control", self.timeout, || {
+                plugin.authorize_control(client, topic)
+            })
+            .await
+            {
+                Some(Decision::Defer) => continue,
+                Some(decision) => return decision == Decision::Allow,
+                None => return false,
+            }
+        }
+        false
     }
 
     pub(crate) async fn on_message(
@@ -738,6 +783,20 @@ mod tests {
         );
         assert!(deferring.may(&client(), "t", Access::Read).await);
         assert!(chain(Vec::new()).may(&client(), "t", Access::Write).await);
+    }
+
+    #[tokio::test]
+    async fn test_control_needs_an_allow_from_its_own_hook() {
+        let topic = "$CONTROL/broker/v1";
+        let allows_topics = chain(vec![fixed("a", Decision::Allow)]);
+        assert!(!allows_topics.may_control(&client(), topic).await);
+        assert!(!chain(Vec::new()).may_control(&client(), topic).await);
+        assert!(
+            chain(Vec::new())
+                .trusted()
+                .may_control(&client(), topic)
+                .await
+        );
     }
 
     #[tokio::test]
