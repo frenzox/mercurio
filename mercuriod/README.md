@@ -216,6 +216,12 @@ enabled = false
 # require_certificate = true
 # Reject client certificates revoked in these CRLs (PEM); needs ca_path
 # crl_path = "/etc/mercurio/crl.pem"
+# Every certificate of a client's chain needs a CRL from its issuer in
+# crl_path, or the client is refused. Check only the client's own
+# certificate, leaving its intermediate CAs unchecked
+# crl_end_entity_only = false
+# Accept certificates whose issuer has no CRL in crl_path
+# crl_allow_unknown = false
 # Use the client certificate's Common Name as the user name, instead of
 # the user name and password the client sends; needs ca_path
 # identity_as_username = false
@@ -570,7 +576,12 @@ TLS on `port`, and on `websocket_port` when it is set. With `ca_path`, the
 broker also requires a client certificate signed by that CA.
 `require_certificate = false` makes it optional: clients without one log
 in by user name and password, while a certificate that is presented must
-still be valid. `crl_path` rejects revoked client certificates. With
+still be valid. `crl_path` rejects revoked client certificates. Each
+certificate of the client's chain, intermediate CAs included, must be
+covered by a CRL from its issuer, or the client is refused: give the CRLs
+of the root and of every intermediate CA. `crl_end_entity_only = true`
+checks only the client's own certificate, and `crl_allow_unknown = true`
+accepts certificates whose issuer has no CRL in the file. With
 `identity_as_username`, the certificate's Common Name becomes the client's
 user name: it counts as authenticated, and `user` rules in `acl_file`
 apply to it. The user name and password in CONNECT are then ignored,

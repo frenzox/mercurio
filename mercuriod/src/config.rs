@@ -885,6 +885,15 @@ pub struct TlsServerConfig {
     /// Revocation lists to check client certificates against
     pub crl_path: Option<String>,
 
+    /// Check only the client's own certificate against `crl_path`, not
+    /// the intermediate CAs that issued it
+    #[serde(default)]
+    pub crl_end_entity_only: bool,
+
+    /// Accept certificates whose issuer has no CRL in `crl_path`
+    #[serde(default)]
+    pub crl_allow_unknown: bool,
+
     /// Oldest TLS version accepted: "1.2" or "1.3"
     #[serde(default)]
     pub min_version: MinTlsVersion,
@@ -916,6 +925,8 @@ impl Default for TlsServerConfig {
             ca_path: None,
             require_certificate: true,
             crl_path: None,
+            crl_end_entity_only: false,
+            crl_allow_unknown: false,
             min_version: MinTlsVersion::default(),
             identity_as_username: false,
             subject_as_username: false,
@@ -943,6 +954,8 @@ impl TlsServerConfig {
         }
         tls.require_certificate = self.require_certificate;
         tls.crl_path = self.crl_path.clone();
+        tls.crl_end_entity_only = self.crl_end_entity_only;
+        tls.crl_allow_unknown = self.crl_allow_unknown;
         tls.min_version = match self.min_version {
             MinTlsVersion::Tls12 => TlsVersion::Tls12,
             MinTlsVersion::Tls13 => TlsVersion::Tls13,
@@ -1278,6 +1291,22 @@ mod tests {
         };
         assert!(tls("").require_certificate);
         assert!(!tls("require_certificate = false").require_certificate);
+    }
+
+    #[test]
+    fn test_crls_cover_the_whole_chain_unless_relaxed() {
+        let tls = |extra: &str| {
+            let config: Config = toml::from_str(&format!(
+                "[server.tls]\nenabled = true\ncert_path = \"c.pem\"\nkey_path = \"k.pem\"\n\
+                 ca_path = \"ca.pem\"\ncrl_path = \"crl.pem\"\n{extra}"
+            ))
+            .unwrap();
+            config.server.tls.build().unwrap().unwrap()
+        };
+        let strict = tls("");
+        assert!(!strict.crl_end_entity_only && !strict.crl_allow_unknown);
+        let relaxed = tls("crl_end_entity_only = true\ncrl_allow_unknown = true");
+        assert!(relaxed.crl_end_entity_only && relaxed.crl_allow_unknown);
     }
 
     #[test]

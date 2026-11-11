@@ -24,8 +24,17 @@ pub struct TlsConfig {
     /// `ca_path`; a certificate that is presented must still be valid.
     pub require_certificate: bool,
     /// Certificate revocation lists (PEM) to check client certificates
-    /// against; requires `ca_path`
+    /// against; requires `ca_path`. Every certificate of a client's chain
+    /// below the CA must be covered by a CRL from its issuer, or the client
+    /// is refused, unless `crl_end_entity_only` or `crl_allow_unknown`
+    /// relax it. CRLs past their next update are still used.
     pub crl_path: Option<String>,
+    /// Check only the client's own certificate against `crl_path`, and
+    /// not the intermediate CAs that issued it
+    pub crl_end_entity_only: bool,
+    /// Accept certificates whose issuer has no CRL in `crl_path`, instead
+    /// of refusing them as their revocation status is unknown
+    pub crl_allow_unknown: bool,
     /// Oldest TLS version accepted
     pub min_version: TlsVersion,
     /// Take the client's user name from its certificate, in place of the
@@ -62,6 +71,8 @@ impl TlsConfig {
             ca_path: None,
             require_certificate: true,
             crl_path: None,
+            crl_end_entity_only: false,
+            crl_allow_unknown: false,
             min_version: TlsVersion::default(),
             username_from_certificate: None,
         }
@@ -83,6 +94,11 @@ impl TlsConfig {
                 "Revocation lists, optional client certificates and certificate identities \
                  need a CA to verify clients with"
                     .to_string(),
+            ));
+        }
+        if self.crl_path.is_none() && (self.crl_end_entity_only || self.crl_allow_unknown) {
+            return Err(ServerError::Tls(
+                "How revocation lists are checked needs revocation lists to check".to_string(),
             ));
         }
         let certs = load_certs(&self.cert_path)?;
@@ -111,6 +127,12 @@ impl TlsConfig {
             let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
             if let Some(crl_path) = &self.crl_path {
                 verifier = verifier.with_crls(load_crls(crl_path)?);
+            }
+            if self.crl_end_entity_only {
+                verifier = verifier.only_check_end_entity_revocation();
+            }
+            if self.crl_allow_unknown {
+                verifier = verifier.allow_unknown_revocation_status();
             }
             if !self.require_certificate {
                 verifier = verifier.allow_unauthenticated();

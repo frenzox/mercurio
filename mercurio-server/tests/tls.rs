@@ -291,3 +291,86 @@ async fn embedders_can_serve_their_own_rustls_configuration() {
     let renewed = handshake(addr, Some("alice")).await.unwrap();
     assert_eq!(served_certificate(&renewed), certs("server.pem")[0]);
 }
+
+/// A listener checking client certificates against the test root CA and
+/// the CRLs of `crls`, with `tune` applied, open to anonymous clients.
+async fn start_with_crls(test: &str, crls: &[&str], tune: fn(&mut TlsConfig)) -> SocketAddr {
+    let path = scratch(test).join("crls.pem");
+    let pem: String = crls
+        .iter()
+        .map(|crl| std::fs::read_to_string(fixture(crl)).unwrap())
+        .collect();
+    std::fs::write(&path, pem).unwrap();
+    let mut files = server_files().with_client_auth(fixture("root.pem"));
+    files.crl_path = Some(path.to_str().unwrap().to_string());
+    tune(&mut files);
+    let mut config = ServerConfig::default();
+    config.tls = Some(Tls::new(files).unwrap());
+    start(config).await
+}
+
+async fn accepted(addr: SocketAddr, identity: &str) -> bool {
+    match handshake(addr, Some(identity)).await {
+        Ok(mut stream) => mqtt_connect(&mut stream, identity, None).await == Some(0),
+        Err(_) => false,
+    }
+}
+
+/// Which of the test clients `addr` lets in: alice and dave from the
+/// root CA, bob and carol from the intermediate; dave and carol are
+/// revoked.
+async fn admitted(addr: SocketAddr) -> Vec<&'static str> {
+    let mut admitted = Vec::new();
+    for name in ["alice", "dave", "bob", "carol"] {
+        if accepted(addr, name).await {
+            admitted.push(name);
+        }
+    }
+    admitted
+}
+
+/// By default every certificate of the chain needs a CRL from its issuer
+/// saying it isn't revoked: a client of the intermediate CA is refused
+/// unless both the root's and the intermediate's CRLs are given.
+#[tokio::test]
+async fn by_default_every_certificate_of_the_chain_needs_a_crl() {
+    let both = start_with_crls("crl-both", &["root.crl", "intermediate.crl"], |_| {}).await;
+    assert_eq!(admitted(both).await, ["alice", "bob"]);
+
+    let root = start_with_crls("crl-root", &["root.crl"], |_| {}).await;
+    assert_eq!(admitted(root).await, ["alice"]);
+
+    let intermediate = start_with_crls("crl-intermediate", &["intermediate.crl"], |_| {}).await;
+    assert_eq!(admitted(intermediate).await, Vec::<&str>::new());
+}
+
+#[tokio::test]
+async fn crls_can_cover_only_the_client_certificate() {
+    let intermediate = start_with_crls("crl-leaf", &["intermediate.crl"], |files| {
+        files.crl_end_entity_only = true;
+    })
+    .await;
+    // Bob's intermediate isn't covered, and no longer needs to be; alice,
+    // from the root CA, still is not covered
+    assert_eq!(admitted(intermediate).await, ["bob"]);
+}
+
+#[tokio::test]
+async fn crls_can_let_certificates_they_dont_cover_in() {
+    let root = start_with_crls("crl-unknown", &["root.crl"], |files| {
+        files.crl_allow_unknown = true;
+    })
+    .await;
+    // Only revoked certificates are refused
+    assert_eq!(admitted(root).await, ["alice", "bob", "carol"]);
+}
+
+#[test]
+fn crl_settings_need_a_crl() {
+    let mut files = server_files().with_client_auth(fixture("root.pem"));
+    files.crl_end_entity_only = true;
+    assert!(Tls::new(files).is_err());
+    let mut files = server_files().with_client_auth(fixture("root.pem"));
+    files.crl_allow_unknown = true;
+    assert!(Tls::new(files).is_err());
+}

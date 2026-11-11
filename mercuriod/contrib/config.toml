@@ -148,6 +148,12 @@ enabled = false
 # require_certificate = true
 # Reject client certificates revoked in these CRLs (PEM); needs ca_path
 # crl_path = "/etc/mercurio/crl.pem"
+# Every certificate of a client's chain needs a CRL from its issuer in
+# crl_path, or the client is refused. Check only the client's own
+# certificate, leaving its intermediate CAs unchecked
+# crl_end_entity_only = false
+# Accept certificates whose issuer has no CRL in crl_path
+# crl_allow_unknown = false
 # Use the client certificate's Common Name as the user name, instead of
 # the user name and password the client sends; needs ca_path
 # identity_as_username = false
