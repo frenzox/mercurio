@@ -34,6 +34,7 @@ mod config;
 mod credentials;
 mod dynsec;
 mod http_auth;
+mod jwt_auth;
 mod logging;
 mod notify;
 mod password_file;
@@ -48,6 +49,7 @@ use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 use dynsec::DynamicSecurity;
 use http_auth::HttpAuth;
+use jwt_auth::JwtAuth;
 use reload::{Reload, Reloadable};
 
 const DEFAULT_CONFIG: &str = "/etc/mercurio/config.toml";
@@ -217,6 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth: auth_config,
         plugins,
         dynsec,
+        jwt,
         listeners: prepared_listeners,
         reloadable,
         bridges,
@@ -397,16 +400,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = match config.storage {
         StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            serve(builder.storage(storage), &commands, dynsec, shutdown).await
+            serve(builder.storage(storage), &commands, dynsec, jwt, shutdown).await
         }
     };
     // Removed now, as exiting skips destructors
@@ -437,6 +440,8 @@ struct Prepared {
     auth: ServerAuthConfig,
     plugins: Vec<Arc<dyn Plugin>>,
     dynsec: Option<Arc<DynamicSecurity>>,
+    /// Of `[auth]` and of every listener, which need the broker's `Admin`
+    jwt: Vec<Arc<JwtAuth>>,
     /// In the order of `[[listeners]]`
     listeners: Vec<PreparedListener>,
     reloadable: Vec<Arc<dyn Reload>>,
@@ -476,7 +481,9 @@ async fn prepare(
 
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
     let tls = build_tls(&config.server.tls, &mut reloadable)?;
-    let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true, create_files)?;
+    let mut jwt = Vec::new();
+    let (auth, builtins, dynsec) =
+        build_auth(&config.auth, &mut reloadable, &mut jwt, true, create_files)?;
     let wasm = load_plugins(
         &config.plugins,
         config.server.plugin_timeout(),
@@ -509,7 +516,8 @@ async fn prepare(
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {
             Some(auth) => {
-                let (auth, plugins, _) = build_auth(auth, &mut reloadable, false, create_files)?;
+                let (auth, plugins, _) =
+                    build_auth(auth, &mut reloadable, &mut jwt, false, create_files)?;
                 (Some(auth), Some(chain(&plugins, names)))
             }
             None => (None, names.map(|_| chain(&builtins, names))),
@@ -537,6 +545,7 @@ async fn prepare(
         auth,
         plugins: chain(&builtins, None),
         dynsec,
+        jwt,
         listeners,
         reloadable,
         bridges,
@@ -557,18 +566,22 @@ fn build_tls(
     Ok(Some(tls))
 }
 
-/// Sets the broker up, hands its `Admin` to the daemon's commands and to
-/// dynamic security, and serves until `shutdown`.
+/// Sets the broker up, hands its `Admin` to the daemon's commands, to
+/// dynamic security and to JWT authentication, and serves until `shutdown`.
 async fn serve<St: MqttStore + 'static>(
     builder: ServerBuilder<St>,
     commands: &commands::DaemonCommands,
     dynsec: Option<Arc<DynamicSecurity>>,
+    jwt: Vec<Arc<JwtAuth>>,
     shutdown: impl Future,
 ) -> Result<(), ServerError> {
     let server = builder.build().await?;
     commands.set_admin(server.admin());
     if let Some(dynsec) = dynsec {
         dynsec.set_admin(server.admin());
+    }
+    for jwt in jwt {
+        jwt.set_admin(server.admin());
     }
     // The listeners are bound and the sessions restored: from here on,
     // connections are served
@@ -724,10 +737,11 @@ fn load_scram_secret(path: &str, create: bool) -> Result<Option<[u8; 32]>, Strin
 }
 
 /// The authentication and access control of `config`, adding the files it
-/// loads to `reloadable`.
+/// loads to `reloadable` and its JWT authentication to `jwt`.
 fn build_auth(
     config: &config::AuthConfig,
     reloadable: &mut Vec<Arc<dyn Reload>>,
+    jwt: &mut Vec<Arc<JwtAuth>>,
     main: bool,
     create_files: bool,
 ) -> Result<Auth, String> {
@@ -736,6 +750,7 @@ fn build_auth(
     let authenticating = [
         ("password_file", config.password_file.is_some()),
         ("dynamic_security", config.dynamic_security.is_some()),
+        ("jwt", config.jwt.is_some()),
         (
             "user_url",
             config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
@@ -759,6 +774,13 @@ fn build_auth(
     }
 
     if let Some(path) = &config.dynamic_security {
+        if config.jwt.is_some() {
+            return Err(
+                "dynamic_security cannot be combined with [auth.jwt]: dynamic security owns \
+                 the users"
+                    .to_string(),
+            );
+        }
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
         }
@@ -793,6 +815,14 @@ fn build_auth(
     }
 
     let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if let Some(settings) = &config.jwt {
+        let auth = Arc::new(JwtAuth::from_config(settings)?);
+        if auth.has_key_file() {
+            reloadable.push(auth.clone());
+        }
+        jwt.push(auth.clone());
+        plugins.push(auth);
+    }
     if let Some(path) = &config.password_file {
         let validator = Arc::new(Reloadable::load(path, load_credentials)?);
         info!("Loaded credentials from {}", path);
@@ -882,7 +912,7 @@ async fn load_plugins(
     }
 }
 
-/// Rereads the ACL, password and dynamic security files, the TLS
+/// Rereads the ACL, password, dynamic security and JWT key files, the TLS
 /// certificates, keys and CRLs and the WebAssembly plugins on SIGHUP, as
 /// the `reload` command does. ACL and plugin changes apply to every later
 /// check or call; password and TLS changes apply to later connections.
@@ -1004,7 +1034,9 @@ mod tests {
             ),
         ] {
             for main in [true, false] {
-                let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main, true) else {
+                let Err(error) =
+                    build_auth(&auth(toml), &mut Vec::new(), &mut Vec::new(), main, true)
+                else {
                     panic!("{toml}: accepted");
                 };
                 assert!(
@@ -1052,6 +1084,7 @@ mod tests {
         let (value, plugins, _) = build_auth(
             &auth("[http]\nacl_url = \"http://h/acl\"\n"),
             &mut Vec::new(),
+            &mut Vec::new(),
             true,
             true,
         )
@@ -1064,6 +1097,7 @@ mod tests {
         std::fs::write(&acl, "topic read public/#\n").unwrap();
         let result = build_auth(
             &auth(&format!("acl_file = \"{}\"\n", acl.display())),
+            &mut Vec::new(),
             &mut Vec::new(),
             true,
             true,
@@ -1078,6 +1112,7 @@ mod tests {
     fn test_a_superuser_endpoint_alone_is_used() {
         let (_, plugins, _) = build_auth(
             &auth("enabled = true\n[http]\nsuperuser_url = \"http://h/su\"\n"),
+            &mut Vec::new(),
             &mut Vec::new(),
             true,
             true,
@@ -1100,6 +1135,7 @@ mod tests {
                     "enabled = true\n[http]\nuser_url = \"https://h/u\"\n{tls}"
                 )),
                 &mut reloadable,
+                &mut Vec::new(),
                 true,
                 true,
             )
@@ -1114,9 +1150,10 @@ mod tests {
     async fn broker_with(toml: &str) -> u16 {
         use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
-        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true, true)
-            .map_err(|e| panic!("{e}"))
-            .unwrap();
+        let (value, plugins, _) =
+            build_auth(&auth(toml), &mut Vec::new(), &mut Vec::new(), true, true)
+                .map_err(|e| panic!("{e}"))
+                .unwrap();
         let mut config = ServerConfig::default();
         config.auth = value;
         config.plugins = plugins;

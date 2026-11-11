@@ -42,7 +42,7 @@
 <p>The broker reads <code>/etc/mercurio/config.toml</code>, or the file given with <code>-c</code>. A commented file with every option is provided as <code>mercuriod/contrib/config.toml</code>.</p>
 
 <h2 id="check">Checking a configuration</h2>
-<p><code>mercuriod --check</code> does what a start does short of listening and opening storage: it reads the configuration and its <code>include_dir</code>, checks the settings that depend on each other, loads the password, ACL and dynamic security files of <code>[auth]</code> and of every listener, loads the TLS certificates and keys, compiles and initialises the WebAssembly plugins, and sets up every bridge: its routes, its remote addresses and its TLS files. It then exits with status 0. A problem makes it exit with status 1 and print the error a start would. It does not connect to PostgreSQL, bind ports or sockets, or contact bridges.</p>
+<p><code>mercuriod --check</code> does what a start does short of listening and opening storage: it reads the configuration and its <code>include_dir</code>, checks the settings that depend on each other, loads the password, ACL, dynamic security and JWT key files of <code>[auth]</code> and of every listener, fetches their JWT key sets, loads the TLS certificates and keys, compiles and initialises the WebAssembly plugins, and sets up every bridge: its routes, its remote addresses and its TLS files. It then exits with status 0. A problem makes it exit with status 1 and print the error a start would. It does not connect to PostgreSQL, bind ports or sockets, or contact bridges.</p>
 <pre><span class="comment"># As the broker's user, so files are read with its permissions</span>
 sudo -u mercurio mercuriod --check -c /etc/mercurio/config.toml &amp;&amp; sudo systemctl restart mercuriod</pre>
 
@@ -172,7 +172,7 @@ mount_point = "tenant1/"</pre>
 <p>See <a href="security.html">Authentication &amp; access</a>. <code>[listeners.auth]</code> takes the same options.</p>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate. Needed by <code>password_file</code>, <code>dynamic_security</code> and <code>user_url</code>: the broker refuses to start when one of them is set and this is <code>false</code>. <code>acl_file</code> and <code>acl_url</code> work without it.</td></tr>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Require clients to authenticate. Needed by <code>password_file</code>, <code>dynamic_security</code>, <code>user_url</code> and <code>[auth.jwt]</code>: the broker refuses to start when one of them is set and this is <code>false</code>. <code>acl_file</code> and <code>acl_url</code> work without it.</td></tr>
 <tr><td><code>allow_anonymous</code></td><td><code>false</code></td><td>With authentication enabled, still accept clients that send no user name.</td></tr>
 <tr><td><code>password_file</code></td><td></td><td>User names and password hashes.</td></tr>
 <tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>
@@ -191,6 +191,21 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>ca_path</code></td><td></td><td>PEM file of the CA certificates that <code>https://</code> endpoints' certificates must chain to, in place of the bundled roots.</td></tr>
 <tr><td><code>cert_path</code></td><td></td><td>PEM certificate chain presented to <code>https://</code> endpoints that ask for one. Needs <code>key_path</code>.</td></tr>
 <tr><td><code>key_path</code></td><td></td><td>PEM private key of <code>cert_path</code>.</td></tr>
+</table>
+<h3 id="auth-jwt">[auth.jwt]</h3>
+<p>Clients log in with a JSON Web Token as their password. See <a href="security.html#jwt">JSON Web Tokens</a>. Needs <code>enabled = true</code>; can't be combined with <code>dynamic_security</code>.</p>
+<table>
+<tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>secret_file</code></td><td></td><td>File holding the shared secret of HS256, HS384 and HS512, at least 32 bytes; one trailing newline is removed. Reread on reload.</td></tr>
+<tr><td><code>public_key_file</code></td><td></td><td>PEM public key of RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 or EdDSA. Reread on reload.</td></tr>
+<tr><td><code>jwks_url</code></td><td></td><td>JSON Web Key Set of the issuer, fetched at startup. <code>https://</code> with a publicly trusted certificate, or <code>http://</code> to a loopback address; redirects are not followed. Not with HMAC algorithms. Exactly one of <code>secret_file</code>, <code>public_key_file</code> and <code>jwks_url</code> is required.</td></tr>
+<tr><td><code>algorithms</code></td><td></td><td>Required. The algorithms tokens may be signed with, such as <code>["RS256"]</code>, all taking the same kind of key. The token's header never chooses.</td></tr>
+<tr><td><code>issuer</code></td><td></td><td>When set, tokens must carry this <code>iss</code>.</td></tr>
+<tr><td><code>audience</code></td><td></td><td>When set, tokens must carry this <code>aud</code>.</td></tr>
+<tr><td><code>username_claim</code></td><td><code>"sub"</code></td><td>Claim holding the user name, which must equal the CONNECT user name.</td></tr>
+<tr><td><code>leeway_seconds</code></td><td><code>30</code></td><td>Clock skew allowed on <code>exp</code> and <code>nbf</code>.</td></tr>
+<tr><td><code>disconnect_on_expiry</code></td><td><code>true</code></td><td>Disconnect a client with Not Authorized once its token expires, checked every <code>[server]</code> <code>plugin_tick_interval</code>.</td></tr>
+<tr><td><code>jwks_refresh_seconds</code></td><td><code>300</code></td><td>Least time between two fetches of <code>jwks_url</code>, made when a token names a key the set lacks. At least <code>10</code>, as any client can name a missing key.</td></tr>
 </table>
 
 <h2 id="admin">[admin]</h2>

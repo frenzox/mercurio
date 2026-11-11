@@ -280,7 +280,7 @@ impl HttpAuth {
 }
 
 /// Whether `url` is plain HTTP to a host other than this machine's loopback.
-fn is_plaintext_to_remote(url: &str) -> bool {
+pub(crate) fn is_plaintext_to_remote(url: &str) -> bool {
     let Some(rest) = url
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
@@ -530,7 +530,7 @@ impl HttpAuth {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         future::Future,
@@ -540,9 +540,9 @@ mod tests {
         task::Poll,
     };
 
-    struct Backend {
-        url: String,
-        requests: Arc<AtomicUsize>,
+    pub(crate) struct Backend {
+        pub(crate) url: String,
+        pub(crate) requests: Arc<AtomicUsize>,
         most_at_once: Arc<AtomicUsize>,
     }
 
@@ -553,21 +553,31 @@ mod tests {
         delay: Duration,
         status: impl Fn(&str, usize) -> &'static str + Send + Sync + 'static,
     ) -> Backend {
+        backend_with_body(delay, move |body, index| {
+            (status(body, index), String::new())
+        })
+    }
+
+    /// Like `backend`, with `respond` giving the body of each answer too.
+    pub(crate) fn backend_with_body(
+        delay: Duration,
+        respond: impl Fn(&str, usize) -> (&'static str, String) + Send + Sync + 'static,
+    ) -> Backend {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let most_at_once = Arc::new(AtomicUsize::new(0));
         let (counter, most) = (Arc::clone(&requests), Arc::clone(&most_at_once));
-        let status = Arc::new(status);
+        let respond = Arc::new(respond);
         std::thread::spawn(move || {
             let active = Arc::new(AtomicUsize::new(0));
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
-                let (counter, most, active, status) = (
+                let (counter, most, active, respond) = (
                     Arc::clone(&counter),
                     Arc::clone(&most),
                     Arc::clone(&active),
-                    Arc::clone(&status),
+                    Arc::clone(&respond),
                 );
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -588,10 +598,11 @@ mod tests {
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     most.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(delay);
-                    let status = status(&String::from_utf8_lossy(&body), index);
+                    let (status, body) = respond(&String::from_utf8_lossy(&body), index);
                     active.fetch_sub(1, Ordering::SeqCst);
                     let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
                     );
                     let _ = stream.write_all(response.as_bytes());
                 });
@@ -1024,7 +1035,9 @@ mod tests {
     }
 
     /// Runs every future concurrently on this task.
-    async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    pub(crate) async fn join_all<F: Future>(
+        futures: impl IntoIterator<Item = F>,
+    ) -> Vec<F::Output> {
         let mut futures: Vec<_> = futures.into_iter().map(Box::pin).collect();
         let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
         std::future::poll_fn(|cx| {
