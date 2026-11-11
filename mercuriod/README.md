@@ -495,11 +495,12 @@ mercurioctl dynsec create-client s1 --role sensor   # asks for the password
 Underneath, these are JSON commands on `$CONTROL/dynamic-security/v1`, in
 the format of mosquitto's plugin.
 
-Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
-`enableClient`, `disableClient`, `addClientRole`, `removeClientRole`,
-`getClient`, `listClients`, `createRole`, `deleteRole`, `addRoleACL`,
-`removeRoleACL`, `getRole`, `listRoles`, `setDefaultACLAccess` and
-`getDefaultACLAccess`, and for groups `createGroup`, `deleteGroup`,
+Supported commands: `createClient`, `modifyClient`, `deleteClient`,
+`setClientPassword`, `enableClient`, `disableClient`, `addClientRole`,
+`removeClientRole`, `getClient`, `listClients`, `createRole`, `modifyRole`,
+`deleteRole`, `addRoleACL`, `removeRoleACL`, `getRole`, `listRoles`,
+`setDefaultACLAccess` and `getDefaultACLAccess`, and for groups
+`createGroup`, `modifyGroup`, `deleteGroup`,
 `addGroupRole`, `removeGroupRole`, `addGroupClient`, `removeGroupClient`,
 `getGroup`, `listGroups`, `setAnonymousGroup` and `getAnonymousGroup`. A
 client created with a `clientid` may connect only with that client id. A
