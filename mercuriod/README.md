@@ -377,12 +377,21 @@ group = "mercurio"
 # mode = "0660"
 #
 # Any TCP listener may also set max_connections, on top of the broker-wide
-# limit, and bind_interface
+# limit, and bind_interface. Any listener may replace the [server] limits
+# max_packet_size, max_connect_packet_size, max_keepalive and
+# connect_timeout for its clients, and with use_username_as_clientid give
+# each client the user name it authenticated as for client id, refusing
+# clients without one
 # [[listeners]]
 # host = "0.0.0.0"
 # port = 8884
 # max_connections = 100
 # bind_interface = "eth1"
+# max_packet_size = 65536
+# max_connect_packet_size = 4096
+# max_keepalive = 120
+# connect_timeout = 5
+# use_username_as_clientid = true
 #
 # Behind a load balancer that sends the PROXY protocol (v1 or v2), so logs
 # show the clients' own addresses

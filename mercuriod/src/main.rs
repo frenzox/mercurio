@@ -314,6 +314,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.proxy_from = prepared.proxy_from;
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
+        value.max_packet_size = extra.max_packet_size;
+        value.max_connect_packet_size = extra.max_connect_packet_size;
+        value.max_keepalive = extra.max_keepalive;
+        value.connect_timeout = extra.connect_timeout.map(Duration::from_secs);
+        value.use_username_as_clientid = extra.use_username_as_clientid;
         value.http_dir = extra.http_dir.clone().map(Into::into);
         value.health = extra.health;
         value.metrics = extra.metrics;
@@ -493,6 +498,9 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     for extra in &config.listeners {
         if extra.port.is_some() == extra.path.is_some() {
             return Err("Each [[listeners]] entry needs either `port` or `path`".into());
+        }
+        if extra.max_connect_packet_size == Some(0) {
+            return Err("A listener's max_connect_packet_size must be at least 1".into());
         }
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {

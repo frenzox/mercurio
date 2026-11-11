@@ -250,6 +250,25 @@ pub struct ListenerConfig {
     /// Concurrent connections allowed on this listener
     pub max_connections: Option<usize>,
 
+    /// Replaces `[server] max_packet_size` for this listener's clients
+    pub max_packet_size: Option<usize>,
+
+    /// Replaces `[server] max_connect_packet_size` for this listener's
+    /// clients
+    pub max_connect_packet_size: Option<usize>,
+
+    /// Replaces `[server] max_keepalive` for this listener's clients
+    pub max_keepalive: Option<u16>,
+
+    /// Replaces `[server] connect_timeout`, in seconds, for this listener's
+    /// clients
+    pub connect_timeout: Option<u64>,
+
+    /// Each client's id is the user name it authenticated as; clients
+    /// without one are refused
+    #[serde(default)]
+    pub use_username_as_clientid: bool,
+
     /// With `protocol = "websocket"`, serve the files of this directory to
     /// plain HTTP requests
     pub http_dir: Option<String>,

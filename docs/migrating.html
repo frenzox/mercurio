@@ -133,6 +133,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td><code>max_qos</code>, <code>retain_available</code></td><td>the same</td></tr>
 <tr><td><code>max_inflight_messages</code></td><td><code>max_inflight</code>, for messages to clients, lowered further by the client's own Receive Maximum; <code>receive_maximum</code> for QoS 2 from clients</td></tr>
 <tr><td><code>upgrade_outgoing_qos</code></td><td><code>upgrade_outgoing_qos</code></td></tr>
+<tr><td><code>use_username_as_clientid</code></td><td><code>use_username_as_clientid</code>, in <code>[[listeners]]</code>; the main listener has none, so serve such clients on an extra listener</td></tr>
 <tr><td><code>persistent_client_expiration 1w</code></td><td><code>persistent_client_expiration = 604800</code>, in seconds</td></tr>
 <tr><td><code>sys_interval</code></td><td><code>sys_interval</code></td></tr>
 <tr><td><code>persistence</code>, <code>persistence_location</code></td><td><code>[storage] backend = "sqlite"</code>, <code>path</code>; written as changes happen</td></tr>

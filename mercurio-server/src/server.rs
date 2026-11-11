@@ -358,6 +358,22 @@ pub struct ListenerConfig {
     /// refuses, or whose credentials can't be read, are closed at once.
     #[cfg(unix)]
     pub peer_filter: Option<PeerFilter>,
+    /// Replaces [`Limits::max_packet_size`] for the listener's clients.
+    pub max_packet_size: Option<usize>,
+    /// Replaces [`Limits::max_connect_packet_size`] for the listener's
+    /// clients.
+    pub max_connect_packet_size: Option<usize>,
+    /// Replaces [`Limits::max_keepalive`] for the listener's clients.
+    pub max_keepalive: Option<u16>,
+    /// Replaces [`Limits::connect_timeout`] for the listener's clients.
+    pub connect_timeout: Option<Duration>,
+    /// The client id of each session is the user name its client
+    /// authenticated as, whatever the client sent, as mosquitto's
+    /// `use_username_as_clientid`; MQTT 5 clients are told it as their
+    /// Assigned Client Identifier. Clients without a verified user name are
+    /// refused with Not Authorized. One user then has one session, and no
+    /// client can take over another user's id.
+    pub use_username_as_clientid: bool,
 }
 
 impl ListenerConfig {
@@ -381,6 +397,11 @@ impl ListenerConfig {
             trusted: false,
             #[cfg(unix)]
             peer_filter: None,
+            max_packet_size: None,
+            max_connect_packet_size: None,
+            max_keepalive: None,
+            connect_timeout: None,
+            use_username_as_clientid: false,
         }
     }
 }
@@ -440,6 +461,11 @@ struct Endpoint {
     state: Arc<ListenerState>,
     /// Its connections get the trusted chain, set by `Server::new`
     trusted: bool,
+    /// The broker's limits with the listener's own settings, set by
+    /// `Server::new`
+    limits: Limits,
+    /// The settings of the listener that replace the broker's
+    overrides: LimitOverrides,
     #[cfg(unix)]
     peer_filter: Option<PeerFilter>,
 }
@@ -480,6 +506,34 @@ struct EndpointSettings {
     chain: Option<Chain>,
     http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
+    use_username_as_clientid: bool,
+}
+
+/// A listener's own limits, replacing the broker's.
+#[derive(Clone, Copy)]
+struct LimitOverrides {
+    max_packet_size: Option<usize>,
+    max_connect_packet_size: Option<usize>,
+    max_keepalive: Option<u16>,
+    connect_timeout: Option<Duration>,
+}
+
+impl LimitOverrides {
+    fn apply(&self, mut limits: Limits) -> Limits {
+        if let Some(max) = self.max_packet_size {
+            limits.max_packet_size = max;
+        }
+        if let Some(max) = self.max_connect_packet_size {
+            limits.max_connect_packet_size = max;
+        }
+        if let Some(max) = self.max_keepalive {
+            limits.max_keepalive = Some(max);
+        }
+        if let Some(timeout) = self.connect_timeout {
+            limits.connect_timeout = timeout;
+        }
+        limits
+    }
 }
 
 impl Endpoint {
@@ -534,6 +588,12 @@ impl Endpoint {
                     .into(),
             ));
         }
+        if config.use_username_as_clientid && config.trusted {
+            return Err(ServerError::Config(
+                "a trusted listener verifies no user names, so it can't use them as client ids"
+                    .into(),
+            ));
+        }
         if !config.proxy_from.is_empty() && unix {
             return Err(ServerError::Config(
                 "a Unix socket's clients have no address for proxy_from to match; its file \
@@ -581,6 +641,13 @@ impl Endpoint {
         Ok(Self {
             state,
             trusted: config.trusted,
+            limits: Limits::default(),
+            overrides: LimitOverrides {
+                max_packet_size: config.max_packet_size,
+                max_connect_packet_size: config.max_connect_packet_size,
+                max_keepalive: config.max_keepalive,
+                connect_timeout: config.connect_timeout,
+            },
             #[cfg(unix)]
             peer_filter: config.peer_filter,
             listener: config.listener,
@@ -607,6 +674,7 @@ impl Endpoint {
                     },
                 ),
                 allowed_origins: config.allowed_origins.map(Into::into),
+                use_username_as_clientid: config.use_username_as_clientid,
             },
         })
     }
@@ -672,6 +740,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
     bans: Arc<Bans>,
+    use_username_as_clientid: bool,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -761,6 +830,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         self.mount_point = settings.mount_point;
+        self.use_username_as_clientid = settings.use_username_as_clientid;
         self.http_site = settings.http_site;
         self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
@@ -944,6 +1014,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             connect_deadline: self.connect_deadline,
             listener: self.listener,
             bans: self.bans,
+            use_username_as_clientid: self.use_username_as_clientid,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -1038,6 +1109,7 @@ where
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
     bans: Arc<Bans>,
+    use_username_as_clientid: bool,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1241,6 +1313,7 @@ impl<St: MqttStore + 'static> Server<St> {
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
+            endpoint.limits = endpoint.overrides.apply(limits);
             endpoint.settings.chain = match endpoint.trusted {
                 true => Some(chain.trusted("admin socket")),
                 false => endpoint
@@ -1471,6 +1544,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
 
             info!(target: CONNECTIONS, "Got a connection: {:?}", peer_addr);
+            let limits = endpoint.map_or(self.limits, |i| self.endpoints[i].limits);
 
             let parts = HandlerParts {
                 broker: self.broker.clone(),
@@ -1480,17 +1554,18 @@ impl<St: MqttStore + 'static> Listener<St> {
                 auth_config: Arc::clone(&self.auth_config),
                 chain: self.chain.clone(),
                 policy: Arc::clone(&self.policy),
-                limits: self.limits,
+                limits,
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
                 http_site: None,
                 allowed_origins: None,
                 local: false,
-                connect_deadline: Instant::now() + self.limits.connect_timeout,
+                connect_deadline: Instant::now() + limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
                 listener: Arc::from("local"),
                 bans: Arc::clone(&self.bans),
+                use_username_as_clientid: false,
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1819,6 +1894,21 @@ where
             return self.reject_connect(&connect_packet, reason).await;
         }
 
+        let mut renamed = false;
+        if self.use_username_as_clientid {
+            let Some(username) = &verified_user else {
+                warn!(
+                    "Client `{}` has no verified user name to use as its client id, refusing",
+                    connect_packet.payload.client_id
+                );
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            };
+            renamed = connect_packet.payload.client_id != *username;
+            connect_packet.payload.client_id = username.clone();
+        }
+
         // MQTT 3.x servers must reject a zero-length client id unless the
         // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
         if connect_packet.payload.client_id.is_empty()
@@ -1960,7 +2050,8 @@ where
                 }
                 Err(StartError::Storage(e)) => return Err(e),
             };
-        start_result.assigned_client_id |= assigned_client_id;
+        // A client whose id was replaced learns the one it has
+        start_result.assigned_client_id |= assigned_client_id || renamed;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
         let held_locally = match self.local {
