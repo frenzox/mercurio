@@ -159,10 +159,20 @@ pub enum ClientCommand {
         page: PageArgs,
     },
     /// Show a client's session, subscriptions and traffic
-    Show { clientid: String },
+    Show {
+        clientid: String,
+        /// The mount point of the client's listener, needed when the
+        /// client id is on more than one; "" for none
+        #[arg(long)]
+        mount_point: Option<String>,
+    },
     /// Close a client's connection; its session stays
     Disconnect {
         clientid: String,
+        /// The mount point of the client's listener, needed when the
+        /// client id is on more than one; "" for none
+        #[arg(long)]
+        mount_point: Option<String>,
         /// Don't publish the client's will
         #[arg(long)]
         no_will: bool,
@@ -174,6 +184,10 @@ pub enum ClientCommand {
     /// Delete a client's stored session, subscriptions and queued messages
     DeleteSession {
         clientid: String,
+        /// The mount point of the client's listener, needed when the
+        /// client id is on more than one; "" for none
+        #[arg(long)]
+        mount_point: Option<String>,
         /// Disconnect the client first if it is connected
         #[arg(long)]
         disconnect: bool,

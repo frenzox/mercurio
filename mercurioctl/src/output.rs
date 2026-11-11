@@ -10,6 +10,7 @@ type Column = (&'static str, &'static [&'static str]);
 
 const CLIENTS: &[Column] = &[
     ("CLIENT ID", &["clientid"]),
+    ("MOUNT POINT", &["mountpoint"]),
     ("USERNAME", &["username"]),
     ("CONNECTED", &["connected"]),
     ("ADDRESS", &["address"]),
@@ -37,6 +38,7 @@ const RETAINED: &[Column] = &[
 const SUBSCRIPTIONS: &[Column] = &[("FILTER", &["filter"]), ("SUBSCRIBERS", &["subscribers"])];
 const SUBSCRIBERS: &[Column] = &[
     ("CLIENT ID", &["clientid"]),
+    ("MOUNT POINT", &["mountpoint"]),
     ("QOS", &["qos"]),
     ("NO LOCAL", &["noLocal"]),
     ("RETAIN AS PUBLISHED", &["retainAsPublished"]),
@@ -312,13 +314,15 @@ mod tests {
         let data = json!({
             "clients": [
                 {
-                    "clientid": "sensor-1", "username": "alice", "connected": true,
+                    "clientid": "sensor-1", "mountpoint": "tenant-a/", "username": "alice",
+                    "connected": true,
                     "address": "10.0.0.7:51234", "listener": "0.0.0.0:1883",
                     "protocolVersion": 5, "connectedSince": 1794340800, "subscriptions": 2,
                     "queued": 0, "inflight": 0, "dropped": 0,
                 },
                 {
-                    "clientid": "s2", "username": null, "connected": false, "address": null,
+                    "clientid": "s2", "mountpoint": null, "username": null, "connected": false,
+                    "address": null,
                     "listener": null, "protocolVersion": 4, "disconnectedSince": 1794344400,
                     "subscriptions": 0, "queued": 12, "inflight": 0, "dropped": 7,
                 },
@@ -328,9 +332,9 @@ mod tests {
         assert_eq!(
             shown(json!({"command": "listClients"}), data),
             "\
-CLIENT ID  USERNAME  CONNECTED  ADDRESS         SINCE                 SUBS  QUEUED  INFLIGHT  DROPPED
-sensor-1   alice     true       10.0.0.7:51234  2026-11-10 20:00:00Z  2     0       0         0
-s2         -         false      -               2026-11-10 21:00:00Z  0     12      0         7
+CLIENT ID  MOUNT POINT  USERNAME  CONNECTED  ADDRESS         SINCE                 SUBS  QUEUED  INFLIGHT  DROPPED
+sensor-1   tenant-a/    alice     true       10.0.0.7:51234  2026-11-10 20:00:00Z  2     0       0         0
+s2         -            -         false      -               2026-11-10 21:00:00Z  0     12      0         7
 "
         );
     }

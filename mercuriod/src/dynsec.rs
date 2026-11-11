@@ -2240,6 +2240,67 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A change disconnects the affected user's client, and leaves another
+    /// user's client with the same id on another mount point connected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_changes_disconnect_only_the_affected_mount_point() {
+        use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-mounted-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = std::sync::Arc::new(DynamicSecurity::load(path).unwrap());
+        let mut config = ServerConfig::default();
+        config.plugins = vec![security.clone()];
+        let mounted = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mounted_port = mounted.local_addr().unwrap().port();
+        let mut mounted = ListenerConfig::new(mounted, Transport::Mqtt);
+        mounted.mount_point = Some("tenant/".into());
+        config.listeners = vec![mounted];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = Server::new(
+            listener,
+            config,
+            std::sync::Arc::new(mercurio_storage::memory::MemoryStore::new()),
+        )
+        .await
+        .unwrap();
+        security.set_admin(server.admin());
+        tokio::spawn(server.run(std::future::pending::<()>()));
+        run(
+            &security,
+            json!([
+                { "command": "createClient", "username": "victim", "password": "pw" },
+                { "command": "createClient", "username": "other", "password": "pw" },
+            ]),
+        );
+
+        let as_shared = |port: u16, username: &str| {
+            mercurio_client::ConnectOptions::new("127.0.0.1", port)
+                .client_id("shared")
+                .username(username)
+                .password("pw")
+        };
+        let affected = mercurio_client::MqttClient::connect(as_shared(port, "victim"))
+            .await
+            .unwrap();
+        let bystander = mercurio_client::MqttClient::connect(as_shared(mounted_port, "other"))
+            .await
+            .unwrap();
+        let admin = ClientInfo::new("admin", Some("admin".to_string()));
+        let request = json!({ "commands": [{ "command": "disableClient", "username": "victim" }] });
+        security
+            .on_control(&admin, "v1", Bytes::from(request.to_string()))
+            .await
+            .unwrap();
+        assert!(kicked(&affected).await);
+        assert!(!kicked(&bystander).await);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn test_users_it_does_not_know_get_no_access() {
         let path =
