@@ -55,11 +55,14 @@ use mercurio_storage::{memory::MemoryStore, MqttStore, SessionOwner};
 use crate::{
     acl::Access,
     admin::{Admin, AdminExtension, AdminParts, ListenerInfo},
-    bans::{Bans, Candidate},
+    bans::{Bans, Candidate, FailedLogins},
     broker::Broker,
     connection::Connection,
     http,
-    plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
+    plugin::{
+        guarded, AuthResult, Chain, ClientInfo, ConnectionInfo, Credentials, Decision, Event,
+        Plugin,
+    },
     proxy,
     session::{
         cap_expiry_interval, cap_session_expiry, effective_keepalive, Outgoing, Session,
@@ -89,8 +92,10 @@ pub struct AuthConfig {
 }
 
 pub use crate::{
+    bans::LoginFailures,
+    broker::ShareStrategy,
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
-    queue::QueueLimits,
+    queue::{Overflow, QueueLimits},
 };
 
 /// Subscriptions a session may hold unless configured otherwise: far more
@@ -180,6 +185,30 @@ pub struct Limits {
     /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
+    /// PUBLISH packets per second one client may send, with a burst
+    /// allowance. Beyond it the broker stops reading from the client until
+    /// the rate allows another, so the client slows down to it as TCP's
+    /// flow control pushes back; nothing is dropped or refused.
+    /// In-process clients and those of trusted listeners are not limited.
+    /// Unlimited when unset.
+    pub max_publish_rate: Option<Rate>,
+    /// Like `max_publish_rate`, for the payload bytes of the PUBLISH
+    /// packets one client sends per second.
+    pub max_publish_bytes_rate: Option<Rate>,
+    /// Failed logins that get a client address banned for a while,
+    /// through the same bans as the admin API's, listed with their expiry
+    /// and the reason `automatic: …`. Addresses count as for
+    /// `max_connections_per_ip`; loopback addresses, in-process clients and
+    /// those of trusted listeners are never banned. Off when unset.
+    pub login_failures: Option<LoginFailures>,
+    /// Sessions that outlive their connection the broker may hold,
+    /// connected or not; a CONNECT that would start one more is refused
+    /// with Quota Exceeded (Server Unavailable for MQTT 3.x). Resuming a
+    /// session is never refused. Sessions that end with their connection
+    /// (Clean Session in MQTT 3.x, a zero Session Expiry Interval in
+    /// MQTT 5) don't count: `max_connections` bounds them. Unbounded when
+    /// unset.
+    pub max_sessions: Option<usize>,
 }
 
 impl Default for Limits {
@@ -205,7 +234,101 @@ impl Default for Limits {
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
+            max_publish_rate: None,
+            max_publish_bytes_rate: None,
+            login_failures: None,
+            max_sessions: None,
         }
+    }
+}
+
+/// A rate of so many a second, with a burst allowance: up to `burst` may
+/// come at once after a quiet spell, and `per_second` on average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Rate {
+    pub per_second: u32,
+    /// At least 1
+    pub burst: u32,
+}
+
+impl Rate {
+    pub fn new(per_second: u32, burst: u32) -> Self {
+        Rate { per_second, burst }
+    }
+}
+
+/// A token bucket holding up to `burst` tokens, refilled at `per_second`.
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    fn new(rate: Rate) -> Self {
+        let burst = f64::from(rate.burst.max(1));
+        Bucket {
+            rate: f64::from(rate.per_second),
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last = now;
+    }
+
+    /// Takes `amount` tokens, going into debt if there are fewer; how long
+    /// until the debt is paid back, if there is one.
+    fn take(&mut self, amount: f64) -> Option<Duration> {
+        self.refill();
+        self.tokens -= amount;
+        if self.tokens >= 0.0 {
+            return None;
+        }
+        if self.rate == 0.0 {
+            return Some(Duration::MAX);
+        }
+        Some(Duration::from_secs_f64(-self.tokens / self.rate))
+    }
+
+    /// Takes one token if there is one.
+    fn try_take(&mut self) -> bool {
+        self.refill();
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+/// How fast one client may publish.
+struct Pacing {
+    messages: Option<Bucket>,
+    bytes: Option<Bucket>,
+}
+
+impl Pacing {
+    fn new(limits: &Limits) -> Self {
+        Pacing {
+            messages: limits.max_publish_rate.map(Bucket::new),
+            bytes: limits.max_publish_bytes_rate.map(Bucket::new),
+        }
+    }
+
+    /// Counts a PUBLISH of `bytes`; how long to wait before reading the
+    /// next packet, if the client went over its rate.
+    fn publish(&mut self, bytes: usize) -> Option<Duration> {
+        let messages = self.messages.as_mut().and_then(|b| b.take(1.0));
+        let bytes = self.bytes.as_mut().and_then(|b| b.take(bytes as f64));
+        messages.max(bytes)
     }
 }
 
@@ -235,6 +358,8 @@ pub struct ServerConfig {
     pub plugin_tick_interval: Duration,
     /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know.
     pub admin_extension: Option<Arc<dyn AdminExtension>>,
+    /// How shared subscriptions pick the member a message goes to.
+    pub share_strategy: ShareStrategy,
 }
 
 impl Default for ServerConfig {
@@ -251,6 +376,7 @@ impl Default for ServerConfig {
             plugin_timeout: Duration::from_secs(5),
             plugin_tick_interval: Duration::from_secs(1),
             admin_extension: None,
+            share_strategy: ShareStrategy::default(),
         }
     }
 }
@@ -345,6 +471,26 @@ pub struct ListenerConfig {
     /// refuses, or whose credentials can't be read, are closed at once.
     #[cfg(unix)]
     pub peer_filter: Option<PeerFilter>,
+    /// New connections per second the listener accepts, with a burst
+    /// allowance; further ones are closed right after being accepted, as
+    /// those beyond `max_connections` are. Unlimited when unset.
+    pub max_connection_rate: Option<Rate>,
+    /// Replaces [`Limits::max_packet_size`] for the listener's clients.
+    pub max_packet_size: Option<usize>,
+    /// Replaces [`Limits::max_connect_packet_size`] for the listener's
+    /// clients.
+    pub max_connect_packet_size: Option<usize>,
+    /// Replaces [`Limits::max_keepalive`] for the listener's clients.
+    pub max_keepalive: Option<u16>,
+    /// Replaces [`Limits::connect_timeout`] for the listener's clients.
+    pub connect_timeout: Option<Duration>,
+    /// The client id of each session is the user name its client
+    /// authenticated as, whatever the client sent, as mosquitto's
+    /// `use_username_as_clientid`; MQTT 5 clients are told it as their
+    /// Assigned Client Identifier. Clients without a verified user name are
+    /// refused with Not Authorized. One user then has one session, and no
+    /// client can take over another user's id.
+    pub use_username_as_clientid: bool,
 }
 
 impl ListenerConfig {
@@ -368,6 +514,12 @@ impl ListenerConfig {
             trusted: false,
             #[cfg(unix)]
             peer_filter: None,
+            max_connection_rate: None,
+            max_packet_size: None,
+            max_connect_packet_size: None,
+            max_keepalive: None,
+            connect_timeout: None,
+            use_username_as_clientid: false,
         }
     }
 }
@@ -427,6 +579,13 @@ struct Endpoint {
     state: Arc<ListenerState>,
     /// Its connections get the trusted chain, set by `Server::new`
     trusted: bool,
+    /// The broker's limits with the listener's own settings, set by
+    /// `Server::new`
+    limits: Limits,
+    /// The settings of the listener that replace the broker's
+    overrides: LimitOverrides,
+    /// New connections allowed, when limited
+    connection_rate: Option<Bucket>,
     #[cfg(unix)]
     peer_filter: Option<PeerFilter>,
 }
@@ -467,6 +626,34 @@ struct EndpointSettings {
     chain: Option<Chain>,
     http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
+    use_username_as_clientid: bool,
+}
+
+/// A listener's own limits, replacing the broker's.
+#[derive(Clone, Copy)]
+struct LimitOverrides {
+    max_packet_size: Option<usize>,
+    max_connect_packet_size: Option<usize>,
+    max_keepalive: Option<u16>,
+    connect_timeout: Option<Duration>,
+}
+
+impl LimitOverrides {
+    fn apply(&self, mut limits: Limits) -> Limits {
+        if let Some(max) = self.max_packet_size {
+            limits.max_packet_size = max;
+        }
+        if let Some(max) = self.max_connect_packet_size {
+            limits.max_connect_packet_size = max;
+        }
+        if let Some(max) = self.max_keepalive {
+            limits.max_keepalive = Some(max);
+        }
+        if let Some(timeout) = self.connect_timeout {
+            limits.connect_timeout = timeout;
+        }
+        limits
+    }
 }
 
 impl Endpoint {
@@ -521,6 +708,12 @@ impl Endpoint {
                     .into(),
             ));
         }
+        if config.use_username_as_clientid && config.trusted {
+            return Err(ServerError::Config(
+                "a trusted listener verifies no user names, so it can't use them as client ids"
+                    .into(),
+            ));
+        }
         if !config.proxy_from.is_empty() && unix {
             return Err(ServerError::Config(
                 "a Unix socket's clients have no address for proxy_from to match; its file \
@@ -568,6 +761,14 @@ impl Endpoint {
         Ok(Self {
             state,
             trusted: config.trusted,
+            limits: Limits::default(),
+            connection_rate: config.max_connection_rate.map(Bucket::new),
+            overrides: LimitOverrides {
+                max_packet_size: config.max_packet_size,
+                max_connect_packet_size: config.max_connect_packet_size,
+                max_keepalive: config.max_keepalive,
+                connect_timeout: config.connect_timeout,
+            },
             #[cfg(unix)]
             peer_filter: config.peer_filter,
             listener: config.listener,
@@ -594,6 +795,7 @@ impl Endpoint {
                     },
                 ),
                 allowed_origins: config.allowed_origins.map(Into::into),
+                use_username_as_clientid: config.use_username_as_clientid,
             },
         })
     }
@@ -646,6 +848,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// The client certificate's Common Name, when it stands in for the
     /// user name
     cert_identity: Option<String>,
+    /// Whether the connection is TLS
+    tls: bool,
     mount_point: Option<String>,
     http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
@@ -659,6 +863,9 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
     bans: Arc<Bans>,
+    use_username_as_clientid: bool,
+    /// Where its failed logins are counted; None when they aren't
+    failed_logins: Option<Arc<FailedLogins>>,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -748,6 +955,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         self.mount_point = settings.mount_point;
+        self.use_username_as_clientid = settings.use_username_as_clientid;
         self.http_site = settings.http_site;
         self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
@@ -779,6 +987,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         return None;
                     }
                 }
+                self.tls = true;
                 Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
             }
             Ok(Err(e)) => {
@@ -912,7 +1121,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        connection.set_mount_point(self.mount_point);
+        connection.set_mount_point(self.mount_point.clone());
         connection.set_stats(Arc::clone(&self.stats));
         connection.set_write_timeout(self.limits.write_timeout);
         let mut handler = Handler {
@@ -927,10 +1136,15 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             limits: self.limits,
             stats: self.stats,
             cert_identity: self.cert_identity,
+            tls: self.tls,
+            mount_point: self.mount_point,
+            connection_info: None,
             local: self.local,
             connect_deadline: self.connect_deadline,
             listener: self.listener,
             bans: self.bans,
+            use_username_as_clientid: self.use_username_as_clientid,
+            failed_logins: self.failed_logins,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -1000,6 +1214,7 @@ struct Listener<St: MqttStore + 'static> {
     address_slots: Arc<AddressSlots>,
     connection_slots: Option<Arc<Semaphore>>,
     bans: Arc<Bans>,
+    failed_logins: Option<Arc<FailedLogins>>,
 }
 
 struct Handler<St, S>
@@ -1019,12 +1234,18 @@ where
     stats: Arc<Stats>,
     limits: Limits,
     cert_identity: Option<String>,
+    tls: bool,
+    mount_point: Option<String>,
+    /// What plugins are told about the connection, once CONNECT is read
+    connection_info: Option<Arc<ConnectionInfo>>,
     /// An in-process connection, from the local listener
     local: bool,
     connect_deadline: Instant,
     /// Reported as the client's listener: its address or path
     listener: Arc<str>,
     bans: Arc<Bans>,
+    use_username_as_clientid: bool,
+    failed_logins: Option<Arc<FailedLogins>>,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1158,6 +1379,9 @@ pub struct Server<St: MqttStore + 'static> {
     sys_interval: Option<Duration>,
 }
 
+/// How often expired retained messages are removed from storage.
+const RETAINED_SWEEP: Duration = Duration::from_secs(60);
+
 impl<St: MqttStore + 'static> Server<St> {
     /// Sets up a broker serving `listener` and `config`'s listeners, with
     /// its state in `storage`. Fails if the configuration can't be used or
@@ -1179,6 +1403,7 @@ impl<St: MqttStore + 'static> Server<St> {
             plugin_timeout,
             plugin_tick_interval,
             admin_extension,
+            share_strategy,
         } = config;
         let stats = Arc::new(Stats::default());
         let policy = Arc::new(policy);
@@ -1198,11 +1423,14 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-        let broker = Broker::new(Arc::clone(&storage)).counted_in(Arc::clone(&stats));
+        let broker = Broker::new(Arc::clone(&storage))
+            .counted_in(Arc::clone(&stats))
+            .with_share_strategy(share_strategy);
         let session_manager_holder = SessionManagerDropGuard::new(
             Arc::clone(&storage),
             limits.queue,
             limits.write_timeout,
+            limits.max_sessions,
             Arc::clone(&stats),
         );
         let session_manager = session_manager_holder.session_manager();
@@ -1224,6 +1452,7 @@ impl<St: MqttStore + 'static> Server<St> {
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
+            endpoint.limits = endpoint.overrides.apply(limits);
             endpoint.settings.chain = match endpoint.trusted {
                 true => Some(chain.trusted("admin socket")),
                 false => endpoint
@@ -1251,6 +1480,9 @@ impl<St: MqttStore + 'static> Server<St> {
             limits,
             stats,
             bans,
+            failed_logins: limits
+                .login_failures
+                .map(|l| Arc::new(FailedLogins::new(l))),
         };
 
         session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
@@ -1316,6 +1548,20 @@ impl<St: MqttStore + 'static> Server<St> {
                 interval,
             );
         }
+        // Lookups leave expired retained messages out; this removes them
+        let broker = server.broker.clone();
+        let mut stop = server.notify_shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(RETAINED_SWEEP);
+            ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.recv() => break,
+                }
+                broker.remove_expired_retained().await;
+            }
+        });
         // Its own timer: the $SYS publisher may be off, or slower
         let bans = Arc::clone(&server.bans);
         let mut stop = server.notify_shutdown.subscribe();
@@ -1336,7 +1582,7 @@ impl<St: MqttStore + 'static> Server<St> {
                 time::sleep(due).await;
                 if session_manager.take_restored_will(&client_id).await {
                     publish_will(&broker, will, &client_id).await;
-                    session_manager.delete_will(&client_id);
+                    session_manager.restored_will_published(&client_id).await;
                 }
             });
         }
@@ -1408,6 +1654,21 @@ impl<St: MqttStore + 'static> Listener<St> {
             // In-process connections, which have no endpoint, are trusted
             let trusted = endpoint.is_none_or(|i| self.endpoints[i].trusted);
 
+            if let Some(i) = endpoint.filter(|_| !trusted) {
+                let endpoint = &mut self.endpoints[i];
+                if endpoint
+                    .connection_rate
+                    .as_mut()
+                    .is_some_and(|b| !b.try_take())
+                {
+                    warn!(
+                        "Connection rate of {} exceeded, refusing {:?}",
+                        endpoint.state.name, peer_addr
+                    );
+                    continue;
+                }
+            }
+
             // Held by the connection's task for as long as it runs. Trusted
             // clients take none, so an operator or an in-process bridge can
             // reach a full broker.
@@ -1454,6 +1715,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
 
             info!(target: CONNECTIONS, "Got a connection: {:?}", peer_addr);
+            let limits = endpoint.map_or(self.limits, |i| self.endpoints[i].limits);
 
             let parts = HandlerParts {
                 broker: self.broker.clone(),
@@ -1463,17 +1725,21 @@ impl<St: MqttStore + 'static> Listener<St> {
                 auth_config: Arc::clone(&self.auth_config),
                 chain: self.chain.clone(),
                 policy: Arc::clone(&self.policy),
-                limits: self.limits,
+                limits,
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
+                tls: false,
                 mount_point: None,
                 http_site: None,
                 allowed_origins: None,
                 local: false,
-                connect_deadline: Instant::now() + self.limits.connect_timeout,
+                connect_deadline: Instant::now() + limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
                 listener: Arc::from("local"),
                 bans: Arc::clone(&self.bans),
+                use_username_as_clientid: false,
+                // Trusted clients skip authentication altogether
+                failed_logins: self.failed_logins.clone().filter(|_| !trusted),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1715,6 +1981,12 @@ where
     async fn run(&mut self, mut connect_packet: Box<ConnectPacket>) -> Result<()> {
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
+        let mut connection_info =
+            ConnectionInfo::new(Arc::clone(&self.listener), connect_packet.protocol_version);
+        connection_info.tls = self.tls;
+        connection_info.certificate = self.cert_identity.clone();
+        connection_info.mount_point = self.mount_point.clone();
+        self.connection_info = Some(Arc::new(connection_info));
 
         if let Some(redirect) = self.policy.redirect.clone() {
             return self.redirect(&connect_packet, &redirect).await;
@@ -1757,11 +2029,8 @@ where
                 &connect_packet.payload.password,
             ) {
                 (Some(username), Some(password)) => {
-                    let client = ClientInfo {
-                        client_id: connect_packet.payload.client_id.clone(),
-                        username: Some(username.clone()),
-                        peer: self.peer,
-                    };
+                    let client =
+                        self.client_info(&connect_packet.payload.client_id, Some(username.clone()));
                     let credentials = Credentials::new(username, password);
                     let checked = validate_credentials(&self.chain, &client, &credentials);
                     let checked = connect_step(&mut self.shutdown, self.connect_deadline, checked);
@@ -1791,6 +2060,7 @@ where
             };
 
             if !authenticated {
+                self.login_failed().await;
                 return self
                     .reject_connect(&connect_packet, ReasonCode::BadUserNameOrPassword)
                     .await;
@@ -1801,6 +2071,21 @@ where
 
         if let Some(reason) = self.refused_will(&connect_packet) {
             return self.reject_connect(&connect_packet, reason).await;
+        }
+
+        let mut renamed = false;
+        if self.use_username_as_clientid {
+            let Some(username) = &verified_user else {
+                warn!(
+                    "Client `{}` has no verified user name to use as its client id, refusing",
+                    connect_packet.payload.client_id
+                );
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            };
+            renamed = connect_packet.payload.client_id != *username;
+            connect_packet.payload.client_id = username.clone();
         }
 
         // MQTT 3.x servers must reject a zero-length client id unless the
@@ -1859,11 +2144,8 @@ where
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
         if let Some(will) = &connect_packet.payload.will {
-            let identity = ClientInfo {
-                client_id: connect_packet.payload.client_id.clone(),
-                username: verified_user.clone(),
-                peer: self.peer,
-            };
+            let identity =
+                self.client_info(&connect_packet.payload.client_id, verified_user.clone());
             if !self.chain.may(&identity, &will.topic, Access::Write).await {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
@@ -1923,9 +2205,38 @@ where
                         )
                         .await;
                 }
+                Err(StartError::TooManySessions) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::QuotaExceeded,
+                        )
+                        .await;
+                }
+                // Logged where the admissions are counted
+                Err(StartError::Crowded) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::ServerBusy,
+                        )
+                        .await;
+                }
+                Err(StartError::SetAside) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::ServerUnavailable,
+                        )
+                        .await;
+                }
                 Err(StartError::Storage(e)) => return Err(e),
             };
-        start_result.assigned_client_id |= assigned_client_id;
+        // A client whose id was replaced learns the one it has
+        start_result.assigned_client_id |= assigned_client_id || renamed;
         let mut session = start_result.session;
         let mut lease = start_result.lease;
         let held_locally = match self.local {
@@ -1937,7 +2248,9 @@ where
         }
 
         session.set_verified_user(verified_user.clone()).await;
-        session.set_peer(self.peer).await;
+        session
+            .set_peer(self.peer, self.connection_info.clone())
+            .await;
         // A ban added after the check above, while this client had yet to
         // claim its id, also missed it in addBan's walk of the connected
         // clients. Checked again now that the id is held and the session
@@ -2102,6 +2415,15 @@ where
         result
     }
 
+    /// The client of this connection as plugins see it, before it has a
+    /// session.
+    fn client_info(&self, client_id: &str, username: Option<String>) -> ClientInfo {
+        let mut client = ClientInfo::new(client_id, username);
+        client.peer = self.peer;
+        client.connection = self.connection_info.clone();
+        client
+    }
+
     /// Runs the AUTH exchange of MQTT 5 enhanced authentication during
     /// CONNECT. Returns the user name the method verified, if any, and the
     /// data for the CONNACK, or None having refused the connection.
@@ -2110,11 +2432,10 @@ where
         connect_packet: &ConnectPacket,
         method: &str,
     ) -> Result<Option<(Option<String>, Option<bytes::Bytes>)>> {
-        let client = ClientInfo {
-            client_id: connect_packet.payload.client_id.clone(),
-            username: connect_packet.payload.user_name.clone(),
-            peer: self.peer,
-        };
+        let client = self.client_info(
+            &connect_packet.payload.client_id,
+            connect_packet.payload.user_name.clone(),
+        );
         let exchange = self.chain.begin_auth(&client, method);
         let Some(mut exchange) = exchange else {
             self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)
@@ -2134,6 +2455,7 @@ where
                 AuthResult::Success { username, data } => return Ok(Some((username, data))),
                 AuthResult::Failed(reason) => {
                     warn!("Enhanced authentication with `{}` failed", method);
+                    self.login_failed().await;
                     self.reject_connect(connect_packet, reason).await?;
                     return Ok(None);
                 }
@@ -2228,6 +2550,14 @@ where
         })
     }
 
+    /// Counts a failed login against the client's address, which may get
+    /// it banned.
+    async fn login_failed(&self) {
+        if let (Some(failed_logins), Some(peer)) = (&self.failed_logins, self.peer) {
+            failed_logins.failed(peer.ip(), &self.bans).await;
+        }
+    }
+
     /// Whether a ban refuses this client, connecting with `client_id` as
     /// the verified `username`.
     fn banned(&self, client_id: &str, username: Option<&str>) -> bool {
@@ -2316,6 +2646,16 @@ where
         let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
 
+        // Clients over their publish rate aren't read from until it allows
+        // another message
+        let mut pacing = match self.local || self.chain.is_trusted() {
+            true => Pacing::new(&Limits::default()),
+            false => Pacing::new(&self.limits),
+        };
+        let paused = time::sleep(Duration::ZERO);
+        tokio::pin!(paused);
+        let mut reading = true;
+
         let client_id = session.get_client_id().await;
         while !self.shutdown.is_shutdown() {
             // Every turn of the loop follows a message sent or a packet
@@ -2339,16 +2679,33 @@ where
             let step = tokio::select! {
                 // So are the packets most clients send, PUBLISH and its
                 // acknowledgements; the rest are boxed
-                packet = self.connection.read_packet() => match HotPacket::try_from(packet?) {
-                    Ok(packet) => Step::Done(self.handle_hot(&session, &client_id, packet).await?),
+                packet = self.connection.read_packet(), if reading => match HotPacket::try_from(packet?) {
+                    Ok(packet) => {
+                        let published = match &packet {
+                            HotPacket::Publish(p) => Some(p.payload.as_ref().map_or(0, |p| p.len())),
+                            _ => None,
+                        };
+                        let flow = self.handle_hot(&session, &client_id, packet).await?;
+                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
+                            reading = false;
+                            paused.as_mut().reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
+                        }
+                        Step::Done(flow)
+                    }
                     Err(packet) => Step::Wake(Wake::Packet(packet)),
                 },
+                // The client is sending, so it is alive: its keep-alive
+                // starts over once it may send again
+                _ = &mut paused, if !reading => {
+                    reading = true;
+                    Step::Done(Flow::PacketHandled)
+                }
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
                 (message, journaled) = session.next_outgoing(window_open) => {
                     Step::Done(self.send_outgoing(&session, &client_id, message, journaled).await?)
                 }
-                _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
+                _ = &mut deadline, if timeout_duration.is_some() && reading => Step::Wake(Wake::KeepAliveExpired),
                 Ok(()) = lease.close.changed() => {
                     let close = (*lease.close.borrow_and_update()).unwrap_or(Close::TakenOver);
                     Step::Wake(Wake::Closed(close))
@@ -2715,7 +3072,7 @@ struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
 /// IPv6 socket counts as its IPv4 address. An IPv6 client counts as its
 /// /64, the block one subscriber is usually given, so it can't take a new
 /// address from it for every connection.
-fn address_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn address_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
@@ -2924,6 +3281,11 @@ enum Flow {
     Close,
 }
 
+/// An instant no timer reaches, for waits too long to add to now.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
 /// Explains `reason` to the client, unless the text would make the packet
 /// larger than the client accepts [MQTT-3.1.2-25].
 fn reason_string(
@@ -2977,6 +3339,38 @@ mod tests {
         let _v6 = slots.acquire(ip("2001:db8:0:1::1"), 1).unwrap();
         assert!(slots.acquire(ip("2001:db8:0:1:ffff::2"), 1).is_none());
         assert!(slots.acquire(ip("2001:db8:0:2::1"), 1).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_buckets_allow_a_burst_then_the_rate() {
+        let mut bucket = Bucket::new(Rate::new(10, 3));
+        for _ in 0..3 {
+            assert_eq!(bucket.take(1.0), None);
+        }
+        // In debt by one, paid back in a tenth of a second
+        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
+        time::advance(Duration::from_millis(100)).await;
+        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
+        // A long quiet spell refills no more than the burst
+        time::advance(Duration::from_secs(60)).await;
+        assert!(bucket.try_take() && bucket.try_take() && bucket.try_take());
+        assert!(!bucket.try_take());
+        time::advance(Duration::from_millis(100)).await;
+        assert!(bucket.try_take());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pacing_waits_for_the_slower_of_messages_and_bytes() {
+        let limits = Limits {
+            max_publish_rate: Some(Rate::new(100, 1)),
+            max_publish_bytes_rate: Some(Rate::new(1000, 1000)),
+            ..Default::default()
+        };
+        let mut pacing = Pacing::new(&limits);
+        assert_eq!(pacing.publish(500), None);
+        // One message too many, and 1000 bytes too many
+        assert_eq!(pacing.publish(1500), Some(Duration::from_secs(1)));
+        assert_eq!(Pacing::new(&Limits::default()).publish(usize::MAX), None);
     }
 
     #[test]

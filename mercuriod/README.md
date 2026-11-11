@@ -117,6 +117,16 @@ max_queued_qos0_messages = 1000
 # Payload bytes that may wait for one client before further messages are
 # dropped, whatever their QoS
 # max_queued_bytes = 104857600
+# Which message a full queue drops: "drop_newest", the one arriving, or
+# "drop_oldest", the oldest waiting of its kind (QoS 0, or QoS 1 and 2) so
+# a client that falls behind gets the latest ones
+# queue_overflow = "drop_newest"
+# How a shared subscription's group picks the member a message goes to:
+# "round_robin", "random", "sticky" (the same member for as long as it is
+# connected and takes messages) or "hash" (by the publisher's client id, so
+# each publisher's messages stay in order). Connected members whose queue
+# has room always come first
+# shared_subscription_strategy = "round_robin"
 
 # Send messages at the QoS of the subscription even when they were published
 # with a lower one; goes beyond the MQTT specification
@@ -185,14 +195,36 @@ max_inflight = 64
 # session expiry of its own
 # persistent_client_expiration = 604800
 # Most seconds any session may outlive its connection, MQTT 5 clients
-# included; worth setting where clients aren't trusted (unbounded by default)
-# max_session_expiry = 2592000
+# included; a week by default, "unlimited" to keep sessions forever
+# max_session_expiry = 604800
+# Sessions outliving their connection the broker may hold, connected or
+# not; a client that would start one more gets Quota Exceeded (MQTT 3.x:
+# Server Unavailable). Resuming one is never refused, and sessions ending
+# with their connection don't count (unbounded by default)
+# max_sessions = 100000
 # Topics that may hold a retained message at once, the broker's own $SYS
 # topics not counted; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
 # max_connections_per_ip = 100
+# Failed logins from one address (IPv6 by /64) within login_failure_window
+# seconds that get it banned for login_failure_ban seconds. The ban is
+# listed by `mercurioctl ban list` and lifted like any other; loopback
+# addresses and the admin socket are never banned. 0 attempts turns it off
+# login_failure_attempts = 10
+# PUBLISH packets per second one client may send on average, and at once
+# after a quiet spell (a second's worth by default). A client going faster
+# isn't read from until its rate allows, so it slows down as TCP pushes
+# back; nothing is dropped. In-process clients (bridges) and the admin
+# socket are not limited. Unlimited by default
+# max_publish_rate = 100
+# publish_rate_burst = 500
+# The same for the payload bytes one client publishes
+# max_publish_bytes_rate = 1048576
+# publish_bytes_burst = 4194304
+# login_failure_window = 60
+# login_failure_ban = 300
 # Seconds one call of a plugin hook may take, for built-in authentication
 # and access control as for [[plugins]]; a slower call denies, or drops the
 # message. [auth.http] timeout_seconds and a plugin's timeout_ms may not
@@ -276,7 +308,10 @@ enabled = false
 # Allow clients that send no user name (when auth is enabled)
 allow_anonymous = false
 
-# User names and Argon2 password hashes, managed with `mercuriod passwd`
+# User names and Argon2 password hashes, managed with `mercuriod passwd`,
+# which also stores SCRAM-SHA-256 keys so clients can log in without
+# sending the password; entries set before, or by mosquitto_passwd, get
+# them when their password is set again
 # password_file = "/etc/mercurio/passwd"
 
 # Restrict the topics each client may publish and subscribe to, using
@@ -362,12 +397,25 @@ group = "mercurio"
 # mode = "0660"
 #
 # Any TCP listener may also set max_connections, on top of the broker-wide
-# limit, and bind_interface
+# limit, bind_interface, and max_connection_rate, the new connections a
+# second it accepts with connection_rate_burst at once, closing the others
+# unanswered. Any listener may replace the [server] limits
+# max_packet_size, max_connect_packet_size, max_keepalive and
+# connect_timeout for its clients, and with use_username_as_clientid give
+# each client the user name it authenticated as for client id, refusing
+# clients without one
 # [[listeners]]
 # host = "0.0.0.0"
 # port = 8884
 # max_connections = 100
 # bind_interface = "eth1"
+# max_connection_rate = 50
+# connection_rate_burst = 200
+# max_packet_size = 65536
+# max_connect_packet_size = 4096
+# max_keepalive = 120
+# connect_timeout = 5
+# use_username_as_clientid = true
 #
 # Behind a load balancer that sends the PROXY protocol (v1 or v2), so logs
 # show the clients' own addresses
@@ -444,8 +492,11 @@ group = "mercurio"
 # remote_prefix = "site1/"
 
 # WebAssembly plugins, run in this order after the built-in authentication
-# and access control. SIGHUP rereads the file at `path`; other changes need
-# a restart
+# and access control. Components built for plugin interface 0.2 or 0.1 load;
+# listPlugins shows which. A plugin publishes as the in-process client
+# mercurio-plugin-<name>, never to $ topics, 64 KiB a message and 100
+# messages a second at most. SIGHUP rereads the file at `path`; other
+# changes need a restart. See docs/plugins.html
 # [[plugins]]
 # path = "/etc/mercurio/plugins/deny_topic.wasm"
 # Names the plugin in logs, in $CONTROL/<name>/ and in a listener's
@@ -739,7 +790,12 @@ The SQLite database runs in WAL mode: while the broker runs, it keeps
 `-wal` and `-shm` files next to the database, and recent changes may be
 only in the `-wal` file. To back it up while the broker runs, use
 `sqlite3 mercurio.db ".backup copy.db"`; a plain copy of the database file
-alone can miss those changes.
+alone can miss those changes. The broker creates the database readable by
+its owner only, and holds a lock on `mercurio.db.lock` while it runs, so a
+second broker started on the same database exits with an error; reading
+the database with `sqlite3`, as for a backup, still works. The database
+records its schema version, and a broker refuses a database written by a
+newer version of it.
 
 Only one broker serves from a PostgreSQL database at a time. Another one
 started on it exits, or, with `standby = true`, waits without listening and
@@ -760,12 +816,12 @@ Every `sys_interval` seconds the broker publishes retained statistics under
 `publish/messages/dropped`, the messages lost before reaching a subscriber.
 Mercurio adds the dropped messages by cause under
 `publish/messages/dropped/` (`queue_full_qos0`, `queue_full`, `expired`,
-`too_large`, `not_authorized`, `no_share_member`) and the storage batches
-retried and given up on as `store/batches/retried` and
-`store/batches/dropped`. `storage/failed batches` counts the batches of
-changes given up since the broker started, and `storage/dirty clients`
-the clients whose stored state is to be written whole again because of
-them. Under `load/` come the 1, 5 and 15
+`too_large`, `not_authorized`, `no_share_member`) and, under `storage/`,
+the batches of session changes written again after a storage error
+(`storage/batches/retried`), those given up on since the broker started
+(`storage/batches/dropped`) and the clients whose stored state is to be
+written whole again because of them (`storage/clients/dirty`). Under
+`load/` come the 1, 5 and 15
 minute averages per minute of messages, bytes and connections, such as
 `load/messages/received/1min`. Clients
 may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`

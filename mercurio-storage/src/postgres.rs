@@ -36,9 +36,9 @@ use tracing::{info, warn};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredSubscription,
-    StoredWillMessage, WillStore, Write,
+    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore,
+    SessionOwner, SessionState, StorageError, StoredBan, StoredClient, StoredSubscription,
+    StoredWillMessage, TopicRange, Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -227,6 +227,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON subscriptions
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
 ",
+    // Lets the removal of expired retained messages find them without
+    // reading the table
+    "
+    CREATE INDEX IF NOT EXISTS retained_messages_expires_at
+        ON retained_messages (expires_at) WHERE expires_at IS NOT NULL;
+",
 ];
 
 /// The migration that creates the subscriptions table, after which
@@ -289,7 +295,9 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
 }
 
 /// Moves the subscriptions sessions kept encoded in their row, before
-/// subscriptions had a table of their own, to that table.
+/// subscriptions had a table of their own, to that table. Those that can't
+/// be read stay where they are, and the session with them, for an operator
+/// to look at; see `load_session`.
 async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
     let sessions = client
         .query(
@@ -300,23 +308,27 @@ async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
         .db()?;
     for row in sessions {
         let client_id: String = row.try_get(0).db()?;
-        let encoded = String::from_utf8(row.try_get(1).db()?)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
-        let subscriptions = decode_subscriptions(&encoded);
+        let encoded: Vec<u8> = row.try_get(1).db()?;
+        let Some(subscriptions) = String::from_utf8(encoded)
+            .ok()
+            .and_then(|encoded| decode_subscriptions(&encoded).ok())
+        else {
+            continue;
+        };
         let (sql, params) = insert_subscriptions(&client_id, &subscriptions, "NOTHING");
         let params: Vec<&(dyn ToSql + Sync)> = params
             .iter()
             .map(|p| p.as_ref() as &(dyn ToSql + Sync))
             .collect();
         client.execute(sql, &params).await.db()?;
+        client
+            .execute(
+                "UPDATE sessions SET subscriptions = ''::BYTEA WHERE client_id = $1",
+                &[&client_id],
+            )
+            .await
+            .db()?;
     }
-    client
-        .execute(
-            "UPDATE sessions SET subscriptions = ''::BYTEA WHERE length(subscriptions) > 0",
-            &[],
-        )
-        .await
-        .db()?;
     Ok(())
 }
 
@@ -362,6 +374,25 @@ impl<T> Db<T> for std::result::Result<T, tokio_postgres::Error> {
     fn db(self) -> Result<T> {
         self.map_err(classify)
     }
+}
+
+/// Turns the errors of reading a column into the crate's: a stored value
+/// that can't be read as what it stands for.
+trait Col<T> {
+    fn col(self) -> Result<T>;
+}
+
+impl<T> Col<T> for std::result::Result<T, tokio_postgres::Error> {
+    fn col(self) -> Result<T> {
+        self.map_err(|e| StorageError::SerializationError(crate::error_chain(&e)))
+    }
+}
+
+/// `value` read as a narrower integer, failing for one out of its range.
+fn narrow<T: TryFrom<i64>>(value: impl Into<i64>, what: &str) -> Result<T> {
+    let value = value.into();
+    T::try_from(value)
+        .map_err(|_| StorageError::SerializationError(format!("{value} is not a valid {what}")))
 }
 
 fn classify(error: tokio_postgres::Error) -> StorageError {
@@ -1083,6 +1114,274 @@ impl BatchStore for PostgresStore {
     async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
         self.fence(self.apply_batch(client_id, writes).await)
     }
+
+    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
+        // One row per subscription, or one without any
+        let rows = self
+            .query(
+                &format!(
+                    "SELECT {SESSION_COLUMNS}, f.topic_filter, f.qos, f.no_local,
+                            f.retain_as_published, f.subscription_identifier
+                     FROM sessions s
+                     LEFT JOIN subscriptions f ON f.client_id = s.client_id
+                     WHERE s.client_id = $1"
+                ),
+                &[&client_id],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let mut session = session_from_row(row, client_id)?;
+        for row in &rows {
+            if row
+                .try_get::<_, Option<&str>>("topic_filter")
+                .col()?
+                .is_some()
+            {
+                session.subscriptions.push(subscription_from_row(row)?);
+            }
+        }
+        Ok(Some(session))
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<String>> {
+        self.query("SELECT client_id FROM sessions", &[])
+            .await?
+            .iter()
+            .map(|row| row.try_get(0).col())
+            .collect()
+    }
+
+    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
+        self.query(
+            "SELECT * FROM will_messages WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await?
+        .first()
+        .map(will_from_row)
+        .transpose()
+    }
+
+    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
+        self.query(
+            "SELECT * FROM inflight_messages WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await?
+        .iter()
+        .map(inflight_from_row)
+        .collect()
+    }
+
+    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        self.query(
+            "SELECT packet_id FROM incoming_qos2 WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await?
+        .iter()
+        .map(incoming_from_row)
+        .collect()
+    }
+
+    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
+        self.query(
+            "SELECT * FROM queued_messages WHERE client_id = $1 ORDER BY sequence",
+            &[&client_id],
+        )
+        .await?
+        .iter()
+        .map(queued_from_row)
+        .collect()
+    }
+
+    /// One query per table for the whole page, those after the sessions
+    /// pipelined: its sessions, then the rows of every other table in the
+    /// range of client ids the page covers.
+    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+        let after_clause = match after {
+            Some(_) => "client_id > $1",
+            None => "$1::TEXT IS NULL",
+        };
+        let sessions = self
+            .query(
+                &format!(
+                    "SELECT s.client_id, {SESSION_COLUMNS} FROM sessions s
+                     WHERE {after_clause} ORDER BY s.client_id LIMIT $2"
+                ),
+                &[&after, &(limit as i64)],
+            )
+            .await?;
+        let mut clients: BTreeMap<String, Result<StoredClient>> = BTreeMap::new();
+        let mut order = Vec::with_capacity(sessions.len());
+        for row in &sessions {
+            let client_id: String = row.try_get("client_id").col()?;
+            let stored = session_from_row(row, &client_id).map(|session| StoredClient {
+                session,
+                will: None,
+                queue: Vec::new(),
+                inflight: Vec::new(),
+                incoming_qos2: Vec::new(),
+            });
+            order.push(client_id.clone());
+            clients.insert(client_id, stored);
+        }
+        let Some(last) = order.last().cloned() else {
+            return Ok(Vec::new());
+        };
+
+        let within = format!("WHERE {after_clause} AND client_id <= $2 ORDER BY client_id");
+        let sql = [
+            format!("SELECT * FROM subscriptions {within}"),
+            format!("SELECT * FROM will_messages {within}"),
+            format!("SELECT * FROM queued_messages {within}, sequence"),
+            format!("SELECT * FROM inflight_messages {within}"),
+            format!("SELECT client_id, packet_id FROM incoming_qos2 {within}"),
+        ];
+        let client = self.client().await?;
+        let mut statements = Vec::with_capacity(sql.len());
+        for sql in &sql {
+            statements.push(client.prepare_cached(sql).await.db()?);
+        }
+        let params: [&(dyn ToSql + Sync); 2] = [&after, &last];
+        let results = join_all(statements.iter().map(|s| client.query(s, &params))).await;
+        let mut results = results.into_iter();
+        let mut next = || results.next().expect("one result per statement").db();
+
+        type Put = fn(&mut StoredClient, &Row) -> Result<()>;
+        let puts: [Put; 5] = [
+            |client, row| {
+                client
+                    .session
+                    .subscriptions
+                    .push(subscription_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.will = Some(will_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.queue.push(queued_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.inflight.push(inflight_from_row(row)?);
+                Ok(())
+            },
+            |client, row| {
+                client.incoming_qos2.push(incoming_from_row(row)?);
+                Ok(())
+            },
+        ];
+        for put in puts {
+            for row in next()? {
+                let client_id: String = row.try_get("client_id").col()?;
+                // Rows of a client without a session are left out
+                let Some(Ok(stored)) = clients.get_mut(&client_id) else {
+                    continue;
+                };
+                if let Err(e) = put(stored, &row) {
+                    clients.insert(client_id, Err(e));
+                }
+            }
+        }
+        Ok(order
+            .into_iter()
+            .map(|client_id| LoadedClient {
+                stored: clients.remove(&client_id).expect("each client is gathered"),
+                client_id,
+            })
+            .collect())
+    }
+}
+
+/// The columns of a session `session_from_row` reads.
+const SESSION_COLUMNS: &str = "s.expiry_interval, s.expires_at, s.owner_username,
+    s.owner_mount_point, length(s.subscriptions) > 0 AS unmoved";
+
+/// A session, without its subscriptions, which have a table of their own.
+fn session_from_row(row: &Row, client_id: &str) -> Result<SessionState> {
+    // Subscriptions an older version kept in the session's row that the
+    // move to their table couldn't read
+    if row.try_get("unmoved").col()? {
+        return Err(StorageError::SerializationError(
+            "subscriptions left in the session's row can't be read".into(),
+        ));
+    }
+    Ok(SessionState {
+        client_id: client_id.to_string(),
+        subscriptions: Vec::new(),
+        expiry_interval: row
+            .try_get::<_, Option<i64>>("expiry_interval")
+            .col()?
+            .map(|i| narrow(i, "session expiry interval"))
+            .transpose()?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        owner: SessionOwner {
+            username: row.try_get("owner_username").col()?,
+            mount_point: row.try_get("owner_mount_point").col()?,
+        },
+    })
+}
+
+fn subscription_from_row(row: &Row) -> Result<StoredSubscription> {
+    Ok(StoredSubscription {
+        topic_filter: row.try_get("topic_filter").col()?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        no_local: row.try_get("no_local").col()?,
+        retain_as_published: row.try_get("retain_as_published").col()?,
+        subscription_identifier: row
+            .try_get::<_, Option<i64>>("subscription_identifier")
+            .col()?
+            .map(|id| narrow(id, "subscription identifier"))
+            .transpose()?,
+    })
+}
+
+fn will_from_row(row: &Row) -> Result<StoredWillMessage> {
+    Ok(StoredWillMessage {
+        topic: row.try_get("topic").col()?,
+        payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").col()?),
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: row.try_get("retain").col()?,
+        delay_secs: narrow(row.try_get::<_, i64>("delay_secs").col()?, "will delay")?,
+        properties: decode_properties(row.try_get("properties").col()?)?,
+    })
+}
+
+fn queued_from_row(row: &Row) -> Result<(u64, Message)> {
+    let topic: String = row.try_get("topic").col()?;
+    let message = Message {
+        packet_id: None,
+        topic: Arc::from(topic.as_str()),
+        dup: false,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: row.try_get("retain").col()?,
+        payload: row
+            .try_get::<_, Option<Vec<u8>>>("payload")
+            .col()?
+            .map(Bytes::from),
+        properties: decode_properties(row.try_get("properties").col()?)?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        subscription_identifiers: decode_identifiers(
+            row.try_get("subscription_identifiers").col()?,
+        )?,
+        origin: None,
+    };
+    Ok((row.try_get::<_, i64>("sequence").col()? as u64, message))
+}
+
+fn incoming_from_row(row: &Row) -> Result<u16> {
+    narrow(row.try_get::<_, i32>("packet_id").col()?, "packet id")
 }
 
 impl PostgresStore {
@@ -1158,143 +1457,92 @@ fn decode_identifiers(ids: Option<String>) -> Result<Vec<u32>> {
         .map_err(|e| StorageError::SerializationError(format!("subscription identifiers: {e}")))
 }
 
-/// A LIKE pattern for the topics a filter can match: those starting with
-/// its part before the first wildcard. `a/#` also matches `a`, so a
-/// trailing `/` is left out.
-fn topic_prefix_pattern(filter: &str) -> String {
-    let prefix = filter
-        .split(['+', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('/');
-    let mut pattern = String::with_capacity(prefix.len() + 1);
-    for c in prefix.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            pattern.push('\\');
-        }
-        pattern.push(c);
-    }
-    pattern.push('%');
-    pattern
-}
-
 fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
     Ok(InflightMessage {
-        packet_id: row.try_get::<_, i32>("packet_id").db()? as u16,
-        topic: row.try_get("topic").db()?,
+        packet_id: narrow(row.try_get::<_, i32>("packet_id").col()?, "packet id")?,
+        topic: row.try_get("topic").col()?,
         payload: row
             .try_get::<_, Option<Vec<u8>>>("payload")
-            .db()?
+            .col()?
             .map(Bytes::from),
-        qos: int_to_qos(row.try_get("qos").db()?)?,
-        dup: row.try_get("dup").db()?,
-        sequence: row.try_get::<_, i64>("sequence").db()? as u64,
-        released: row.try_get("released").db()?,
-        properties: decode_properties(row.try_get("properties").db()?)?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        dup: row.try_get("dup").col()?,
+        sequence: row.try_get::<_, i64>("sequence").col()? as u64,
+        released: row.try_get("released").col()?,
+        properties: decode_properties(row.try_get("properties").col()?)?,
         subscription_identifiers: decode_identifiers(
-            row.try_get("subscription_identifiers").db()?,
+            row.try_get("subscription_identifiers").col()?,
         )?,
-        retain: row.try_get("retain").db()?,
+        retain: row.try_get("retain").col()?,
         expires_at: row
             .try_get::<_, Option<i64>>("expires_at")
-            .db()?
+            .col()?
             .map(|t| t as u64),
     })
 }
 
-#[async_trait]
-impl SessionStore for PostgresStore {
-    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
-        self.apply(client_id, &[Write::SaveSession(session.clone())])
-            .await
-    }
+fn retained_from_row(row: &Row) -> Result<Message> {
+    let topic: String = row.try_get("topic").col()?;
+    let origin = row
+        .try_get::<_, Option<String>>("origin_client_id")
+        .col()?
+        .map(|client_id| -> Result<_> {
+            Ok(Arc::new(MessageOrigin {
+                client_id,
+                username: row.try_get("origin_username").col()?,
+            }))
+        })
+        .transpose()?;
+    Ok(Message {
+        packet_id: None,
+        topic: Arc::from(topic.as_str()),
+        dup: row.try_get("dup").col()?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: true,
+        payload: row
+            .try_get::<_, Option<Vec<u8>>>("payload")
+            .col()?
+            .map(Bytes::from),
+        properties: decode_properties(row.try_get("properties").col()?)?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        subscription_identifiers: Vec::new(),
+        origin,
+    })
+}
 
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
-        // One row per subscription, or one without any
-        let rows = self
-            .query(
-                "SELECT s.expiry_interval, s.expires_at, s.owner_username, s.owner_mount_point,
-                        f.topic_filter, f.qos, f.no_local, f.retain_as_published,
-                        f.subscription_identifier
-                 FROM sessions s
-                 LEFT JOIN subscriptions f ON f.client_id = s.client_id
-                 WHERE s.client_id = $1
-                 ORDER BY f.topic_filter",
-                &[&client_id],
-            )
-            .await?;
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        let mut subscriptions = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let Some(topic_filter) = row.try_get::<_, Option<String>>("topic_filter").db()? else {
-                continue;
-            };
-            subscriptions.push(StoredSubscription {
-                topic_filter,
-                qos: int_to_qos(row.try_get("qos").db()?)?,
-                no_local: row.try_get("no_local").db()?,
-                retain_as_published: row.try_get("retain_as_published").db()?,
-                subscription_identifier: row
-                    .try_get::<_, Option<i64>>("subscription_identifier")
-                    .db()?
-                    .map(|id| id as u32),
-            });
-        }
-        Ok(Some(SessionState {
-            client_id: client_id.to_string(),
-            subscriptions,
-            expiry_interval: row
-                .try_get::<_, Option<i64>>("expiry_interval")
-                .db()?
-                .map(|i| i as u32),
-            expires_at: row
-                .try_get::<_, Option<i64>>("expires_at")
-                .db()?
-                .map(|t| t as u64),
-            owner: SessionOwner {
-                username: row.try_get("owner_username").db()?,
-                mount_point: row.try_get("owner_mount_point").db()?,
-            },
-        }))
-    }
-
-    async fn delete_session(&self, client_id: &str) -> Result<()> {
-        let client = self.client().await?;
-        let statement = client
-            .prepare_cached(
-                "WITH subscriptions AS (DELETE FROM subscriptions WHERE client_id = $1)
-                 DELETE FROM sessions WHERE client_id = $1",
-            )
-            .await
-            .db()?;
-        self.fence(client.execute(&statement, &[&client_id]).await.db())?;
-        Ok(())
-    }
-
-    async fn list_sessions(&self) -> Result<Vec<String>> {
-        self.query("SELECT client_id FROM sessions", &[])
-            .await?
-            .iter()
-            .map(|row| row.try_get(0).db())
-            .collect()
-    }
+/// The retained lookup of `get_retained_page`: `$1` the first topic, read
+/// from on, or after if not `inclusive`, `$2` now, `$3` the limit, and `$4`
+/// the topic before which to stop, if `bounded`. Only reads, so it never
+/// waits for the lock the fence triggers take.
+fn retained_sql(inclusive: bool, bounded: bool) -> String {
+    format!(
+        "SELECT topic, payload, qos, dup, properties, expires_at,
+                origin_client_id, origin_username
+         FROM retained_messages
+         WHERE topic {} $1 {} AND (expires_at IS NULL OR expires_at > $2)
+         ORDER BY topic LIMIT $3",
+        if inclusive { ">=" } else { ">" },
+        if bounded { "AND topic < $4" } else { "" },
+    )
 }
 
 #[async_trait]
 impl RetainedMessageStore for PostgresStore {
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool> {
         let client = self.client().await?;
         let Some(msg) = message else {
             let statement = client
                 .prepare_cached("DELETE FROM retained_messages WHERE topic = $1")
                 .await
                 .db()?;
-            self.fence(client.execute(&statement, &[&topic]).await.db())?;
-            return Ok(());
+            let removed = self.fence(client.execute(&statement, &[&topic]).await.db())?;
+            return Ok(removed > 0);
         };
         let origin = msg.origin.as_deref();
+        // xmax is set on a row an ON CONFLICT clause updated
         let statement = client
             .prepare_cached(
                 "INSERT INTO retained_messages
@@ -1305,12 +1553,13 @@ impl RetainedMessageStore for PostgresStore {
                  payload = EXCLUDED.payload, qos = EXCLUDED.qos, dup = EXCLUDED.dup,
                  properties = EXCLUDED.properties, expires_at = EXCLUDED.expires_at,
                  origin_client_id = EXCLUDED.origin_client_id,
-                 origin_username = EXCLUDED.origin_username",
+                 origin_username = EXCLUDED.origin_username
+                 RETURNING xmax <> 0",
             )
             .await
             .db()?;
         let stored = client
-            .execute(
+            .query_one(
                 &statement,
                 &[
                     &topic,
@@ -1325,62 +1574,89 @@ impl RetainedMessageStore for PostgresStore {
             )
             .await
             .db();
-        self.fence(stored)?;
-        Ok(())
+        self.fence(stored)?.try_get(0).db()
     }
 
-    /// Reads only the topics sharing the filter's literal prefix, and drops
-    /// the expired ones among them for good, in one round trip.
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
-        let rows = self
+    /// Reads only the topics the filter's literal prefix allows, through the
+    /// primary key, whose C collation orders them by their bytes, in chunks,
+    /// as wildcards past the prefix are matched here.
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let now = unix_millis() as i64;
+        let (start, end) = match TopicRange::of(topic_filter) {
+            TopicRange::Exact(topic) => {
+                if after.is_some_and(|after| after >= topic.as_str()) || limit == 0 {
+                    return Ok(Vec::new());
+                }
+                return self
+                    .query(
+                        "SELECT topic, payload, qos, dup, properties, expires_at,
+                                origin_client_id, origin_username
+                         FROM retained_messages
+                         WHERE topic = $1 AND (expires_at IS NULL OR expires_at > $2)",
+                        &[&topic, &now],
+                    )
+                    .await?
+                    .iter()
+                    .map(retained_from_row)
+                    .collect();
+            }
+            TopicRange::From { start, end } => (start, end),
+        };
+        let (mut from, mut inclusive) = match after {
+            Some(after) if after >= start.as_str() => (after.to_string(), false),
+            _ => (start, true),
+        };
+        let chunk = limit.max(256) as i64;
+        let mut messages = Vec::new();
+        loop {
+            let sql = retained_sql(inclusive, end.is_some());
+            let rows = match &end {
+                Some(end) => self.query(&sql, &[&from, &now, &chunk, end]).await?,
+                None => self.query(&sql, &[&from, &now, &chunk]).await?,
+            };
+            let read = rows.len() as i64;
+            for row in &rows {
+                let topic: String = row.try_get("topic").col()?;
+                if topic_matches_filter(&topic, topic_filter) {
+                    messages.push(retained_from_row(row)?);
+                    if messages.len() == limit {
+                        return Ok(messages);
+                    }
+                }
+                from = topic;
+                inclusive = false;
+            }
+            if read < chunk {
+                return Ok(messages);
+            }
+        }
+    }
+
+    /// Checks first, as the deletion takes the fence's lock even when it
+    /// removes nothing.
+    async fn remove_expired_retained(&self) -> Result<usize> {
+        let now = unix_millis() as i64;
+        let any = self
             .query(
-                "WITH expired AS (
-                     DELETE FROM retained_messages WHERE topic LIKE $1 AND expires_at <= $2
-                 )
-                 SELECT topic, payload, qos, dup, properties, expires_at,
-                        origin_client_id, origin_username
-                 FROM retained_messages
-                 WHERE topic LIKE $1 AND (expires_at IS NULL OR expires_at > $2)",
-                &[&topic_prefix_pattern(topic_filter), &(unix_millis() as i64)],
+                "SELECT EXISTS (SELECT 1 FROM retained_messages WHERE expires_at <= $1)",
+                &[&now],
             )
             .await?;
-
-        let mut messages = Vec::new();
-        for row in rows {
-            let topic: String = row.try_get("topic").db()?;
-            if !topic_matches_filter(&topic, topic_filter) {
-                continue;
-            }
-            let origin = row
-                .try_get::<_, Option<String>>("origin_client_id")
-                .db()?
-                .map(|client_id| -> Result<_> {
-                    Ok(Arc::new(MessageOrigin {
-                        client_id,
-                        username: row.try_get("origin_username").db()?,
-                    }))
-                })
-                .transpose()?;
-            messages.push(Message {
-                packet_id: None,
-                topic: Arc::from(topic.as_str()),
-                dup: row.try_get("dup").db()?,
-                qos: int_to_qos(row.try_get("qos").db()?)?,
-                retain: true,
-                payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")
-                    .db()?
-                    .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").db()?)?,
-                expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")
-                    .db()?
-                    .map(|t| t as u64),
-                subscription_identifiers: Vec::new(),
-                origin,
-            });
+        if !any[0].try_get::<_, bool>(0).db()? {
+            return Ok(0);
         }
-        Ok(messages)
+        let client = self.client().await?;
+        let statement = client
+            .prepare_cached("DELETE FROM retained_messages WHERE expires_at <= $1")
+            .await
+            .db()?;
+        let removed = self.fence(client.execute(&statement, &[&now]).await.db())?;
+        Ok(removed as usize)
     }
 
     async fn clear_all_retained(&self) -> Result<()> {
@@ -1469,166 +1745,9 @@ impl BanStore for PostgresStore {
     }
 }
 
-#[async_trait]
-impl WillStore for PostgresStore {
-    async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()> {
-        self.apply(client_id, &[Write::StoreWill(will.clone())])
-            .await
-    }
-
-    async fn get_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        let rows = self
-            .query(
-                "SELECT topic, payload, qos, retain, delay_secs, properties
-                 FROM will_messages WHERE client_id = $1",
-                &[&client_id],
-            )
-            .await?;
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        Ok(Some(StoredWillMessage {
-            topic: row.try_get("topic").db()?,
-            payload: Bytes::from(row.try_get::<_, Vec<u8>>("payload").db()?),
-            qos: int_to_qos(row.try_get("qos").db()?)?,
-            retain: row.try_get("retain").db()?,
-            delay_secs: row.try_get::<_, i64>("delay_secs").db()? as u32,
-            properties: decode_properties(row.try_get("properties").db()?)?,
-        }))
-    }
-
-    async fn delete_will(&self, client_id: &str) -> Result<()> {
-        self.apply(client_id, &[Write::DeleteWill]).await
-    }
-}
-
-#[async_trait]
-impl InflightStore for PostgresStore {
-    async fn store_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-        message: &InflightMessage,
-    ) -> Result<()> {
-        let message = InflightMessage {
-            packet_id,
-            ..message.clone()
-        };
-        self.apply(client_id, &[Write::StoreInflight(message)])
-            .await
-    }
-
-    async fn get_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-    ) -> Result<Option<InflightMessage>> {
-        self.query(
-            "SELECT * FROM inflight_messages WHERE client_id = $1 AND packet_id = $2",
-            &[&client_id, &i32::from(packet_id)],
-        )
-        .await?
-        .first()
-        .map(inflight_from_row)
-        .transpose()
-    }
-
-    async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::RemoveInflight(packet_id)])
-            .await
-    }
-
-    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::ReleaseInflight(packet_id)])
-            .await
-    }
-
-    async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
-        self.query(
-            "SELECT * FROM inflight_messages WHERE client_id = $1",
-            &[&client_id],
-        )
-        .await?
-        .iter()
-        .map(inflight_from_row)
-        .collect()
-    }
-
-    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::StoreIncomingQos2(packet_id)])
-            .await
-    }
-
-    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::RemoveIncomingQos2(packet_id)])
-            .await
-    }
-
-    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
-        self.query(
-            "SELECT packet_id FROM incoming_qos2 WHERE client_id = $1",
-            &[&client_id],
-        )
-        .await?
-        .iter()
-        .map(|row| Ok(row.try_get::<_, i32>(0).db()? as u16))
-        .collect()
-    }
-}
-
-#[async_trait]
-impl QueueStore for PostgresStore {
-    async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()> {
-        self.apply(client_id, &[Write::Enqueue(sequence, message.clone())])
-            .await
-    }
-
-    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()> {
-        self.apply(client_id, &[Write::Dequeue(sequence)]).await
-    }
-
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
-        self.query(
-            "SELECT * FROM queued_messages WHERE client_id = $1 ORDER BY sequence",
-            &[&client_id],
-        )
-        .await?
-        .iter()
-        .map(|row| {
-            let topic: String = row.try_get("topic").db()?;
-            let message = Message {
-                packet_id: None,
-                topic: Arc::from(topic.as_str()),
-                dup: false,
-                qos: int_to_qos(row.try_get("qos").db()?)?,
-                retain: row.try_get("retain").db()?,
-                payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")
-                    .db()?
-                    .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").db()?)?,
-                expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")
-                    .db()?
-                    .map(|t| t as u64),
-                subscription_identifiers: decode_identifiers(
-                    row.try_get("subscription_identifiers").db()?,
-                )?,
-                origin: None,
-            };
-            Ok((row.try_get::<_, i64>("sequence").db()? as u64, message))
-        })
-        .collect()
-    }
-
-    async fn clear_queue(&self, client_id: &str) -> Result<()> {
-        self.apply(client_id, &[Write::ClearQueue]).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use mercurio_core::{properties::ResponseTopic, qos::QoS};
+    use mercurio_core::qos::QoS;
     use tokio::sync::Mutex;
 
     use super::*;
@@ -1637,12 +1756,12 @@ mod tests {
     /// The tests share one database, and some take it over or empty it.
     static DATABASE: Mutex<()> = Mutex::const_new(());
 
-    fn database_url() -> Option<String> {
-        let url = std::env::var("MERCURIO_TEST_POSTGRES_URL").ok();
-        if url.is_none() {
-            eprintln!("MERCURIO_TEST_POSTGRES_URL not set, skipping");
-        }
-        url
+    /// The database the tests that need one use. They are ignored, and
+    /// listed as such, unless `MERCURIO_TEST_POSTGRES_URL` was set when the
+    /// tests were built; see `build.rs`.
+    fn database_url() -> String {
+        std::env::var("MERCURIO_TEST_POSTGRES_URL")
+            .expect("MERCURIO_TEST_POSTGRES_URL was set when the tests were built, but not now")
     }
 
     async fn empty_store(url: &str) -> PostgresStore {
@@ -1662,51 +1781,12 @@ mod tests {
         store
     }
 
-    fn message(topic: &str, payload: &str) -> Message {
-        Message {
-            packet_id: None,
-            topic: Arc::from(topic),
-            dup: false,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            payload: Some(Bytes::from(payload.to_string())),
-            properties: Default::default(),
-            expires_at: None,
-            subscription_identifiers: Vec::new(),
-            origin: None,
-        }
-    }
-
-    fn inflight(packet_id: u16) -> InflightMessage {
-        InflightMessage {
-            packet_id,
-            topic: "t".into(),
-            payload: Some(Bytes::from_static(b"p")),
-            qos: QoS::ExactlyOnce,
-            dup: false,
-            retain: true,
-            expires_at: Some(u64::MAX >> 1),
-            sequence: u64::MAX,
-            released: false,
-            properties: Default::default(),
-            subscription_identifiers: vec![1, u32::MAX],
-        }
-    }
-
-    #[test]
-    fn test_topic_prefix_pattern() {
-        assert_eq!(topic_prefix_pattern("#"), "%");
-        assert_eq!(topic_prefix_pattern("a/#"), "a%");
-        assert_eq!(topic_prefix_pattern("a/+/c"), "a%");
-        assert_eq!(topic_prefix_pattern("a/b"), "a/b%");
-        assert_eq!(topic_prefix_pattern("50%_off\\/+"), "50\\%\\_off\\\\%");
-    }
-
     /// A database created by 0.2.0, at schema version 1, keeps its
     /// sessions when a newer broker migrates it.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_migrates_a_version_1_database() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let store = PostgresStore::connect(&url, &ConnectOptions::default())
             .await
@@ -1769,8 +1849,9 @@ mod tests {
     /// In-flight messages stored before they kept their RETAIN flag and
     /// expiry load without either.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_migrates_in_flight_messages_without_retain_or_expiry() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         database_at(
             &url,
@@ -1782,237 +1863,19 @@ mod tests {
         let store = PostgresStore::connect(&url, &ConnectOptions::default())
             .await
             .unwrap();
-        let loaded = store.get_all_inflight("c").await.unwrap();
+        let loaded = store.load_inflight("c").await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
         assert!(!loaded[0].retain);
         assert_eq!(loaded[0].expires_at, None);
     }
 
-    #[tokio::test]
-    async fn test_round_trips_every_store() {
-        let Some(url) = database_url() else { return };
-        let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-
-        let mut subscription = StoredSubscription::new("a/#", QoS::ExactlyOnce);
-        subscription.subscription_identifier = Some(268_435_455);
-        let session = SessionState {
-            client_id: "c".into(),
-            subscriptions: vec![
-                subscription.clone(),
-                StoredSubscription::new("b", QoS::AtMostOnce),
-            ],
-            expiry_interval: Some(u32::MAX),
-            expires_at: Some(1),
-            owner: SessionOwner {
-                username: Some("alice".into()),
-                mount_point: Some("tenant/".into()),
-            },
-        };
-        store.save_session("c", &session).await.unwrap();
-        store.save_session("c", &session).await.unwrap();
-        let loaded = store.load_session("c").await.unwrap().unwrap();
-        assert_eq!(loaded.subscriptions[0], subscription);
-        assert_eq!(loaded.subscriptions.len(), 2);
-        assert_eq!(loaded.expiry_interval, Some(u32::MAX));
-        assert_eq!(loaded.owner, session.owner);
-        assert_eq!(store.list_sessions().await.unwrap(), vec!["c".to_string()]);
-        store.delete_session("c").await.unwrap();
-        assert!(store.load_session("c").await.unwrap().is_none());
-
-        let mut retained = message("a/b", "kept");
-        retained.properties.response_topic = Some(ResponseTopic::new("reply".into()));
-        retained.origin = Some(Arc::new(MessageOrigin {
-            client_id: "c".into(),
-            username: None,
-        }));
-        store
-            .store_retained("a/b", Some(retained.clone()))
-            .await
-            .unwrap();
-        let mut expired = message("a/c", "gone");
-        expired.expires_at = Some(1);
-        store.store_retained("a/c", Some(expired)).await.unwrap();
-        let found = store.get_retained("a/+").await.unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].payload, retained.payload);
-        assert_eq!(found[0].properties, retained.properties);
-        assert_eq!(found[0].origin.as_ref().unwrap().client_id, "c");
-        assert_eq!(store.count_retained().await.unwrap(), 1);
-        store.store_retained("a/b", None).await.unwrap();
-        assert_eq!(store.count_retained().await.unwrap(), 0);
-
-        let will = StoredWillMessage {
-            topic: "w".into(),
-            payload: Bytes::from_static(b"bye"),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-            delay_secs: u32::MAX,
-            properties: Default::default(),
-        };
-        store.store_will("c", &will).await.unwrap();
-        let loaded = store.get_will("c").await.unwrap().unwrap();
-        assert_eq!(
-            (loaded.payload, loaded.delay_secs),
-            (will.payload, u32::MAX)
-        );
-        store.delete_will("c").await.unwrap();
-        assert!(store.get_will("c").await.unwrap().is_none());
-
-        store
-            .store_inflight("c", u16::MAX, &inflight(u16::MAX))
-            .await
-            .unwrap();
-        store.release_inflight("c", u16::MAX).await.unwrap();
-        let loaded = store.get_inflight("c", u16::MAX).await.unwrap().unwrap();
-        assert!(loaded.released && loaded.payload.is_none());
-        assert_eq!(loaded.sequence, u64::MAX);
-        assert_eq!(loaded.subscription_identifiers, vec![1, u32::MAX]);
-        assert!(loaded.retain);
-        assert_eq!(loaded.expires_at, Some(u64::MAX >> 1));
-        assert_eq!(store.get_all_inflight("c").await.unwrap().len(), 1);
-        store.remove_inflight("c", u16::MAX).await.unwrap();
-        assert!(store.get_all_inflight("c").await.unwrap().is_empty());
-
-        let mut second = message("q", "2");
-        second.subscription_identifiers = vec![4];
-        store.enqueue("c", 2, &second).await.unwrap();
-        store.enqueue("c", 1, &message("q", "1")).await.unwrap();
-        let queue = store.load_queue("c").await.unwrap();
-        assert_eq!(queue.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [1, 2]);
-        assert_eq!(queue[1].1.subscription_identifiers, vec![4]);
-        store.clear_queue("c").await.unwrap();
-        assert!(store.load_queue("c").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_batches_apply_in_order_and_atomically() {
-        let Some(url) = database_url() else { return };
-        let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-
-        store
-            .apply(
-                "c",
-                &[
-                    Write::SaveSession(SessionState {
-                        client_id: "c".into(),
-                        subscriptions: vec![StoredSubscription::new("a", QoS::AtMostOnce)],
-                        expiry_interval: None,
-                        expires_at: None,
-                        owner: SessionOwner::default(),
-                    }),
-                    Write::SetExpiry {
-                        interval: 60,
-                        expires_at: 5,
-                    },
-                    Write::StoreInflight(inflight(1)),
-                    Write::StoreInflight(inflight(2)),
-                    Write::ReleaseInflight(2),
-                    Write::RemoveInflight(1),
-                    Write::Enqueue(1, message("q", "1")),
-                ],
-            )
-            .await
-            .unwrap();
-        let session = store.load_session("c").await.unwrap().unwrap();
-        assert_eq!(session.subscriptions.len(), 1);
-        assert_eq!(
-            (session.expiry_interval, session.expires_at),
-            (Some(60), Some(5))
-        );
-        let inflight_left = store.get_all_inflight("c").await.unwrap();
-        assert_eq!(inflight_left.len(), 1);
-        assert!(inflight_left[0].released);
-
-        // Rows stored by an earlier batch, then a run that reuses packet id
-        // 1 and clears the queue between two enqueues
-        store
-            .apply(
-                "c",
-                &[
-                    Write::StoreInflight(inflight(4)),
-                    Write::StoreInflight(inflight(5)),
-                ],
-            )
-            .await
-            .unwrap();
-        let mut reused = inflight(1);
-        reused.sequence = 7;
-        store
-            .apply(
-                "c",
-                &[
-                    Write::ReleaseInflight(4),
-                    Write::RemoveInflight(5),
-                    Write::StoreInflight(inflight(1)),
-                    Write::RemoveInflight(1),
-                    Write::StoreInflight(reused),
-                    Write::ReleaseInflight(1),
-                    Write::Enqueue(5, message("q", "dropped")),
-                    Write::ClearQueue,
-                    Write::Enqueue(6, message("q", "kept")),
-                    Write::Enqueue(6, message("q", "kept, again")),
-                ],
-            )
-            .await
-            .unwrap();
-        let mut left = store.get_all_inflight("c").await.unwrap();
-        left.sort_by_key(|m| m.packet_id);
-        let summary: Vec<_> = left
-            .iter()
-            .map(|m| (m.packet_id, m.sequence, m.released, m.payload.is_some()))
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                (1, 7, true, false),
-                (2, u64::MAX, true, false),
-                (4, u64::MAX, true, false)
-            ]
-        );
-        let queue = store.load_queue("c").await.unwrap();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].0, 6);
-        assert_eq!(queue[0].1.payload.as_deref(), Some(&b"kept, again"[..]));
-
-        // A failing statement undoes the whole batch: text can't hold NUL
-        let mut bad = inflight(3);
-        bad.topic = "\0".into();
-        assert!(store
-            .apply("c", &[Write::DeleteSession, Write::StoreInflight(bad)])
-            .await
-            .is_err());
-        assert!(store.load_session("c").await.unwrap().is_some());
-
-        store.apply("c", &[Write::DeleteSession]).await.unwrap();
-        assert!(store.load_session("c").await.unwrap().is_none());
-        assert!(store.load_queue("c").await.unwrap().is_empty());
-        assert!(store.get_all_inflight("c").await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_queued_messages_leave_one_at_a_time() {
-        let Some(url) = database_url() else { return };
-        let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-        crate::testing::queue_round_trip(&store).await;
-    }
-
-    #[tokio::test]
-    async fn test_subscriptions() {
-        let Some(url) = database_url() else { return };
-        let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-        crate::testing::subscriptions_round_trip(&store).await;
-    }
-
     /// Sessions of a database from before subscriptions had a table of
     /// their own keep their subscriptions.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_migrates_encoded_subscriptions_to_their_table() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let subscriptions = vec![
             StoredSubscription {
@@ -2030,7 +1893,8 @@ mod tests {
             &format!(
                 "INSERT INTO sessions (client_id, subscriptions, clean_start, owner_username)
                  VALUES ('old', decode('{}', 'hex'), FALSE, 'alice'),
-                        ('none', '', FALSE, NULL);",
+                        ('none', '', FALSE, NULL),
+                        ('bad', '9xx:a', FALSE, NULL);",
                 encoded
                     .bytes()
                     .map(|b| format!("{b:02x}"))
@@ -2050,6 +1914,11 @@ mod tests {
         assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
         let none = store.load_session("none").await.unwrap().unwrap();
         assert!(none.subscriptions.is_empty());
+        // Those that can't be read stay, and their session fails to load
+        assert!(matches!(
+            store.load_session("bad").await,
+            Err(StorageError::SerializationError(_))
+        ));
         let blobs: i64 = store
             .client()
             .await
@@ -2061,55 +1930,140 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(blobs, 0);
+        assert_eq!(blobs, 1);
     }
 
     #[tokio::test]
-    async fn test_incoming_qos2() {
-        let Some(url) = database_url() else { return };
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_conformance() {
+        let url = database_url();
         let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-        crate::testing::incoming_qos2_round_trip(&store).await;
+        crate::testing::conformance(&empty_store(&url).await).await;
     }
 
     #[tokio::test]
-    async fn test_retained_lookup_by_prefix() {
-        let Some(url) = database_url() else { return };
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_bans() {
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let store = empty_store(&url).await;
-        for topic in ["a", "a/b", "ab", "a%b/c", "axb/c", "$SYS/x"] {
+        crate::testing::bans(&store).await;
+        assert!(Arc::new(store).ban_store().is_some());
+    }
+
+    /// A failing statement undoes the whole batch, its deletion included.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_batches_apply_atomically() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        store
+            .apply("c", &[Write::SaveSession(crate::testing::session("c"))])
+            .await
+            .unwrap();
+
+        // Text can't hold NUL
+        let mut bad = crate::testing::inflight_message(3);
+        bad.topic = "\0".into();
+        assert!(store
+            .apply("c", &[Write::DeleteSession, Write::StoreInflight(bad)])
+            .await
+            .is_err());
+        assert!(store.load_session("c").await.unwrap().is_some());
+    }
+
+    /// Rows that can't be read fail to load as undecodable, each in the
+    /// loads of its own client only, and stay in the database.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_rows_that_cannot_be_read_are_an_error() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        for client_id in ["bad", "good"] {
             store
-                .store_retained(topic, Some(message(topic, "")))
+                .apply(
+                    client_id,
+                    &[
+                        Write::SaveSession(crate::testing::session(client_id)),
+                        Write::StoreInflight(crate::testing::inflight_message(1)),
+                        Write::Enqueue(1, crate::testing::message("q", "1")),
+                    ],
+                )
                 .await
                 .unwrap();
         }
-        let topics = |filter: &'static str| {
-            let store = store.clone();
-            async move {
-                let mut topics: Vec<_> = store
-                    .get_retained(filter)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .map(|m| m.topic.to_string())
-                    .collect();
-                topics.sort();
-                topics
-            }
+        store
+            .client()
+            .await
+            .unwrap()
+            .batch_execute(
+                "UPDATE subscriptions SET qos = 7 WHERE client_id = 'bad';
+                 UPDATE inflight_messages SET packet_id = 70000 WHERE client_id = 'bad';
+                 UPDATE queued_messages SET properties = '\\xff' WHERE client_id = 'bad';",
+            )
+            .await
+            .unwrap();
+        let undecodable =
+            |result: Result<_>| matches!(result, Err(StorageError::SerializationError(_)));
+
+        assert!(undecodable(store.load_session("bad").await.map(|_| ())));
+        assert!(undecodable(store.load_inflight("bad").await.map(|_| ())));
+        assert!(undecodable(store.load_queue("bad").await.map(|_| ())));
+        assert!(store.load_session("good").await.unwrap().is_some());
+        assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
+        assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
+        let loaded = store.load_clients(None, 10).await.unwrap();
+        let stored = |client_id: &str| {
+            &loaded
+                .iter()
+                .find(|c| c.client_id == client_id)
+                .unwrap()
+                .stored
         };
-        assert_eq!(topics("a/#").await, ["a", "a/b"]);
-        assert_eq!(topics("a%b/+").await, ["a%b/c"]);
-        assert_eq!(topics("+/c").await, ["a%b/c", "axb/c"]);
-        assert_eq!(topics("#").await.len(), 5);
+        assert!(undecodable(stored("bad").as_ref().map(|_| ()).map_err(
+            |e| {
+                assert!(matches!(e, StorageError::SerializationError(_)), "{e}");
+                StorageError::SerializationError(e.to_string())
+            }
+        )));
+        assert!(stored("good").is_ok());
+
+        store.delete_session("bad").await.unwrap();
+        assert!(store.load_session("bad").await.unwrap().is_none());
     }
 
+    /// A retained lookup only reads, so it doesn't wait for the lock a
+    /// takeover holds on the lease, as a deletion through the fence trigger
+    /// would on every SUBSCRIBE.
     #[tokio::test]
-    async fn test_bans() {
-        let Some(url) = database_url() else { return };
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_retained_lookups_take_no_lock() {
+        let url = database_url();
         let _database = DATABASE.lock().await;
-        let store = empty_store(&url).await;
-        crate::testing::bans_round_trip(&store).await;
-        assert!(Arc::new(store).ban_store().is_some());
+        let database = empty_store(&url).await;
+        let (store, _lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut expired = crate::testing::message("a/x", "");
+        expired.expires_at = Some(1);
+        store.store_retained("a/x", Some(expired)).await.unwrap();
+
+        let admin = database.client().await.unwrap();
+        admin
+            .batch_execute("BEGIN; SELECT * FROM mercurio_lease FOR UPDATE;")
+            .await
+            .unwrap();
+        let found = tokio::time::timeout(Duration::from_secs(2), store.get_retained("a/#")).await;
+        admin.batch_execute("ROLLBACK").await.unwrap();
+        assert!(found
+            .expect("the lookup waited for the lock")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.remove_expired_retained().await.unwrap(), 1);
     }
 
     /// `url` with `user` and `password` in place of its credentials.
@@ -2122,8 +2076,9 @@ mod tests {
     /// Managed PostgreSQL often gives roles a statement or lock timeout,
     /// which would cancel a standby's wait for the lock.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_a_standby_waits_despite_its_roles_timeouts() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
         let admin = database.client().await.unwrap();
@@ -2163,8 +2118,9 @@ mod tests {
     /// A newer standby leaves the schema alone until it holds the
     /// database, as the broker serving from it may not know the new one.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_a_standby_migrates_once_it_holds_the_database() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
         let admin = database.client().await.unwrap();
@@ -2212,8 +2168,9 @@ mod tests {
     /// A standby older than the database's schema fails at once, rather
     /// than wait for a database it can't serve from.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_an_older_standby_refuses_a_newer_schema() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
         let admin = database.client().await.unwrap();
@@ -2247,8 +2204,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_one_broker_holds_the_database() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
 
@@ -2328,8 +2286,9 @@ mod tests {
     /// A takeover the holder's lock connection hasn't noticed yet, as when
     /// that connection hangs: the first fenced write gives the lock up.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_a_fenced_write_loses_the_lock() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let database = empty_store(&url).await;
         let (active, lock) =
@@ -2355,8 +2314,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_errors_worth_retrying_are_transient() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let store = PostgresStore::connect(&url, &ConnectOptions::default())
             .await
@@ -2400,8 +2360,9 @@ mod tests {
     /// A broker waiting for a free connection retries, rather than give
     /// its changes up.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_the_pool_is_sized_and_its_wait_is_transient() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         let options = ConnectOptions {
             pool_size: 1,
@@ -2460,8 +2421,9 @@ mod tests {
 
     /// The server in the tests has TLS off, as PostgreSQL's images do.
     #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
     async fn test_a_ca_path_refuses_plaintext() {
-        let Some(url) = database_url() else { return };
+        let url = database_url();
         let _database = DATABASE.lock().await;
         if url.contains("sslmode=") {
             return;

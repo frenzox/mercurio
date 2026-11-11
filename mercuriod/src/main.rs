@@ -6,11 +6,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
 use mercurio_server::admin::AdminExtension;
+use mercurio_server::auth::ScramAuth;
 use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
@@ -195,7 +194,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_writer(std::io::stderr)
             .with_env_filter("warn")
             .init();
-        prepare(&config).await?;
+        // Nothing serves it, so plugins publishing at load get an error
+        let (unserved, _) = LocalConnector::new();
+        prepare(&config, &unserved).await?;
         println!("{}: the configuration is valid", cli.config.display());
         return Ok(());
     }
@@ -206,6 +207,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .inspect_err(|e| tracing::warn!("getConfig will be unavailable: {}", e))
         .ok();
 
+    // Before the plugins load, as they publish through it
+    let (connector, local_listener) = LocalConnector::new();
     let Prepared {
         limits,
         policy,
@@ -215,7 +218,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dynsec,
         listeners: prepared_listeners,
         reloadable,
-    } = prepare(&config).await?;
+    } = prepare(&config, &connector).await?;
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -314,6 +317,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.proxy_from = prepared.proxy_from;
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
+        value.max_connection_rate = config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
+        value.max_packet_size = extra.max_packet_size;
+        value.max_connect_packet_size = extra.max_connect_packet_size;
+        value.max_keepalive = extra.max_keepalive;
+        value.connect_timeout = extra.connect_timeout.map(Duration::from_secs);
+        value.use_username_as_clientid = extra.use_username_as_clientid;
         value.http_dir = extra.http_dir.clone().map(Into::into);
         value.health = extra.health;
         value.metrics = extra.metrics;
@@ -337,8 +350,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         tracing::warn!("Ignoring [admin]: the admin socket needs Linux");
     }
-
-    let (connector, local_listener) = LocalConnector::new();
 
     let bridges = config
         .bridges
@@ -371,6 +382,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     server_config.plugin_timeout = config.server.plugin_timeout();
     server_config.plugin_tick_interval = config.server.plugin_tick_interval();
+    server_config.share_strategy = config.server.share_strategy();
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(hangup, reloadable));
 
@@ -455,8 +467,12 @@ struct PreparedListener {
 
 /// Checks the settings a start needs, loads the files of `[auth]` and of
 /// every listener, the TLS certificates and keys, and the WebAssembly
-/// plugins, binding nothing and leaving storage alone.
-async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>> {
+/// plugins, binding nothing and leaving storage alone. Plugins publish
+/// through `broker`.
+async fn prepare(
+    config: &Config,
+    broker: &LocalConnector,
+) -> Result<Prepared, Box<dyn std::error::Error>> {
     let limits = config.server.limits()?;
     let mut policy = ConnectPolicy::default();
     policy.response_information = config.server.response_information.clone();
@@ -476,6 +492,7 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     let wasm = load_plugins(
         &config.plugins,
         config.server.plugin_timeout(),
+        broker,
         &mut reloadable,
     )
     .await?;
@@ -492,6 +509,14 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     for extra in &config.listeners {
         if extra.port.is_some() == extra.path.is_some() {
             return Err("Each [[listeners]] entry needs either `port` or `path`".into());
+        }
+        config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
+        if extra.max_connect_packet_size == Some(0) {
+            return Err("A listener's max_connect_packet_size must be at least 1".into());
         }
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {
@@ -704,7 +729,9 @@ fn build_auth(
         let mut value = ServerAuthConfig::default();
         value.require_auth = config.enabled;
         value.allow_anonymous = config.allow_anonymous;
-        return Ok((value, vec![security.clone()], Some(security)));
+        // SCRAM-SHA-256 for the clients whose password was set with keys
+        let scram = Arc::new(ScramAuth::new(security.clone()));
+        return Ok((value, vec![security.clone(), scram], Some(security)));
     }
 
     let http = match &config.http {
@@ -728,7 +755,8 @@ fn build_auth(
         let validator = Arc::new(Reloadable::load(path, load_credentials)?);
         info!("Loaded credentials from {}", path);
         reloadable.push(validator.clone());
-        plugins.push(validator);
+        plugins.push(validator.clone());
+        plugins.push(Arc::new(ScramAuth::new(validator)));
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
@@ -753,6 +781,7 @@ fn build_auth(
 async fn load_plugins(
     plugins: &[config::PluginConfig],
     plugin_timeout: Duration,
+    broker: &LocalConnector,
     reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {
@@ -775,6 +804,7 @@ async fn load_plugins(
                 .timeout_ms
                 .map_or(plugin_timeout, Duration::from_millis),
             memory: plugin.memory_mb << 20,
+            broker: Some(broker.clone()),
         };
         let loaded_plugin = wasm::WasmPlugin::load(&runtime, settings)
             .await
@@ -793,6 +823,7 @@ async fn load_plugins(
 async fn load_plugins(
     plugins: &[config::PluginConfig],
     _plugin_timeout: Duration,
+    _broker: &LocalConnector,
     _reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {
@@ -825,7 +856,8 @@ fn load_acl_file(path: &str) -> Result<AclFile, String> {
 }
 
 fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
-    Ok(HashedCredentialValidator::new(password_file::load(path)?))
+    let loaded = password_file::load(path)?;
+    Ok(HashedCredentialValidator::new(loaded.hashes).with_scram(loaded.scram))
 }
 
 /// Add or update a user in the password file.
@@ -834,13 +866,15 @@ fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::err
     let mut users = password_file::read_users(path)?;
     let password = prompt_new_password(username)?;
 
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| format!("Failed to hash password: {}", e))?
-        .to_string();
+    let (hash, scram) = credentials::hash_new_password(&password)?;
 
-    users.insert(username.to_string(), hash);
+    users.insert(
+        username.to_string(),
+        password_file::User {
+            hash,
+            scram: Some(scram),
+        },
+    );
     password_file::write_users(path, &users)?;
 
     eprintln!("User `{}` added/updated in `{}`", username, path);
@@ -941,6 +975,116 @@ mod tests {
         .map_err(|e| panic!("{e}"))
         .unwrap();
         assert_eq!(plugins.len(), 1);
+    }
+
+    /// A broker with the authentication `toml` sets up; its port.
+    async fn broker_with(toml: &str) -> u16 {
+        use mercurio_server::server::ServerConfig;
+
+        let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true)
+            .map_err(|e| panic!("{e}"))
+            .unwrap();
+        let mut config = ServerConfig::default();
+        config.auth = value;
+        config.plugins = plugins;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(mercurio_server::server::run_with_config(
+            listener,
+            config,
+            std::future::pending::<()>(),
+        ));
+        port
+    }
+
+    /// Logs `username` in with `password`, by SCRAM-SHA-256 or as a plain
+    /// user name and password.
+    async fn login(port: u16, username: &str, password: &str, scram: bool) -> bool {
+        use mercurio_client::{ConnectOptions, MqttClient, ScramSha256};
+
+        let options = ConnectOptions::new("127.0.0.1", port).client_id(username);
+        let options = if scram {
+            options.authenticator(ScramSha256::new(username, password))
+        } else {
+            options.username(username).password(password.to_string())
+        };
+        match MqttClient::connect(options).await {
+            Ok(client) => {
+                if scram {
+                    client.reauthenticate().await.unwrap();
+                }
+                let _ = client.disconnect().await;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Both logins of `alice`, whose password is `secret`, and of `legacy`,
+    /// whose password `old` was set without SCRAM keys.
+    async fn check_logins(port: u16) {
+        assert!(login(port, "alice", "secret", true).await);
+        assert!(login(port, "alice", "secret", false).await);
+        assert!(!login(port, "alice", "wrong", true).await);
+        assert!(!login(port, "nobody", "secret", true).await);
+        assert!(login(port, "legacy", "old", false).await);
+        assert!(!login(port, "legacy", "old", true).await);
+    }
+
+    fn argon2_hash(password: &str) -> String {
+        use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+
+        let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scram_logs_in_against_the_password_file() {
+        use crate::password_file::{write_users, User};
+
+        let path = std::env::temp_dir().join(format!("mercuriod-scram-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let (hash, scram) = crate::credentials::hash_new_password("secret").unwrap();
+        let users = [
+            (
+                "alice".to_string(),
+                User {
+                    hash,
+                    scram: Some(scram),
+                },
+            ),
+            ("legacy".to_string(), User::new(argon2_hash("old"))),
+        ];
+        write_users(path, &users.into_iter().collect()).unwrap();
+        let port = broker_with(&format!("enabled = true\npassword_file = \"{path}\"\n")).await;
+        std::fs::remove_file(path).unwrap();
+        check_logins(port).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scram_logs_in_against_dynamic_security() {
+        use crate::dynsec::DynamicSecurity;
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-scram-dynsec-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "alice", "secret").unwrap();
+        // A client of an older release, without SCRAM keys
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        file["clients"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "username": "legacy", "password": argon2_hash("old") }));
+        std::fs::write(path, file.to_string()).unwrap();
+
+        let port = broker_with(&format!("enabled = true\ndynamic_security = \"{path}\"\n")).await;
+        std::fs::remove_file(path).unwrap();
+        check_logins(port).await;
     }
 
     #[test]

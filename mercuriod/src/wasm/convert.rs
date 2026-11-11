@@ -20,6 +20,13 @@ pub(crate) fn client(client: &ClientInfo) -> wit::ClientInfo {
         client_id: client.client_id.clone(),
         username: client.username.clone(),
         peer: client.peer.map(|peer| peer.to_string()),
+        connection: client.connection.as_deref().map(|c| wit::Connection {
+            listener: c.listener.to_string(),
+            protocol_version: c.protocol_version.protocol_level(),
+            tls: c.tls,
+            certificate: c.certificate.clone(),
+            mount_point: c.mount_point.clone(),
+        }),
     }
 }
 
@@ -154,10 +161,10 @@ pub(crate) fn auth_result(result: wit::AuthResult) -> (AuthResult, Option<Vec<u8
             AuthResult::Continue(challenge.data.into()),
             Some(challenge.state),
         ),
-        wit::AuthResult::Success(username) => (
+        wit::AuthResult::Success(success) => (
             AuthResult::Success {
-                username,
-                data: None,
+                username: success.username,
+                data: success.data.map(Bytes::from),
             },
             None,
         ),

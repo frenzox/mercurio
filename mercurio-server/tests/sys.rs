@@ -97,10 +97,11 @@ async fn statistics_are_published_under_sys() {
         values["$SYS/broker/publish/messages/dropped/queue_full_qos0"],
         "0"
     );
-    assert!(values.contains_key("$SYS/broker/store/batches/retried"));
-    assert!(values.contains_key("$SYS/broker/store/batches/dropped"));
-    assert_eq!(values["$SYS/broker/storage/failed batches"], "0");
-    assert_eq!(values["$SYS/broker/storage/dirty clients"], "0");
+    assert_eq!(values["$SYS/broker/storage/batches/retried"], "0");
+    assert_eq!(values["$SYS/broker/storage/batches/dropped"], "0");
+    assert_eq!(values["$SYS/broker/storage/clients/dirty"], "0");
+    assert!(!values.keys().any(|topic| topic.contains("/store/")));
+    assert_eq!(values["$SYS/broker/storage/sessions/set aside"], "0");
     // CONNECT and three 8 byte PUBLISH packets
     assert_eq!(values["$SYS/broker/bytes/received"], "40");
     // The statistics are kept apart from the retained messages stored

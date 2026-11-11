@@ -4,7 +4,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -17,14 +17,7 @@ use mercurio_storage::{MqttStore, Result as StorageResult, RetainedMessageStore}
 use tokio::time;
 use tracing::warn;
 
-use crate::{broker::Broker, session_manager::SessionManager};
-
-/// Storage batches the writers attempted again after a failure, for every
-/// broker of the process: the writers' retry loop has no broker to count in.
-pub(crate) static BATCHES_RETRIED: AtomicU64 = AtomicU64::new(0);
-
-/// Storage batches the writers gave up on, their changes lost.
-pub(crate) static BATCHES_DROPPED: AtomicU64 = AtomicU64::new(0);
+use crate::{broker::Broker, session_manager::SessionManager, writer::StorageHealth};
 
 /// Why the broker lost a message it had accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +114,14 @@ pub(crate) struct ClientCounters {
 /// storing each update would be wasted writes, and they would count toward
 /// `max_retained_messages`. Clients may not publish to `$SYS`, so only the
 /// broker and its bridges put anything there.
+///
+/// Also keeps the count of stored messages, read from the store once and
+/// kept up to date as messages are stored and removed, as the store would
+/// count them all on each retained publish under `max_retained_messages`.
 pub(crate) struct SysOverlay<S> {
     store: Arc<S>,
     sys: RwLock<BTreeMap<String, Message>>,
+    stored: tokio::sync::OnceCell<AtomicUsize>,
 }
 
 impl<S: RetainedMessageStore> SysOverlay<S> {
@@ -131,15 +129,39 @@ impl<S: RetainedMessageStore> SysOverlay<S> {
         SysOverlay {
             store,
             sys: Default::default(),
+            stored: Default::default(),
         }
     }
 
     /// Removes the `$SYS` messages an earlier version left in the store.
     pub(crate) async fn forget_stored(&self) -> StorageResult<()> {
         for message in self.store.get_retained("$SYS/#").await? {
-            self.store.store_retained(&message.topic, None).await?;
+            let existed = self.store.store_retained(&message.topic, None).await?;
+            self.count(0, usize::from(existed));
         }
         Ok(())
+    }
+
+    /// The count of stored messages, read from the store the first time.
+    async fn stored(&self) -> StorageResult<&AtomicUsize> {
+        self.stored
+            .get_or_try_init(|| async { Ok(AtomicUsize::new(self.store.count_retained().await?)) })
+            .await
+    }
+
+    /// Updates the count, once it has been read, by `added` and `removed`.
+    fn count(&self, added: usize, removed: usize) {
+        if let Some(stored) = self.stored.get() {
+            let mut count = stored.load(Ordering::Relaxed);
+            while let Err(actual) = stored.compare_exchange_weak(
+                count,
+                (count + added).saturating_sub(removed),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                count = actual;
+            }
+        }
     }
 }
 
@@ -149,43 +171,76 @@ pub(crate) fn is_sys(topic: &str) -> bool {
 
 #[async_trait]
 impl<S: RetainedMessageStore> RetainedMessageStore for SysOverlay<S> {
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> StorageResult<()> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> StorageResult<bool> {
         if !is_sys(topic) {
-            return self.store.store_retained(topic, message).await;
+            let added = message.is_some();
+            let existed = self.store.store_retained(topic, message).await?;
+            self.count(
+                usize::from(added && !existed),
+                usize::from(!added && existed),
+            );
+            return Ok(existed);
         }
         let mut sys = self.sys.write().unwrap();
-        match message {
+        Ok(match message {
             Some(message) => sys.insert(topic.to_string(), message),
             None => sys.remove(topic),
-        };
-        Ok(())
+        }
+        .is_some())
     }
 
-    async fn get_retained(&self, topic_filter: &str) -> StorageResult<Vec<Message>> {
-        let mut found = self.store.get_retained(topic_filter).await?;
+    /// The store's page merged with the `$SYS` messages, both in topic
+    /// order.
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<Message>> {
+        let mut found = self
+            .store
+            .get_retained_page(topic_filter, after, limit)
+            .await?;
         // Wildcards at the first level never match `$` topics
         if topic_filter.starts_with('$') {
             let sys = self.sys.read().unwrap();
             found.extend(
                 sys.iter()
-                    .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
+                    .filter(|(topic, message)| {
+                        after.is_none_or(|after| topic.as_str() > after)
+                            && !message.is_expired()
+                            && topic_matches_filter(topic, topic_filter)
+                    })
+                    .take(limit)
                     .map(|(_, message)| Message {
                         retain: true,
                         ..message.clone()
                     }),
             );
+            found.sort_by(|a, b| a.topic.cmp(&b.topic));
+            found.truncate(limit);
         }
         Ok(found)
     }
 
     async fn clear_all_retained(&self) -> StorageResult<()> {
         self.sys.write().unwrap().clear();
-        self.store.clear_all_retained().await
+        self.store.clear_all_retained().await?;
+        if let Some(stored) = self.stored.get() {
+            stored.store(0, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Only those stored, which `max_retained_messages` limits.
     async fn count_retained(&self) -> StorageResult<usize> {
-        self.store.count_retained().await
+        Ok(self.stored().await?.load(Ordering::Relaxed))
+    }
+
+    async fn remove_expired_retained(&self) -> StorageResult<usize> {
+        let removed = self.store.remove_expired_retained().await?;
+        self.count(0, removed);
+        Ok(removed)
     }
 }
 
@@ -258,7 +313,7 @@ pub(crate) fn counters(
     expired: u64,
     retained: usize,
     subscriptions: usize,
-    storage_failures: (u64, usize),
+    storage: StorageHealth,
 ) -> Vec<(&'static str, u64)> {
     let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     let connected = get(&stats.connected);
@@ -277,14 +332,16 @@ pub(crate) fn counters(
         ("retained messages/count", retained as u64),
         ("subscriptions/count", subscriptions as u64),
         ("publish/messages/dropped", dropped.iter().sum()),
-        ("storage/failed batches", storage_failures.0),
-        ("storage/dirty clients", storage_failures.1 as u64),
+        ("storage/batches/retried", storage.retried),
+        ("storage/batches/dropped", storage.dropped),
+        ("storage/clients/dirty", storage.dirty as u64),
     ];
     counters.extend(DROPPED_BY_CAUSE.into_iter().zip(dropped));
-    counters.push(("store/batches/retried", get(&BATCHES_RETRIED)));
-    counters.push(("store/batches/dropped", get(&BATCHES_DROPPED)));
     counters
 }
+
+/// Stored sessions set aside at restore as they couldn't be read.
+pub(crate) const SET_ASIDE: &str = "storage/sessions/set aside";
 
 /// The counters published under `$SYS/broker/`, read now.
 pub(crate) async fn current<St: MqttStore + 'static>(
@@ -292,14 +349,16 @@ pub(crate) async fn current<St: MqttStore + 'static>(
     session_manager: &SessionManager<St>,
     stats: &Stats,
 ) -> Vec<(&'static str, u64)> {
-    counters(
+    let mut counters = counters(
         stats,
         session_manager.session_count().await,
         session_manager.expired_count(),
         broker.retained_count().await,
         broker.topics().subscription_count(),
-        session_manager.storage_failures(),
-    )
+        session_manager.storage_health(),
+    );
+    counters.push((SET_ASIDE, session_manager.set_aside_count().await as u64));
+    counters
 }
 
 /// The Prometheus metric a `$SYS/broker/` counter is exposed as: its name,
@@ -343,15 +402,25 @@ fn metric(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
             gauge,
         ),
         "subscriptions/count" => ("mercurio_subscriptions", "Subscriptions", gauge),
-        "store/batches/retried" => (
+        SET_ASIDE => (
+            "mercurio_sessions_set_aside",
+            "Stored sessions set aside as they could not be read, their clients refused",
+            gauge,
+        ),
+        "storage/batches/retried" => (
             "mercurio_storage_batches_retried_total",
             "Batches of session changes written again after a storage error",
             counter,
         ),
-        "store/batches/dropped" => (
+        "storage/batches/dropped" => (
             "mercurio_storage_batches_dropped_total",
             "Batches of session changes given up on after storage errors",
             counter,
+        ),
+        "storage/clients/dirty" => (
+            "mercurio_storage_dirty_clients",
+            "Clients whose stored state differs from the broker's until it is stored whole again",
+            gauge,
         ),
         "connections" => (
             "mercurio_connections_total",
@@ -474,6 +543,58 @@ async fn publish<St: MqttStore>(broker: &Broker<St>, name: &str, value: String) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retained(topic: &str) -> Message {
+        Message {
+            packet_id: None,
+            topic: Arc::from(topic),
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            payload: Some(Bytes::from_static(b"1")),
+            properties: Default::default(),
+            expires_at: None,
+            subscription_identifiers: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// Pages of `$SYS` lookups hold the stored messages and those in memory
+    /// in one topic order.
+    #[tokio::test]
+    async fn test_pages_merge_the_messages_in_memory() {
+        let store = Arc::new(mercurio_storage::memory::MemoryStore::new());
+        for topic in ["$SYS/b", "$SYS/d"] {
+            store
+                .store_retained(topic, Some(retained(topic)))
+                .await
+                .unwrap();
+        }
+        let overlay = SysOverlay::new(store);
+        for topic in ["$SYS/a", "$SYS/c", "$SYS/e"] {
+            overlay
+                .store_retained(topic, Some(retained(topic)))
+                .await
+                .unwrap();
+        }
+        let mut topics = Vec::new();
+        loop {
+            let after = topics.last().cloned();
+            let page = overlay
+                .get_retained_page("$SYS/#", after.as_deref(), 2)
+                .await
+                .unwrap();
+            assert!(page.len() <= 2);
+            let last = page.len() < 2;
+            topics.extend(page.iter().map(|m| m.topic.to_string()));
+            if last {
+                break;
+            }
+        }
+        assert_eq!(topics, ["$SYS/a", "$SYS/b", "$SYS/c", "$SYS/d", "$SYS/e"]);
+        // Only those stored count
+        assert_eq!(overlay.count_retained().await.unwrap(), 2);
+    }
 
     #[test]
     fn test_load_averages_approach_the_rate() {

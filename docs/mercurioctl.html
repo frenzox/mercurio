@@ -58,6 +58,9 @@ mercurioctl client list
 <span class="comment"># Another broker, over TLS; asks for the password</span>
 mercurioctl -H broker.example.com -p 8883 --tls -u ops client list
 
+<span class="comment"># Logging in with SCRAM-SHA-256, so the password never reaches the broker</span>
+mercurioctl -H broker.example.com --auth-method scram-sha-256 -u ops client list
+
 <span class="comment"># An admin socket somewhere else</span>
 mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <p>Connection options go before the command. Each can also be set with an environment variable, which the option overrides:</p>

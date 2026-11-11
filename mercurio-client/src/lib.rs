@@ -20,6 +20,7 @@ mod error;
 mod event;
 mod options;
 mod redirect;
+mod scram;
 #[cfg(feature = "tls")]
 mod tls;
 #[cfg(feature = "websocket")]
@@ -34,6 +35,7 @@ pub use mercurio_packets::subscribe::{RetainHandling, SubscriptionOptions};
 pub use options::{
     Authenticator, Backoff, ConnectOptions, MessageProperties, RequestOptions, Will,
 };
+pub use scram::ScramSha256;
 
 // Types of the public API that come from other crates, so applications
 // need no direct dependency on them

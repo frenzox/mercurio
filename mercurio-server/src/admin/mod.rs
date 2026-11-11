@@ -287,7 +287,8 @@ pub(crate) struct AdminParts {
 pub(crate) trait Directory: Send + Sync {
     fn session_count(&self) -> BoxFuture<'_, usize>;
     fn expired_count(&self) -> u64;
-    fn storage_failures(&self) -> (u64, usize);
+    fn storage_health(&self) -> crate::writer::StorageHealth;
+    fn set_aside_count(&self) -> BoxFuture<'_, usize>;
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>>;
     fn entry<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<ClientEntry>>;
     fn close_connection<'a>(&'a self, client_id: &'a str, close: Close) -> BoxFuture<'a, bool>;
@@ -313,8 +314,12 @@ impl<S: BatchStore + 'static> Directory for SessionManager<S> {
         SessionManager::expired_count(self)
     }
 
-    fn storage_failures(&self) -> (u64, usize) {
-        SessionManager::storage_failures(self)
+    fn storage_health(&self) -> crate::writer::StorageHealth {
+        SessionManager::storage_health(self)
+    }
+
+    fn set_aside_count(&self) -> BoxFuture<'_, usize> {
+        Box::pin(SessionManager::set_aside_count(self))
     }
 
     fn entries(&self) -> BoxFuture<'_, Vec<ClientEntry>> {
@@ -419,14 +424,18 @@ impl Admin {
     pub async fn info(&self) -> BrokerInfo {
         let inner = &self.inner;
         let retained = inner.retained.count_retained().await.unwrap_or(0);
-        let counters = sys::counters(
+        let mut counters = sys::counters(
             &inner.stats,
             inner.directory.session_count().await,
             inner.directory.expired_count(),
             retained,
             inner.topics.subscription_count(),
-            inner.directory.storage_failures(),
+            inner.directory.storage_health(),
         );
+        counters.push((
+            sys::SET_ASIDE,
+            inner.directory.set_aside_count().await as u64,
+        ));
         BrokerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: inner.started_at,

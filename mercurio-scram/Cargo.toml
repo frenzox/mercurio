@@ -1,0 +1,20 @@
+[package]
+name = "mercurio-scram"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "SCRAM-SHA-256 message handling and key derivation for the Mercurio MQTT implementation"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+homepage = "https://frenzox.github.io/mercurio/"
+keywords = ["mqtt", "scram", "sasl", "authentication"]
+categories = ["authentication", "cryptography"]
+
+[dependencies]
+base64 = "0.23.1"
+getrandom = "0.4"
+hmac = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = "0.11.1"
+stringprep = "0.1.5"
+subtle = "2.6"

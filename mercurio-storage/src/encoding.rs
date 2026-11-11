@@ -3,7 +3,7 @@
 use bytes::BytesMut;
 use mercurio_core::{codec::Encoder, error::EncodeError, message::MessageProperties, qos::QoS};
 
-use crate::{StorageError, StoredSubscription};
+use crate::{Result, StorageError, StoredSubscription};
 
 pub(crate) fn qos_to_int(qos: QoS) -> i32 {
     match qos {
@@ -13,43 +13,23 @@ pub(crate) fn qos_to_int(qos: QoS) -> i32 {
     }
 }
 
-/// A stored QoS column that holds anything but 0, 1 or 2.
-#[derive(Debug)]
-pub(crate) struct InvalidQoS(i32);
-
-impl std::fmt::Display for InvalidQoS {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid stored QoS {}", self.0)
+/// Fails for a value no version stores, rather than read it as a QoS the
+/// broker would then have to refuse.
+pub(crate) fn int_to_qos(val: i32) -> Result<QoS> {
+    match val {
+        0 => Ok(QoS::AtMostOnce),
+        1 => Ok(QoS::AtLeastOnce),
+        2 => Ok(QoS::ExactlyOnce),
+        _ => Err(StorageError::SerializationError(format!(
+            "{val} is not a QoS"
+        ))),
     }
-}
-
-impl std::error::Error for InvalidQoS {}
-
-impl From<InvalidQoS> for StorageError {
-    fn from(e: InvalidQoS) -> Self {
-        StorageError::SerializationError(e.to_string())
-    }
-}
-
-/// Fails like any other unreadable column.
-#[cfg(feature = "sqlite")]
-impl From<InvalidQoS> for rusqlite::Error {
-    fn from(e: InvalidQoS) -> Self {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(e))
-    }
-}
-
-pub(crate) fn int_to_qos(val: i32) -> Result<QoS, InvalidQoS> {
-    u8::try_from(val)
-        .ok()
-        .and_then(|n| QoS::try_from(n).ok())
-        .ok_or(InvalidQoS(val))
 }
 
 /// A message's properties as a column value. Properties MQTT can't carry
 /// fail the statement, like any other value the database refuses.
 #[derive(Debug)]
-pub(crate) struct EncodedProperties(Result<Vec<u8>, EncodeError>);
+pub(crate) struct EncodedProperties(std::result::Result<Vec<u8>, EncodeError>);
 
 pub(crate) fn encode_properties(properties: &MessageProperties) -> EncodedProperties {
     let mut buffer = BytesMut::new();
@@ -72,7 +52,8 @@ impl tokio_postgres::types::ToSql for EncodedProperties {
         &self,
         ty: &tokio_postgres::types::Type,
         out: &mut BytesMut,
-    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> std::result::Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    {
         match &self.0 {
             Ok(bytes) => bytes.to_sql(ty, out),
             Err(e) => Err(Box::new(*e)),
@@ -113,19 +94,31 @@ pub(crate) fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> Stri
         .join("\0")
 }
 
-pub(crate) fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
+/// Fails for subscriptions that can't be read whole, as every other
+/// stored row does, rather than leave them out.
+pub(crate) fn decode_subscriptions(encoded: &str) -> Result<Vec<StoredSubscription>> {
     encoded
         .split('\0')
-        .filter_map(|s| {
-            let (flags, rest) = s.split_at_checked(3)?;
-            let (identifier, topic_filter) = rest.split_once(':')?;
-            let flags: Vec<u8> = flags.bytes().map(|b| b.wrapping_sub(b'0')).collect();
-            Some(StoredSubscription {
+        .map(|s| {
+            let invalid =
+                || StorageError::SerializationError(format!("invalid stored subscription `{s}`"));
+            let (flags, rest) = s.split_at_checked(3).ok_or_else(invalid)?;
+            let (identifier, topic_filter) = rest.split_once(':').ok_or_else(invalid)?;
+            let flag = |index: usize| match flags.as_bytes()[index] {
+                b'0' => Ok(false),
+                b'1' => Ok(true),
+                _ => Err(invalid()),
+            };
+            let qos = flags.as_bytes()[0].wrapping_sub(b'0');
+            Ok(StoredSubscription {
                 topic_filter: topic_filter.to_string(),
-                qos: QoS::try_from(flags[0]).ok()?,
-                no_local: flags[1] == 1,
-                retain_as_published: flags[2] == 1,
-                subscription_identifier: identifier.parse().ok(),
+                qos: int_to_qos(i32::from(qos)).map_err(|_| invalid())?,
+                no_local: flag(1)?,
+                retain_as_published: flag(2)?,
+                subscription_identifier: match identifier {
+                    "" => None,
+                    identifier => Some(identifier.parse().map_err(|_| invalid())?),
+                },
             })
         })
         .collect()
@@ -136,12 +129,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stored_qos_outside_0_to_2_is_an_error() {
-        for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
-            assert_eq!(int_to_qos(qos_to_int(qos)).unwrap(), qos);
-        }
-        for stored in [-1, 3, 256] {
-            assert!(int_to_qos(stored).is_err(), "{stored}");
+    fn test_subscriptions_that_cannot_be_read_are_an_error() {
+        let subscriptions = vec![
+            StoredSubscription {
+                no_local: true,
+                retain_as_published: false,
+                subscription_identifier: Some(7),
+                ..StoredSubscription::new("a/+:x", QoS::ExactlyOnce)
+            },
+            StoredSubscription::new("b", QoS::AtMostOnce),
+        ];
+        let encoded = encode_subscriptions(&subscriptions);
+        assert_eq!(decode_subscriptions(&encoded).unwrap(), subscriptions);
+
+        for bad in [
+            "9007:a",
+            "1x0:a",
+            "100",
+            "100x:a",
+            &format!("{encoded}\0junk"),
+        ] {
+            assert!(
+                matches!(
+                    decode_subscriptions(bad),
+                    Err(StorageError::SerializationError(_))
+                ),
+                "{bad:?}"
+            );
         }
     }
 
@@ -162,9 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_subscription_with_a_bad_qos_is_skipped() {
-        let decoded = decode_subscriptions("100:a\u{0}300:b");
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].topic_filter, "a");
+    fn test_unknown_qos_values_are_an_error() {
+        assert_eq!(int_to_qos(2).unwrap(), QoS::ExactlyOnce);
+        assert!(int_to_qos(3).is_err());
+        assert!(int_to_qos(-1).is_err());
     }
 }

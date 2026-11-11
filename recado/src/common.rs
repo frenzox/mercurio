@@ -78,6 +78,11 @@ impl WillArgs {
 impl ConnectionArgs {
     /// Convert CLI arguments to ConnectOptions.
     pub fn to_connect_options(&self) -> Result<ConnectOptions, Failure> {
+        if self.connect.auth_method.is_some() && self.protocol_version != Protocol::V5 {
+            return Err(Failure::Usage(
+                "--auth-method needs MQTT 5, which -V 5 selects".to_string(),
+            ));
+        }
         let options = self
             .connect
             .to_connect_options()

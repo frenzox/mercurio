@@ -1,0 +1,20 @@
+[package]
+name = "interface-0-1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The bindings come straight from the frozen 0.1 interface, as the SDK
+# follows the current one
+[dependencies]
+wit-bindgen = "0.63"
+
+[profile.release]
+opt-level = "s"
+
+# Its own workspace: cargo would otherwise take the nearest workspace above it,
+# which in a checkout nested in another (a git worktree) does not list it
+[workspace]

@@ -14,7 +14,9 @@ use mercurio_packets::{
     ControlPacket,
 };
 use mercurio_server::{
-    plugin::{ready, BoxFuture, ClientInfo, MessageAction, Plugin, PluginMessage},
+    plugin::{
+        ready, Access, BoxFuture, ClientInfo, Decision, Event, MessageAction, Plugin, PluginMessage,
+    },
     server::ServerConfig,
 };
 use tokio::{
@@ -461,4 +463,56 @@ async fn message_hook_cant_move_messages_to_reserved_topics() {
     assert_eq!(delivered.topic_name, "plain/x");
     assert!(subscriber.receive().await.is_none());
     assert_eq!(redirect.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// Keeps the client of every `Connected` event and authorization it sees.
+#[derive(Default)]
+struct Witness(std::sync::Mutex<Vec<ClientInfo>>);
+
+impl Plugin for Witness {
+    fn name(&self) -> &str {
+        "witness"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        _topic: &'a str,
+        _access: Access,
+    ) -> BoxFuture<'a, Decision> {
+        self.0.lock().unwrap().push(client.clone());
+        ready(Decision::Defer)
+    }
+
+    fn on_event<'a>(&'a self, event: &'a Event) -> BoxFuture<'a, ()> {
+        if let Event::Connected { client, .. } = event {
+            self.0.lock().unwrap().push(client.clone());
+        }
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn plugins_see_the_connection_of_a_client() {
+    let witness = Arc::new(Witness::default());
+    let addr = start_broker(vec![witness.clone()]).await;
+    let mut client = Client::connect(addr, "seen").await;
+    client.subscribe("a").await;
+    for _ in 0..200 {
+        if witness.0.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let seen = witness.0.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for client in seen {
+        let connection = client.connection.expect("the connection");
+        assert_eq!(&*connection.listener, addr.to_string());
+        assert_eq!(connection.protocol_version, ProtocolVersion::V5);
+        assert!(!connection.tls);
+        assert_eq!(connection.certificate, None);
+        assert_eq!(connection.mount_point, None);
+    }
 }

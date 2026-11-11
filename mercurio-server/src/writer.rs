@@ -49,6 +49,18 @@ pub(crate) trait Snapshots: Send + Sync {
     fn snapshot<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<Vec<Write>>>;
 }
 
+/// How the writers of one broker fared with storage.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageHealth {
+    /// Batches attempted again after a failure
+    pub retried: u64,
+    /// Batches given up on, the client's state then stored whole instead
+    pub dropped: u64,
+    /// Clients whose stored state differs from the broker's until it is
+    /// stored whole again
+    pub dirty: usize,
+}
+
 /// How storage has been failing the writers.
 #[derive(Default)]
 struct Health {
@@ -56,6 +68,8 @@ struct Health {
     /// given up, so storage holds something else than the broker until
     /// their state is stored whole again
     dirty: Mutex<HashSet<String>>,
+    /// Batches attempted again after a failure since the broker started
+    retried: AtomicU64,
     /// Batches given up since the broker started
     failed: AtomicU64,
     snapshots: OnceLock<Box<dyn Snapshots>>,
@@ -162,13 +176,14 @@ impl<S: BatchStore + 'static> Writers<S> {
         let _ = self.health.snapshots.set(snapshots);
     }
 
-    /// Batches given up since the broker started, and clients whose stored
-    /// state is dirty because of them.
-    pub(crate) fn failures(&self) -> (u64, usize) {
-        (
-            self.health.failed.load(Ordering::Relaxed),
-            self.health.dirty.lock().unwrap().len(),
-        )
+    /// Batches retried and given up since the broker started, and clients
+    /// whose stored state is dirty because of them.
+    pub(crate) fn health(&self) -> StorageHealth {
+        StorageHealth {
+            retried: self.health.retried.load(Ordering::Relaxed),
+            dropped: self.health.failed.load(Ordering::Relaxed),
+            dirty: self.health.dirty.lock().unwrap().len(),
+        }
     }
 
     /// The client's writer, started if it has none.
@@ -344,7 +359,7 @@ async fn run<S: BatchStore>(
         } else {
             compact(&mut batch);
             if !batch.is_empty() {
-                if apply(storage.as_ref(), &client_id, &batch).await == Applied::GaveUp {
+                if apply(storage.as_ref(), &client_id, &batch, &health).await == Applied::GaveUp {
                     health.failed.fetch_add(1, Ordering::Relaxed);
                     health.dirty.lock().unwrap().insert(client_id.clone());
                     dirty = true;
@@ -419,7 +434,12 @@ enum Applied {
 /// Applies a batch, retrying with a growing delay, as storage on another
 /// host fails now and then. Changes are applied again whole, which they
 /// allow.
-async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) -> Applied {
+async fn apply<S: BatchStore>(
+    storage: &S,
+    client_id: &str,
+    batch: &[Write],
+    health: &Health,
+) -> Applied {
     let mut retry = Retry::default();
     loop {
         let Err(e) = storage.apply(client_id, batch).await else {
@@ -427,7 +447,7 @@ async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) -> 
         };
         match retry.after(&e) {
             Some(delay) => {
-                crate::sys::Stats::add(&crate::sys::BATCHES_RETRIED);
+                health.retried.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "Failed to store changes for `{}`, retrying: {}",
                     client_id, e
@@ -436,7 +456,6 @@ async fn apply<S: BatchStore>(storage: &S, client_id: &str, batch: &[Write]) -> 
             }
             None if matches!(e, StorageError::Fenced) => return Applied::Fenced,
             None => {
-                crate::sys::Stats::add(&crate::sys::BATCHES_DROPPED);
                 error!(
                     "Gave up storing {} changes for `{}`, storing its whole state instead \
                      once storage takes it: {}",
@@ -509,7 +528,7 @@ impl Retry {
 
 #[cfg(test)]
 mod tests {
-    use mercurio_storage::{memory::MemoryStore, SessionStore, WillStore};
+    use mercurio_storage::memory::MemoryStore;
 
     use super::*;
 
@@ -672,6 +691,6 @@ mod tests {
         writers.settle("c").await;
         tokio::task::yield_now().await;
         assert!(writers.entries.lock().unwrap().is_empty());
-        assert!(storage.get_will("c").await.unwrap().is_none());
+        assert!(storage.load_will("c").await.unwrap().is_none());
     }
 }

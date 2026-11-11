@@ -67,6 +67,7 @@ the password on a terminal; `MERCURIOCTL_PASSWORD` keeps it out of `ps`.
 | `-H, --host`, `-p, --port` | Broker over TCP | admin socket, else `localhost:1883` |
 | `--unix` | Broker over a Unix socket | |
 | `-u, --username`, `-P, --password` | Credentials | |
+| `--auth-method scram-sha-256` | Log in with SCRAM-SHA-256, so the password never reaches the broker; needs `-u` | |
 | `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
 | `--ws`, `--ws-path` | MQTT over WebSocket, `wss://` with `--tls`, at the path given (`MERCURIOCTL_WS`, `MERCURIOCTL_WS_PATH`) | `/mqtt` |

@@ -9,9 +9,20 @@ use wasmtime::{
 
 use super::sandbox::State;
 
+/// The current interface, 0.2.
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "wit",
+        world: "plugin",
+        imports: { default: async },
+        exports: { default: async },
+    });
+}
+
+/// Interface 0.1, for plugins built before 0.2.
+pub(crate) mod bindings_0_1 {
+    wasmtime::component::bindgen!({
+        path: "wit-0.1",
         world: "plugin",
         imports: { default: async },
         exports: { default: async },
@@ -49,6 +60,7 @@ impl Runtime {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         bindings::Plugin::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
+        bindings_0_1::Plugin::add_to_linker::<State, HasSelf<State>>(&mut linker, |state| state)?;
         Ok(Runtime { engine, linker })
     }
 }

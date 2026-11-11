@@ -11,6 +11,8 @@ keywords = ["mqtt", "broker", "sqlite", "postgres", "persistence"]
 categories = ["network-programming", "database"]
 
 [features]
+# The `testing` module: the conformance suite every store should pass
+test-util = []
 sqlite = ["dep:rusqlite", "dep:tokio"]
 postgres = [
     "dep:tokio",

@@ -3,22 +3,88 @@
 use std::collections::HashMap;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use mercurio_server::auth::{ScramCredentialStore, StoredCredentials};
 use mercurio_server::plugin::{
-    BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
+    ready, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 
 /// Credential validator for the password file's `username:hash` entries,
 /// where the hash is an Argon2 PHC string, as `mercuriod passwd` writes, or
-/// one of `mosquitto_passwd`'s, see [`check_hash`].
+/// one of `mosquitto_passwd`'s, see [`check_hash`], and the SCRAM-SHA-256
+/// credentials set along with some of them.
 pub struct HashedCredentialValidator {
     /// Map of username -> password hash.
     credentials: HashMap<String, String>,
+    scram: HashMap<String, StoredCredentials>,
 }
 
 impl HashedCredentialValidator {
     pub fn new(credentials: HashMap<String, String>) -> Self {
-        Self { credentials }
+        Self {
+            credentials,
+            scram: HashMap::new(),
+        }
     }
+
+    /// With these users' SCRAM-SHA-256 credentials.
+    pub fn with_scram(mut self, scram: HashMap<String, StoredCredentials>) -> Self {
+        self.scram = scram;
+        self
+    }
+}
+
+impl ScramCredentialStore for HashedCredentialValidator {
+    fn scram_credentials<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        username: &'a str,
+    ) -> BoxFuture<'a, Option<StoredCredentials>> {
+        ready(self.scram.get(username).cloned())
+    }
+}
+
+/// A new password's Argon2 hash, for user name and password logins, and
+/// its SCRAM-SHA-256 credentials, as [`scram_entry`] stores them.
+pub fn hash_new_password(password: &str) -> Result<(String, String), String> {
+    use argon2::{password_hash::SaltString, PasswordHasher};
+
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| format!("Failed to hash password: {e}"))?
+        .to_string();
+    let scram = StoredCredentials::generate(password, mercurio_scram::DEFAULT_ITERATIONS)
+        .map_err(|e| format!("Failed to derive SCRAM credentials: {e}"))?;
+    let entry = scram_entry(&hash, &scram);
+    Ok((hash, entry))
+}
+
+/// What ties SCRAM credentials to the password hash set with them: a
+/// digest of the hash. A tool that changes the hash and not the SCRAM
+/// credentials, such as `mosquitto_passwd` or an older `mercuriod`, leaves
+/// a digest that no longer matches, so the old password stops working.
+fn scram_binding(hash: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sha2::{Digest, Sha256};
+
+    STANDARD.encode(Sha256::digest(hash.as_bytes()))
+}
+
+/// `credentials` stored next to the password `hash`:
+/// `<binding>:SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`,
+/// the binding being [`scram_binding`] and the rest RFC 5803's form.
+pub fn scram_entry(hash: &str, credentials: &StoredCredentials) -> String {
+    format!("{}:{credentials}", scram_binding(hash))
+}
+
+/// The SCRAM credentials of `entry`, or None when they were set with
+/// another password than `hash`'s. The error does not repeat `entry`.
+pub fn scram_credentials(hash: &str, entry: &str) -> Result<Option<StoredCredentials>, String> {
+    let (binding, credentials) = entry
+        .split_once(':')
+        .ok_or("SCRAM credentials have the form `<binding>:SCRAM-SHA-256$...`")?;
+    let credentials: StoredCredentials = credentials.parse().map_err(|e| format!("{e}"))?;
+    Ok((binding == scram_binding(hash)).then_some(credentials))
 }
 
 impl HashedCredentialValidator {
@@ -256,6 +322,23 @@ mod tests {
         let validator = HashedCredentialValidator::new(creds);
 
         assert!(!validator.check("nobody", b"pass"));
+    }
+
+    #[test]
+    fn test_scram_credentials_hold_only_for_the_hash_set_with_them() {
+        let (hash, entry) = hash_new_password("secret").unwrap();
+        let credentials = scram_credentials(&hash, &entry).unwrap().unwrap();
+        assert_eq!(credentials.iterations, mercurio_scram::DEFAULT_ITERATIONS);
+        assert!(verify(&hash, b"secret"));
+
+        // The password changed by a tool that kept the old SCRAM keys
+        let other = hash_password("other");
+        assert_eq!(scram_credentials(&other, &entry).unwrap(), None);
+
+        for bad in ["", "binding", "binding:SCRAM-SHA-256$4096:c2FsdA=="] {
+            let error = scram_credentials(&hash, bad).unwrap_err();
+            assert!(!error.contains("c2FsdA"), "{error}");
+        }
     }
 
     #[test]
