@@ -300,7 +300,7 @@ pub struct ConnectOptions {
     pub(crate) session_expiry: u32,
     pub(crate) will: Option<Will>,
     pub(crate) protocol_version: ProtocolVersion,
-    pub(crate) connect_timeout_secs: u64,
+    pub(crate) connect_timeout: Duration,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
     pub(crate) reconnect_max: Option<Duration>,
@@ -332,7 +332,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("session_expiry", &self.session_expiry)
             .field("will", &self.will)
             .field("protocol_version", &self.protocol_version)
-            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("connect_timeout", &self.connect_timeout)
             .field("tls", &self.tls)
             .field("reconnect_delay", &self.reconnect_delay)
             .field("reconnect_max", &self.reconnect_max)
@@ -395,7 +395,7 @@ impl ConnectOptions {
             session_expiry: 0,
             will: None,
             protocol_version: ProtocolVersion::V5,
-            connect_timeout_secs: 30,
+            connect_timeout: Duration::from_secs(30),
             tls: TlsOptions::default(),
             reconnect_delay: None,
             reconnect_max: None,
@@ -638,9 +638,10 @@ impl ConnectOptions {
         })
     }
 
-    /// Set the connection timeout in seconds.
-    pub fn connect_timeout(mut self, seconds: u64) -> Self {
-        self.connect_timeout_secs = seconds;
+    /// Longest the connection may take to open, TLS handshake and CONNECT
+    /// included, 30 seconds unless set.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }
@@ -669,6 +670,14 @@ mod tests {
         assert!(spread.len() > 1, "no jitter");
         // A maximum below the minimum gives way
         assert_eq!(Backoff::new(ms(100), ms(10)).next_delay(), ms(100));
+    }
+
+    #[test]
+    fn test_connect_timeout_takes_a_duration_as_the_other_timeouts() {
+        let options = ConnectOptions::new("localhost", 1883);
+        assert_eq!(options.connect_timeout, Duration::from_secs(30));
+        let options = options.connect_timeout(Duration::from_millis(1500));
+        assert_eq!(options.connect_timeout, Duration::from_millis(1500));
     }
 
     #[test]

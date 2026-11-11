@@ -98,7 +98,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>manual_acks(bool)</code></td><td>Acknowledge QoS 1 and 2 messages when the application calls <code>ack</code>, not on receipt</td></tr>
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
 <tr><td><code>connector(f)</code></td><td>Open the stream with <code>f</code> instead of TCP</td></tr>
-<tr><td><code>connect_timeout(seconds)</code></td><td>Longest wait for the connection, 30 by default</td></tr>
+<tr><td><code>connect_timeout(Duration)</code></td><td>Longest wait for the connection, CONNACK included, 30 seconds by default</td></tr>
 <tr><td><code>write_timeout(duration)</code></td><td>Longest a packet may take to write before the connection counts as lost; the keep-alive by default, or 30 seconds with a keep-alive of 0</td></tr>
 </table>
 <p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own.</p>

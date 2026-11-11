@@ -868,7 +868,10 @@ mod tests {
             .unwrap();
             let mut bridge = prepare(config, connector.clone()).unwrap();
             bridge.retry = Backoff::new(Duration::from_millis(100), Duration::from_millis(400));
-            bridge.local_options = bridge.local_options.keep_alive(1).connect_timeout(1);
+            bridge.local_options = bridge
+                .local_options
+                .keep_alive(1)
+                .connect_timeout(Duration::from_secs(1));
             let status = Arc::clone(&bridge.status);
             (status, tokio::spawn(bridge.run()))
         }

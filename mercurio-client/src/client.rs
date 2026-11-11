@@ -112,7 +112,7 @@ impl MqttClient {
             return Ok((connection, session));
         }
 
-        let connect_timeout = Duration::from_secs(options.connect_timeout_secs);
+        let connect_timeout = options.connect_timeout;
         #[cfg(unix)]
         if let Some(path) = &options.unix_path {
             info!("Connecting to MQTT broker at {}", path.display());
@@ -161,13 +161,10 @@ impl MqttClient {
 
         // Answer the broker's challenges until it sends CONNACK
         let connack = loop {
-            let packet = timeout(
-                Duration::from_secs(options.connect_timeout_secs),
-                connection.read_packet(),
-            )
-            .await
-            .map_err(|_| ClientError::Timeout)??
-            .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
+            let packet = timeout(options.connect_timeout, connection.read_packet())
+                .await
+                .map_err(|_| ClientError::Timeout)??
+                .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
             let ControlPacket::Auth(auth) = packet else {
                 break packet;
             };

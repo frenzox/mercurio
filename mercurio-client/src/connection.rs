@@ -43,7 +43,7 @@ impl Connection {
             protocol_version: options.protocol_version,
             max_packet_size: None,
             max_incoming_size: options.incoming_packet_limit(),
-            write_timeout: Duration::from_secs(options.connect_timeout_secs),
+            write_timeout: options.connect_timeout,
             broken: false,
         }
     }
