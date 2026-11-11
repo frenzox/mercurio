@@ -1,6 +1,8 @@
 //! The `$CONTROL/broker/v1` commands only the daemon can serve: the ones
 //! about its configuration, files, logs and bridges.
 
+use std::sync::Arc;
+
 use mercurio_server::{
     admin::{AdminError, AdminExtension},
     plugin::BoxFuture,
@@ -10,10 +12,13 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::logging::LogLevel;
+use crate::reload::{self, Reload};
 
 /// Serves the daemon's commands, as the broker's `AdminExtension`.
 pub struct DaemonCommands {
     log_level: LogLevel,
+    /// The files SIGHUP rereads too
+    reloadable: Arc<[Arc<dyn Reload>]>,
 }
 
 #[derive(Deserialize)]
@@ -23,7 +28,21 @@ struct LevelArgs {
 
 impl DaemonCommands {
     pub fn new(log_level: LogLevel) -> Self {
-        DaemonCommands { log_level }
+        DaemonCommands {
+            log_level,
+            reloadable: Arc::new([]),
+        }
+    }
+
+    /// Reloads `files` on `reload`.
+    pub fn with_reload(mut self, files: Arc<[Arc<dyn Reload>]>) -> Self {
+        self.reloadable = files;
+        self
+    }
+
+    fn reload(&self) -> Value {
+        info!("Reloading on request");
+        json!({ "items": reload::reload_all(&self.reloadable) })
     }
 
     fn set_log_level(&self, args: &Value) -> Result<Value, AdminError> {
@@ -44,6 +63,7 @@ impl AdminExtension for DaemonCommands {
             Some(match command {
                 "getLogLevel" => Ok(json!({ "level": self.log_level.get() })),
                 "setLogLevel" => self.set_log_level(args),
+                "reload" => Ok(self.reload()),
                 _ => return None,
             })
         })
@@ -69,6 +89,7 @@ mod tests {
 
     use super::DaemonCommands;
     use crate::logging::LogLevel;
+    use crate::reload::{Reload, Reloadable};
 
     /// Serves a broker with `commands` and an in-process listener.
     async fn start(commands: Arc<DaemonCommands>, local_listener: LocalListener) {
@@ -148,5 +169,38 @@ mod tests {
         let level = commands.handle("getLogLevel", &json!({})).await.unwrap();
         assert_eq!(level.unwrap()["level"], "warn");
         assert!(commands.handle("getlogLevel", &json!({})).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reload_reports_each_file() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-commands-acl-{}", std::process::id()));
+        std::fs::write(&path, "topic read public/#\n").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        let acl: Arc<dyn Reload> =
+            Arc::new(Reloadable::load(&path_str, crate::load_acl_file).unwrap());
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let commands = DaemonCommands::new(log_level).with_reload(vec![acl].into());
+        let args = json!({ "command": "reload" });
+
+        let result = commands.handle("reload", &args).await.unwrap().unwrap();
+        assert_eq!(
+            result,
+            json!({ "items": [{ "item": "acl-file", "path": path_str, "ok": true }] })
+        );
+
+        std::fs::write(&path, "bogus\n").unwrap();
+        let result = commands.handle("reload", &args).await.unwrap().unwrap();
+        assert_eq!(result["items"][0]["ok"], false, "{result}");
+        let error = result["items"][0]["error"].as_str().unwrap();
+        assert!(error.contains("unknown keyword"), "{error}");
+        std::fs::remove_file(&path).unwrap();
+
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let none = DaemonCommands::new(log_level);
+        assert_eq!(
+            none.handle("reload", &args).await.unwrap(),
+            Ok(json!({ "items": [] }))
+        );
     }
 }

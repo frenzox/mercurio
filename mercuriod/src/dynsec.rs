@@ -607,8 +607,22 @@ impl DynamicSecurity {
 fn read(path: &str) -> Result<Data, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read dynamic security file {path}: {e}"))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Invalid dynamic security file {path}: {e}"))
+    serde_json::from_str(&contents).map_err(|e| {
+        // serde_json quotes the offending value, which can be a hash or a
+        // salt, and the returned text reaches admin clients
+        error!("Invalid dynamic security file {path}: {e}");
+        let category = match e.classify() {
+            serde_json::error::Category::Io => "io",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "data",
+            serde_json::error::Category::Eof => "eof",
+        };
+        format!(
+            "Invalid dynamic security file {path}: {category} error at line {} column {}",
+            e.line(),
+            e.column()
+        )
+    })
 }
 
 /// Replaces the file in one step, so a crash never leaves half of it.
@@ -722,6 +736,10 @@ impl Reload for DynamicSecurity {
     fn path(&self) -> &str {
         &self.path
     }
+
+    fn item(&self) -> &str {
+        self.name()
+    }
 }
 
 #[cfg(test)]
@@ -754,6 +772,28 @@ mod tests {
             .await
             .is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_reload_error_does_not_quote_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-secret-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = std::sync::Arc::new(DynamicSecurity::load(path).unwrap());
+        std::fs::write(
+            path,
+            "{\n \"clients\": [{\"username\": \"a\", \"disabled\": \"SECRET-hash\"}]\n}",
+        )
+        .unwrap();
+
+        let files: Vec<std::sync::Arc<dyn Reload>> = vec![security];
+        let items = crate::reload::reload_all(&files);
+        let error = items[0].error.as_deref().unwrap();
+        assert!(!error.contains("SECRET-hash"), "{error}");
+        assert!(error.contains("data error at line 2"), "{error}");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

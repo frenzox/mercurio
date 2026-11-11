@@ -303,7 +303,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bridge::spawn(bridge, connector.clone())?;
     }
 
-    let commands = Arc::new(commands::DaemonCommands::new(log_level));
+    let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
+    let commands =
+        Arc::new(commands::DaemonCommands::new(log_level).with_reload(Arc::clone(&reloadable)));
 
     let mut server_config = ServerConfig::default();
     server_config.tls = tls_config;
@@ -559,21 +561,17 @@ async fn load_plugins(
     }
 }
 
-/// Rereads the ACL and password files and the WebAssembly plugins on
-/// SIGHUP. ACL and plugin changes apply to every later check or call;
-/// password changes apply to later connections.
+/// Rereads the ACL, password and dynamic security files and the
+/// WebAssembly plugins on SIGHUP, as the `reload` command does. ACL and
+/// plugin changes apply to every later check or call; password changes
+/// apply to later connections.
 #[cfg(unix)]
-async fn reload_on_sighup(files: Vec<Arc<dyn Reload>>) {
+async fn reload_on_sighup(files: Arc<[Arc<dyn Reload>]>) {
     let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup())
         .expect("failed to listen for SIGHUP");
     while hangup.recv().await.is_some() {
         info!("Received SIGHUP, reloading");
-        for file in &files {
-            match file.reload() {
-                Ok(()) => info!("Reloaded {}", file.path()),
-                Err(e) => error!("Keeping the previous {}: {}", file.path(), e),
-            }
-        }
+        reload::reload_all(&files);
     }
 }
 

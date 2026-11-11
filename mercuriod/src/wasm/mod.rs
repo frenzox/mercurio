@@ -145,6 +145,10 @@ impl Reload for Reloader {
     fn path(&self) -> &str {
         &self.path
     }
+
+    fn item(&self) -> &str {
+        self.plugin.name()
+    }
 }
 
 impl Loaded {

@@ -1,10 +1,12 @@
-//! Files the daemon rereads on SIGHUP.
+//! Files the daemon rereads on SIGHUP and on the `reload` command.
 
 use std::sync::{Arc, OnceLock, RwLock};
 
 use mercurio_server::plugin::{
     Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginStatus,
 };
+use serde::Serialize;
+use tracing::{error, info};
 
 type Loader<T> = fn(&str) -> Result<T, String>;
 
@@ -49,9 +51,11 @@ impl<T> Reloadable<T> {
 pub trait Reload: Send + Sync {
     fn reload(&self) -> Result<(), String>;
     fn path(&self) -> &str;
+    /// The name of the plugin the file configures
+    fn item(&self) -> &str;
 }
 
-impl<T: Send + Sync> Reload for Reloadable<T> {
+impl<T: Plugin> Reload for Reloadable<T> {
     fn reload(&self) -> Result<(), String> {
         Reloadable::reload(self)
     }
@@ -59,6 +63,45 @@ impl<T: Send + Sync> Reload for Reloadable<T> {
     fn path(&self) -> &str {
         Reloadable::path(self)
     }
+
+    fn item(&self) -> &str {
+        Plugin::name(self)
+    }
+}
+
+/// How reloading one file went: an entry of the `reload` command's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Reloaded {
+    pub item: String,
+    pub path: String,
+    pub ok: bool,
+    /// Why the previous contents were kept
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Reloads each file in turn and logs how it went: what SIGHUP and the
+/// `reload` command do.
+pub fn reload_all(files: &[Arc<dyn Reload>]) -> Vec<Reloaded> {
+    // Runs overlap when SIGHUP arrives during a `reload` command
+    static RELOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _running = RELOADING.lock().unwrap_or_else(|e| e.into_inner());
+    files
+        .iter()
+        .map(|file| {
+            let failure = file.reload().err();
+            match &failure {
+                None => info!("Reloaded {}", file.path()),
+                Some(e) => error!("Keeping the previous {}: {}", file.path(), e),
+            }
+            Reloaded {
+                item: file.item().to_string(),
+                path: file.path().to_string(),
+                ok: failure.is_none(),
+                error: failure,
+            }
+        })
+        .collect()
 }
 
 impl<T: Plugin> Plugin for Reloadable<T> {
