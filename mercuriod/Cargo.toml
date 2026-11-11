@@ -18,6 +18,9 @@ path = "src/main.rs"
 default = ["wasm"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http", "dep:http", "dep:http-body-util", "dep:anyhow"]
 
+[lints]
+workspace = true
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-client = { path = "../mercurio-client", version = "0.4.1" }

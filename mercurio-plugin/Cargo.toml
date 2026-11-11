@@ -11,5 +11,8 @@ keywords = ["mqtt", "broker", "plugin", "wasm", "wit"]
 categories = ["wasm", "network-programming"]
 readme = "README.md"
 
+[lints]
+workspace = true
+
 [dependencies]
 wit-bindgen = "0.63"

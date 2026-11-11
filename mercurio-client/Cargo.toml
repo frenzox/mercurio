@@ -24,6 +24,9 @@ tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-
 # MQTT over WebSocket, ws:// and, with tls, wss://
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
+[lints]
+workspace = true
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 mercurio-packets = { path = "../mercurio-packets", version = "0.2.1" }

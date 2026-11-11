@@ -25,6 +25,9 @@ postgres = [
     "dep:tracing",
 ]
 
+[lints]
+workspace = true
+
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
 async-trait.workspace = true

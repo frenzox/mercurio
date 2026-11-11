@@ -10,6 +10,9 @@ homepage.workspace = true
 keywords = ["mqtt", "scram", "sasl", "authentication"]
 categories = ["authentication", "cryptography"]
 
+[lints]
+workspace = true
+
 [dependencies]
 base64.workspace = true
 getrandom = "0.4"

@@ -21,6 +21,26 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/frenzox/mercurio"
 homepage = "https://frenzox.github.io/mercurio/"
 
+# On top of rustc's and clippy's defaults, which CI denies with -D warnings.
+# unsafe_code is not forbidden here, as mercuriod calls into libc.
+[workspace.lints.rust]
+non_ascii_idents = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+lossy_float_literal = "warn"
+rc_buffer = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+todo = "warn"
+unimplemented = "warn"
+verbose_file_reads = "warn"
+
 # Third-party crates more than one member uses. Members add their own
 # features; default features stay off where a no_std or library crate needs
 # them off, so those crates opt back in with "std" or the features they use.

@@ -14,5 +14,8 @@ categories = ["network-programming", "no-std"]
 default = ["std"]
 std = []
 
+[lints]
+workspace = true
+
 [dependencies]
 bytes.workspace = true

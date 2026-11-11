@@ -10,6 +10,9 @@ homepage.workspace = true
 keywords = ["mqtt", "mqtt5", "broker", "iot", "server"]
 categories = ["network-programming", "asynchronous"]
 
+[lints]
+workspace = true
+
 [dependencies]
 bytes = { workspace = true, features = ["std"] }
 smallvec = "1.11"
