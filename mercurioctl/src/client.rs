@@ -1,6 +1,6 @@
 //! Sending one command to the broker and waiting for its answer.
 
-use std::{fmt, path::Path, time::Duration};
+use std::{fmt, io, path::Path, time::Duration};
 
 use bytes::Bytes;
 use mercurio_client::{cli::ConnectArgs, ClientError, Event, MessageProperties, MqttClient, QoS};
@@ -97,16 +97,7 @@ pub async fn send(
     let outcome = tokio::time::timeout(wait, async {
         let client = MqttClient::connect(args.to_connect_options())
             .await
-            .map_err(|e| {
-                let mut message = format!("{}: {e}", target(args));
-                if message.contains("Permission denied") {
-                    message.push_str(
-                        "; run as root or a member of the mercurio group, or use -H to \
-                         connect over the network",
-                    );
-                }
-                Failure::Connection(message)
-            })?;
+            .map_err(|e| connection_failure(&target(args), e))?;
         let result = ask(&client, request).await;
         Ok::<_, Failure>((client, result))
     })
@@ -129,6 +120,19 @@ pub async fn send(
             Err(Failure::Connection(message))
         }
     }
+}
+
+/// Connecting to `target` failed with `error`.
+fn connection_failure(target: &str, error: ClientError) -> Failure {
+    let mut message = format!("{target}: {error}");
+    if matches!(&error, ClientError::ConnectionFailed(e) if e.kind() == io::ErrorKind::PermissionDenied)
+    {
+        message.push_str(
+            "; run as root or a member of the mercurio group, or use -H to connect over the \
+             network",
+        );
+    }
+    Failure::Connection(message)
 }
 
 /// Where `args` connect to, for messages.
@@ -252,8 +256,35 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
-    use super::{answer, camel_case, resolve, response_topic, token, Failure};
+    use super::{answer, camel_case, connection_failure, resolve, response_topic, token, Failure};
     use crate::cli::Cli;
+
+    #[test]
+    fn a_socket_refused_for_permissions_says_how_to_get_in() {
+        use mercurio_client::ClientError;
+        use std::io::{Error, ErrorKind};
+
+        // The message of the I/O error doesn't matter, only its kind
+        let denied =
+            ClientError::ConnectionFailed(Error::new(ErrorKind::PermissionDenied, "EACCES"));
+        let Failure::Connection(message) = connection_failure("/run/a.sock", denied) else {
+            panic!("not a connection failure");
+        };
+        assert!(message.starts_with("/run/a.sock: "), "{message}");
+        assert!(
+            message.contains("member of the mercurio group"),
+            "{message}"
+        );
+
+        let refused = ClientError::ConnectionFailed(Error::new(
+            ErrorKind::ConnectionRefused,
+            "Permission denied in the text only",
+        ));
+        let Failure::Connection(message) = connection_failure("/run/a.sock", refused) else {
+            panic!("not a connection failure");
+        };
+        assert!(!message.contains("mercurio group"), "{message}");
+    }
 
     #[cfg(unix)]
     #[test]
