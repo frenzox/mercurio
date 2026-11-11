@@ -248,3 +248,46 @@ fn optional_client_certificates_need_a_ca() {
     files.require_certificate = false;
     assert!(Tls::new(files).is_err());
 }
+
+/// A rustls configuration serving `server` that requires client
+/// certificates signed by the test root CA.
+fn rustls_config(server: &str) -> Arc<rustls::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(certs("root.pem"));
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::clone(&provider),
+    )
+    .build()
+    .unwrap();
+    let key = PrivateKeyDer::from_pem_file(fixture(&format!("{server}.key"))).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs(&format!("{server}.pem")), key)
+        .unwrap();
+    Arc::new(config)
+}
+
+#[tokio::test]
+async fn embedders_can_serve_their_own_rustls_configuration() {
+    let tls = Tls::from_rustls(rustls_config("server2"), Some(CertificateName::CommonName));
+    let mut config = ServerConfig::default();
+    config.tls = Some(tls.clone());
+    config.auth.require_auth = true;
+    let addr = start(config).await;
+
+    assert!(refused(addr, None).await);
+    let mut alice = handshake(addr, Some("alice")).await.unwrap();
+    assert_eq!(served_certificate(&alice), certs("server2.pem")[0]);
+    // Named by its certificate, as no password was sent
+    assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
+
+    // There are no files to reread; the embedder swaps the configuration
+    assert!(tls.reload().is_err());
+    tls.set_server_config(rustls_config("server"));
+    let renewed = handshake(addr, Some("alice")).await.unwrap();
+    assert_eq!(served_certificate(&renewed), certs("server.pem")[0]);
+}

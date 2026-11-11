@@ -78,7 +78,7 @@ impl Reload for Tls {
     }
 
     fn path(&self) -> &str {
-        &self.files().cert_path
+        self.files().map_or("", |files| &files.cert_path)
     }
 
     fn item(&self) -> &str {

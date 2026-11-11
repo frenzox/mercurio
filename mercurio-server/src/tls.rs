@@ -138,12 +138,17 @@ impl TlsConfig {
 #[derive(Clone)]
 pub struct Tls {
     current: Arc<RwLock<Arc<ServerConfig>>>,
-    files: Arc<TlsConfig>,
+    /// None for a configuration the embedder built
+    files: Option<Arc<TlsConfig>>,
+    username_from_certificate: Option<CertificateName>,
 }
 
 impl std::fmt::Debug for Tls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tls").field("files", &self.files).finish()
+        f.debug_struct("Tls")
+            .field("files", &self.files)
+            .field("username_from_certificate", &self.username_from_certificate)
+            .finish_non_exhaustive()
     }
 }
 
@@ -152,25 +157,53 @@ impl Tls {
     pub fn new(config: TlsConfig) -> Result<Self, ServerError> {
         Ok(Self {
             current: Arc::new(RwLock::new(config.server_config()?)),
-            files: Arc::new(config),
+            username_from_certificate: config.username_from_certificate,
+            files: Some(Arc::new(config)),
         })
+    }
+
+    /// Serves a rustls configuration built by the caller, for settings
+    /// [`TlsConfig`] has no field for. With `username_from_certificate`,
+    /// clients that present a certificate are named by it; whether they
+    /// must present one, and what makes it valid, is up to `config`'s
+    /// client verifier. [`Tls::reload`] has no files to read:
+    /// [`Tls::set_server_config`] replaces the configuration instead.
+    pub fn from_rustls(
+        config: Arc<ServerConfig>,
+        username_from_certificate: Option<CertificateName>,
+    ) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(config)),
+            files: None,
+            username_from_certificate,
+        }
     }
 
     /// Reads the files again, for connections from now on. On error the
     /// settings in use are kept.
     pub fn reload(&self) -> Result<(), ServerError> {
-        let config = self.files.server_config()?;
-        *self.current.write().unwrap() = config;
+        let Some(files) = &self.files else {
+            return Err(ServerError::Tls(
+                "the TLS configuration was not read from files".to_string(),
+            ));
+        };
+        self.set_server_config(files.server_config()?);
         Ok(())
     }
 
-    /// The files read, as given to [`Tls::new`].
-    pub fn files(&self) -> &TlsConfig {
-        &self.files
+    /// Serves `config` to connections from now on.
+    pub fn set_server_config(&self, config: Arc<ServerConfig>) {
+        *self.current.write().unwrap() = config;
+    }
+
+    /// The files read, as given to [`Tls::new`]; None for a configuration
+    /// from [`Tls::from_rustls`].
+    pub fn files(&self) -> Option<&TlsConfig> {
+        self.files.as_deref()
     }
 
     pub(crate) fn username_from_certificate(&self) -> Option<CertificateName> {
-        self.files.username_from_certificate
+        self.username_from_certificate
     }
 
     pub(crate) fn acceptor(&self) -> TlsAcceptor {

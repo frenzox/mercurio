@@ -96,6 +96,7 @@ let mut config = ServerConfig::default();
 config.listeners.push(tls_listener);</pre>
 <h3 id="tls">TLS</h3>
 <p><code>Tls::new</code> reads the certificate, key, CA and CRL files a <code>TlsConfig</code> names, and fails if they can't be used. <code>Tls::reload</code> reads them again, for example after a certificate is renewed: connections from then on get the new files, and those already up keep theirs. A reload that fails returns the error and keeps the previous files. Clones of a <code>Tls</code> share it, so one reload reaches every listener given a clone.</p>
+<p>For settings <code>TlsConfig</code> has no field for, such as ALPN, session resumption, a certificate resolver or a client verifier of your own, build a <code>rustls::ServerConfig</code> and serve it with <code>Tls::from_rustls(config, username_from_certificate)</code>. Reloading is then up to you: <code>Tls::reload</code> returns an error, and <code>Tls::set_server_config</code> swaps in a new configuration for later connections. With a <code>CertificateName</code>, clients that present a certificate are named by it; whether they must present one is up to your client verifier.</p>
 <p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
 
 <h2 id="auth">Plugins</h2>
