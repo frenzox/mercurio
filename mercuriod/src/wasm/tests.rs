@@ -411,7 +411,7 @@ async fn test_payload_rewrite_tags_and_drops() {
 async fn test_webhook_audit_posts_events() {
     use std::sync::Arc;
 
-    use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
+    use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let hook = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -465,16 +465,18 @@ async fn test_webhook_audit_posts_events() {
     let mut config = ServerConfig::default();
     config.plugins = vec![plugin];
     config.sys_interval = None;
-    config.listeners = vec![{
+    let listeners = vec![{
         let mut mounted = ListenerConfig::new(mounted, Transport::Mqtt);
         mounted.mount_point = Some("tenant/".into());
         mounted
     }];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     // MQTT 5 CONNECT with clean start and the given properties
     let connect = |id: &[u8], properties: &[u8]| {
@@ -584,9 +586,8 @@ async fn test_list_plugins_shows_wasm_plugins() {
 
     use mercurio_server::{
         plugin::PluginKind,
-        server::{Server, ServerConfig},
+        server::{ListenerConfig, Server, ServerConfig, Transport},
     };
-    use mercurio_storage::memory::MemoryStore;
 
     let plugin = WasmPlugin::load(
         &Runtime::new().unwrap(),
@@ -597,7 +598,10 @@ async fn test_list_plugins_shows_wasm_plugins() {
     let mut config = ServerConfig::default();
     config.plugins = vec![plugin as Arc<dyn Plugin>];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
+    let server = Server::builder()
+        .config(config)
+        .listener(ListenerConfig::new(listener, Transport::Mqtt))
+        .build()
         .await
         .unwrap();
     let plugins = server.admin().plugins().await;
@@ -776,18 +780,19 @@ async fn broker_with(
     plugins: Vec<std::sync::Arc<dyn Plugin>>,
     listener: mercurio_server::server::LocalListener,
 ) {
-    use mercurio_server::server::ServerConfig;
+    use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
     let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = ServerConfig::default();
     config.plugins = plugins;
     config.sys_interval = None;
-    config.local_listener = Some(listener);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        tcp,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(tcp, Transport::Mqtt))
+            .local_listener(listener)
+            .run(std::future::pending::<()>()),
+    );
 }
 
 /// misbehave, publishing into a running broker, and a client of that

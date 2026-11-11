@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
@@ -17,11 +19,9 @@ const QUEUE: usize = 256;
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        ServerConfig::default(),
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, ServerConfig::default()).run(std::future::pending::<()>()),
+    );
     addr
 }
 

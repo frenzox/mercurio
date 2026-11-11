@@ -1,5 +1,7 @@
 #![cfg(feature = "websocket")]
 
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS};
@@ -14,13 +16,13 @@ async fn start_broker(tls: Option<mercurio_server::tls::TlsConfig>) -> SocketAdd
     let address = websocket_listener.local_addr().unwrap();
     let mut websocket = ListenerConfig::new(websocket_listener, Transport::WebSocket);
     websocket.tls = tls.map(|tls| mercurio_server::tls::Tls::new(tls).unwrap());
-    let mut config = ServerConfig::default();
-    config.listeners = vec![websocket];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    let listeners = vec![websocket];
+    tokio::spawn(
+        common::broker(listener, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     address
 }
 
@@ -72,11 +74,9 @@ async fn messages_travel_over_secure_websocket() {
 async fn a_plain_mqtt_listener_fails_the_websocket_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        ServerConfig::default(),
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, ServerConfig::default()).run(std::future::pending::<()>()),
+    );
     let options = ConnectOptions::new("127.0.0.1", port)
         .websocket("/mqtt")
         .connect_timeout(Duration::from_secs(2));

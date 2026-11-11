@@ -1,11 +1,12 @@
+mod common;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use mercurio_server::{
     admin::{Admin, BanKey, BanKind, Paging},
     plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin},
-    server::{Limits, ListenerConfig, LoginFailures, Server, ServerConfig, Transport},
+    server::{Limits, ListenerConfig, LoginFailures, ServerConfig, Transport},
 };
-use mercurio_storage::memory::MemoryStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -53,13 +54,15 @@ async fn start_broker() -> (SocketAddr, SocketAddr, Admin) {
         ));
         value
     };
-    config.listeners = vec![{
+    let listeners = vec![{
         let mut value = ListenerConfig::new(proxied, Transport::Mqtt);
         value.proxy_protocol = true;
         value.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         value
     }];
-    let server = Server::new(main, config, Arc::new(MemoryStore::new()))
+    let server = common::broker(main, config)
+        .listeners(listeners)
+        .build()
         .await
         .unwrap();
     let admin = server.admin();

@@ -20,18 +20,18 @@ const CONNECT: [u8; 16] = [
 async fn proxied_connections_start_with_a_header() {
     let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = proxied.local_addr().unwrap();
-    let mut config = ServerConfig::default();
-    config.listeners = vec![{
+    let config = ServerConfig::default();
+    let listeners = vec![{
         let mut value = ListenerConfig::new(proxied, Transport::Mqtt);
         value.proxy_protocol = true;
         value.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         value
     }];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut bytes = b"PROXY TCP4 192.0.2.1 127.0.0.1 56324 1883\r\n".to_vec();
@@ -74,13 +74,12 @@ async fn start_proxied(proxy_from: &[&str], max_per_ip: Option<usize>) -> std::n
     listener.proxy_protocol = true;
     listener.proxy_from = proxy_from.iter().map(|r| r.parse().unwrap()).collect();
     let mut config = ServerConfig::default();
-    config.listeners.push(listener);
     config.limits.max_connections_per_ip = max_per_ip;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listener(listener)
+            .run(std::future::pending::<()>()),
+    );
     addr
 }
 

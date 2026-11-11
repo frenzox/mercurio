@@ -40,11 +40,9 @@ fn variable_byte_integer(mut value: usize) -> Vec<u8> {
 async fn filters_too_deep_are_refused_and_the_broker_survives() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        ServerConfig::default(),
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, ServerConfig::default()).run(std::future::pending::<()>()),
+    );
 
     let mut stream = connect(addr, b'a').await;
     let filter = "/".repeat(8000);

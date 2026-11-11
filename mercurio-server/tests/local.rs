@@ -1,8 +1,10 @@
+mod common;
+
 use std::{sync::Arc, time::Duration};
 
 use mercurio_server::{
     plugin::{ready, BoxFuture, ClientInfo, Decision, Plugin},
-    server::{LocalConnector, ServerConfig},
+    server::{LocalConnector, Server, ServerConfig},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -28,6 +30,23 @@ async fn connack_reason<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S)
     connack[3]
 }
 
+/// A broker needs no network listener: in-process clients reach it
+/// through the connector the server hands out, until it stops.
+#[tokio::test]
+async fn brokers_without_listeners_serve_in_process_clients() {
+    let server = Server::builder().build().await.unwrap();
+    let connector = server.local_connector();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run(stopped));
+
+    let mut local = connector.connect().unwrap();
+    assert_eq!(connack_reason(&mut local).await, 0x00);
+
+    stop.send(()).unwrap();
+    running.await.unwrap().unwrap();
+    assert!(connector.connect().is_err());
+}
+
 #[tokio::test]
 async fn local_connections_skip_authentication() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,12 +55,11 @@ async fn local_connections_skip_authentication() {
     let mut config = ServerConfig::default();
     config.auth.require_auth = true;
     config.auth.allow_anonymous = false;
-    config.local_listener = Some(local_listener);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, config)
+            .local_listener(local_listener)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut tcp = TcpStream::connect(addr).await.unwrap();
     assert_ne!(connack_reason(&mut tcp).await, 0x00);
@@ -60,12 +78,11 @@ async fn local_connections_skip_the_connection_limit() {
     let (connector, local_listener) = LocalConnector::new();
     let mut config = ServerConfig::default();
     config.limits.max_connections = Some(1);
-    config.local_listener = Some(local_listener);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, config)
+            .local_listener(local_listener)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut local = connector.connect().unwrap();
     assert_eq!(connack_reason(&mut local).await, 0x00);
@@ -96,13 +113,12 @@ async fn control_topics_need_an_explicit_allow() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let mut config = ServerConfig::default();
-    config.local_listener = Some(local_listener);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    tokio::spawn(
+        common::broker(listener, config)
+            .local_listener(local_listener)
+            .run(std::future::pending::<()>()),
+    );
 
     // Not Authorized for a client no plugin allows
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -131,11 +147,7 @@ async fn control_topics_open_to_clients_a_plugin_allows() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.plugins = vec![Arc::new(AllowControl)];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     // No Matching Subscribers: accepted
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -166,13 +178,12 @@ async fn network_clients_cant_take_an_in_process_client_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (connector, local_listener) = LocalConnector::new();
-    let mut config = ServerConfig::default();
-    config.local_listener = Some(local_listener);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    tokio::spawn(
+        common::broker(listener, config)
+            .local_listener(local_listener)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut local = connector.connect().unwrap();
     assert_eq!(connack_reason(&mut local).await, 0x00);

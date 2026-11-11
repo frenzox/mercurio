@@ -356,7 +356,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_messages_queued_before_the_broker_serves_wait_for_it() {
         use mercurio_client::Event;
-        use mercurio_server::server::ServerConfig;
+        use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
         let (connector, listener) = LocalConnector::new();
         let publisher = Publisher::new("p", Some(connector.clone()));
@@ -369,13 +369,14 @@ mod tests {
 
         let mut config = ServerConfig::default();
         config.sys_interval = None;
-        config.local_listener = Some(listener);
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        tokio::spawn(mercurio_server::server::run_with_config(
-            tcp,
-            config,
-            std::future::pending::<()>(),
-        ));
+        tokio::spawn(
+            Server::builder()
+                .config(config)
+                .listener(ListenerConfig::new(tcp, Transport::Mqtt))
+                .local_listener(listener)
+                .run(std::future::pending::<()>()),
+        );
         let options = ConnectOptions::new("localhost", 0)
             .client_id("watcher")
             .connector(move || std::future::ready(connector.connect()));

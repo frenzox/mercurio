@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use mercurio_server::server::ServerConfig;
@@ -13,11 +15,7 @@ async fn connection_without_connect_is_closed() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits.connect_timeout = Duration::from_millis(200);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     // Connect and never send CONNECT
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -41,13 +39,13 @@ async fn every_handshake_step_shares_one_deadline() {
     listener.proxy_protocol = true;
     listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
     let mut config = ServerConfig::default();
-    config.listeners.push(listener);
+    let listeners = vec![listener];
     config.limits.connect_timeout = Duration::from_millis(1000);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     // Each step alone fits the timeout, both together don't

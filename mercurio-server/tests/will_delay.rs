@@ -13,10 +13,7 @@ const WILL_PUBLISH: [u8; 9] = [0x30, 0x07, 0x00, 0x01, b'w', 0x00, b'b', b'y', b
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     addr
 }
 

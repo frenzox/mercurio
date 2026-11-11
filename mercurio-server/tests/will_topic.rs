@@ -30,11 +30,9 @@ async fn connect_with_will(addr: std::net::SocketAddr, topic: &str) -> u8 {
 async fn wills_need_a_publishable_topic() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        ServerConfig::default(),
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, ServerConfig::default()).run(std::future::pending::<()>()),
+    );
 
     // Topic Name invalid
     assert_eq!(connect_with_will(addr, "$SYS/broker/uptime").await, 0x90);

@@ -14,7 +14,7 @@ use mercurio_server::error::ServerError;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AddressRange, AuthConfig as ServerAuthConfig, ConnectPolicy, Limits, ListenerConfig,
-    LocalConnector, Redirect, Server, ServerConfig, Socket, Transport,
+    LocalConnector, Redirect, Server, ServerBuilder, ServerConfig, Socket, Transport,
 };
 use mercurio_server::tls::Tls;
 use mercurio_storage::{
@@ -295,16 +295,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Mercurio MQTT broker listening on {}", listen_addr);
 
+    let mut main = ListenerConfig::new(listener, Transport::Mqtt);
+    main.tls = tls_config.clone();
+    let mut listeners = vec![main];
     // The WebSocket listener shares the main listener's TLS settings
-    let mut listeners: Vec<_> = websocket_listener
-        .map(|listener| {
-            let mut value = ListenerConfig::new(listener, Transport::WebSocket);
-            value.tls = tls_config.clone();
-            value.http_dir = config.server.http_dir.clone().map(Into::into);
-            value
-        })
-        .into_iter()
-        .collect();
+    if let Some(listener) = websocket_listener {
+        let mut value = ListenerConfig::new(listener, Transport::WebSocket);
+        value.tls = tls_config;
+        value.http_dir = config.server.http_dir.clone().map(Into::into);
+        listeners.push(value);
+    }
     for (extra, prepared) in config.listeners.iter().zip(prepared_listeners) {
         let (listener, addr) = bind_listener(extra).await?;
         info!(
@@ -371,62 +371,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_bridges(bridges),
     );
 
-    let mut server_config = ServerConfig::default();
-    server_config.tls = tls_config;
-    server_config.auth = auth_config;
-    server_config.plugins = plugins;
-    server_config.limits = limits;
-    server_config.policy = policy;
-    server_config.listeners = listeners;
-    server_config.local_listener = Some(local_listener);
     let extension: Arc<dyn AdminExtension> = commands.clone();
-    server_config.admin_extension = Some(extension);
-    server_config.sys_interval =
-        (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
-    server_config.plugin_timeout = config.server.plugin_timeout();
-    server_config.plugin_tick_interval = config.server.plugin_tick_interval();
-    server_config.share_strategy = config.server.share_strategy();
-    server_config.share_redelivery = config.server.share_redelivery();
+    let builder = Server::builder()
+        .listeners(listeners)
+        .local_listener(local_listener)
+        .config(
+            ServerConfig::default()
+                .with_auth(auth_config)
+                .with_plugins(plugins)
+                .with_limits(limits)
+                .with_policy(policy)
+                .with_admin_extension(extension)
+                .with_sys_interval(
+                    (config.server.sys_interval > 0)
+                        .then(|| Duration::from_secs(config.server.sys_interval)),
+                )
+                .with_plugin_timeout(config.server.plugin_timeout())
+                .with_plugin_tick_interval(config.server.plugin_tick_interval())
+                .with_share_strategy(config.server.share_strategy())
+                .with_share_redelivery(config.server.share_redelivery()),
+        );
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(hangup, reloadable));
 
     let result = match config.storage {
         StorageConfig::Memory {} => {
             let storage = Arc::new(MemoryStore::new());
-            serve(
-                listener,
-                server_config,
-                storage,
-                &commands,
-                dynsec,
-                shutdown,
-            )
-            .await
+            serve(builder.storage(storage), &commands, dynsec, shutdown).await
         }
         StorageConfig::Sqlite { path } => {
             info!("Using SQLite storage at {}", path);
             let storage = Arc::new(SqliteStore::new(&path)?);
-            serve(
-                listener,
-                server_config,
-                storage,
-                &commands,
-                dynsec,
-                shutdown,
-            )
-            .await
+            serve(builder.storage(storage), &commands, dynsec, shutdown).await
         }
         StorageConfig::Postgres { .. } => {
             let storage = Arc::new(postgres.expect("opened before binding"));
-            serve(
-                listener,
-                server_config,
-                storage,
-                &commands,
-                dynsec,
-                shutdown,
-            )
-            .await
+            serve(builder.storage(storage), &commands, dynsec, shutdown).await
         }
     };
     // Removed now, as exiting skips destructors
@@ -579,14 +559,12 @@ fn build_tls(
 /// Sets the broker up, hands its `Admin` to the daemon's commands and to
 /// dynamic security, and serves until `shutdown`.
 async fn serve<St: MqttStore + 'static>(
-    listener: TcpListener,
-    config: ServerConfig,
-    storage: Arc<St>,
+    builder: ServerBuilder<St>,
     commands: &commands::DaemonCommands,
     dynsec: Option<Arc<DynamicSecurity>>,
     shutdown: impl Future,
 ) -> Result<(), ServerError> {
-    let server = Server::new(listener, config, storage).await?;
+    let server = builder.build().await?;
     commands.set_admin(server.admin());
     if let Some(dynsec) = dynsec {
         dynsec.set_admin(server.admin());
@@ -1017,7 +995,7 @@ mod tests {
 
     /// A broker with the authentication `toml` sets up; its port.
     async fn broker_with(toml: &str) -> u16 {
-        use mercurio_server::server::ServerConfig;
+        use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
         let (value, plugins, _) = build_auth(&auth(toml), &mut Vec::new(), true)
             .map_err(|e| panic!("{e}"))
@@ -1027,11 +1005,12 @@ mod tests {
         config.plugins = plugins;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(mercurio_server::server::run_with_config(
-            listener,
-            config,
-            std::future::pending::<()>(),
-        ));
+        tokio::spawn(
+            Server::builder()
+                .config(config)
+                .listener(ListenerConfig::new(listener, Transport::Mqtt))
+                .run(std::future::pending::<()>()),
+        );
         port
     }
 

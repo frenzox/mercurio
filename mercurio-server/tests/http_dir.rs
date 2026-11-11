@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
@@ -26,12 +28,12 @@ async fn serve(dir: PathBuf, connect_timeout: Duration) -> SocketAddr {
     config.limits.connect_timeout = connect_timeout;
     let mut listener = ListenerConfig::new(websocket_listener, Transport::WebSocket);
     listener.http_dir = Some(dir);
-    config.listeners = vec![listener];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    let listeners = vec![listener];
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     addr
 }
 

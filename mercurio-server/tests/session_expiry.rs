@@ -11,10 +11,7 @@ use tokio::{
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     addr
 }
 
@@ -121,11 +118,7 @@ async fn session_expiry_is_capped_and_announced() {
     let addr = listener.local_addr().unwrap();
     let mut config = mercurio_server::server::ServerConfig::default();
     config.limits.max_session_expiry = Some(Duration::from_secs(60));
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     // No expiry, and a longer one, are lowered to the maximum
     assert_eq!(announced_expiry(addr, u32::MAX).await, Some(60));
@@ -169,11 +162,7 @@ async fn session_expiry_set_on_disconnect_is_capped() {
     let addr = listener.local_addr().unwrap();
     let mut config = mercurio_server::server::ServerConfig::default();
     config.limits.max_session_expiry = Some(Duration::from_secs(1));
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     for asked in [u32::MAX, 3600] {
         assert!(!reset_expiry_on_disconnect(addr, true, 1, asked).await);

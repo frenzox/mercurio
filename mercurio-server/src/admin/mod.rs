@@ -707,7 +707,7 @@ impl Admin {
         })
     }
 
-    /// The listeners, the main one first: `listListeners`.
+    /// The listeners, in the order they were given: `listListeners`.
     pub async fn listeners(&self) -> Vec<ListenerInfo> {
         self.inner
             .listeners

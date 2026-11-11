@@ -1,10 +1,12 @@
+mod common;
+
 #[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 
 use mercurio_server::{
     error::{ConfigErrorKind, ServerError},
-    server::{run_with_config, ListenerConfig, ServerConfig, Transport},
+    server::{ListenerConfig, Server, ServerConfig, Socket, Transport},
 };
 #[cfg(unix)]
 use tokio::net::{unix::UCred, UnixListener};
@@ -14,11 +16,13 @@ use tokio::{net::TcpListener, time::timeout};
 /// startup gave, which must come before it serves.
 async fn start_with(extra: ListenerConfig) -> Result<(), ServerError> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = ServerConfig::default();
-    config.listeners = vec![extra];
+    let config = ServerConfig::default();
+    let listeners = vec![extra];
     timeout(
         Duration::from_secs(2),
-        run_with_config(listener, config, std::future::pending::<()>()),
+        common::broker(listener, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
     )
     .await
     .expect("server started serving anyway")
@@ -163,6 +167,25 @@ async fn websocket_settings_on_mqtt_listeners_fail_startup() {
     assert_kind(result, ConfigErrorKind::WebSocketOnly("allowed_origins"));
 }
 
+/// Listeners are numbered from 0 in the order given, none of them special.
+#[tokio::test]
+async fn the_first_listener_is_checked_like_the_others() {
+    let mut value = tcp_listener(Transport::Mqtt).await;
+    value.metrics = true;
+    let name = match &value.listener {
+        Socket::Tcp(listener) => listener.local_addr().unwrap(),
+        _ => unreachable!(),
+    };
+    let result = Server::builder().listener(value).build().await;
+    let Err(ServerError::Config(error)) = result else {
+        panic!("served metrics on an MQTT listener");
+    };
+    assert_eq!(error.listener, 0);
+    assert_eq!(error.name, name.to_string());
+    assert_eq!(error.kind, ConfigErrorKind::WebSocketOnly("metrics"));
+    assert!(error.to_string().contains(&name.to_string()), "{error}");
+}
+
 /// A limit too large to count is no limit, not a panic.
 #[tokio::test]
 async fn huge_connection_limits_serve() {
@@ -175,12 +198,12 @@ async fn huge_connection_limits_serve() {
     extra.max_connections = Some(usize::MAX);
     let mut config = ServerConfig::default();
     config.limits.max_connections = Some(usize::MAX);
-    config.listeners = vec![extra];
-    let server = tokio::spawn(run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let listeners = vec![extra];
+    let server = tokio::spawn(
+        common::broker(listener, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream

@@ -1,5 +1,5 @@
-//! Running the broker: [`Server`] and the `run` functions, its configuration
-//! and limits, and in-process connections.
+//! Running the broker: [`Server`] and its [`ServerBuilder`], its
+//! configuration and limits, and in-process connections.
 
 use std::{
     collections::HashMap,
@@ -402,24 +402,19 @@ impl Pacing {
     }
 }
 
-/// Broker configuration. Start from `ServerConfig::default()` and set
-/// what differs; fields may be added in minor releases.
+/// The broker-wide settings of a [`ServerBuilder`]. Start from
+/// `ServerConfig::default()` and set what differs; fields may be added in
+/// minor releases.
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// Serve TLS instead of plain TCP on the main listener when set.
-    pub tls: Option<Tls>,
-    /// For the main listener, and listeners without their own
+    /// For listeners without their own
     pub auth: AuthConfig,
     pub limits: Limits,
     pub policy: ConnectPolicy,
-    /// Listeners to serve besides the main one.
-    pub listeners: Vec<ListenerConfig>,
-    /// Accept in-process connections from the paired `LocalConnector`.
-    pub local_listener: Option<LocalListener>,
     /// How often to publish statistics under `$SYS/broker/`; never if unset.
     pub sys_interval: Option<Duration>,
-    /// Run in this order for the main listener, and listeners without
-    /// their own list; see [`crate::plugin`].
+    /// Run in this order for listeners without their own list; see
+    /// [`crate::plugin`].
     pub plugins: Vec<Arc<dyn Plugin>>,
     /// Longest a plugin hook may take; one that takes longer denies, or
     /// drops the message.
@@ -437,12 +432,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            tls: None,
             auth: AuthConfig::default(),
             limits: Limits::default(),
             policy: ConnectPolicy::default(),
-            listeners: Vec::new(),
-            local_listener: None,
             sys_interval: Some(Duration::from_secs(10)),
             plugins: Vec::new(),
             plugin_timeout: Duration::from_secs(5),
@@ -684,15 +676,26 @@ setters!(ListenerConfig {
 #[derive(Clone)]
 pub struct LocalConnector(mpsc::UnboundedSender<DuplexStream>);
 
-/// The broker's end of a `LocalConnector`, given in `ServerConfig`.
-pub struct LocalListener(mpsc::UnboundedReceiver<DuplexStream>);
+/// The broker's end of a [`LocalConnector`], given to
+/// [`ServerBuilder::local_listener`].
+pub struct LocalListener {
+    connections: mpsc::UnboundedReceiver<DuplexStream>,
+    /// Handed out by [`Server::local_connector`]
+    connector: LocalConnector,
+}
 
 impl LocalConnector {
-    /// A connector, and the listener for `ServerConfig::local_listener`
-    /// it reaches the broker through.
+    /// A connector, and the listener for [`ServerBuilder::local_listener`]
+    /// it reaches the broker through. Needed only to connect before the
+    /// broker is built; [`Server::local_connector`] gives one otherwise.
     pub fn new() -> (LocalConnector, LocalListener) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (LocalConnector(tx), LocalListener(rx))
+        let connector = LocalConnector(tx);
+        let listener = LocalListener {
+            connections: rx,
+            connector: connector.clone(),
+        };
+        (connector, listener)
     }
 
     /// A new connection to the broker, which fails once the broker stopped.
@@ -731,10 +734,10 @@ struct Endpoint {
     /// One permit per allowed concurrent connection, when limited
     connection_slots: Option<Arc<Semaphore>>,
     state: Arc<ListenerState>,
-    /// Its connections get the trusted chain, set by `Server::new`
+    /// Its connections get the trusted chain, set by `ServerBuilder::build`
     trusted: bool,
     /// The broker's limits with the listener's own settings, set by
-    /// `Server::new`
+    /// `ServerBuilder::build`
     limits: Limits,
     /// The settings of the listener that replace the broker's
     overrides: LimitOverrides,
@@ -1299,7 +1302,7 @@ impl Redirect {
 
 struct Listener<St: MqttStore + 'static> {
     endpoints: Vec<Endpoint>,
-    local_listener: Option<LocalListener>,
+    local_listener: LocalListener,
     /// Given to local connections instead of `chain`
     trusted_chain: Chain,
     /// Where the next accept starts looking, so a busy listener does not
@@ -1427,14 +1430,6 @@ async fn connect_step<F: Future>(
     }
 }
 
-/// Run the MQTT broker with plain TCP connections.
-pub async fn run(
-    listener: TcpListener,
-    shutdown: impl Future,
-) -> std::result::Result<(), ServerError> {
-    run_with_config(listener, ServerConfig::default(), shutdown).await
-}
-
 /// Every plugin of the broker and of its listeners, each once.
 fn distinct_plugins(
     main: &[Arc<dyn Plugin>],
@@ -1449,64 +1444,163 @@ fn distinct_plugins(
     all
 }
 
-/// Run the MQTT broker with the given configuration, keeping its state in
-/// memory.
-pub async fn run_with_config(
-    listener: TcpListener,
+/// Sets a broker up: its listeners, storage and settings. Start from
+/// [`Server::builder`]; [`ServerBuilder::build`] checks the configuration
+/// and restores what storage holds, and [`ServerBuilder::run`] serves at
+/// once.
+pub struct ServerBuilder<St: MqttStore + 'static = MemoryStore> {
     config: ServerConfig,
-    shutdown: impl Future,
-) -> std::result::Result<(), ServerError> {
-    run_with_storage(listener, config, Arc::new(MemoryStore::new()), shutdown).await
-}
-
-/// Run the MQTT broker with the given configuration, keeping sessions,
-/// retained messages, wills and in-flight messages in `storage`. Fails
-/// without serving anyone if the configuration can't be used.
-pub async fn run_with_storage<St: MqttStore + 'static>(
-    listener: TcpListener,
-    config: ServerConfig,
+    listeners: Vec<ListenerConfig>,
+    local_listener: Option<LocalListener>,
     storage: Arc<St>,
-    shutdown: impl Future,
-) -> std::result::Result<(), ServerError> {
-    Server::new(listener, config, storage)
-        .await?
-        .run(shutdown)
-        .await
 }
 
-/// A broker set up but not serving yet: its configuration is checked and
-/// the sessions an earlier run stored are restored. [`Server::admin`]
-/// administers it from then on; [`Server::run`] serves it.
-pub struct Server<St: MqttStore + 'static> {
-    listener: Listener<St>,
-    admin: Admin,
-    shutdown_complete_rx: mpsc::Receiver<()>,
-    restored_wills: Vec<(SessionKey, WillMessage, Duration)>,
-    plugins: Vec<Arc<dyn Plugin>>,
-    plugin_timeout: Duration,
-    plugin_tick_interval: Duration,
-    sys_interval: Option<Duration>,
+impl Server<MemoryStore> {
+    /// A broker without listeners, keeping its state in memory, with the
+    /// default settings.
+    pub fn builder() -> ServerBuilder<MemoryStore> {
+        ServerBuilder {
+            config: ServerConfig::default(),
+            listeners: Vec::new(),
+            local_listener: None,
+            storage: Arc::new(MemoryStore::new()),
+        }
+    }
 }
 
-/// How often expired retained messages are removed from storage.
-const RETAINED_SWEEP: Duration = Duration::from_secs(60);
+impl<St: MqttStore + 'static> ServerBuilder<St> {
+    /// Keeps sessions, retained messages, wills and in-flight messages in
+    /// `storage` instead of memory.
+    pub fn storage<S: MqttStore + 'static>(self, storage: Arc<S>) -> ServerBuilder<S> {
+        ServerBuilder {
+            config: self.config,
+            listeners: self.listeners,
+            local_listener: self.local_listener,
+            storage,
+        }
+    }
 
-impl<St: MqttStore + 'static> Server<St> {
-    /// Sets up a broker serving `listener` and `config`'s listeners, with
-    /// its state in `storage`. Fails if the configuration can't be used or
-    /// storage can't be read.
-    pub async fn new(
-        listener: TcpListener,
-        config: ServerConfig,
-        storage: Arc<St>,
-    ) -> std::result::Result<Self, ServerError> {
+    /// Serves `listener` too. Listeners are numbered in the order they are
+    /// added, from 0, in [`ConfigError`]s.
+    #[must_use]
+    pub fn listener(mut self, listener: ListenerConfig) -> Self {
+        self.listeners.push(listener);
+        self
+    }
+
+    /// Serves each of `listeners` too.
+    #[must_use]
+    pub fn listeners(mut self, listeners: impl IntoIterator<Item = ListenerConfig>) -> Self {
+        self.listeners.extend(listeners);
+        self
+    }
+
+    /// Accepts in-process connections from the [`LocalConnector`] paired
+    /// with `listener`, for connectors needed before the broker is built.
+    #[must_use]
+    pub fn local_listener(mut self, listener: LocalListener) -> Self {
+        self.local_listener = Some(listener);
+        self
+    }
+
+    /// Replaces every broker-wide setting with `config`'s.
+    #[must_use]
+    pub fn config(mut self, config: ServerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets [`ServerConfig::auth`].
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.config.auth = auth;
+        self
+    }
+
+    /// Sets [`ServerConfig::limits`].
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.config.limits = limits;
+        self
+    }
+
+    /// Sets [`ServerConfig::policy`].
+    #[must_use]
+    pub fn with_policy(mut self, policy: ConnectPolicy) -> Self {
+        self.config.policy = policy;
+        self
+    }
+
+    /// Sets [`ServerConfig::sys_interval`].
+    #[must_use]
+    pub fn with_sys_interval(mut self, interval: Option<Duration>) -> Self {
+        self.config.sys_interval = interval;
+        self
+    }
+
+    /// Sets [`ServerConfig::plugins`].
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: Vec<Arc<dyn Plugin>>) -> Self {
+        self.config.plugins = plugins;
+        self
+    }
+
+    /// Sets [`ServerConfig::plugin_timeout`].
+    #[must_use]
+    pub fn with_plugin_timeout(mut self, timeout: Duration) -> Self {
+        self.config.plugin_timeout = timeout;
+        self
+    }
+
+    /// Sets [`ServerConfig::plugin_tick_interval`].
+    #[must_use]
+    pub fn with_plugin_tick_interval(mut self, interval: Duration) -> Self {
+        self.config.plugin_tick_interval = interval;
+        self
+    }
+
+    /// Sets [`ServerConfig::admin_extension`].
+    #[must_use]
+    pub fn with_admin_extension(mut self, extension: Arc<dyn AdminExtension>) -> Self {
+        self.config.admin_extension = Some(extension);
+        self
+    }
+
+    /// Sets [`ServerConfig::share_strategy`].
+    #[must_use]
+    pub fn with_share_strategy(mut self, strategy: ShareStrategy) -> Self {
+        self.config.share_strategy = strategy;
+        self
+    }
+
+    /// Sets [`ServerConfig::share_redelivery`].
+    #[must_use]
+    pub fn with_share_redelivery(mut self, redelivery: ShareRedelivery) -> Self {
+        self.config.share_redelivery = redelivery;
+        self
+    }
+
+    /// Builds the broker and serves it until `shutdown` completes; see
+    /// [`ServerBuilder::build`] and [`Server::run`].
+    pub async fn run(self, shutdown: impl Future) -> std::result::Result<(), ServerError> {
+        self.build().await?.run(shutdown).await
+    }
+
+    /// Checks the configuration, binding nothing more, and restores the
+    /// sessions, wills and bans storage holds. Fails before anyone is
+    /// served if a listener's settings can't be served together, with a
+    /// [`ServerError::Config`] naming it, or if storage can't be read.
+    pub async fn build(self) -> std::result::Result<Server<St>, ServerError> {
+        let ServerBuilder {
+            config,
+            listeners,
+            local_listener,
+            storage,
+        } = self;
         let ServerConfig {
-            tls: tls_config,
             auth: auth_config,
             limits,
             policy,
-            listeners,
-            local_listener,
             sys_interval,
             plugins,
             plugin_timeout,
@@ -1522,12 +1616,8 @@ impl<St: MqttStore + 'static> Server<St> {
         let (shutdown_complete, shutdown_complete_rx) = mpsc::channel(1);
 
         let listener_plugins: Vec<_> = listeners.iter().map(|l| l.plugins.clone()).collect();
-        let main = ListenerConfig {
-            tls: tls_config,
-            ..ListenerConfig::new(listener, Transport::Mqtt)
-        };
-        let mut endpoints = std::iter::once(main)
-            .chain(listeners)
+        let mut endpoints = listeners
+            .into_iter()
             .enumerate()
             .map(|(i, l)| Endpoint::new(i, l, plugin_timeout))
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1583,7 +1673,7 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let server = Listener {
             endpoints,
-            local_listener,
+            local_listener: local_listener.unwrap_or_else(|| LocalConnector::new().1),
             trusted_chain: chain.trusted("in-process"),
             next_endpoint: 0,
             broker,
@@ -1620,10 +1710,36 @@ impl<St: MqttStore + 'static> Server<St> {
             sys_interval,
         })
     }
+}
 
+/// A broker set up but not serving yet, from [`ServerBuilder::build`]:
+/// its configuration is checked and the sessions an earlier run stored
+/// are restored. [`Server::admin`] administers it from then on,
+/// [`Server::local_connector`] connects to it from the same program, and
+/// [`Server::run`] serves it.
+pub struct Server<St: MqttStore + 'static> {
+    listener: Listener<St>,
+    admin: Admin,
+    shutdown_complete_rx: mpsc::Receiver<()>,
+    restored_wills: Vec<(SessionKey, WillMessage, Duration)>,
+    plugins: Vec<Arc<dyn Plugin>>,
+    plugin_timeout: Duration,
+    plugin_tick_interval: Duration,
+    sys_interval: Option<Duration>,
+}
+
+/// How often expired retained messages are removed from storage.
+const RETAINED_SWEEP: Duration = Duration::from_secs(60);
+
+impl<St: MqttStore + 'static> Server<St> {
     /// Administers this broker, before and while it runs.
     pub fn admin(&self) -> Admin {
         self.admin.clone()
+    }
+
+    /// Opens in-process connections to this broker once it runs.
+    pub fn local_connector(&self) -> LocalConnector {
+        self.listener.local_listener.connector.clone()
     }
 
     /// Serves clients until `shutdown` completes, then lets connections
@@ -2063,10 +2179,8 @@ impl<St: MqttStore + 'static> Listener<St> {
 
         loop {
             let accepted = poll_fn(|cx| {
-                if let Some(LocalListener(local)) = &mut self.local_listener {
-                    if let Poll::Ready(Some(stream)) = local.poll_recv(cx) {
-                        return Poll::Ready(Ok(Accepted::Local(stream)));
-                    }
+                if let Poll::Ready(Some(stream)) = self.local_listener.connections.poll_recv(cx) {
+                    return Poll::Ready(Ok(Accepted::Local(stream)));
                 }
                 let count = self.endpoints.len();
                 for offset in 0..count {

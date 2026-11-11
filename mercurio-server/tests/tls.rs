@@ -6,7 +6,7 @@ use mercurio_server::{
     auth::SimpleCredentialValidator,
     error::TlsError,
     plugin::{ready, BoxFuture, ClientInfo, Event, Plugin},
-    server::{run_with_config, ServerConfig},
+    server::{ListenerConfig, Server, ServerConfig, Transport},
     tls::{CertificateName, Tls, TlsConfig},
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
@@ -35,15 +35,17 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-/// Serves `config` on a new port and returns its address.
-async fn start(config: ServerConfig) -> SocketAddr {
+/// Serves `config` with `tls` on a new port and returns its address.
+async fn start(config: ServerConfig, tls: Tls) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let listener = ListenerConfig::new(listener, Transport::Mqtt).with_tls(tls);
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(listener)
+            .run(std::future::pending::<()>()),
+    );
     addr
 }
 
@@ -145,9 +147,8 @@ async fn reload_serves_new_connections_the_new_certificate() {
         key.to_str().unwrap(),
     ))
     .unwrap();
-    let mut config = ServerConfig::default();
-    config.tls = Some(tls.clone());
-    let addr = start(config).await;
+    let config = ServerConfig::default();
+    let addr = start(config, tls.clone()).await;
 
     let mut established = handshake(addr, None).await.unwrap();
     assert_eq!(served_certificate(&established), certs("server.pem")[0]);
@@ -195,11 +196,10 @@ async fn start_with_client_certificates(files: TlsConfig) -> SocketAddr {
     let mut files = files.with_client_auth(fixture("root.pem"));
     files.username_from_certificate = Some(CertificateName::CommonName);
     let mut config = ServerConfig::default();
-    config.tls = Some(Tls::new(files).unwrap());
     config.auth.require_auth = true;
     let users = [("user".to_string(), "secret".to_string())].into();
     config.plugins = vec![Arc::new(SimpleCredentialValidator::new(users))];
-    start(config).await
+    start(config, Tls::new(files).unwrap()).await
 }
 
 fn server_files() -> TlsConfig {
@@ -272,9 +272,8 @@ async fn plugins_see_tls_and_the_certificate_name() {
     let mut files = server_files().with_client_auth(fixture("root.pem"));
     files.username_from_certificate = Some(CertificateName::CommonName);
     let mut config = ServerConfig::default();
-    config.tls = Some(Tls::new(files).unwrap());
     config.plugins = vec![connections.clone()];
-    let addr = start(config).await;
+    let addr = start(config, Tls::new(files).unwrap()).await;
 
     let mut alice = handshake(addr, Some("alice")).await.unwrap();
     assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
@@ -326,9 +325,8 @@ fn rustls_config(server: &str) -> Arc<rustls::ServerConfig> {
 async fn embedders_can_serve_their_own_rustls_configuration() {
     let tls = Tls::from_rustls(rustls_config("server2"), Some(CertificateName::CommonName));
     let mut config = ServerConfig::default();
-    config.tls = Some(tls.clone());
     config.auth.require_auth = true;
-    let addr = start(config).await;
+    let addr = start(config, tls.clone()).await;
 
     assert!(refused(addr, None).await);
     let mut alice = handshake(addr, Some("alice")).await.unwrap();
@@ -355,9 +353,8 @@ async fn start_with_crls(test: &str, crls: &[&str], tune: fn(&mut TlsConfig)) ->
     let mut files = server_files().with_client_auth(fixture("root.pem"));
     files.crl_path = Some(path.to_str().unwrap().to_string());
     tune(&mut files);
-    let mut config = ServerConfig::default();
-    config.tls = Some(Tls::new(files).unwrap());
-    start(config).await
+    let config = ServerConfig::default();
+    start(config, Tls::new(files).unwrap()).await
 }
 
 async fn accepted(addr: SocketAddr, identity: &str) -> bool {

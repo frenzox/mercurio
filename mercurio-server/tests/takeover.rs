@@ -48,10 +48,7 @@ async fn connect(addr: SocketAddr, clean_start: bool) -> (TcpStream, u8) {
 async fn new_connection_takes_over_client_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let (mut old, _) = connect(addr, true).await;
     // SUBSCRIBE packet id 1, "t" at QoS 0, then wait for SUBACK
@@ -111,10 +108,7 @@ async fn connect_311(addr: SocketAddr, clean_session: bool) -> (TcpStream, Vec<u
 async fn mqtt311_takeover_of_a_clean_session_starts_a_new_one() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let (mut old, _) = connect_311(addr, true).await;
     // SUBSCRIBE packet id 1, "t" at QoS 0, then wait for SUBACK
@@ -164,11 +158,7 @@ async fn start_authenticating_broker() -> SocketAddr {
         ("alice".to_string(), "alice-pw".to_string()),
         ("mallory".to_string(), "mallory-pw".to_string()),
     ])))];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

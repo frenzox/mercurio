@@ -43,10 +43,7 @@ async fn next_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> ControlPa
 async fn slow_subscriber_receives_every_qos1_message() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut subscriber = connect(addr, b's').await;
     // SUBSCRIBE packet id 1, "t" at QoS 1

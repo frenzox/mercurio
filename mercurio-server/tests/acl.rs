@@ -1,3 +1,5 @@
+mod common;
+
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -38,11 +40,7 @@ async fn start_broker(verify_users: bool) -> SocketAddr {
         )]))),
         Arc::new(AclFile::parse(ACL).unwrap()),
     ];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

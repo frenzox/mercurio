@@ -2,7 +2,7 @@ mod common;
 
 use std::{net::SocketAddr, time::Duration};
 
-use mercurio_server::server::{Limits, ListenerConfig, Rate, ServerConfig, Transport};
+use mercurio_server::server::{Limits, ListenerConfig, Rate, Server, ServerConfig, Transport};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -14,11 +14,7 @@ async fn start_broker(limits: Limits) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits = limits;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 
@@ -126,11 +122,7 @@ async fn response_information_is_given_to_clients_that_ask() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.policy.response_information = Some("responses/%c".into());
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     // CONNECT for client "r" with Request Response Information 1
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -158,11 +150,7 @@ async fn clients_are_redirected_when_configured() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.policy.redirect = Some(mercurio_server::server::Redirect::new("other:1883", true));
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     // MQTT 5: Server Moved, with Server Reference (0x1c) "other:1883"
     let (_, connack) = connect(addr, b'c').await;
@@ -349,11 +337,7 @@ async fn retained_messages_beyond_the_limit_are_refused() {
     config.limits.max_retained_messages = Some(1);
     // The broker's own $SYS topics don't count
     config.sys_interval = Some(Duration::from_millis(50));
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let (mut stream, _) = connect(addr, b'r').await;
 
@@ -371,20 +355,19 @@ async fn an_address_holds_its_slots_through_the_tls_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
-    config.tls = Some(
-        mercurio_server::tls::Tls::new(mercurio_server::tls::TlsConfig::new(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
-        ))
-        .unwrap(),
-    );
+    let main_tls = mercurio_server::tls::Tls::new(mercurio_server::tls::TlsConfig::new(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+    ))
+    .unwrap();
     config.limits.max_connections_per_ip = Some(1);
     config.limits.connect_timeout = Duration::from_secs(30);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt).with_tls(main_tls))
+            .run(std::future::pending::<()>()),
+    );
 
     // Neither starts its TLS handshake: the first takes the address's
     // only slot, the second is closed at once
@@ -546,17 +529,17 @@ async fn listeners_close_connections_beyond_their_rate() {
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let limited = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = limited.local_addr().unwrap();
-    let mut config = ServerConfig::default();
-    config.listeners = vec![{
+    let config = ServerConfig::default();
+    let listeners = vec![{
         let mut value = ListenerConfig::new(limited, Transport::Mqtt);
         value.max_connection_rate = Some(Rate::new(1, 2));
         value
     }];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        main,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(main, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let _first = connect(addr, b'1').await;
     let _second = connect(addr, b'2').await;

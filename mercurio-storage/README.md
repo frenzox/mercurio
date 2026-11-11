@@ -18,11 +18,15 @@ the first two gathered in `MqttStore`, with three implementations:
 ```rust,ignore
 use std::sync::Arc;
 
-use mercurio_server::server::{run_with_storage, ServerConfig};
+use mercurio_server::server::{ListenerConfig, Server, Transport};
 use mercurio_storage::sqlite::SqliteStore;
 
 let storage = Arc::new(SqliteStore::new("/var/lib/myapp/mqtt.db")?);
-run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;
+Server::builder()
+    .storage(storage)
+    .listener(ListenerConfig::new(listener, Transport::Mqtt))
+    .run(shutdown)
+    .await?;
 ```
 
 Implement the traits to keep the broker's state anywhere else. The broker

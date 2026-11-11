@@ -31,10 +31,7 @@ async fn connect(addr: SocketAddr, client_id: u8) -> TcpStream {
 async fn expired_retained_message_is_not_delivered() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut publisher = connect(addr, b'p').await;
     let publish = PublishPacket {

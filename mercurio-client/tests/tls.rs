@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS};
 use mercurio_server::{
-    server::ServerConfig,
+    server::{ListenerConfig, Server, Transport},
     tls::{Tls, TlsConfig},
 };
 use tokio::{net::TcpListener, time::timeout};
@@ -17,13 +17,12 @@ const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/server-ke
 async fn start_broker() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let mut config = ServerConfig::default();
-    config.tls = Some(Tls::new(TlsConfig::new(CERT, KEY)).unwrap());
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let tls = Tls::new(TlsConfig::new(CERT, KEY)).unwrap();
+    tokio::spawn(
+        Server::builder()
+            .listener(ListenerConfig::new(listener, Transport::Mqtt).with_tls(tls))
+            .run(std::future::pending::<()>()),
+    );
     port
 }
 

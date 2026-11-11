@@ -2064,7 +2064,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_changes_disconnect_the_clients_they_affect() {
-        use mercurio_server::server::{Server, ServerConfig};
+        use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
 
         let path =
             std::env::temp_dir().join(format!("mercuriod-dynsec-kick-{}", std::process::id()));
@@ -2076,13 +2076,15 @@ mod tests {
         config.plugins = vec![security.clone()];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = Server::new(
-            listener,
-            config,
-            std::sync::Arc::new(mercurio_storage::memory::MemoryStore::new()),
-        )
-        .await
-        .unwrap();
+        let server = Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .storage(std::sync::Arc::new(
+                mercurio_storage::memory::MemoryStore::new(),
+            ))
+            .build()
+            .await
+            .unwrap();
         security.set_admin(server.admin());
         tokio::spawn(server.run(std::future::pending::<()>()));
 
@@ -2258,16 +2260,19 @@ mod tests {
         let mounted_port = mounted.local_addr().unwrap().port();
         let mut mounted = ListenerConfig::new(mounted, Transport::Mqtt);
         mounted.mount_point = Some("tenant/".into());
-        config.listeners = vec![mounted];
+        let listeners = vec![mounted];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = Server::new(
-            listener,
-            config,
-            std::sync::Arc::new(mercurio_storage::memory::MemoryStore::new()),
-        )
-        .await
-        .unwrap();
+        let server = Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .listeners(listeners)
+            .storage(std::sync::Arc::new(
+                mercurio_storage::memory::MemoryStore::new(),
+            ))
+            .build()
+            .await
+            .unwrap();
         security.set_admin(server.admin());
         tokio::spawn(server.run(std::future::pending::<()>()));
         run(

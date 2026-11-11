@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     io::Write,
     net::SocketAddr,
@@ -62,7 +64,7 @@ async fn client_caused_failures_are_not_errors() {
     let addr = listener.local_addr().unwrap();
     let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tls_addr = tls_listener.local_addr().unwrap();
-    let mut config = ServerConfig::default();
+    let config = ServerConfig::default();
     let mut tls = ListenerConfig::new(tls_listener, Transport::Mqtt);
     tls.tls = Some(
         Tls::new(TlsConfig::new(
@@ -71,12 +73,11 @@ async fn client_caused_failures_are_not_errors() {
         ))
         .unwrap(),
     );
-    config.listeners.push(tls);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, config)
+            .listener(tls)
+            .run(std::future::pending::<()>()),
+    );
 
     let mut peers = Vec::new();
     // A TCP health check: connect, then close before CONNECT

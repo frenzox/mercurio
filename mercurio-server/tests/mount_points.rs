@@ -2,6 +2,8 @@
 //! sessions, apart in every respect, also across a restart on durable
 //! storage.
 
+mod common;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -16,7 +18,7 @@ use mercurio_packets::{
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
 };
-use mercurio_server::server::{ListenerConfig, Server, ServerConfig, Transport};
+use mercurio_server::server::{ListenerConfig, ServerConfig, Transport};
 use mercurio_storage::{sqlite::SqliteStore, MqttStore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -40,6 +42,7 @@ impl Broker {
     async fn start<St: MqttStore + 'static>(storage: Arc<St>) -> Broker {
         let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = ServerConfig::default();
+        let mut listeners = Vec::new();
         config.sys_interval = None;
         let mut addrs = Vec::new();
         for mount_point in ["a/", "b/"] {
@@ -47,10 +50,15 @@ impl Broker {
             addrs.push(listener.local_addr().unwrap());
             let mut listener = ListenerConfig::new(listener, Transport::Mqtt);
             listener.mount_point = Some(mount_point.into());
-            config.listeners.push(listener);
+            listeners.push(listener);
         }
         let main_addr = main.local_addr().unwrap();
-        let server = Server::new(main, config, storage).await.unwrap();
+        let server = common::broker(main, config)
+            .listeners(listeners)
+            .storage(storage)
+            .build()
+            .await
+            .unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             server

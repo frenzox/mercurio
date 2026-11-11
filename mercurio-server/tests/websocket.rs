@@ -26,16 +26,16 @@ async fn start_broker() -> (SocketAddr, SocketAddr) {
         listener.local_addr().unwrap(),
         websocket_listener.local_addr().unwrap(),
     );
-    let mut config = ServerConfig::default();
-    config.listeners = vec![ListenerConfig::new(
+    let config = ServerConfig::default();
+    let listeners = vec![ListenerConfig::new(
         websocket_listener,
         Transport::WebSocket,
     )];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     addrs
 }
 
@@ -155,17 +155,17 @@ async fn websocket_listeners_serve_files_and_mqtt() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = websocket_listener.local_addr().unwrap();
-    let mut config = ServerConfig::default();
-    config.listeners = vec![{
+    let config = ServerConfig::default();
+    let listeners = vec![{
         let mut value = ListenerConfig::new(websocket_listener, Transport::WebSocket);
         value.http_dir = Some(dir.clone());
         value
     }];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let get = |target: &'static str| async move {
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -235,13 +235,13 @@ async fn only_allowed_origins_may_upgrade() {
     let addr = websocket_listener.local_addr().unwrap();
     let mut listener = ListenerConfig::new(websocket_listener, Transport::WebSocket);
     listener.allowed_origins = Some(vec!["https://app.example".into()]);
-    let mut config = ServerConfig::default();
-    config.listeners = vec![listener];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    let listeners = vec![listener];
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let mqtt = ("Sec-WebSocket-Protocol", "mqtt");
     let from = |origin| [mqtt, ("Origin", origin)];

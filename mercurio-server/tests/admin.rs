@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -21,7 +23,7 @@ use mercurio_server::{
         ready, Access, AuthExchange, AuthResult, BoxFuture, ClientInfo, Credentials, Decision,
         Plugin,
     },
-    server::{ListenerConfig, LocalConnector, Server, ServerConfig, Transport},
+    server::{ListenerConfig, LocalConnector, ServerBuilder, ServerConfig, Transport},
 };
 use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore, BanStore, SessionKey};
 
@@ -44,9 +46,18 @@ fn config(plugins: Vec<Arc<dyn Plugin>>) -> ServerConfig {
 }
 
 async fn start(config: ServerConfig) -> (SocketAddr, Admin) {
+    start_with(config, |builder| builder).await
+}
+
+/// Like `start`, with what `extra` adds to the broker, such as listeners.
+async fn start_with(
+    config: ServerConfig,
+    extra: impl FnOnce(ServerBuilder) -> ServerBuilder,
+) -> (SocketAddr, Admin) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
+    let server = extra(common::broker(listener, config))
+        .build()
         .await
         .unwrap();
     let admin = server.admin();
@@ -491,9 +502,8 @@ async fn allowing_every_topic_grants_no_admin_commands() {
 #[tokio::test]
 async fn in_process_clients_run_every_command() {
     let (connector, local_listener) = LocalConnector::new();
-    let mut config = config(Vec::new());
-    config.local_listener = Some(local_listener);
-    start(config).await;
+    let config = config(Vec::new());
+    start_with(config, |builder| builder.local_listener(local_listener)).await;
     let stream = connector.connect().unwrap();
     let mut bridge = Client::handshake(stream, connect_packet("bridge")).await;
     bridge.subscribe("replies/bridge").await;
@@ -593,9 +603,9 @@ async fn listeners_are_listed_with_their_connections() {
     let ws_addr = ws.local_addr().unwrap();
     let mut websocket = ListenerConfig::new(ws, Transport::WebSocket);
     websocket.mount_point = Some("tenant/".into());
-    let mut config = config(Vec::new());
-    config.listeners = vec![websocket];
-    let (addr, admin) = start(config).await;
+    let config = config(Vec::new());
+    let listeners = vec![websocket];
+    let (addr, admin) = start_with(config, |builder| builder.listeners(listeners)).await;
 
     let _socket = TcpStream::connect(addr).await.unwrap();
     // Counted once the accept loop picks the connection up
@@ -1499,14 +1509,14 @@ async fn address_bans_refuse_before_authentication() {
 async fn address_bans_match_the_address_a_proxy_reports() {
     let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxied_addr = proxied.local_addr().unwrap();
-    let mut config = config(vec![Arc::new(AllowAll)]);
-    config.listeners = vec![{
+    let config = config(vec![Arc::new(AllowAll)]);
+    let listeners = vec![{
         let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
         listener.proxy_protocol = true;
         listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         listener
     }];
-    let (_, admin) = start(config).await;
+    let (_, admin) = start_with(config, |builder| builder.listeners(listeners)).await;
     admin
         .add_ban(NewBan::new(BanKey::new(BanKind::Address, "192.0.2.0/24")))
         .await
@@ -1537,7 +1547,9 @@ async fn bans_survive_a_restart_on_sqlite() {
     let open = || Arc::new(SqliteStore::new(&db).unwrap());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server = Server::new(listener, config(Vec::new()), open())
+    let server = common::broker(listener, config(Vec::new()))
+        .storage(open())
+        .build()
         .await
         .unwrap();
     let mut key = BanKey::new(BanKind::ClientId, "bad");
@@ -1549,7 +1561,9 @@ async fn bans_survive_a_restart_on_sqlite() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Server::new(listener, config(Vec::new()), open())
+    let server = common::broker(listener, config(Vec::new()))
+        .storage(open())
+        .build()
         .await
         .unwrap();
     let bans = server.admin().bans(Paging::default()).await;
@@ -1591,14 +1605,14 @@ async fn banned_clients_publish_no_will_and_start_no_session() {
 async fn address_bans_on_mapped_blocks_apply_to_ipv4_clients() {
     let proxied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxied_addr = proxied.local_addr().unwrap();
-    let mut config = config(vec![Arc::new(AllowAll)]);
-    config.listeners = vec![{
+    let config = config(vec![Arc::new(AllowAll)]);
+    let listeners = vec![{
         let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
         listener.proxy_protocol = true;
         listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         listener
     }];
-    let (_, admin) = start(config).await;
+    let (_, admin) = start_with(config, |builder| builder.listeners(listeners)).await;
     admin
         .add_ban(NewBan::new(BanKey::new(
             BanKind::Address,
@@ -1649,7 +1663,8 @@ async fn a_client_banned_while_it_connects_is_closed_once_up() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let plugin = Arc::new(BansDuringConnect(Arc::clone(&slot)));
-    let server = Server::new(listener, config(vec![plugin]), Arc::new(MemoryStore::new()))
+    let server = common::broker(listener, config(vec![plugin]))
+        .build()
         .await
         .unwrap();
     assert!(slot.set(server.admin()).is_ok());
@@ -1708,7 +1723,9 @@ async fn expired_bans_are_dropped_from_the_list_and_storage() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // config() publishes no $SYS statistics: bans are swept regardless
-    let server = Server::new(listener, config(Vec::new()), Arc::clone(&store))
+    let server = common::broker(listener, config(Vec::new()))
+        .storage(Arc::clone(&store))
+        .build()
         .await
         .unwrap();
     let admin = server.admin();
@@ -1759,8 +1776,8 @@ async fn trusted_unix_listeners_skip_authentication_and_access_control() {
     let acl = AclFile::parse("topic read nothing/#\n").unwrap();
     let mut config = config(vec![Arc::new(acl)]);
     config.auth.require_auth = true;
-    config.listeners = vec![trusted];
-    let (addr, _) = start(config).await;
+    let listeners = vec![trusted];
+    let (addr, _) = start_with(config, |builder| builder.listeners(listeners)).await;
 
     assert_eq!(
         connack_reason(addr, b"", connect_packet("outsider")).await,
@@ -1784,9 +1801,9 @@ async fn the_admin_socket_admits_the_brokers_own_user() {
     let mut admin_socket = ListenerConfig::new(socket, Transport::Mqtt);
     admin_socket.trusted = true;
     admin_socket.peer_filter = Some(Arc::new(move |peer: &UCred| peer.uid() == own_uid));
-    let mut config = config(Vec::new());
-    config.listeners = vec![admin_socket];
-    start(config).await;
+    let config = config(Vec::new());
+    let listeners = vec![admin_socket];
+    start_with(config, |builder| builder.listeners(listeners)).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let mut admin = Client::handshake(stream, connect_packet("admin")).await;
@@ -1803,9 +1820,9 @@ async fn clients_the_peer_filter_refuses_are_closed_unanswered() {
     let mut admin_socket = ListenerConfig::new(socket, Transport::Mqtt);
     admin_socket.trusted = true;
     admin_socket.peer_filter = Some(Arc::new(|_: &UCred| false));
-    let mut config = config(Vec::new());
-    config.listeners = vec![admin_socket];
-    start(config).await;
+    let config = config(Vec::new());
+    let listeners = vec![admin_socket];
+    start_with(config, |builder| builder.listeners(listeners)).await;
 
     let mut stream = UnixStream::connect(&path).await.unwrap();
     let mut bytes = BytesMut::new();
@@ -1830,8 +1847,8 @@ async fn trusted_unix_listeners_ignore_limits() {
     trusted.trusted = true;
     let mut config = config(Vec::new());
     config.limits.max_connections = Some(1);
-    config.listeners = vec![trusted];
-    let (addr, _) = start(config).await;
+    let listeners = vec![trusted];
+    let (addr, _) = start_with(config, |builder| builder.listeners(listeners)).await;
 
     // Once its CONNACK is back the client holds the only slot
     let _full = Client::connect(addr, "full").await;
@@ -1859,8 +1876,8 @@ async fn trusted_unix_listeners_ignore_redirects_and_client_id_prefixes() {
     let mut config = config(Vec::new());
     config.policy.redirect = Some(mercurio_server::server::Redirect::new("other:1883", true));
     config.policy.client_id_prefixes = vec!["app-".into()];
-    config.listeners = vec![trusted];
-    let (_, _) = start(config).await;
+    let listeners = vec![trusted];
+    let (_, _) = start_with(config, |builder| builder.listeners(listeners)).await;
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let mut admin = Client::handshake(stream, connect_packet("admin")).await;
@@ -1876,9 +1893,9 @@ async fn bans_still_apply_on_trusted_unix_listeners() {
     let (socket, path) = unix_listener("trusted-ban");
     let mut trusted = ListenerConfig::new(socket, Transport::Mqtt);
     trusted.trusted = true;
-    let mut config = config(Vec::new());
-    config.listeners = vec![trusted];
-    let (_, admin) = start(config).await;
+    let config = config(Vec::new());
+    let listeners = vec![trusted];
+    let (_, admin) = start_with(config, |builder| builder.listeners(listeners)).await;
     admin
         .add_ban(NewBan::new(BanKey::new(BanKind::ClientId, "bad")))
         .await
@@ -1895,16 +1912,17 @@ async fn bans_still_apply_on_trusted_unix_listeners() {
 /// A broker with two more listeners, under the mount points `a/` and `b/`;
 /// returns the addresses of those.
 async fn start_mounted() -> (SocketAddr, SocketAddr, SocketAddr, Admin) {
-    let mut config = config(vec![Arc::new(AllowAll)]);
+    let mut listeners = Vec::new();
     let mut addrs = Vec::new();
     for mount_point in ["a/", "b/"] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         addrs.push(listener.local_addr().unwrap());
         let mut listener = ListenerConfig::new(listener, Transport::Mqtt);
         listener.mount_point = Some(mount_point.into());
-        config.listeners.push(listener);
+        listeners.push(listener);
     }
-    let (addr, admin) = start(config).await;
+    let config = config(vec![Arc::new(AllowAll)]);
+    let (addr, admin) = start_with(config, |builder| builder.listeners(listeners)).await;
     (addr, addrs[0], addrs[1], admin)
 }
 

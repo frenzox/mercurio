@@ -1,6 +1,8 @@
 //! SCRAM-SHA-256 between the client's authenticator and the broker's
 //! built-in mechanism.
 
+mod common;
+
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -82,11 +84,7 @@ async fn start_broker(tamper: Arc<AtomicBool>) -> SocketAddr {
         tamper,
     })];
     config.auth.require_auth = true;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

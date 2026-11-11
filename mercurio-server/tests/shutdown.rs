@@ -1,7 +1,9 @@
+mod common;
+
 use std::time::Duration;
 
 use mercurio_server::{
-    server::{ListenerConfig, ServerConfig, Transport},
+    server::{ListenerConfig, Server, ServerConfig, Transport},
     tls::{Tls, TlsConfig},
 };
 use tokio::{
@@ -16,15 +18,14 @@ use tokio::{
 async fn handshaking_connections_end_with_the_server() {
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = ServerConfig::default();
+    let mut listeners = Vec::new();
     config.limits.connect_timeout = Duration::from_secs(30);
     config.sys_interval = None;
-    config.tls = Some(
-        Tls::new(TlsConfig::new(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
-        ))
-        .unwrap(),
-    );
+    let main_tls = Tls::new(TlsConfig::new(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+    ))
+    .unwrap();
     // Each listener, with the start of its first step: nothing of the TLS
     // handshake, part of CONNECT, of the HTTP upgrade, of the PROXY header
     let mut started = vec![(main.local_addr().unwrap(), &b""[..])];
@@ -40,16 +41,18 @@ async fn handshaking_connections_end_with_the_server() {
         if proxy_protocol {
             listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         }
-        config.listeners.push(listener);
+        listeners.push(listener);
     }
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(mercurio_server::server::run_with_config(
-        main,
-        config,
-        async {
-            let _ = stopped.await;
-        },
-    ));
+    let server = tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(main, Transport::Mqtt).with_tls(main_tls))
+            .listeners(listeners)
+            .run(async {
+                let _ = stopped.await;
+            }),
+    );
 
     let mut clients = Vec::new();
     for (addr, start) in started {

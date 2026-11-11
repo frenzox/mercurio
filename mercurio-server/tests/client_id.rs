@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_server::server::{ConnectPolicy, ServerConfig};
@@ -17,11 +19,7 @@ async fn start_broker_with(policy: ConnectPolicy) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.policy = policy;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

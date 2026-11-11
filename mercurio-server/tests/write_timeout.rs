@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -10,9 +12,8 @@ use mercurio_packets::{
 };
 use mercurio_server::{
     plugin::{Access, BoxFuture, ClientInfo, Decision, Plugin},
-    server::{Server, ServerConfig},
+    server::ServerConfig,
 };
-use mercurio_storage::memory::MemoryStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -26,9 +27,7 @@ async fn start(mut config: ServerConfig) -> SocketAddr {
     config.limits.write_timeout = WRITE_TIMEOUT;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
-        .await
-        .unwrap();
+    let server = common::broker(listener, config).build().await.unwrap();
     tokio::spawn(server.run(std::future::pending::<()>()));
     addr
 }

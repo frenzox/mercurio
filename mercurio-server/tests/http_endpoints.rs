@@ -4,9 +4,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use mercurio_server::{
     error::{ConfigErrorKind, ServerError},
-    server::{ListenerConfig, Server, ServerConfig, Transport},
+    server::{ListenerConfig, ServerConfig, Transport},
 };
-use mercurio_storage::memory::MemoryStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -22,13 +21,13 @@ async fn serve(configure: impl FnOnce(&mut ListenerConfig)) -> (SocketAddr, Sock
     let addr = websocket.local_addr().unwrap();
     let mut listener = ListenerConfig::new(websocket, Transport::WebSocket);
     configure(&mut listener);
-    let mut config = ServerConfig::default();
-    config.listeners = vec![listener];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        mqtt,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    let listeners = vec![listener];
+    tokio::spawn(
+        common::broker(mqtt, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     (addr, mqtt_addr)
 }
 
@@ -134,10 +133,13 @@ async fn endpoints_need_a_websocket_listener() {
         Transport::Mqtt,
     );
     listener.metrics = true;
-    let mut config = ServerConfig::default();
-    config.listeners = vec![listener];
+    let config = ServerConfig::default();
+    let listeners = vec![listener];
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let result = Server::new(main, config, std::sync::Arc::new(MemoryStore::new())).await;
+    let result = common::broker(main, config)
+        .listeners(listeners)
+        .build()
+        .await;
     let Err(ServerError::Config(error)) = result else {
         panic!("served metrics on an MQTT listener");
     };

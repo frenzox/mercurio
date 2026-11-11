@@ -10,7 +10,7 @@ use mercurio_client::Bytes;
 use mercurio_client::{ConnectOptions, MessageProperties, MqttClient, QoS};
 use mercurio_server::{
     auth::SimpleCredentialValidator,
-    server::{run_with_config, ServerConfig},
+    server::{ListenerConfig, Server, ServerConfig, Transport},
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -20,7 +20,7 @@ struct Broker {
 }
 
 async fn start() -> Broker {
-    start_with(ServerConfig::default()).await
+    start_with(ServerConfig::default(), Vec::new()).await
 }
 
 /// A broker that only lets alice in, with the password `secret`.
@@ -31,18 +31,21 @@ async fn start_with_login() -> Broker {
     config.plugins = vec![Arc::new(SimpleCredentialValidator::new(
         credentials.into_iter().collect(),
     ))];
-    start_with(config).await
+    start_with(config, Vec::new()).await
 }
 
-async fn start_with(mut config: ServerConfig) -> Broker {
+/// A broker with `config`, serving MQTT on its port and `listeners`.
+async fn start_with(mut config: ServerConfig, listeners: Vec<ListenerConfig>) -> Broker {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     config.sys_interval = None;
-    tokio::spawn(run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     Broker { port }
 }
 
@@ -303,7 +306,7 @@ async fn subscriptions_are_made_again_after_the_session_is_lost() {
 async fn a_refused_subscription_fails() {
     let mut config = ServerConfig::default();
     config.limits.max_subscriptions = Some(1);
-    let broker = start_with(config).await;
+    let broker = start_with(config, Vec::new()).await;
     let output = broker.run(&["sub", "-t", "a", "-t", "b"]).await;
     let message = stderr(&output);
     assert_eq!(output.status.code(), Some(1), "{message}");
@@ -397,7 +400,7 @@ async fn scram_logs_in_without_sending_the_password() {
         ))
         .decoy_iterations(4096),
     )];
-    let broker = start_with(config).await;
+    let broker = start_with(config, Vec::new()).await;
     let publish = [
         "pub",
         "--auth-method",
@@ -689,13 +692,10 @@ async fn sub_fails_when_the_timeout_comes_first() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_reaches_a_websocket_listener() {
-    use mercurio_server::server::{ListenerConfig, Transport};
-
     let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let websocket_port = websocket.local_addr().unwrap().port().to_string();
-    let mut config = ServerConfig::default();
-    config.listeners = vec![ListenerConfig::new(websocket, Transport::WebSocket)];
-    let broker = start_with(config).await;
+    let websocket = ListenerConfig::new(websocket, Transport::WebSocket);
+    let broker = start_with(ServerConfig::default(), vec![websocket]).await;
     let receiver = broker.client("receiver").await;
     receiver
         .subscribe(&[("ws", QoS::AtMostOnce)])

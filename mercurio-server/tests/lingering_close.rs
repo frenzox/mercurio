@@ -20,11 +20,7 @@ async fn disconnect_survives_a_client_still_sending() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits.receive_maximum = 1;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     let mut client = TcpStream::connect(addr).await.unwrap();
     client
