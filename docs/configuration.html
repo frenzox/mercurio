@@ -178,7 +178,7 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>acl_file</code></td><td></td><td>Topic access rules, in mosquitto's format.</td></tr>
 <tr><td><code>dynamic_security</code></td><td></td><td>Dynamic security state file; replaces <code>password_file</code> and <code>acl_file</code>. Only in <code>[auth]</code>.</td></tr>
 <tr><td><code>scram_secret_file</code></td><td></td><td>File with 32 bytes of the secret that the SCRAM salts of unknown users come from. Created with random bytes and mode 0600 when missing, and the broker refuses to start when it has another length. Set it so the salts, and so the list of users, stay hidden across restarts. <code>--check</code> does not create it.</td></tr>
-<tr><td><code>scram_require_channel_binding</code></td><td><code>false</code></td><td>Refuse SCRAM-SHA-256 without channel binding on TLS 1.3 connections, so clients there must use SCRAM-SHA-256-PLUS. Plain TCP, Unix sockets, TLS 1.2 and connections behind a TLS-terminating proxy cannot bind and are not affected. See <a href="security.html#scram-plus">SCRAM-SHA-256-PLUS</a>.</td></tr>
+<tr><td><code>scram_require_channel_binding</code></td><td><code>false</code></td><td>Refuse SCRAM-SHA-256 without channel binding on TLS 1.3 connections, so clients there must use SCRAM-SHA-256-PLUS. Plain TCP, Unix sockets, TLS 1.2 and connections behind a TLS-terminating proxy cannot bind and are not affected, and plain user name and password CONNECTs on the same listener are still accepted. A refused client counts as a failed login. See <a href="security.html#scram-plus">SCRAM-SHA-256-PLUS</a>.</td></tr>
 </table>
 <h3 id="auth-http">[auth.http]</h3>
 <table>
