@@ -55,7 +55,7 @@ async fn statistics(addr: SocketAddr) -> HashMap<String, String> {
         while values.len() < 39 {
             if ControlPacket::check(&buffer).is_ok() {
                 if let ControlPacket::Publish(publish) =
-                    ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
+                    ControlPacket::parse(&mut buffer, ProtocolVersion::V5).unwrap()
                 {
                     let value = String::from_utf8(publish.payload.unwrap().to_vec()).unwrap();
                     values.insert(publish.topic_name, value);

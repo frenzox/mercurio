@@ -3,10 +3,10 @@ mod common;
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use mercurio_core::{codec::Encoder, properties::*, protocol::ProtocolVersion, qos::QoS};
+use mercurio_core::{properties::*, protocol::ProtocolVersion, qos::QoS};
 use mercurio_packets::{
     publish::{PublishPacket, PublishProperties},
-    ControlPacket,
+    ControlPacket, Packet,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -52,7 +52,7 @@ async fn next_packet(
 ) -> ControlPacket {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return ControlPacket::parse_with_version(buffer, version).unwrap();
+            return ControlPacket::parse(buffer, version).unwrap();
         }
         let read = timeout(Duration::from_secs(2), stream.read_buf(buffer))
             .await
@@ -98,7 +98,7 @@ async fn application_properties_are_forwarded() {
         payload: Some(Bytes::from_static(b"hi")),
     };
     let mut encoded = BytesMut::new();
-    publish.encode(&mut encoded);
+    publish.encode(&mut encoded, ProtocolVersion::V5).unwrap();
     publisher.write_all(&encoded).await.unwrap();
 
     let mut buffer = BytesMut::new();

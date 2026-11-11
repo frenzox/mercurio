@@ -8,8 +8,8 @@ use tokio::{
 };
 
 use mercurio_core::{
-    codec::MAX_PACKET_SIZE, error::Error, protocol::ProtocolVersion, reason::ReasonCode,
-    topic::parse_shared_subscription, Result,
+    error::Error, protocol::ProtocolVersion, reason::ReasonCode, topic::parse_shared_subscription,
+    Result,
 };
 use mercurio_packets::ControlPacket;
 use tracing::warn;
@@ -128,8 +128,8 @@ fn mount(packet: &mut ControlPacket, mount_point: &str) {
     };
     match packet {
         ControlPacket::Connect(connect) => {
-            if let Some(topic) = &mut connect.payload.will_topic {
-                mounted(topic);
+            if let Some(will) = &mut connect.payload.will {
+                mounted(&mut will.topic);
             }
         }
         ControlPacket::Publish(publish) => mounted(&mut publish.topic_name),
@@ -265,12 +265,14 @@ where
             }
         }
 
-        packet.encode_with_version(&mut self.write_buffer, self.protocol_version);
-        // Only a forwarded PUBLISH can grow this large, by the properties
-        // added to a message that already filled a whole packet
-        if self.write_buffer.len() > MAX_PACKET_SIZE {
-            warn!("Dropping a packet too large for MQTT to frame");
-            self.write_buffer.clear();
+        // Only a forwarded PUBLISH can grow too large to frame, by the
+        // properties added to a message that already filled a whole packet.
+        // A refused packet leaves the buffer empty and is dropped.
+        if let Err(e) = packet.encode(&mut self.write_buffer, self.protocol_version) {
+            warn!(
+                "Dropping a {:?} that can't be encoded: {e}",
+                packet.packet_type()
+            );
         }
         if let (Some(counters), ControlPacket::Publish(_)) = (&self.counters, &packet) {
             if !self.write_buffer.is_empty() {
@@ -347,10 +349,7 @@ where
 
         match ControlPacket::check(&self.read_buffer) {
             Ok(_) => {
-                let packet = ControlPacket::parse_with_version(
-                    &mut self.read_buffer,
-                    self.protocol_version,
-                )?;
+                let packet = ControlPacket::parse(&mut self.read_buffer, self.protocol_version)?;
                 Ok(Some(packet))
             }
             // Not enough bytes in the buffer to parse a packet

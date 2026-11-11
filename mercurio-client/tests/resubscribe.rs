@@ -6,7 +6,6 @@ use common::Peer;
 use mercurio_client::{
     ConnectOptions, Event, MqttClient, QoS, ReasonCode, RetainHandling, SubscriptionOptions,
 };
-use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::subscribe::SubscribePacket;
 use mercurio_packets::unsuback::{UnsubAckPacket, UnsubAckPayload};
 use mercurio_packets::ControlPacket;
@@ -38,7 +37,7 @@ fn contents(subscribe: &SubscribePacket) -> (Vec<(String, SubscriptionOptions)>,
         .properties
         .as_ref()
         .and_then(|p| p.subscription_id.as_ref())
-        .map(|id| id.value.0);
+        .map(|id| id.value());
     (filters, id)
 }
 
@@ -78,7 +77,6 @@ async fn first_connection(listener: TcpListener) -> TcpListener {
         panic!("expected UNSUBSCRIBE");
     };
     peer.write(ControlPacket::UnsubAck(UnsubAckPacket {
-        protocol_version: ProtocolVersion::V5,
         packet_id: unsubscribe.packet_id,
         properties: None,
         payload: vec![UnsubAckPayload {

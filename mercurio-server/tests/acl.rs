@@ -1,9 +1,9 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use mercurio_core::{codec::Encoder, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
+use mercurio_core::{protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, Will},
     publish::PublishPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -60,22 +60,19 @@ impl Client {
     ) -> (Self, ReasonCode) {
         let connect = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                clean_start: true,
-                user_name: credentials.is_some(),
-                password: credentials.is_some(),
-                will_flag: will.is_some(),
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: Some(ConnectProperties::default()),
             payload: ConnectPayload {
                 client_id: client_id.into(),
                 user_name: credentials.map(|(user, _)| user.into()),
                 password: credentials.map(|(_, password)| Bytes::from(password.to_string())),
-                will_properties: will.map(|_| Default::default()),
-                will_topic: will.map(Into::into),
-                will_payload: will.map(|_| Bytes::from_static(b"bye")),
+                will: will.map(|topic| Will {
+                    properties: Some(Default::default()),
+                    topic: topic.into(),
+                    payload: Bytes::from_static(b"bye"),
+                    ..Default::default()
+                }),
             },
         };
         let mut client = Client {
@@ -91,15 +88,14 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
             if ControlPacket::check(&self.buffer).is_ok() {
-                let packet =
-                    ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5);
+                let packet = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5);
                 return Some(packet.unwrap());
             }
             match timeout(
@@ -155,7 +151,7 @@ async fn topics_follow_the_acl() {
 
     assert_eq!(reader.subscribe("alice/#").await, ReasonCode::NotAuthorized);
     // Granted QoS 0
-    assert_eq!(reader.subscribe("public/#").await.get_code(), 0x00);
+    assert_eq!(reader.subscribe("public/#").await.code(), 0x00);
 
     // Accepted; nobody happens to be subscribed
     assert_eq!(
@@ -183,7 +179,7 @@ async fn shared_subscriptions_are_checked_by_their_topic_filter() {
     let (mut reader, _) = Client::connect(addr, "reader", None, None).await;
 
     // Granted QoS 0, as for public/# itself
-    assert_eq!(reader.subscribe("$share/g/public/#").await.get_code(), 0x00);
+    assert_eq!(reader.subscribe("$share/g/public/#").await.code(), 0x00);
     assert_eq!(
         reader.subscribe("$share/g/alice/#").await,
         ReasonCode::NotAuthorized
@@ -210,5 +206,5 @@ async fn credentials_are_verified_without_required_authentication() {
 
     let (mut alice, accepted) = Client::connect(addr, "a", Some(("alice", "secret")), None).await;
     assert_eq!(accepted, ReasonCode::Success);
-    assert_eq!(alice.subscribe("alice/#").await.get_code(), 0x00);
+    assert_eq!(alice.subscribe("alice/#").await.code(), 0x00);
 }

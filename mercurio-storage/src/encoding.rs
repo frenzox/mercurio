@@ -1,7 +1,7 @@
 //! Column encodings shared by the SQL backends.
 
 use bytes::BytesMut;
-use mercurio_core::{codec::Encoder, message::MessageProperties, qos::QoS};
+use mercurio_core::{codec::Encoder, error::EncodeError, message::MessageProperties, qos::QoS};
 
 use crate::{Result, StorageError, StoredSubscription};
 
@@ -10,7 +10,6 @@ pub(crate) fn qos_to_int(qos: QoS) -> i32 {
         QoS::AtMostOnce => 0,
         QoS::AtLeastOnce => 1,
         QoS::ExactlyOnce => 2,
-        QoS::Invalid => -1,
     }
 }
 
@@ -27,10 +26,45 @@ pub(crate) fn int_to_qos(val: i32) -> Result<QoS> {
     }
 }
 
-pub(crate) fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
+/// A message's properties as a column value. Properties MQTT can't carry
+/// fail the statement, like any other value the database refuses.
+#[derive(Debug)]
+pub(crate) struct EncodedProperties(std::result::Result<Vec<u8>, EncodeError>);
+
+pub(crate) fn encode_properties(properties: &MessageProperties) -> EncodedProperties {
     let mut buffer = BytesMut::new();
-    properties.encode(&mut buffer);
-    buffer.to_vec()
+    EncodedProperties(properties.encode(&mut buffer).map(|()| buffer.to_vec()))
+}
+
+#[cfg(feature = "sqlite")]
+impl rusqlite::ToSql for EncodedProperties {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match &self.0 {
+            Ok(bytes) => bytes.to_sql(),
+            Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(*e))),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl tokio_postgres::types::ToSql for EncodedProperties {
+    fn to_sql(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut BytesMut,
+    ) -> std::result::Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>>
+    {
+        match &self.0 {
+            Ok(bytes) => bytes.to_sql(ty, out),
+            Err(e) => Err(Box::new(*e)),
+        }
+    }
+
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        <Vec<u8> as tokio_postgres::types::ToSql>::accepts(ty)
+    }
+
+    tokio_postgres::types::to_sql_checked!();
 }
 
 /// How sessions kept their subscriptions before they had a table of their
@@ -123,6 +157,22 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_properties_mqtt_cannot_carry_fail_the_statement() {
+        use mercurio_core::properties::ResponseTopic;
+        use rusqlite::ToSql;
+
+        let properties = MessageProperties {
+            response_topic: Some(ResponseTopic::new("a/#".into())),
+            ..Default::default()
+        };
+        assert!(encode_properties(&properties).to_sql().is_err());
+        assert!(encode_properties(&MessageProperties::default())
+            .to_sql()
+            .is_ok());
     }
 
     #[test]

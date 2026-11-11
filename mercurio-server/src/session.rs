@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::CONNECTIONS;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::Mutex,
@@ -18,7 +18,6 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    codec::{Encoder, VariableByteInteger},
     message::{unix_millis, Message, MessageOrigin, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
@@ -47,7 +46,7 @@ use mercurio_packets::{
     subscribe::RetainHandling,
     unsuback::{UnsubAckPacket, UnsubAckPayload},
     unsubscribe::UnsubscribePacket,
-    ControlPacket,
+    ControlPacket, Packet,
 };
 
 use crate::{
@@ -81,15 +80,10 @@ pub struct WillMessage {
 }
 
 impl WillMessage {
-    /// Extract will message from a ConnectPacket if will_flag is set.
+    /// Extract will message from a ConnectPacket if it has one.
     fn from_connect_packet(packet: &ConnectPacket) -> Option<Self> {
-        if !packet.flags.will_flag {
-            return None;
-        }
-
-        let topic = packet.payload.will_topic.as_ref()?;
-        let payload = packet.payload.will_payload.clone().unwrap_or_default();
-        let will_properties = packet.payload.will_properties.as_ref();
+        let will = packet.payload.will.as_ref()?;
+        let will_properties = will.properties.as_ref();
         let delay = will_properties
             .and_then(|p| p.will_delay_interval.as_ref())
             .map_or(0, |d| d.value);
@@ -105,10 +99,10 @@ impl WillMessage {
             .unwrap_or_default();
 
         Some(WillMessage {
-            topic: topic.clone(),
-            payload,
-            qos: packet.flags.will_qos,
-            retain: packet.flags.will_retain,
+            topic: will.topic.clone(),
+            payload: will.payload.clone(),
+            qos: will.qos,
+            retain: will.retain,
             delay: Duration::from_secs(delay.into()),
             properties,
         })
@@ -179,7 +173,8 @@ fn publish_properties(
     Some(PublishProperties {
         subscription_identifiers: subscription_identifiers
             .iter()
-            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(*id)))
+            // A stored identifier outside the range can't be sent
+            .filter_map(|id| SubscriptionIdentifier::new(*id))
             .collect(),
         payload_format_indicator: properties.payload_format_indicator.clone(),
         message_expiry_interval: properties.message_expiry_interval.clone(),
@@ -695,9 +690,6 @@ impl Session {
             session.max_topic_filter_length = limits.max_topic_filter_length;
             session.max_retained_messages = limits.max_retained_messages;
 
-            // Set protocol version from the CONNECT packet
-            ack.protocol_version = session.connect_packet.protocol_version;
-
             // CONNACK properties only exist in MQTT 5.0
             if session
                 .connect_packet
@@ -938,7 +930,6 @@ impl Session {
                     Err(ReasonCode::ProtocolError.into())
                 }
             }
-            QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
         // Recorded as delivered only once the broker took the message, so
@@ -1230,7 +1221,7 @@ impl Session {
             listener: presence.listener.clone(),
             protocol_version: seen.then_some(state.connect_packet.protocol_version),
             keepalive: seen.then_some(presence.keepalive),
-            clean_start: seen.then_some(state.connect_packet.flags.clean_start),
+            clean_start: seen.then_some(state.connect_packet.clean_start),
             connected_at: presence
                 .connected_at
                 .filter(|_| presence.disconnected_at.is_none()),
@@ -1291,7 +1282,7 @@ impl Session {
                     .map(|p| {
                         p.subscription_identifiers
                             .iter()
-                            .map(|id| id.value.0)
+                            .map(|id| id.value())
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -1403,7 +1394,7 @@ impl Session {
         session.unsent.retain(|id| *id != packet_id);
 
         // A failure reason ends the exchange: the client won't take the message
-        if packet.reason.get_code() >= 0x80 {
+        if packet.reason.code() >= 0x80 {
             session.pubrecs.remove(&packet_id);
             return Ok(None);
         }
@@ -1460,11 +1451,7 @@ impl Session {
             .properties
             .as_ref()
             .and_then(|p| p.subscription_id.as_ref())
-            .map(|id| id.value.0);
-        // An identifier of 0 is a protocol error
-        if subscription_identifier == Some(0) {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+            .map(|id| id.value());
 
         // A client can't opt out of its own messages on a shared subscription
         // [MQTT-3.8.3-4]
@@ -1508,7 +1495,6 @@ impl Session {
 
         let mut session = self.shared.state.lock().await;
         let mut ack = SubAckPacket {
-            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -1617,7 +1603,6 @@ impl Session {
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let mut ack = UnsubAckPacket {
-            protocol_version: session.connect_packet.protocol_version,
             packet_id: packet.packet_id,
             properties: None,
             payload: Vec::with_capacity(packet.payload.len()),
@@ -2242,9 +2227,7 @@ impl State {
     /// Whether `publish` is larger than the client accepts.
     fn too_big(&self, publish: &PublishPacket) -> bool {
         self.client_maximum_packet_size().is_some_and(|maximum| {
-            let mut encoded = BytesMut::new();
-            publish.encode(&mut encoded);
-            encoded.len() > maximum
+            publish.encoded_size(self.connect_packet.protocol_version) > maximum
         })
     }
 
@@ -2286,7 +2269,7 @@ mod tests {
     use super::*;
     use mercurio_core::protocol::ProtocolVersion;
     use mercurio_packets::{
-        connect::{ConnectFlags, ConnectPayload},
+        connect::{self, ConnectPayload},
         subscribe::{RetainHandling, SubscribePayload, SubscriptionOptions},
         unsubscribe::UnsubscribePayload,
     };
@@ -2300,14 +2283,12 @@ mod tests {
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags::default(),
+            clean_start: false,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
                 client_id: "test-client".to_string(),
-                will_properties: None,
-                will_topic: None,
-                will_payload: None,
+                will: None,
                 user_name: None,
                 password: None,
             },
@@ -2322,19 +2303,18 @@ mod tests {
     fn create_connect_packet_with_will() -> ConnectPacket {
         ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                will_flag: true,
-                will_qos: QoS::AtLeastOnce,
-                will_retain: true,
-                clean_start: true,
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
                 client_id: "test-client".to_string(),
-                will_topic: Some("will/topic".to_string()),
-                will_payload: Some(Bytes::from("goodbye")),
+                will: Some(connect::Will {
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    properties: None,
+                    topic: "will/topic".to_string(),
+                    payload: Bytes::from("goodbye"),
+                }),
                 ..Default::default()
             },
         }
@@ -2343,11 +2323,7 @@ mod tests {
     fn create_connect_packet_without_will() -> ConnectPacket {
         ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                will_flag: false,
-                clean_start: true,
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
@@ -2836,7 +2812,7 @@ mod tests {
             .await;
         assert!(matches!(
             failed,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ImplementationSpecificError
             ))
         ));
@@ -3178,7 +3154,7 @@ mod tests {
     ) -> mercurio_packets::subscribe::SubscribePacket {
         let mut packet = subscribe_packet(topic_filter, QoS::AtMostOnce);
         packet.properties = Some(mercurio_packets::subscribe::SubscribeProperties {
-            subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(identifier))),
+            subscription_id: SubscriptionIdentifier::new(identifier),
             user_property: None,
         });
         packet
@@ -3208,7 +3184,7 @@ mod tests {
         let mut identifiers: Vec<u32> = properties
             .subscription_identifiers
             .iter()
-            .map(|id| id.value.0)
+            .map(|id| id.value())
             .collect();
         identifiers.sort();
         assert_eq!(identifiers, [7, 9]);
@@ -3244,20 +3220,11 @@ mod tests {
         let mut session = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
-        let zero = session
-            .handle_subscribe(subscribe_with_identifier("z", 0), &broker, &no_plugins())
-            .await;
-        assert!(matches!(
-            zero,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
-                ReasonCode::ProtocolError
-            ))
-        ));
-
+        // An identifier of 0 can't be built; the decoder refuses it
         let from_client = ControlPacket::Publish(PublishPacket {
             topic_name: "t".into(),
             properties: Some(PublishProperties {
-                subscription_identifiers: vec![SubscriptionIdentifier::new(VariableByteInteger(1))],
+                subscription_identifiers: SubscriptionIdentifier::new(1).into_iter().collect(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -3266,7 +3233,7 @@ mod tests {
             session
                 .process_incoming(from_client, &broker, &no_plugins())
                 .await,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ProtocolError
             ))
         ));
@@ -3319,7 +3286,7 @@ mod tests {
                 .process_incoming(aliased_publish(topic, alias), &broker, &no_plugins())
                 .await;
             assert!(
-                matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
+                matches!(result, Err(mercurio_core::error::Error::Reason(r)) if r == reason),
                 "alias {alias}"
             );
         }
@@ -3409,7 +3376,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ProtocolError
             ))
         ));
@@ -3441,7 +3408,7 @@ mod tests {
                 .await;
             assert!(matches!(
                 result,
-                Err(mercurio_core::error::Error::MQTTReasonCode(
+                Err(mercurio_core::error::Error::Reason(
                     ReasonCode::ProtocolError
                 ))
             ));
@@ -3528,9 +3495,7 @@ mod tests {
         let ControlPacket::Publish(publish) = packet else {
             panic!("Expected Publish");
         };
-        let mut encoded = BytesMut::new();
-        publish.encode(&mut encoded);
-        encoded.len()
+        publish.encoded_size(ProtocolVersion::V5)
     }
 
     #[tokio::test]
@@ -3685,7 +3650,7 @@ mod tests {
                 assert_eq!(publish.qos_level, QoS::AtMostOnce);
                 assert!(publish.retain);
                 let identifiers = &publish.properties.unwrap().subscription_identifiers;
-                assert_eq!(identifiers[0].value.0, 7);
+                assert_eq!(identifiers[0].value(), 7);
                 topics.push(publish.topic_name);
             }
         }
@@ -3812,10 +3777,11 @@ mod tests {
     #[test]
     fn test_will_message_keeps_will_properties() {
         let mut packet = create_connect_packet_with_will();
-        packet.payload.will_properties = Some(mercurio_packets::connect::WillProperties {
-            content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
-            ..Default::default()
-        });
+        packet.payload.will.as_mut().unwrap().properties =
+            Some(mercurio_packets::connect::WillProperties {
+                content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
+                ..Default::default()
+            });
 
         let will = WillMessage::from_connect_packet(&packet).unwrap();
         assert_eq!(will.properties.content_type.unwrap().value, "text");

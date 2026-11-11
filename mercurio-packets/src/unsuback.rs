@@ -6,13 +6,14 @@ use alloc::vec::Vec;
 use bytes::{Buf, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubAckProperties {
@@ -21,9 +22,10 @@ pub struct UnsubAckProperties {
 }
 
 impl Encoder for UnsubAckProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -62,8 +64,8 @@ pub struct UnsubAckPayload {
 }
 
 impl Encoder for UnsubAckPayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.reason_code.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        crate::encode_reason(self.reason_code, PacketType::UnsubAck, buffer)
     }
 
     fn encoded_size(&self) -> usize {
@@ -85,59 +87,61 @@ impl Decoder for UnsubAckPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubAckPacket {
-    /// Selects the wire format on encode. `decode` sets `V5`, and
-    /// `decode_v3` sets `V3_1_1`.
-    /// [`ControlPacket::parse_with_version`](crate::ControlPacket::parse_with_version)
-    /// sets the version it is given.
-    pub protocol_version: ProtocolVersion,
     pub packet_id: u16,
+    /// MQTT 5 only.
     pub properties: Option<UnsubAckProperties>,
     /// MQTT 5 only. A 3.x UNSUBACK has no payload, so this is empty after
-    /// `decode_v3` and not encoded.
+    /// decoding one and not encoded.
     pub payload: Vec<UnsubAckPayload>,
 }
 
 const PACKET_TYPE: u8 = 0x0b;
 
-impl Encoder for UnsubAckPacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        // Fixed header
-        let fixed_header: u8 = PACKET_TYPE << 4;
-        fixed_header.encode(buffer);
+impl Packet for UnsubAckPacket {
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if version.supports_reason_codes() && self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::UnsubAck));
+            }
+            // Fixed header
+            let fixed_header: u8 = PACKET_TYPE << 4;
+            fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+            crate::encode_length(self.remaining_len(version), buffer)?;
 
-        self.packet_id.encode(buffer);
+            crate::encode_packet_id(self.packet_id, buffer)?;
 
-        // Properties and payload reason codes only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-            self.payload.encode(buffer);
-        }
+            // Properties and payload reason codes only for MQTT 5.0
+            if version.supports_properties() {
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+                self.payload.encode(buffer)?;
+            }
+            Ok(())
+        })
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len())
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version))
     }
-}
 
-impl UnsubAckPacket {
-    fn remaining_len(&self) -> usize {
-        // MQTT 3.x UNSUBACK is just the packet id
-        let mut len = self.packet_id.encoded_size();
-        if self.protocol_version.supports_properties() {
-            len += crate::property_list_size(&self.properties) + self.payload.encoded_size();
-        }
-        len
-    }
-}
-
-impl Decoder for UnsubAckPacket {
-    /// Decodes an UNSUBACK packet assuming MQTT 5.0 format.
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::UnsubAck, version, |_, buffer| {
             let packet_id = crate::decode_packet_id(buffer)?;
+
+            // MQTT 3.x UNSUBACK: just packet_id (no properties, no payload)
+            if !version.supports_properties() {
+                return Ok(UnsubAckPacket {
+                    packet_id,
+                    properties: None,
+                    payload: Vec::new(),
+                });
+            }
+
             let properties = crate::present(UnsubAckProperties::decode(buffer)?);
 
             if !buffer.has_remaining() {
@@ -150,7 +154,6 @@ impl Decoder for UnsubAckPacket {
             }
 
             Ok(UnsubAckPacket {
-                protocol_version: ProtocolVersion::V5,
                 packet_id,
                 properties,
                 payload,
@@ -160,19 +163,13 @@ impl Decoder for UnsubAckPacket {
 }
 
 impl UnsubAckPacket {
-    /// Decodes an UNSUBACK packet in MQTT 3.x format.
-    /// MQTT 3.x UNSUBACK: just packet_id (no properties, no payload)
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::UnsubAck, |_, buffer| {
-            let packet_id = crate::decode_packet_id(buffer)?;
-
-            Ok(UnsubAckPacket {
-                protocol_version: ProtocolVersion::V3_1_1,
-                packet_id,
-                properties: None,
-                payload: Vec::new(),
-            })
-        })
+    fn remaining_len(&self, version: ProtocolVersion) -> usize {
+        // MQTT 3.x UNSUBACK is just the packet id
+        let mut len = self.packet_id.encoded_size();
+        if version.supports_properties() {
+            len += crate::property_list_size(&self.properties) + self.payload.encoded_size();
+        }
+        len
     }
 }
 
@@ -187,7 +184,6 @@ mod tests {
         let expected = vec![0xb0, 0x04, 0x00, 0x01, 0x00, 0x11];
 
         let packet = UnsubAckPacket {
-            protocol_version: ProtocolVersion::V5,
             packet_id: 1,
             properties: None,
             payload: vec![UnsubAckPayload {
@@ -196,13 +192,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = UnsubAckPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            UnsubAckPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

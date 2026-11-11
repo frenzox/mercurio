@@ -2,31 +2,27 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
+use mercurio_core::{error::EncodeError, protocol::ProtocolVersion};
 
-use crate::PacketType;
+use crate::{Packet, PacketType};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PingRespPacket {}
 
-const PACKET_TYPE: u8 = 0x0d;
-
-impl Encoder for PingRespPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        buffer.put_u8(PACKET_TYPE << 4);
-
-        let remaining_len = 0;
-        VariableByteInteger(remaining_len).encode(buffer);
+impl Packet for PingRespPacket {
+    fn encode(&self, buffer: &mut BytesMut, _: ProtocolVersion) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_slice(&[0xd0, 0x00]);
+            Ok(())
+        })
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, _: ProtocolVersion) -> usize {
         2
     }
-}
 
-impl Decoder for PingRespPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::PingResp, |_, _| Ok(Self {}))
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::PingResp, version, |_, _| Ok(Self {}))
     }
 }
 
@@ -37,7 +33,7 @@ mod tests {
     #[test]
     fn test_decode_consumes_whole_packet() {
         let mut buffer = BytesMut::from(&[0xd0, 0x00, 0xd0, 0x00][..]);
-        PingRespPacket::decode(&mut buffer).unwrap();
+        PingRespPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap();
         assert_eq!(buffer.len(), 2);
     }
 }

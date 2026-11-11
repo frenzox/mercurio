@@ -9,7 +9,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, Will},
     publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -167,10 +167,7 @@ impl AuthExchange for SwitchExchange {
 fn connect_packet(client_id: &str) -> ConnectPacket {
     ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 60,
         properties: Some(ConnectProperties::default()),
         payload: ConnectPayload {
@@ -215,13 +212,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Client<S> {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode_with_version(&mut encoded, self.version);
+        packet.encode(&mut encoded, self.version).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
-            if let Ok(packet) = ControlPacket::parse_with_version(&mut self.buffer, self.version) {
+            if let Ok(packet) = ControlPacket::parse(&mut self.buffer, self.version) {
                 return Some(packet);
             }
             let read = timeout(
@@ -325,10 +322,12 @@ fn persistent(client_id: &str) -> ConnectPacket {
 /// A persistent session with a will on `wills/<client id>`.
 fn with_will(client_id: &str) -> ConnectPacket {
     let mut packet = persistent(client_id);
-    packet.flags.will_flag = true;
-    packet.payload.will_properties = Some(Default::default());
-    packet.payload.will_topic = Some(format!("wills/{client_id}"));
-    packet.payload.will_payload = Some(Bytes::from_static(b"gone"));
+    packet.payload.will = Some(Will {
+        properties: Some(Default::default()),
+        topic: format!("wills/{client_id}"),
+        payload: Bytes::from_static(b"gone"),
+        ..Default::default()
+    });
     packet
 }
 
@@ -360,11 +359,13 @@ async fn connack_reason_on<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> ReasonCode {
     let version = packet.protocol_version;
     let mut bytes = BytesMut::from(header);
-    ControlPacket::Connect(packet).encode_with_version(&mut bytes, version);
+    ControlPacket::Connect(packet)
+        .encode(&mut bytes, version)
+        .unwrap();
     stream.write_all(&bytes).await.unwrap();
     let mut buffer = BytesMut::new();
     loop {
-        if let Ok(packet) = ControlPacket::parse_with_version(&mut buffer, version) {
+        if let Ok(packet) = ControlPacket::parse(&mut buffer, version) {
             let ControlPacket::ConnAck(connack) = packet else {
                 panic!("Expected CONNACK, got {packet:?}");
             };
@@ -1034,7 +1035,7 @@ async fn disconnect_client_closes_mqtt311_connections() {
     let mut packet = connect_packet("old");
     packet.protocol_version = ProtocolVersion::V3_1_1;
     packet.properties = None;
-    packet.flags.clean_start = false;
+    packet.clean_start = false;
     let mut old = Client::connect_with(addr, packet).await;
 
     admin.disconnect("old", Default::default()).await.unwrap();
@@ -1407,8 +1408,6 @@ async fn user_name_bans_match_the_verified_user() {
 
     let as_user = |client_id: &str, user: &str| {
         let mut packet = connect_packet(client_id);
-        packet.flags.user_name = true;
-        packet.flags.password = true;
         packet.payload.user_name = Some(user.into());
         packet.payload.password = Some(Bytes::from_static(b"secret"));
         packet
@@ -1433,7 +1432,9 @@ async fn user_name_bans_match_the_verified_user() {
 async fn closed_unanswered(addr: SocketAddr, header: &[u8], packet: ConnectPacket) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut bytes = BytesMut::from(header);
-    ControlPacket::Connect(packet).encode_with_version(&mut bytes, ProtocolVersion::V5);
+    ControlPacket::Connect(packet)
+        .encode(&mut bytes, ProtocolVersion::V5)
+        .unwrap();
     // The broker may have closed already, which is what is checked below
     let _ = stream.write_all(&bytes).await;
     let mut answer = Vec::new();
@@ -1453,8 +1454,6 @@ async fn address_bans_refuse_before_authentication() {
 
     let as_alice = || {
         let mut packet = connect_packet("a");
-        packet.flags.user_name = true;
-        packet.flags.password = true;
         packet.payload.user_name = Some("alice".into());
         packet.payload.password = Some(Bytes::from_static(b"secret"));
         packet
@@ -1785,7 +1784,8 @@ async fn clients_the_peer_filter_refuses_are_closed_unanswered() {
     let mut stream = UnixStream::connect(&path).await.unwrap();
     let mut bytes = BytesMut::new();
     ControlPacket::Connect(connect_packet("intruder"))
-        .encode_with_version(&mut bytes, ProtocolVersion::V5);
+        .encode(&mut bytes, ProtocolVersion::V5)
+        .unwrap();
     // The broker may have closed it already
     let _ = stream.write_all(&bytes).await;
     let mut buffer = [0u8; 16];

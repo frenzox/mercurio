@@ -17,11 +17,13 @@ fuzz_target!(|data: &[u8]| {
         _ => ProtocolVersion::V5,
     };
     let mut src = BytesMut::from(bytes);
-    while let Ok(packet) = ControlPacket::parse_with_version(&mut src, version) {
+    while let Ok(packet) = ControlPacket::parse(&mut src, version) {
         let mut encoded = BytesMut::new();
-        packet.encode_with_version(&mut encoded, version);
-        let decoded = ControlPacket::parse_with_version(&mut encoded, version)
-            .expect("an encoded packet decodes");
+        packet
+            .encode(&mut encoded, version)
+            .expect("a decoded packet encodes");
+        let decoded =
+            ControlPacket::parse(&mut encoded, version).expect("an encoded packet decodes");
         assert_eq!(packet, decoded);
         assert!(encoded.is_empty(), "encoding wrote more than one packet");
     }

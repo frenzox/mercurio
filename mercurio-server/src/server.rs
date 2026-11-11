@@ -1832,9 +1832,9 @@ impl<St: MqttStore + 'static> Listener<St> {
                 // for as long as it runs, the whole connection
                 match handler.run(Box::new(p)).await {
                     // Closed by the broker's own shutdown
-                    Err(mercurio_core::error::Error::MQTTReasonCode(
-                        ReasonCode::ServerShuttingDown,
-                    )) => debug!(target: CONNECTIONS, "Connection closed for shutdown"),
+                    Err(mercurio_core::error::Error::Reason(ReasonCode::ServerShuttingDown)) => {
+                        debug!(target: CONNECTIONS, "Connection closed for shutdown")
+                    }
                     // Only the broker's own storage failing is its error;
                     // anything else a client can cause at will
                     Err(Error::Storage(e)) => {
@@ -1864,15 +1864,17 @@ impl<St: MqttStore + 'static> Listener<St> {
                 handler.peer,
                 describe(&packet)
             ),
-            Ok(Err(Error::MQTTReasonCode(ReasonCode::UnsupportedProtocolVersion))) => {
+            Ok(Err(Error::Reason(ReasonCode::UnsupportedProtocolVersion))) => {
                 debug!(
                     target: CONNECTIONS,
                     "{:?} asked for an unsupported protocol version", handler.peer
                 );
                 // Answered in the MQTT 3.1.1 format, which every version can
                 // read [MQTT-3.1.2-2]
+                handler
+                    .connection
+                    .set_protocol_version(ProtocolVersion::V3_1_1);
                 let connack = ConnAckPacket {
-                    protocol_version: ProtocolVersion::V3_1_1,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -1886,7 +1888,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             }
             // MQTT 5 clients are told why their CONNECT was refused; earlier
             // versions have no reason code for it and are just disconnected
-            Ok(Err(Error::MQTTReasonCode(reason)))
+            Ok(Err(Error::Reason(reason)))
                 if handler.connection.connect_version() == Some(ProtocolVersion::V5) =>
             {
                 warn!(
@@ -1894,7 +1896,6 @@ impl<St: MqttStore + 'static> Listener<St> {
                     "Refusing invalid CONNECT from {:?}: {:?}", handler.peer, reason
                 );
                 let connack = ConnAckPacket {
-                    protocol_version: ProtocolVersion::V5,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2090,7 +2091,7 @@ where
         // MQTT 3.x servers must reject a zero-length client id unless the
         // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
         if connect_packet.payload.client_id.is_empty()
-            && !connect_packet.flags.clean_start
+            && !connect_packet.clean_start
             && !connect_packet.protocol_version.supports_properties()
         {
             return self
@@ -2142,10 +2143,10 @@ where
         }
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
-        if let Some(will_topic) = &connect_packet.payload.will_topic {
+        if let Some(will) = &connect_packet.payload.will {
             let identity =
                 self.client_info(&connect_packet.payload.client_id, verified_user.clone());
-            if !self.chain.may(&identity, will_topic, Access::Write).await {
+            if !self.chain.may(&identity, &will.topic, Access::Write).await {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                     .await;
@@ -2331,7 +2332,7 @@ where
         .await;
 
         let reason = match &result {
-            Err(Error::MQTTReasonCode(reason)) => Some(*reason),
+            Err(Error::Reason(reason)) => Some(*reason),
             _ => None,
         };
         // Plugins never saw a connection that failed before it was accepted
@@ -2343,8 +2344,8 @@ where
         }
 
         // Tell MQTT 5 clients why the server is closing the connection
-        if let Err(Error::MQTTReasonCode(reason)) = &result {
-            if protocol_version.supports_reason_codes() && reason.get_code() >= 0x80 {
+        if let Err(Error::Reason(reason)) = &result {
+            if protocol_version.supports_reason_codes() && reason.code() >= 0x80 {
                 let disconnect = ControlPacket::Disconnect(DisconnectPacket {
                     reason: *reason,
                     properties: Some(DisconnectProperties {
@@ -2517,7 +2518,6 @@ where
         Box::pin(async move {
             let connack = if connect_packet.protocol_version.supports_properties() {
                 ConnAckPacket {
-                    protocol_version: connect_packet.protocol_version,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2535,7 +2535,6 @@ where
                 }
             } else {
                 ConnAckPacket {
-                    protocol_version: connect_packet.protocol_version,
                     flags: ConnAckFlags {
                         session_present: false,
                     },
@@ -2572,23 +2571,16 @@ where
     /// Why a will the broker can't honour is refused [MQTT-3.2.2-12]
     /// [MQTT-3.2.2-13]
     fn refused_will(&self, connect_packet: &ConnectPacket) -> Option<ReasonCode> {
-        let flags = &connect_packet.flags;
-        if !flags.will_flag {
-            return None;
-        }
-        if flags.will_qos as u8 > self.limits.maximum_qos as u8 {
+        let will = connect_packet.payload.will.as_ref()?;
+        if will.qos as u8 > self.limits.maximum_qos as u8 {
             return Some(ReasonCode::QoSNotSupported);
         }
-        if flags.will_retain && !self.limits.retain_available {
+        if will.retain && !self.limits.retain_available {
             return Some(ReasonCode::RetainNotSupported);
         }
         // A will is published like a PUBLISH, so its topic must be one;
         // `$` topics belong to the broker
-        let topic = connect_packet
-            .payload
-            .will_topic
-            .as_deref()
-            .unwrap_or_default();
+        let topic = will.topic.as_str();
         if validate_publish_topic(topic).is_err() || topic.starts_with('$') {
             return Some(ReasonCode::TopicNameInvalid);
         }
@@ -2618,7 +2610,6 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let connack = ConnAckPacket {
-                protocol_version,
                 flags: ConnAckFlags {
                     session_present: false,
                 },
@@ -2772,7 +2763,7 @@ where
                     .await?;
                 // The client now awaits PUBREL's answer for this id
                 if let Some(ControlPacket::PubRec(pubrec)) = &response {
-                    if pubrec.reason.get_code() < 0x80 {
+                    if pubrec.reason.code() < 0x80 {
                         self.session_manager
                             .store_incoming_qos2(client_id, pubrec.packet_id)
                             .await;
@@ -2789,7 +2780,7 @@ where
                 response
             }
             HotPacket::PubRec(rec) => {
-                let (packet_id, failed) = (rec.packet_id, rec.reason.get_code() >= 0x80);
+                let (packet_id, failed) = (rec.packet_id, rec.reason.code() >= 0x80);
                 let response = session.handle_pubrec(rec).await?;
                 if failed {
                     self.session_manager
@@ -2949,9 +2940,7 @@ where
                 let inflight_completed = match &packet {
                     ControlPacket::PubAck(ack) => Some(ack.packet_id),
                     ControlPacket::PubComp(comp) => Some(comp.packet_id),
-                    ControlPacket::PubRec(rec) if rec.reason.get_code() >= 0x80 => {
-                        Some(rec.packet_id)
-                    }
+                    ControlPacket::PubRec(rec) if rec.reason.code() >= 0x80 => Some(rec.packet_id),
                     _ => None,
                 };
 

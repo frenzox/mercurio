@@ -60,7 +60,7 @@ async fn next_packet(
 ) -> ControlPacket {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap();
+            return ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap();
         }
         let frame = timeout(Duration::from_secs(2), websocket.next())
             .await

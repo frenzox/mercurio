@@ -9,14 +9,13 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder,
     properties::{AuthenticationData, AuthenticationMethod},
     protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     ControlPacket,
 };
 use mercurio_server::{
@@ -100,14 +99,14 @@ async fn start_broker_with(challenge: Arc<Challenge>) -> SocketAddr {
 
 async fn send(stream: &mut TcpStream, packet: ControlPacket) {
     let mut buffer = BytesMut::new();
-    packet.encode(&mut buffer);
+    packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
     stream.write_all(&buffer).await.unwrap();
 }
 
 async fn receive(stream: &mut TcpStream, buffer: &mut BytesMut) -> ControlPacket {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap();
+            return ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap();
         }
         let read = timeout(Duration::from_secs(2), stream.read_buf(buffer))
             .await
@@ -132,10 +131,7 @@ async fn connect_with(addr: SocketAddr, method: &str) -> (TcpStream, BytesMut) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let connect = ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 60,
         properties: Some(ConnectProperties {
             authentication_method: Some(AuthenticationMethod::new(method.into())),

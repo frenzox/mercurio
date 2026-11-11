@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
     codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
     qos::QoS,
     reason::ReasonCode,
@@ -94,13 +95,13 @@ pub struct MessageProperties {
 
 /// Encoded as a bare property list, without the length prefix packets use.
 impl Encoder for MessageProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.payload_format_indicator.encode(buffer);
-        self.message_expiry_interval.encode(buffer);
-        self.content_type.encode(buffer);
-        self.response_topic.encode(buffer);
-        self.correlation_data.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.payload_format_indicator.encode(buffer)?;
+        self.message_expiry_interval.encode(buffer)?;
+        self.content_type.encode(buffer)?;
+        self.response_topic.encode(buffer)?;
+        self.correlation_data.encode(buffer)?;
+        self.user_property.encode(buffer)
     }
 
     fn encoded_size(&self) -> usize {
@@ -157,7 +158,7 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        properties.encode(&mut buffer);
+        properties.encode(&mut buffer).unwrap();
         assert_eq!(buffer.len(), properties.encoded_size());
         assert_eq!(MessageProperties::decode(&mut buffer).unwrap(), properties);
     }

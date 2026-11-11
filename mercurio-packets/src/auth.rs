@@ -7,12 +7,14 @@ use alloc::vec::Vec;
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     properties::*,
+    protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
@@ -23,11 +25,13 @@ pub struct AuthProperties {
 }
 
 impl Encoder for AuthProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.auth_method.encode(buffer);
-        self.auth_data.encode(buffer);
-        self.reason_string.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        crate::check_authentication(&self.auth_method, &self.auth_data)?;
+        self.auth_method.encode(buffer)?;
+        self.auth_data.encode(buffer)?;
+        self.reason_string.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -59,7 +63,7 @@ impl Decoder for AuthProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
-        check_authentication(&properties.auth_method, &properties.auth_data)?;
+        crate::check_decoded_authentication(&properties.auth_method, &properties.auth_data)?;
 
         Ok(properties)
     }
@@ -75,30 +79,33 @@ pub struct AuthPacket {
 
 const PACKET_TYPE: u8 = 0x0f;
 
-impl Encoder for AuthPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
+impl Packet for AuthPacket {
+    /// MQTT 3.x has no AUTH packet, so encoding one for it fails.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        if !version.supports_auth_packet() {
+            return Err(EncodeError::UnsupportedVersion(PacketType::Auth, version));
+        }
+        crate::write_packet(buffer, |buffer| {
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(), buffer)?;
 
-        self.reason.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+            crate::encode_reason(self.reason, PacketType::Auth, buffer)?;
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
+            Ok(())
+        })
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, _: ProtocolVersion) -> usize {
         crate::packet_size(self.remaining_len())
     }
-}
 
-impl AuthPacket {
-    fn remaining_len(&self) -> usize {
-        self.reason.encoded_size() + crate::property_list_size(&self.properties)
-    }
-}
-
-impl Decoder for AuthPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Auth, |_, buffer| {
+    /// MQTT 3.x has no AUTH packet, so there it is malformed.
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        if !version.supports_auth_packet() {
+            return Err(ReasonCode::MalformedPacket.into());
+        }
+        crate::decode_packet(buffer, PacketType::Auth, version, |_, buffer| {
             // Both reason and properties may be omitted [MQTT-3.15.2-1]
             let reason = if buffer.has_remaining() {
                 crate::decode_reason(buffer, PacketType::Auth)?
@@ -113,6 +120,12 @@ impl Decoder for AuthPacket {
 
             Ok(AuthPacket { reason, properties })
         })
+    }
+}
+
+impl AuthPacket {
+    fn remaining_len(&self) -> usize {
+        self.reason.encoded_size() + crate::property_list_size(&self.properties)
     }
 }
 
@@ -134,8 +147,11 @@ mod tests {
         };
 
         let mut buffer = BytesMut::new();
-        packet.encode(&mut buffer);
-        assert_eq!(AuthPacket::decode(&mut buffer).unwrap(), packet);
+        packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
+        assert_eq!(
+            AuthPacket::decode(&mut buffer, ProtocolVersion::V5).unwrap(),
+            packet
+        );
         assert!(buffer.is_empty());
     }
 }

@@ -29,7 +29,7 @@ async fn connect(addr: std::net::SocketAddr, client_id: u8) -> TcpStream {
 async fn next_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> ControlPacket {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap();
+            return ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap();
         }
         let read = timeout(Duration::from_secs(2), stream.read_buf(buffer))
             .await

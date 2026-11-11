@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     publish::PublishPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -36,10 +36,7 @@ async fn start(mut config: ServerConfig) -> SocketAddr {
 fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
     ConnectPacket {
         protocol_version: version,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 1,
         properties: (version == ProtocolVersion::V5).then(ConnectProperties::default),
         payload: ConnectPayload {
@@ -51,14 +48,14 @@ fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
 
 async fn send(stream: &mut TcpStream, packet: ControlPacket, version: ProtocolVersion) {
     let mut bytes = BytesMut::new();
-    packet.encode_with_version(&mut bytes, version);
+    packet.encode(&mut bytes, version).unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
 
 async fn receive(stream: &mut TcpStream, version: ProtocolVersion) -> ControlPacket {
     let mut buffer = BytesMut::new();
     loop {
-        if let Ok(packet) = ControlPacket::parse_with_version(&mut buffer, version) {
+        if let Ok(packet) = ControlPacket::parse(&mut buffer, version) {
             return packet;
         }
         let read = timeout(Duration::from_secs(2), stream.read_buf(&mut buffer)).await;

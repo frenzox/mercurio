@@ -25,13 +25,15 @@ pub mod subscribe;
 pub mod unsuback;
 pub mod unsubscribe;
 
-use core::convert::TryInto;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
-use bytes::{buf::Take, Buf, BufMut, BytesMut};
+use bytes::{buf::Take, Buf, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
+    error::{EncodeError, Error},
+    properties::{AuthenticationData, AuthenticationMethod, UserProperty},
     protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
@@ -126,176 +128,132 @@ impl ControlPacket {
         };
         let remaining_len = VariableByteInteger::decode(&mut remaining_bytes)?;
         let header_len = src.len() - remaining_bytes.len();
-        Ok(header_len + remaining_len.0 as usize)
+        Ok(header_len + remaining_len.value() as usize)
     }
 
-    /// Same as [`Self::parse_with_version`] with MQTT 5.0. Several packets
-    /// have a different shape in MQTT 3.x, so this misreads them on a 3.x
-    /// connection.
-    pub fn parse(src: &mut BytesMut) -> crate::Result<ControlPacket> {
-        // Default to MQTT 5.0 parsing
-        Self::parse_with_version(src, ProtocolVersion::V5)
-    }
-
-    /// Parse a control packet with version-specific decoding.
-    /// Use this when the protocol version is known (e.g., after CONNECT).
+    /// Removes one packet from the front of `src` and decodes it in the
+    /// wire format of `version`.
     ///
-    /// Removes the packet from `src` and leaves any bytes after it. Returns
-    /// `Error::PacketIncomplete`, with `src` untouched, until the whole
-    /// packet is there. A packet that is malformed, or that doesn't use all
-    /// its own bytes, is still removed from `src` and gives a reason code
-    /// error, usually `MalformedPacket`.
-    pub fn parse_with_version(
-        src: &mut BytesMut,
-        version: ProtocolVersion,
-    ) -> crate::Result<ControlPacket> {
+    /// Returns `Error::PacketIncomplete`, with `src` untouched, until the
+    /// whole packet is there. A packet that is malformed, or that doesn't use
+    /// all its own bytes, is still removed from `src` and gives a reason code
+    /// error, usually `MalformedPacket`. A CONNECT is read in the version it
+    /// names, whatever `version` is.
+    pub fn parse(src: &mut BytesMut, version: ProtocolVersion) -> crate::Result<ControlPacket> {
+        use ControlPacket::*;
+
         let frame_len = Self::frame_len(src)?;
         if src.len() < frame_len {
             return Err(Error::PacketIncomplete);
         }
 
         // Decode from exactly this packet's bytes, so a malformed packet can't
-        // read into the next one. Running short within it is malformed.
-        let mut frame = src.split_to(frame_len);
-        let packet = Self::decode_frame(&mut frame, version).map_err(|e| match e {
-            Error::PacketIncomplete => ReasonCode::MalformedPacket.into(),
-            e => e,
-        })?;
-        if !frame.is_empty() {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        Ok(packet)
-    }
-
-    fn decode_frame(src: &mut BytesMut, version: ProtocolVersion) -> crate::Result<ControlPacket> {
-        use ControlPacket::*;
-
-        let packet_type: u8 = src[0] >> 4;
-
-        // MQTT 3.1 sets DUP when it resends a PUBREL, SUBSCRIBE or
-        // UNSUBSCRIBE (3.1 section 2.1); 3.1.1 reserved that bit. None of the
-        // three keeps the flag, so drop it before the decoders check it.
-        if version == ProtocolVersion::V3_1
-            && matches!(packet_type, 0x06 | 0x08 | 0x0a)
-            && src[0] & 0x0f == 0b1010
-        {
-            src[0] &= !0b1000;
-        }
-
-        // In MQTT 3.x acknowledgements carry only a packet id, DISCONNECT and
-        // the pings nothing, and AUTH doesn't exist; MQTT 5 extended them
-        if !version.supports_properties() {
-            let body_len = match packet_type {
-                0x04..=0x07 => Some(2),
-                0x0c..=0x0e => Some(0),
-                0x0f => return Err(ReasonCode::MalformedPacket.into()),
-                _ => None,
-            };
-            let mut header = src.get(1..).unwrap_or_default();
-            let remaining_len = VariableByteInteger::decode(&mut header)?.0 as usize;
-            if body_len.is_some_and(|len| len != remaining_len) {
-                return Err(ReasonCode::MalformedPacket.into());
-            }
-        }
-
-        let packet = match packet_type.try_into()? {
-            PacketType::Connect => Connect(ConnectPacket::decode(src)?),
-            PacketType::ConnAck => {
-                if version.supports_properties() {
-                    ConnAck(ConnAckPacket::decode(src)?)
-                } else {
-                    ConnAck(ConnAckPacket {
-                        protocol_version: version,
-                        ..ConnAckPacket::decode_v3(src)?
-                    })
-                }
-            }
-            PacketType::Publish => {
-                if version.supports_properties() {
-                    Publish(PublishPacket::decode(src)?)
-                } else {
-                    Publish(PublishPacket::decode_v3(src)?)
-                }
-            }
-            PacketType::PubAck => PubAck(PubAckPacket::decode(src)?),
-            PacketType::PubRec => PubRec(PubRecPacket::decode(src)?),
-            PacketType::PubRel => PubRel(PubRelPacket::decode(src)?),
-            PacketType::PubComp => PubComp(PubCompPacket::decode(src)?),
-            PacketType::Subscribe => {
-                if version.supports_properties() {
-                    Subscribe(SubscribePacket::decode(src)?)
-                } else {
-                    Subscribe(SubscribePacket::decode_v3(src)?)
-                }
-            }
-            PacketType::SubAck => {
-                if version.supports_properties() {
-                    SubAck(SubAckPacket::decode(src)?)
-                } else {
-                    SubAck(SubAckPacket {
-                        protocol_version: version,
-                        ..SubAckPacket::decode_v3(src)?
-                    })
-                }
-            }
-            PacketType::Unsubscribe => {
-                if version.supports_properties() {
-                    Unsubscribe(UnsubscribePacket::decode(src)?)
-                } else {
-                    Unsubscribe(UnsubscribePacket::decode_v3(src)?)
-                }
-            }
-            PacketType::UnsubAck => {
-                if version.supports_properties() {
-                    UnsubAck(UnsubAckPacket::decode(src)?)
-                } else {
-                    UnsubAck(UnsubAckPacket {
-                        protocol_version: version,
-                        ..UnsubAckPacket::decode_v3(src)?
-                    })
-                }
-            }
-            PacketType::PingReq => PingReq(PingReqPacket::decode(src)?),
-            PacketType::PingResp => PingResp(PingRespPacket::decode(src)?),
-            PacketType::Disconnect => Disconnect(DisconnectPacket::decode(src)?),
-            PacketType::Auth => Auth(AuthPacket::decode(src)?),
+        // read into the next one
+        let mut frame = src.split_to(frame_len).freeze();
+        let frame = &mut frame;
+        let packet = match (frame[0] >> 4).try_into()? {
+            PacketType::Connect => Connect(ConnectPacket::decode(frame, version)?),
+            PacketType::ConnAck => ConnAck(ConnAckPacket::decode(frame, version)?),
+            PacketType::Publish => Publish(PublishPacket::decode(frame, version)?),
+            PacketType::PubAck => PubAck(PubAckPacket::decode(frame, version)?),
+            PacketType::PubRec => PubRec(PubRecPacket::decode(frame, version)?),
+            PacketType::PubRel => PubRel(PubRelPacket::decode(frame, version)?),
+            PacketType::PubComp => PubComp(PubCompPacket::decode(frame, version)?),
+            PacketType::Subscribe => Subscribe(SubscribePacket::decode(frame, version)?),
+            PacketType::SubAck => SubAck(SubAckPacket::decode(frame, version)?),
+            PacketType::Unsubscribe => Unsubscribe(UnsubscribePacket::decode(frame, version)?),
+            PacketType::UnsubAck => UnsubAck(UnsubAckPacket::decode(frame, version)?),
+            PacketType::PingReq => PingReq(PingReqPacket::decode(frame, version)?),
+            PacketType::PingResp => PingResp(PingRespPacket::decode(frame, version)?),
+            PacketType::Disconnect => Disconnect(DisconnectPacket::decode(frame, version)?),
+            PacketType::Auth => Auth(AuthPacket::decode(frame, version)?),
         };
 
         Ok(packet)
     }
 
-    /// Encode a control packet in the wire format of the given protocol version.
+    /// Appends the packet in the wire format of `version`.
     ///
-    /// CONNACK, SUBACK and UNSUBACK use their own `protocol_version` field
-    /// instead of `version`. PUBACK, PUBREC, PUBREL and PUBCOMP are only
-    /// valid in MQTT 3.x with reason `Success` and no properties, since they
-    /// are then encoded without either.
-    pub fn encode_with_version(&self, buffer: &mut BytesMut, version: ProtocolVersion) {
+    /// MQTT 3.x has no reason codes or properties: PUBACK, PUBREC, PUBREL,
+    /// PUBCOMP and DISCONNECT leave theirs out, CONNACK maps its reason code
+    /// to a 3.x return code, and SUBACK writes every failure as 0x80.
+    ///
+    /// Fails, leaving `buffer` as it was, on a packet MQTT can't carry or
+    /// the receiver would have to refuse; see [`EncodeError`].
+    pub fn encode(
+        &self,
+        buffer: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> core::result::Result<(), EncodeError> {
         use ControlPacket::*;
 
-        if version.supports_properties() {
-            return self.encode(buffer);
-        }
-
-        // MQTT 3.x acknowledgements carry only the packet id: a reason code
-        // or properties would make them malformed there
-        let ack = |buffer: &mut BytesMut, first_byte: u8, packet_id: u16| {
-            buffer.put_slice(&[first_byte, 0x02]);
-            buffer.put_u16(packet_id);
-        };
         match self {
-            Publish(p) => p.encode_v3(buffer),
-            Subscribe(p) => p.encode_v3(buffer),
-            Unsubscribe(p) => p.encode_v3(buffer),
-            Disconnect(p) => p.encode_v3(buffer),
-            PubAck(p) => ack(buffer, 0x40, p.packet_id),
-            PubRec(p) => ack(buffer, 0x50, p.packet_id),
-            PubRel(p) => ack(buffer, 0x62, p.packet_id),
-            PubComp(p) => ack(buffer, 0x70, p.packet_id),
-            p => p.encode(buffer),
+            Connect(p) => p.encode(buffer, version),
+            ConnAck(p) => p.encode(buffer, version),
+            Publish(p) => p.encode(buffer, version),
+            PubAck(p) => p.encode(buffer, version),
+            PubRec(p) => p.encode(buffer, version),
+            PubRel(p) => p.encode(buffer, version),
+            PubComp(p) => p.encode(buffer, version),
+            Subscribe(p) => p.encode(buffer, version),
+            SubAck(p) => p.encode(buffer, version),
+            Unsubscribe(p) => p.encode(buffer, version),
+            UnsubAck(p) => p.encode(buffer, version),
+            PingReq(p) => p.encode(buffer, version),
+            PingResp(p) => p.encode(buffer, version),
+            Disconnect(p) => p.encode(buffer, version),
+            Auth(p) => p.encode(buffer, version),
         }
     }
+
+    /// Number of bytes [`encode`](Self::encode) writes for `version`.
+    pub fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        use ControlPacket::*;
+
+        match self {
+            Connect(p) => p.encoded_size(version),
+            ConnAck(p) => p.encoded_size(version),
+            Publish(p) => p.encoded_size(version),
+            PubAck(p) => p.encoded_size(version),
+            PubRec(p) => p.encoded_size(version),
+            PubRel(p) => p.encoded_size(version),
+            PubComp(p) => p.encoded_size(version),
+            Subscribe(p) => p.encoded_size(version),
+            SubAck(p) => p.encoded_size(version),
+            Unsubscribe(p) => p.encoded_size(version),
+            UnsubAck(p) => p.encoded_size(version),
+            PingReq(p) => p.encoded_size(version),
+            PingResp(p) => p.encoded_size(version),
+            Disconnect(p) => p.encoded_size(version),
+            Auth(p) => p.encoded_size(version),
+        }
+    }
+}
+
+/// One kind of control packet, written and read in the wire format of a
+/// protocol version. Each packet type implements it; [`ControlPacket`] does
+/// the same for any packet.
+pub trait Packet: Sized {
+    /// Appends the packet in the wire format of `version`.
+    ///
+    /// Fails, leaving `buffer` as it was, on a packet MQTT can't carry or
+    /// the receiver would have to refuse; see [`EncodeError`].
+    fn encode(
+        &self,
+        buffer: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> core::result::Result<(), EncodeError>;
+
+    /// Number of bytes [`encode`](Packet::encode) writes for `version`.
+    fn encoded_size(&self, version: ProtocolVersion) -> usize;
+
+    /// Reads one packet in the wire format of `version` from the front of
+    /// `buffer`, and advances past it.
+    ///
+    /// Fails with [`Error::PacketIncomplete`] when `buffer` ends before the
+    /// packet does, and with a reason code when the packet is of another
+    /// type or malformed. On failure `buffer` may be partly consumed.
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> Result<Self>;
 }
 
 /// Decodes one packet of `packet_type` from the front of `buffer`: reads
@@ -309,6 +267,7 @@ impl ControlPacket {
 pub(crate) fn decode_packet<T, P, F>(
     buffer: &mut T,
     packet_type: PacketType,
+    version: ProtocolVersion,
     decode_body: F,
 ) -> Result<P>
 where
@@ -321,10 +280,16 @@ where
     }
 
     // Flags are free on PUBLISH, 0b0010 on PUBREL, SUBSCRIBE and
-    // UNSUBSCRIBE, and zero elsewhere
+    // UNSUBSCRIBE, and zero elsewhere. MQTT 3.1 sets DUP when it resends one
+    // of those three (3.1 section 2.1); 3.1.1 reserved that bit.
     let flags = first_byte & 0x0f;
     let expected_flags = match packet_type {
         PacketType::Publish => flags,
+        PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe
+            if version == ProtocolVersion::V3_1 && flags == 0b1010 =>
+        {
+            flags
+        }
         PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => 0b0010,
         _ => 0,
     };
@@ -332,7 +297,7 @@ where
         return Err(ReasonCode::MalformedPacket.into());
     }
 
-    let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+    let remaining_len = VariableByteInteger::decode(buffer)?.value() as usize;
     if buffer.remaining() < remaining_len {
         return Err(Error::PacketIncomplete);
     }
@@ -368,68 +333,128 @@ pub(crate) fn decode_packet_id<T: Buf>(buffer: &mut T) -> Result<u16> {
     }
 }
 
+/// Runs `write`, which appends one packet to `buffer`, and takes back what
+/// it wrote if it fails, so a refused packet leaves no partial bytes.
+pub(crate) fn write_packet<F>(
+    buffer: &mut BytesMut,
+    write: F,
+) -> core::result::Result<(), EncodeError>
+where
+    F: FnOnce(&mut BytesMut) -> core::result::Result<(), EncodeError>,
+{
+    let start = buffer.len();
+    let written = write(buffer);
+    if written.is_err() {
+        buffer.truncate(start);
+    }
+    written
+}
+
+/// Writes a Remaining Length or property list length.
+pub(crate) fn encode_length(
+    len: usize,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    u32::try_from(len)
+        .ok()
+        .and_then(VariableByteInteger::new)
+        .ok_or(EncodeError::TooLarge)?
+        .encode(buffer)
+}
+
+/// Writes a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
+pub(crate) fn encode_packet_id(
+    packet_id: u16,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    if packet_id == 0 {
+        return Err(EncodeError::PacketIdZero);
+    }
+    packet_id.encode(buffer)
+}
+
+/// Writes an MQTT 5 reason code that `packet_type` lists.
+pub(crate) fn encode_reason(
+    reason: ReasonCode,
+    packet_type: PacketType,
+    buffer: &mut BytesMut,
+) -> core::result::Result<(), EncodeError> {
+    if !reason.is_valid_for(packet_type) {
+        return Err(EncodeError::InvalidReasonCode(packet_type, reason));
+    }
+    reason.encode(buffer)
+}
+
+/// Authentication Data means nothing without an Authentication Method, and
+/// the receiver refuses it (section 3.1.2.11.10).
+pub(crate) fn check_authentication(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> core::result::Result<(), EncodeError> {
+    if lone_authentication_data(method, data) {
+        return Err(EncodeError::InvalidProperty(AuthenticationData::ID));
+    }
+    Ok(())
+}
+
+/// The decoder's side of [`check_authentication`]: a protocol error.
+pub(crate) fn check_decoded_authentication(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> Result<()> {
+    if lone_authentication_data(method, data) {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    Ok(())
+}
+
+fn lone_authentication_data(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> bool {
+    data.is_some() && method.is_none()
+}
+
+/// Stores a property that may appear at most once in a packet; a repeat is
+/// a protocol error [MQTT-2.2.2-2].
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
+    if slot.is_some() {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Appends a User Property, which may appear any number of times.
+pub(crate) fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
+    slot.get_or_insert_with(Vec::new).push(value);
+}
+
+/// Size of the Variable Byte Integer that writes `len`; a length too large
+/// for one counts as the four bytes of the largest.
+fn length_size(len: usize) -> usize {
+    u32::try_from(len)
+        .ok()
+        .and_then(VariableByteInteger::new)
+        .map_or(4, |len| len.encoded_size())
+}
+
 /// Size of a whole packet whose body is `remaining_len` bytes: the first
 /// byte, the Remaining Length and the body.
 pub(crate) fn packet_size(remaining_len: usize) -> usize {
-    1 + VariableByteInteger(remaining_len as u32).encoded_size() + remaining_len
+    1 + length_size(remaining_len) + remaining_len
 }
 
 /// Size of a property list with its length prefix.
 pub(crate) fn property_list_size<P: Encoder>(properties: &P) -> usize {
     let len = properties.encoded_size();
-    VariableByteInteger(len as u32).encoded_size() + len
+    length_size(len) + len
 }
 
 /// A property block that sets nothing reads as no block at all: the two
 /// mean the same, and senders use either.
 pub(crate) fn present<P: Default + PartialEq>(properties: P) -> Option<P> {
     (properties != P::default()).then_some(properties)
-}
-
-impl Encoder for ControlPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        use ControlPacket::*;
-
-        match self {
-            Connect(p) => p.encode(buffer),
-            ConnAck(p) => p.encode(buffer),
-            Publish(p) => p.encode(buffer),
-            PubAck(p) => p.encode(buffer),
-            PubRec(p) => p.encode(buffer),
-            PubRel(p) => p.encode(buffer),
-            PubComp(p) => p.encode(buffer),
-            Subscribe(p) => p.encode(buffer),
-            SubAck(p) => p.encode(buffer),
-            Unsubscribe(p) => p.encode(buffer),
-            UnsubAck(p) => p.encode(buffer),
-            PingReq(p) => p.encode(buffer),
-            PingResp(p) => p.encode(buffer),
-            Disconnect(p) => p.encode(buffer),
-            Auth(p) => p.encode(buffer),
-        }
-    }
-
-    fn encoded_size(&self) -> usize {
-        use ControlPacket::*;
-
-        match self {
-            Connect(p) => p.encoded_size(),
-            ConnAck(p) => p.encoded_size(),
-            Publish(p) => p.encoded_size(),
-            PubAck(p) => p.encoded_size(),
-            PubRec(p) => p.encoded_size(),
-            PubRel(p) => p.encoded_size(),
-            PubComp(p) => p.encoded_size(),
-            Subscribe(p) => p.encoded_size(),
-            SubAck(p) => p.encoded_size(),
-            Unsubscribe(p) => p.encoded_size(),
-            UnsubAck(p) => p.encoded_size(),
-            PingReq(p) => p.encoded_size(),
-            PingResp(p) => p.encoded_size(),
-            Disconnect(p) => p.encoded_size(),
-            Auth(p) => p.encoded_size(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -441,8 +466,7 @@ mod tests {
 
     fn parse_v3(bytes: &[u8]) -> ControlPacket {
         let mut buffer = BytesMut::from(bytes);
-        let packet =
-            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1_1).unwrap();
+        let packet = ControlPacket::parse(&mut buffer, ProtocolVersion::V3_1_1).unwrap();
         assert!(buffer.is_empty(), "packet not fully consumed");
         packet
     }
@@ -464,7 +488,9 @@ mod tests {
         assert_eq!(publish.payload, Some(Bytes::from("hi")));
 
         let mut encoded = BytesMut::new();
-        packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(&encoded[..], &wire[..]);
     }
 
@@ -488,14 +514,14 @@ mod tests {
         let wire = [0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'#', 0x05];
         let mut buffer = BytesMut::from(&wire[..]);
 
-        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1_1).is_err());
+        assert!(ControlPacket::parse(&mut buffer, ProtocolVersion::V3_1_1).is_err());
 
         // The same option byte is valid in MQTT 5, which adds a properties length
         let wire = [
             0x82, 0x09, 0x00, 0x01, 0x00, 0x00, 0x03, b'a', b'/', b'#', 0x05,
         ];
         let mut buffer = BytesMut::from(&wire[..]);
-        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+        assert!(ControlPacket::parse(&mut buffer, ProtocolVersion::V5).is_ok());
     }
 
     #[test]
@@ -506,7 +532,9 @@ mod tests {
             properties: None,
         });
         let mut encoded = BytesMut::new();
-        packet.encode_with_version(&mut encoded, ProtocolVersion::V3_1_1);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(&encoded[..], [0x62, 0x02, 0x00, 0x07]);
     }
 
@@ -519,13 +547,12 @@ mod tests {
             &[0xaa, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'],
         ];
         for bytes in resent {
-            let parse =
-                |version| ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
+            let parse = |version| ControlPacket::parse(&mut BytesMut::from(bytes), version);
             assert!(parse(ProtocolVersion::V3_1).is_ok(), "{bytes:02x?}");
             assert!(
                 matches!(
                     parse(ProtocolVersion::V3_1_1),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{bytes:02x?}"
             );
@@ -533,14 +560,27 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_1_acks_keep_their_version() {
-        let mut buffer = BytesMut::from(&[0x90, 0x03, 0x00, 0x01, 0x01][..]);
-        let ControlPacket::SubAck(suback) =
-            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V3_1).unwrap()
-        else {
-            panic!("Expected SubAck");
+    fn test_encoding_follows_the_version_passed_in() {
+        let suback = ControlPacket::SubAck(suback::SubAckPacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![suback::SubAckPayload {
+                reason_code: ReasonCode::NotAuthorized,
+            }],
+        });
+        let encode = |version| {
+            let mut buffer = BytesMut::new();
+            suback.encode(&mut buffer, version).unwrap();
+            buffer
         };
-        assert_eq!(suback.protocol_version, ProtocolVersion::V3_1);
+        assert_eq!(
+            &encode(ProtocolVersion::V3_1)[..],
+            [0x90, 0x03, 0x00, 0x01, 0x80]
+        );
+        assert_eq!(
+            &encode(ProtocolVersion::V5)[..],
+            [0x90, 0x04, 0x00, 0x01, 0x00, 0x87]
+        );
     }
 
     #[test]
@@ -620,7 +660,7 @@ mod robustness_tests {
             let mut buffer = BytesMut::from(bytes);
             let result = catch_unwind(AssertUnwindSafe(|| {
                 while ControlPacket::check(&buffer).is_ok() {
-                    if ControlPacket::parse_with_version(&mut buffer, version).is_err() {
+                    if ControlPacket::parse(&mut buffer, version).is_err() {
                         break;
                     }
                 }
@@ -665,9 +705,7 @@ mod robustness_tests {
     #[test]
     fn test_packet_type_is_the_first_nibble() {
         for (bytes, version) in versioned_samples() {
-            let packet =
-                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
-                    .unwrap();
+            let packet = ControlPacket::parse(&mut BytesMut::from(&bytes[..]), version).unwrap();
             assert_eq!(packet.packet_type() as u8, bytes[0] >> 4, "{packet:?}");
             assert_eq!(packet.clone(), packet);
         }
@@ -676,12 +714,10 @@ mod robustness_tests {
     #[test]
     fn test_encoded_size_is_what_encode_writes() {
         for (bytes, version) in versioned_samples() {
-            let packet =
-                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
-                    .unwrap();
+            let packet = ControlPacket::parse(&mut BytesMut::from(&bytes[..]), version).unwrap();
             let mut encoded = BytesMut::new();
-            packet.encode(&mut encoded);
-            assert_eq!(packet.encoded_size(), encoded.len(), "{packet:?}");
+            packet.encode(&mut encoded, version).unwrap();
+            assert_eq!(packet.encoded_size(version), encoded.len(), "{packet:?}");
         }
     }
 
@@ -691,7 +727,7 @@ mod robustness_tests {
             let mut buffer = BytesMut::from(&bytes[..]);
             // Followed by another packet that must stay untouched
             buffer.extend_from_slice(&[0xc0, 0x00]);
-            let result = ControlPacket::parse_with_version(&mut buffer, version);
+            let result = ControlPacket::parse(&mut buffer, version);
             assert!(result.is_ok(), "{:02x?}: {:?}", bytes, result);
             assert_eq!(&buffer[..], &[0xc0, 0x00], "{:02x?}", bytes);
         }
@@ -707,7 +743,7 @@ mod robustness_tests {
         ];
         let mut buffer = BytesMut::from(&wire[..]);
         let Ok(ControlPacket::Connect(connect)) =
-            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5)
+            ControlPacket::parse(&mut buffer, ProtocolVersion::V5)
         else {
             panic!("Expected Connect");
         };
@@ -724,8 +760,8 @@ mod robustness_tests {
         ];
         let mut buffer = BytesMut::from(&repeated[..]);
         assert!(matches!(
-            ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5),
-            Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+            ControlPacket::parse(&mut buffer, ProtocolVersion::V5),
+            Err(Error::Reason(ReasonCode::ProtocolError))
         ));
 
         // The same with two User Properties, which may repeat
@@ -734,7 +770,7 @@ mod robustness_tests {
             0x01, b'k', 0x00, 0x00,
         ];
         let mut buffer = BytesMut::from(&user_properties[..]);
-        assert!(ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).is_ok());
+        assert!(ControlPacket::parse(&mut buffer, ProtocolVersion::V5).is_ok());
     }
 
     #[test]
@@ -755,12 +791,9 @@ mod robustness_tests {
 
     fn assert_protocol_error(packets: &[(&[u8], ProtocolVersion)]) {
         for &(bytes, version) in packets {
-            let result = ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
+            let result = ControlPacket::parse(&mut BytesMut::from(bytes), version);
             assert!(
-                matches!(
-                    result,
-                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
-                ),
+                matches!(result, Err(Error::Reason(ReasonCode::ProtocolError))),
                 "{bytes:02x?} ({version}): {result:?}"
             );
         }
@@ -811,13 +844,13 @@ mod robustness_tests {
 
         for (name, valid, invalid) in cases {
             let parse = |bytes: &[u8]| {
-                ControlPacket::parse_with_version(&mut BytesMut::from(bytes), ProtocolVersion::V5)
+                ControlPacket::parse(&mut BytesMut::from(bytes), ProtocolVersion::V5)
             };
             assert!(parse(valid).is_ok(), "{name}: {:?}", parse(valid));
             assert!(
                 matches!(
                     parse(invalid),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{name}: {:?}",
                 parse(invalid)
@@ -907,8 +940,8 @@ mod robustness_tests {
             let mut buffer = BytesMut::from(bytes);
             assert!(
                 matches!(
-                    ControlPacket::parse_with_version(&mut buffer, version),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    ControlPacket::parse(&mut buffer, version),
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{:02x?}",
                 bytes
@@ -952,38 +985,45 @@ mod robustness_tests {
 
     type DirectDecoder = fn(&mut Bytes) -> Result<()>;
 
-    /// Every per-packet decoder, for both wire formats where they differ.
+    /// Every per-packet decoder, in MQTT 5 and MQTT 3.1.1.
     fn direct_decoders() -> Vec<(&'static str, DirectDecoder)> {
-        fn run<P: Decoder>(bytes: &mut Bytes) -> Result<()> {
-            P::decode(bytes).map(|_| ())
-        }
         vec![
-            ("CONNECT", run::<ConnectPacket>),
-            ("CONNACK", run::<ConnAckPacket>),
-            ("CONNACK v3", |b| ConnAckPacket::decode_v3(b).map(|_| ())),
-            ("PUBLISH", run::<PublishPacket>),
-            ("PUBLISH v3", |b| PublishPacket::decode_v3(b).map(|_| ())),
-            ("PUBACK", run::<PubAckPacket>),
-            ("PUBREC", run::<PubRecPacket>),
-            ("PUBREL", run::<PubRelPacket>),
-            ("PUBCOMP", run::<PubCompPacket>),
-            ("SUBSCRIBE", run::<SubscribePacket>),
-            ("SUBSCRIBE v3", |b| {
-                SubscribePacket::decode_v3(b).map(|_| ())
-            }),
-            ("SUBACK", run::<SubAckPacket>),
-            ("SUBACK v3", |b| SubAckPacket::decode_v3(b).map(|_| ())),
-            ("UNSUBSCRIBE", run::<UnsubscribePacket>),
-            ("UNSUBSCRIBE v3", |b| {
-                UnsubscribePacket::decode_v3(b).map(|_| ())
-            }),
-            ("UNSUBACK", run::<UnsubAckPacket>),
-            ("UNSUBACK v3", |b| UnsubAckPacket::decode_v3(b).map(|_| ())),
-            ("PINGREQ", run::<PingReqPacket>),
-            ("PINGRESP", run::<PingRespPacket>),
-            ("DISCONNECT", run::<DisconnectPacket>),
-            ("AUTH", run::<AuthPacket>),
+            ("CONNECT", run::<ConnectPacket, 5>),
+            ("CONNECT v3", run::<ConnectPacket, 4>),
+            ("CONNACK", run::<ConnAckPacket, 5>),
+            ("CONNACK v3", run::<ConnAckPacket, 4>),
+            ("PUBLISH", run::<PublishPacket, 5>),
+            ("PUBLISH v3", run::<PublishPacket, 4>),
+            ("PUBACK", run::<PubAckPacket, 5>),
+            ("PUBACK v3", run::<PubAckPacket, 4>),
+            ("PUBREC", run::<PubRecPacket, 5>),
+            ("PUBREC v3", run::<PubRecPacket, 4>),
+            ("PUBREL", run::<PubRelPacket, 5>),
+            ("PUBREL v3", run::<PubRelPacket, 4>),
+            ("PUBCOMP", run::<PubCompPacket, 5>),
+            ("PUBCOMP v3", run::<PubCompPacket, 4>),
+            ("SUBSCRIBE", run::<SubscribePacket, 5>),
+            ("SUBSCRIBE v3", run::<SubscribePacket, 4>),
+            ("SUBACK", run::<SubAckPacket, 5>),
+            ("SUBACK v3", run::<SubAckPacket, 4>),
+            ("UNSUBSCRIBE", run::<UnsubscribePacket, 5>),
+            ("UNSUBSCRIBE v3", run::<UnsubscribePacket, 4>),
+            ("UNSUBACK", run::<UnsubAckPacket, 5>),
+            ("UNSUBACK v3", run::<UnsubAckPacket, 4>),
+            ("PINGREQ", run::<PingReqPacket, 5>),
+            ("PINGREQ v3", run::<PingReqPacket, 4>),
+            ("PINGRESP", run::<PingRespPacket, 5>),
+            ("PINGRESP v3", run::<PingRespPacket, 4>),
+            ("DISCONNECT", run::<DisconnectPacket, 5>),
+            ("DISCONNECT v3", run::<DisconnectPacket, 4>),
+            ("AUTH", run::<AuthPacket, 5>),
+            ("AUTH v3", run::<AuthPacket, 4>),
         ]
+    }
+
+    fn run<P: Packet, const LEVEL: u8>(bytes: &mut Bytes) -> Result<()> {
+        let version = ProtocolVersion::try_from(LEVEL).expect("a protocol level");
+        P::decode(bytes, version).map(|_| ())
     }
 
     fn decode_direct(name: &str, decode: DirectDecoder, bytes: &[u8]) -> Result<()> {
@@ -1040,26 +1080,28 @@ mod robustness_tests {
     fn test_direct_decoders_check_the_packet_type() {
         // A PUBREC is not a PUBACK, and a PINGRESP not a PINGREQ
         let pubrec = [0x50, 0x02, 0x00, 0x01];
-        assert!(PubAckPacket::decode(&mut Bytes::copy_from_slice(&pubrec)).is_err());
-        assert!(PingReqPacket::decode(&mut Bytes::from_static(&[0xd0, 0x00])).is_err());
+        assert!(
+            PubAckPacket::decode(&mut Bytes::copy_from_slice(&pubrec), ProtocolVersion::V5)
+                .is_err()
+        );
+        assert!(
+            PingReqPacket::decode(&mut Bytes::from_static(&[0xd0, 0x00]), ProtocolVersion::V5)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_direct_decoders_refuse_bytes_left_in_the_packet() {
         let malformed: [(&str, DirectDecoder, &[u8]); 3] = [
-            (
-                "PINGREQ",
-                |b| PingReqPacket::decode(b).map(|_| ()),
-                &[0xc0, 0x01, 0x00],
-            ),
+            ("PINGREQ", run::<PingReqPacket, 5>, &[0xc0, 0x01, 0x00]),
             (
                 "CONNACK v3",
-                |b| ConnAckPacket::decode_v3(b).map(|_| ()),
+                run::<ConnAckPacket, 4>,
                 &[0x20, 0x03, 0x00, 0x00, 0x00],
             ),
             (
                 "UNSUBACK v3",
-                |b| UnsubAckPacket::decode_v3(b).map(|_| ()),
+                run::<UnsubAckPacket, 4>,
                 &[0xb0, 0x03, 0x00, 0x01, 0x00],
             ),
         ];
@@ -1067,9 +1109,297 @@ mod robustness_tests {
             assert!(
                 matches!(
                     decode_direct(name, decode, bytes),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{name}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use std::{string::String, vec::Vec};
+
+    use bytes::Bytes;
+    use mercurio_core::{
+        properties::{AuthenticationData, ResponseTopic, TopicAlias},
+        qos::QoS,
+    };
+
+    use super::*;
+    use crate::{
+        auth::{AuthPacket, AuthProperties},
+        connect::{ConnectPayload, ConnectProperties},
+        publish::PublishProperties,
+        suback::SubAckPayload,
+        subscribe::{SubscribePayload, SubscriptionOptions},
+        unsuback::UnsubAckPayload,
+        unsubscribe::UnsubscribePayload,
+    };
+
+    fn publish() -> PublishPacket {
+        PublishPacket {
+            dup: false,
+            qos_level: QoS::AtLeastOnce,
+            retain: false,
+            topic_name: "t".into(),
+            packet_id: Some(1),
+            properties: None,
+            payload: Some(Bytes::from_static(b"m")),
+        }
+    }
+
+    fn connect(version: ProtocolVersion) -> ConnectPacket {
+        ConnectPacket {
+            protocol_version: version,
+            clean_start: true,
+            keepalive: 0,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "c".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Encodes `packet` after some bytes already in the buffer, and checks
+    /// it fails with `expected` and leaves those bytes alone.
+    fn assert_refused(packet: ControlPacket, version: ProtocolVersion, expected: EncodeError) {
+        let mut buffer = BytesMut::from(&b"before"[..]);
+        assert_eq!(
+            packet.encode(&mut buffer, version),
+            Err(expected),
+            "{packet:?}"
+        );
+        assert_eq!(&buffer[..], b"before", "{packet:?} left bytes behind");
+    }
+
+    #[test]
+    fn test_packets_the_receiver_refuses_are_not_encoded() {
+        use ControlPacket::*;
+        use ProtocolVersion::{V3_1_1, V5};
+
+        let cases: Vec<(ControlPacket, ProtocolVersion, EncodeError)> = vec![
+            (
+                PubAck(puback::PubAckPacket {
+                    packet_id: 0,
+                    ..Default::default()
+                }),
+                V5,
+                EncodeError::PacketIdZero,
+            ),
+            (
+                PubRel(pubrel::PubRelPacket {
+                    packet_id: 1,
+                    reason: ReasonCode::NoMatchingSubscribers,
+                    properties: None,
+                }),
+                V5,
+                EncodeError::InvalidReasonCode(
+                    PacketType::PubRel,
+                    ReasonCode::NoMatchingSubscribers,
+                ),
+            ),
+            (
+                Subscribe(SubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V3_1_1,
+                EncodeError::EmptyPayload(PacketType::Subscribe),
+            ),
+            (
+                Unsubscribe(UnsubscribePacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V5,
+                EncodeError::EmptyPayload(PacketType::Unsubscribe),
+            ),
+            (
+                SubAck(SubAckPacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V3_1_1,
+                EncodeError::EmptyPayload(PacketType::SubAck),
+            ),
+            (
+                UnsubAck(UnsubAckPacket {
+                    packet_id: 1,
+                    properties: None,
+                    payload: Vec::new(),
+                }),
+                V5,
+                EncodeError::EmptyPayload(PacketType::UnsubAck),
+            ),
+            (
+                Publish(PublishPacket {
+                    topic_name: "a\0b".into(),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::NulInString,
+            ),
+            (
+                Publish(PublishPacket {
+                    properties: Some(PublishProperties {
+                        response_topic: Some(ResponseTopic::new("a/+".into())),
+                        ..Default::default()
+                    }),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::InvalidProperty(ResponseTopic::ID),
+            ),
+            (
+                Publish(PublishPacket {
+                    properties: Some(PublishProperties {
+                        topic_alias: Some(TopicAlias::new(0)),
+                        ..Default::default()
+                    }),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::InvalidProperty(TopicAlias::ID),
+            ),
+            (
+                Publish(PublishPacket {
+                    packet_id: None,
+                    ..publish()
+                }),
+                V3_1_1,
+                EncodeError::PacketIdMismatch,
+            ),
+            (
+                Publish(PublishPacket {
+                    qos_level: QoS::AtMostOnce,
+                    ..publish()
+                }),
+                V5,
+                EncodeError::PacketIdMismatch,
+            ),
+            (
+                Publish(PublishPacket {
+                    packet_id: Some(0),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::PacketIdZero,
+            ),
+            (
+                Publish(PublishPacket {
+                    dup: true,
+                    qos_level: QoS::AtMostOnce,
+                    packet_id: None,
+                    ..publish()
+                }),
+                V5,
+                EncodeError::DupAtQoS0,
+            ),
+            (
+                Publish(PublishPacket {
+                    topic_name: "a".repeat(65_536),
+                    ..publish()
+                }),
+                V5,
+                EncodeError::TooLong,
+            ),
+            (
+                Connect(ConnectPacket {
+                    properties: Some(ConnectProperties {
+                        authentication_data: Some(AuthenticationData::new(Bytes::new())),
+                        ..Default::default()
+                    }),
+                    ..connect(V5)
+                }),
+                V5,
+                EncodeError::InvalidProperty(AuthenticationData::ID),
+            ),
+            (
+                Connect(ConnectPacket {
+                    payload: ConnectPayload {
+                        client_id: "c".into(),
+                        password: Some(Bytes::from_static(b"p")),
+                        ..Default::default()
+                    },
+                    ..connect(V3_1_1)
+                }),
+                V3_1_1,
+                EncodeError::PasswordWithoutUserName,
+            ),
+            (
+                Connect(connect(V5)),
+                V3_1_1,
+                EncodeError::UnsupportedVersion(PacketType::Connect, V3_1_1),
+            ),
+            (
+                Auth(AuthPacket {
+                    reason: ReasonCode::Success,
+                    properties: AuthProperties::default(),
+                }),
+                V3_1_1,
+                EncodeError::UnsupportedVersion(PacketType::Auth, V3_1_1),
+            ),
+        ];
+
+        for (packet, version, expected) in cases {
+            assert_refused(packet, version, expected);
+        }
+    }
+
+    #[test]
+    fn test_packet_too_large_to_frame_is_refused() {
+        // Two filters of 65,535 bytes take 131,076 bytes; enough of them
+        // pass 268,435,455
+        let filter = SubscribePayload {
+            topic_filter: "a".repeat(65_535),
+            subs_opt: SubscriptionOptions::default(),
+        };
+        let subscribe = ControlPacket::Subscribe(SubscribePacket {
+            packet_id: 1,
+            properties: None,
+            payload: vec![filter; 4_100],
+        });
+        assert_refused(subscribe, ProtocolVersion::V5, EncodeError::TooLarge);
+    }
+
+    #[test]
+    fn test_valid_packets_still_encode() {
+        let packets = [
+            ControlPacket::SubAck(SubAckPacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![SubAckPayload {
+                    reason_code: ReasonCode::GrantedQoS0,
+                }],
+            }),
+            ControlPacket::UnsubAck(UnsubAckPacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![UnsubAckPayload {
+                    reason_code: ReasonCode::NoSubscriptionExisted,
+                }],
+            }),
+            ControlPacket::Unsubscribe(UnsubscribePacket {
+                packet_id: 1,
+                properties: None,
+                payload: vec![UnsubscribePayload {
+                    topic_filter: String::from("a/#"),
+                }],
+            }),
+            ControlPacket::Publish(publish()),
+        ];
+        for packet in packets {
+            let mut buffer = BytesMut::new();
+            packet.encode(&mut buffer, ProtocolVersion::V5).unwrap();
+            assert_eq!(
+                ControlPacket::parse(&mut buffer, ProtocolVersion::V5).unwrap(),
+                packet
             );
         }
     }
@@ -1110,10 +1440,7 @@ mod property_list_tests {
         for bytes in [&[0x05, 0x26][..], &[0x02, 0x26, 0x00]] {
             for (i, result) in decode_all(bytes).into_iter().enumerate() {
                 assert!(
-                    matches!(
-                        result,
-                        Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
-                    ),
+                    matches!(result, Err(Error::Reason(ReasonCode::MalformedPacket))),
                     "{bytes:02x?} in decoder {i}: {result:?}"
                 );
             }
@@ -1139,7 +1466,7 @@ mod property_list_tests {
             assert!(
                 matches!(
                     decode(data_only),
-                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                    Err(Error::Reason(ReasonCode::ProtocolError))
                 ),
                 "decoder {i}"
             );

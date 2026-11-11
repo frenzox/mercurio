@@ -9,7 +9,8 @@ use alloc::{string::String, vec::Vec};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
     error::Error,
     properties::*,
     protocol::ProtocolVersion,
@@ -17,31 +18,37 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{push_user_property, set_once, Packet, PacketType};
 
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
-/// The Connect Flags byte (section 3.1.2.3). The flags decide which
-/// optional fields of the payload are encoded and decoded.
-pub struct ConnectFlags {
-    /// The payload has a user name.
-    pub user_name: bool,
-    /// The payload has a password. MQTT 3.x doesn't allow one without a user
-    /// name [MQTT-3.1.2-22].
-    pub password: bool,
-    /// Publish the will message as a retained message.
-    pub will_retain: bool,
-    /// QoS of the will message. Encoded only when `will_flag` is set.
-    pub will_qos: QoS,
-    /// The payload has a will message, which the server publishes when the
-    /// connection closes without a normal DISCONNECT (section 3.1.2.5).
-    pub will_flag: bool,
-    /// Discard any existing session. MQTT 3.x calls it Clean Session, and
-    /// there it also ends the session when the connection closes.
-    pub clean_start: bool,
+/// The Connect Flags byte (section 3.1.2.3). It says which optional fields
+/// of the payload follow, so [`ConnectPacket`] derives it from the payload
+/// on encode instead of storing it.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct ConnectFlags {
+    user_name: bool,
+    password: bool,
+    will_retain: bool,
+    will_qos: QoS,
+    will_flag: bool,
+    clean_start: bool,
+}
+
+impl ConnectFlags {
+    fn of(packet: &ConnectPacket) -> ConnectFlags {
+        let will = packet.payload.will.as_ref();
+        ConnectFlags {
+            user_name: packet.payload.user_name.is_some(),
+            password: packet.payload.password.is_some(),
+            will_retain: will.is_some_and(|will| will.retain),
+            will_qos: will.map_or(QoS::AtMostOnce, |will| will.qos),
+            will_flag: will.is_some(),
+            clean_start: packet.clean_start,
+        }
+    }
 }
 
 impl Encoder for ConnectFlags {
-    fn encode(&self, buffer: &mut BytesMut) {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         let mut flags: u8 = 0;
 
         if self.user_name {
@@ -66,6 +73,7 @@ impl Encoder for ConnectFlags {
         }
 
         buffer.put_u8(flags);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -99,14 +107,11 @@ impl Decoder for ConnectFlags {
 
         if (byte & 0b0000_0100) != 0 {
             flags.will_flag = true;
-            flags.will_qos = ((byte >> 3) & 0b0000_0011).into();
+            flags.will_qos = QoS::try_from((byte >> 3) & 0b0000_0011)
+                .map_err(|_| Error::from(ReasonCode::MalformedPacket))?;
         }
 
-        if flags.will_qos != QoS::Invalid {
-            Ok(flags)
-        } else {
-            Err(ReasonCode::MalformedPacket.into())
-        }
+        Ok(flags)
     }
 }
 
@@ -138,16 +143,18 @@ pub struct ConnectProperties {
 }
 
 impl Encoder for ConnectProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.session_expiry_interval.encode(buffer);
-        self.receive_maximum.encode(buffer);
-        self.maximum_packet_size.encode(buffer);
-        self.topic_alias_maximum.encode(buffer);
-        self.request_response_information.encode(buffer);
-        self.request_problem_information.encode(buffer);
-        self.user_property.encode(buffer);
-        self.authentication_method.encode(buffer);
-        self.authentication_data.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        crate::check_authentication(&self.authentication_method, &self.authentication_data)?;
+        self.session_expiry_interval.encode(buffer)?;
+        self.receive_maximum.encode(buffer)?;
+        self.maximum_packet_size.encode(buffer)?;
+        self.topic_alias_maximum.encode(buffer)?;
+        self.request_response_information.encode(buffer)?;
+        self.request_problem_information.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        self.authentication_method.encode(buffer)?;
+        self.authentication_data.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -193,7 +200,7 @@ impl Decoder for ConnectProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
-        check_authentication(
+        crate::check_decoded_authentication(
             &properties.authentication_method,
             &properties.authentication_data,
         )?;
@@ -218,14 +225,15 @@ pub struct WillProperties {
 }
 
 impl Encoder for WillProperties {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.will_delay_interval.encode(buffer);
-        self.payload_format_indicator.encode(buffer);
-        self.message_expiry_interval.encode(buffer);
-        self.content_type.encode(buffer);
-        self.response_topic.encode(buffer);
-        self.correlation_data.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        self.will_delay_interval.encode(buffer)?;
+        self.payload_format_indicator.encode(buffer)?;
+        self.message_expiry_interval.encode(buffer)?;
+        self.content_type.encode(buffer)?;
+        self.response_topic.encode(buffer)?;
+        self.correlation_data.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -267,114 +275,103 @@ impl Decoder for WillProperties {
     }
 }
 
+/// The will message: what the server publishes for the client when the
+/// connection closes without a normal DISCONNECT (section 3.1.2.5).
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
+pub struct Will {
+    pub qos: QoS,
+    /// Publish the will as a retained message.
+    pub retain: bool,
+    /// MQTT 5 only.
+    pub properties: Option<WillProperties>,
+    pub topic: String,
+    pub payload: Bytes,
+}
+
+/// The CONNECT payload. Each optional field is on the wire exactly when it
+/// is set here: the Connect Flags are derived from it.
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnectPayload {
     /// May be empty, and the server then assigns one (section 3.1.3.1).
     pub client_id: String,
-    /// MQTT 5 only.
-    pub will_properties: Option<WillProperties>,
-    /// Set when `ConnectFlags::will_flag` is.
-    pub will_topic: Option<String>,
-    /// Set when `ConnectFlags::will_flag` is.
-    pub will_payload: Option<Bytes>,
+    pub will: Option<Will>,
     pub user_name: Option<String>,
+    /// MQTT 3.x doesn't allow a password without a user name
+    /// [MQTT-3.1.2-22].
     pub password: Option<Bytes>,
 }
 
 impl ConnectPayload {
-    fn present_fields(&self) -> ConnectFlags {
-        ConnectFlags {
-            user_name: self.user_name.is_some(),
-            password: self.password.is_some(),
-            will_flag: self.will_topic.is_some(),
-            ..Default::default()
-        }
-    }
+    /// Writes the payload; the will properties only in MQTT 5.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        self.client_id.encode(buffer)?;
 
-    /// Encode payload with version-specific handling.
-    ///
-    /// The will, user name and password are written only when `flags` says
-    /// the payload has them, and the will properties only in MQTT 5.
-    pub fn encode_for_version(
-        &self,
-        buffer: &mut BytesMut,
-        version: ProtocolVersion,
-        flags: &ConnectFlags,
-    ) {
-        self.client_id.encode(buffer);
-
-        // Will properties only for MQTT 5.0
-        if flags.will_flag {
+        if let Some(will) = &self.will {
             if version.supports_properties() {
                 // Will properties length must be encoded even if 0
-                VariableByteInteger(self.will_properties.encoded_size() as u32).encode(buffer);
-                self.will_properties.encode(buffer);
+                crate::encode_length(will.properties.encoded_size(), buffer)?;
+                will.properties.encode(buffer)?;
             }
-            self.will_topic.encode(buffer);
-            self.will_payload.encode(buffer);
+            will.topic.encode(buffer)?;
+            will.payload.encode(buffer)?;
         }
 
-        if flags.user_name {
-            self.user_name.encode(buffer);
-        }
-        if flags.password {
-            self.password.encode(buffer);
-        }
+        self.user_name.encode(buffer)?;
+        self.password.encode(buffer)
     }
 
-    /// Calculate encoded size with version-specific handling, matching
-    /// [`Self::encode_for_version`].
-    pub fn encoded_size_for_version(
-        &self,
+    /// Size of what [`Self::encode`] writes.
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        let mut len = self.client_id.encoded_size();
+
+        if let Some(will) = &self.will {
+            if version.supports_properties() {
+                len += crate::property_list_size(&will.properties);
+            }
+            len += will.topic.encoded_size() + will.payload.encoded_size();
+        }
+
+        len + self.user_name.encoded_size() + self.password.encoded_size()
+    }
+
+    /// Reads the payload fields that `flags` announces.
+    fn decode<T: Buf>(
+        buffer: &mut T,
         version: ProtocolVersion,
         flags: &ConnectFlags,
-    ) -> usize {
-        let mut len = 0;
+    ) -> crate::Result<Self> {
+        let client_id = String::decode(buffer)?;
 
-        len += self.client_id.encoded_size();
-
-        if flags.will_flag {
-            // Will properties only for MQTT 5.0
-            if version.supports_properties() {
-                // Will properties length must be encoded even if 0
-                len +=
-                    VariableByteInteger(self.will_properties.encoded_size() as u32).encoded_size();
-                len += self.will_properties.encoded_size();
-            }
-            len += self.will_topic.encoded_size();
-            len += self.will_payload.encoded_size();
-        }
-
-        if flags.user_name {
-            len += self.user_name.encoded_size();
-        }
-        if flags.password {
-            len += self.password.encoded_size();
-        }
-
-        len
-    }
-}
-
-/// Encodes the MQTT 5 form, with the fields that are set.
-impl Encoder for ConnectPayload {
-    fn encode(&self, buffer: &mut BytesMut) {
-        self.encode_for_version(buffer, ProtocolVersion::V5, &self.present_fields());
-    }
-
-    fn encoded_size(&self) -> usize {
-        self.encoded_size_for_version(ProtocolVersion::V5, &self.present_fields())
-    }
-}
-
-impl Decoder for ConnectPayload {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let payload = ConnectPayload {
-            client_id: String::decode(buffer)?,
-            ..Default::default()
+        let will = if flags.will_flag {
+            // Will properties only exist in MQTT 5.0
+            let properties = if version.supports_properties() {
+                crate::present(WillProperties::decode(buffer)?)
+            } else {
+                None
+            };
+            Some(Will {
+                qos: flags.will_qos,
+                retain: flags.will_retain,
+                properties,
+                topic: String::decode(buffer)?,
+                payload: Bytes::decode(buffer)?,
+            })
+        } else {
+            None
         };
 
-        Ok(payload)
+        let user_name = flags
+            .user_name
+            .then(|| String::decode(buffer))
+            .transpose()?;
+        let password = flags.password.then(|| Bytes::decode(buffer)).transpose()?;
+
+        Ok(ConnectPayload {
+            client_id,
+            will,
+            user_name,
+            password,
+        })
     }
 }
 
@@ -383,7 +380,9 @@ pub struct ConnectPacket {
     /// Read from the protocol name and level. Selects the wire format on
     /// encode.
     pub protocol_version: ProtocolVersion,
-    pub flags: ConnectFlags,
+    /// Discard any existing session. MQTT 3.x calls it Clean Session, and
+    /// there it also ends the session when the connection closes.
+    pub clean_start: bool,
     /// Longest time, in seconds, between two packets from the client. 0 turns
     /// keep alive off (section 3.1.2.10).
     pub keepalive: u16,
@@ -394,34 +393,57 @@ pub struct ConnectPacket {
 
 const PACKET_TYPE: u8 = 0x01;
 
-impl Encoder for ConnectPacket {
-    fn encode(&self, buffer: &mut BytesMut) {
-        let protocol_name = self.protocol_version.protocol_name();
-        let protocol_level = self.protocol_version.protocol_level();
-
-        // Fixed header
-        buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
-
-        // Variable header
-        protocol_name.encode(buffer);
-        protocol_level.encode(buffer);
-        self.flags.encode(buffer);
-        self.keepalive.encode(buffer);
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
+/// A CONNECT names its own protocol version, `protocol_version`; it is
+/// what decoding reads, whatever version is passed in.
+impl Packet for ConnectPacket {
+    /// Fails for a `version` other than the packet's own.
+    fn encode(&self, buffer: &mut BytesMut, version: ProtocolVersion) -> Result<(), EncodeError> {
+        if version != self.protocol_version {
+            return Err(EncodeError::UnsupportedVersion(
+                PacketType::Connect,
+                version,
+            ));
         }
+        // MQTT 3.x has no password without a user name [MQTT-3.1.2-22]
+        if !version.supports_properties()
+            && self.payload.password.is_some()
+            && self.payload.user_name.is_none()
+        {
+            return Err(EncodeError::PasswordWithoutUserName);
+        }
+        crate::write_packet(buffer, |buffer| {
+            let protocol_name = self.protocol_version.protocol_name();
+            let protocol_level = self.protocol_version.protocol_level();
 
-        // Payload
-        self.payload
-            .encode_for_version(buffer, self.protocol_version, &self.flags);
+            // Fixed header
+            buffer.put_u8(PACKET_TYPE << 4);
+            crate::encode_length(self.remaining_len(), buffer)?;
+
+            // Variable header
+            protocol_name.encode(buffer)?;
+            protocol_level.encode(buffer)?;
+            ConnectFlags::of(self).encode(buffer)?;
+            self.keepalive.encode(buffer)?;
+
+            // Properties only for MQTT 5.0
+            if self.protocol_version.supports_properties() {
+                crate::encode_length(self.properties.encoded_size(), buffer)?;
+                self.properties.encode(buffer)?;
+            }
+
+            self.payload.encode(buffer, self.protocol_version)?;
+            Ok(())
+        })
     }
 
-    fn encoded_size(&self) -> usize {
+    fn encoded_size(&self, _: ProtocolVersion) -> usize {
         crate::packet_size(self.remaining_len())
+    }
+
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Connect, version, |_, body| {
+            Self::decode_body(body)
+        })
     }
 }
 
@@ -429,7 +451,7 @@ impl ConnectPacket {
     fn remaining_len(&self) -> usize {
         let mut len = self.protocol_version.protocol_name().encoded_size()
             + self.protocol_version.protocol_level().encoded_size()
-            + self.flags.encoded_size()
+            + ConnectFlags::default().encoded_size()
             + self.keepalive.encoded_size();
 
         // Properties only for MQTT 5.0
@@ -437,21 +459,9 @@ impl ConnectPacket {
             len += crate::property_list_size(&self.properties);
         }
 
-        len + self
-            .payload
-            .encoded_size_for_version(self.protocol_version, &self.flags)
+        len + self.payload.encoded_size(self.protocol_version)
     }
-}
 
-impl Decoder for ConnectPacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Connect, |_, body| {
-            Self::decode_body(body)
-        })
-    }
-}
-
-impl ConnectPacket {
     fn decode_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // Parse protocol name and level to determine version
         let protocol_name = String::decode(buffer)?;
@@ -476,28 +486,11 @@ impl ConnectPacket {
             None
         };
 
-        let mut payload = ConnectPayload::decode(buffer)?;
-
-        if flags.will_flag {
-            // Will properties only exist in MQTT 5.0
-            if protocol_version.supports_properties() {
-                payload.will_properties = crate::present(WillProperties::decode(buffer)?);
-            }
-            payload.will_topic = Some(String::decode(buffer)?);
-            payload.will_payload = Some(Bytes::decode(buffer)?);
-        }
-
-        if flags.user_name {
-            payload.user_name = Some(String::decode(buffer)?);
-        }
-
-        if flags.password {
-            payload.password = Some(Bytes::decode(buffer)?);
-        }
+        let payload = ConnectPayload::decode(buffer, protocol_version, &flags)?;
 
         Ok(ConnectPacket {
             protocol_version,
-            flags,
+            clean_start: flags.clean_start,
             keepalive,
             properties,
             payload,
@@ -513,17 +506,51 @@ mod tests {
     fn test_payload_encoder_writes_empty_will_properties() {
         let payload = ConnectPayload {
             client_id: "c".into(),
-            will_topic: Some("t".into()),
-            will_payload: Some(Bytes::from_static(b"p")),
+            will: Some(Will {
+                topic: "t".into(),
+                payload: Bytes::from_static(b"p"),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let mut encoded = BytesMut::new();
-        payload.encode(&mut encoded);
+        payload.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         assert_eq!(
             &encoded[..],
             [0x00, 0x01, b'c', 0x00, 0x00, 0x01, b't', 0x00, 0x01, b'p']
         );
-        assert_eq!(payload.encoded_size(), encoded.len());
+        assert_eq!(payload.encoded_size(ProtocolVersion::V5), encoded.len());
+    }
+
+    #[test]
+    fn test_flags_follow_the_payload() {
+        let packet = ConnectPacket {
+            protocol_version: ProtocolVersion::V3_1_1,
+            clean_start: false,
+            keepalive: 0,
+            properties: None,
+            payload: ConnectPayload {
+                client_id: "c".into(),
+                will: Some(Will {
+                    qos: QoS::ExactlyOnce,
+                    retain: true,
+                    topic: "t".into(),
+                    ..Default::default()
+                }),
+                user_name: Some("u".into()),
+                password: None,
+            },
+        };
+        let mut encoded = BytesMut::new();
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
+        // User name, will retain, will QoS 2 and will flag
+        assert_eq!(encoded[9], 0b1011_0100);
+        assert_eq!(
+            ConnectPacket::decode(&mut encoded.freeze(), ProtocolVersion::V5).unwrap(),
+            packet
+        );
     }
 
     #[test]
@@ -533,15 +560,6 @@ mod tests {
             0x00, 0x14, 0x00, 0x00,
         ];
 
-        let flags = ConnectFlags {
-            user_name: false,
-            password: false,
-            will_retain: false,
-            will_qos: QoS::AtMostOnce,
-            will_flag: false,
-            clean_start: true,
-        };
-
         let properties = ConnectProperties {
             receive_maximum: ReceiveMaximum::new(20).into(),
             ..Default::default()
@@ -550,20 +568,23 @@ mod tests {
         let payload = ConnectPayload::default();
         let packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags,
+            clean_start: true,
             keepalive: 60,
             properties: properties.into(),
             payload,
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -578,15 +599,6 @@ mod tests {
             0x75, 0x73, 0x65, 0x72, 0x00, 0x08, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x70, 0x77, 0x64,
         ];
 
-        let flags = ConnectFlags {
-            user_name: true,
-            password: true,
-            will_retain: true,
-            will_qos: QoS::AtLeastOnce,
-            will_flag: true,
-            clean_start: true,
-        };
-
         let properties = ConnectProperties {
             session_expiry_interval: SessionExpiryInterval::new(30).into(),
             receive_maximum: ReceiveMaximum::new(20).into(),
@@ -599,9 +611,13 @@ mod tests {
         };
 
         let payload = ConnectPayload {
-            will_properties: will_properties.into(),
-            will_topic: String::from("test_topic").into(),
-            will_payload: Bytes::from("test_payload").into(),
+            will: Some(Will {
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                properties: will_properties.into(),
+                topic: String::from("test_topic"),
+                payload: Bytes::from("test_payload"),
+            }),
             user_name: String::from("test_user").into(),
             password: Bytes::from("test_pwd").into(),
             ..Default::default()
@@ -609,20 +625,23 @@ mod tests {
 
         let packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags,
+            clean_start: true,
             keepalive: 60,
             properties: properties.into(),
             payload,
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded, expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -640,27 +659,25 @@ mod tests {
             0x00, 0x00, // Client ID: empty
         ];
 
-        let flags = ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        };
-
         let payload = ConnectPayload::default();
         let packet = ConnectPacket {
             protocol_version: ProtocolVersion::V3_1_1,
-            flags,
+            clean_start: true,
             keepalive: 60,
             properties: None, // No properties for 3.1.1
             payload,
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet
+            .encode(&mut encoded, packet.protocol_version)
+            .unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
-        let new_packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 
@@ -679,10 +696,11 @@ mod tests {
         ];
 
         let mut bytes = Bytes::from(input);
-        let packet = ConnectPacket::decode(&mut bytes).expect("Unexpected error");
+        let packet =
+            ConnectPacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
 
         assert_eq!(packet.protocol_version, ProtocolVersion::V3_1);
-        assert!(packet.flags.clean_start);
+        assert!(packet.clean_start);
         assert_eq!(packet.keepalive, 60);
         assert!(packet.properties.is_none());
     }

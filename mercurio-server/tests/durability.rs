@@ -10,11 +10,10 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder, properties::MessageExpiryInterval, protocol::ProtocolVersion, qos::QoS,
-    reason::ReasonCode,
+    properties::MessageExpiryInterval, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode,
 };
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     puback::PubAckPacket,
     publish::{PublishPacket, PublishProperties},
     pubrel::PubRelPacket,
@@ -133,10 +132,7 @@ impl Client {
         let v5 = options.protocol_version == ProtocolVersion::V5;
         let connect = ConnectPacket {
             protocol_version: options.protocol_version,
-            flags: ConnectFlags {
-                clean_start: options.clean_start,
-                ..Default::default()
-            },
+            clean_start: options.clean_start,
             keepalive: 60,
             properties: v5.then(|| ConnectProperties {
                 session_expiry_interval: Some(
@@ -166,7 +162,7 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
@@ -175,8 +171,7 @@ impl Client {
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
             if ControlPacket::check(&self.buffer).is_ok() {
-                let packet =
-                    ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5);
+                let packet = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5);
                 return Some(packet.unwrap());
             }
             match timeout(
@@ -496,7 +491,7 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
     let mut stream = TcpStream::connect(broker.addr).await.unwrap();
     let connect = ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags::default(),
+        clean_start: false,
         keepalive: 60,
         properties: Some(ConnectProperties {
             session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
@@ -511,7 +506,9 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
         },
     };
     let mut encoded = BytesMut::new();
-    ControlPacket::Connect(connect).encode(&mut encoded);
+    ControlPacket::Connect(connect)
+        .encode(&mut encoded, ProtocolVersion::V5)
+        .unwrap();
     stream.write_all(&encoded).await.unwrap();
     let mut subscriber = Client {
         stream,

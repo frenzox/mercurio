@@ -53,7 +53,7 @@ async fn connect(addr: SocketAddr, client_id: u8, receive_maximum: Option<u16>) 
 async fn next_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> Option<ControlPacket> {
     loop {
         if ControlPacket::check(buffer).is_ok() {
-            return Some(ControlPacket::parse_with_version(buffer, ProtocolVersion::V5).unwrap());
+            return Some(ControlPacket::parse(buffer, ProtocolVersion::V5).unwrap());
         }
         match timeout(Duration::from_millis(300), stream.read_buf(buffer)).await {
             Ok(read) => assert_ne!(read.unwrap(), 0, "connection closed"),

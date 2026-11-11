@@ -48,12 +48,11 @@ pub(crate) fn decision(decision: wit::Decision) -> Decision {
     }
 }
 
-/// `QoS::Invalid` never reaches a plugin, as the server refuses it first.
 fn qos(qos: QoS) -> wit::Qos {
     match qos {
         QoS::AtLeastOnce => wit::Qos::AtLeastOnce,
         QoS::ExactlyOnce => wit::Qos::ExactlyOnce,
-        QoS::AtMostOnce | QoS::Invalid => wit::Qos::AtMostOnce,
+        QoS::AtMostOnce => wit::Qos::AtMostOnce,
     }
 }
 
@@ -131,7 +130,7 @@ pub(crate) fn event(event: &Event) -> Option<wit::Event> {
             client: c, reason, ..
         } => wit::Event::Disconnected(wit::Disconnected {
             client: client(c),
-            reason: reason.map(|reason| reason.get_code()),
+            reason: reason.map(|reason| reason.code()),
         }),
         Event::Subscribed {
             client: c,
@@ -236,8 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_qos_reaches_plugins_as_at_most_once() {
-        assert_eq!(qos(QoS::Invalid), wit::Qos::AtMostOnce);
+    fn test_qos_converts_both_ways() {
         for q in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
             assert_eq!(qos_from(qos(q)), q);
         }

@@ -79,6 +79,11 @@ pub enum ClientError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// A packet the client was to send can't be encoded, as the broker
+    /// would have to refuse it; nothing was sent.
+    #[error("Packet can't be encoded: {0}")]
+    Encode(#[from] mercurio_core::error::EncodeError),
+
     /// A packet from the broker couldn't be decoded.
     #[error("Packet error: {0}")]
     Packet(#[from] mercurio_core::error::Error),

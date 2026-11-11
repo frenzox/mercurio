@@ -110,7 +110,8 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
         qos: args.qos,
         no_local: subscription.no_local,
         retain_as_pub: subscription.retain_as_published,
-        retain_handling: RetainHandling::from(subscription.retain_handling),
+        retain_handling: RetainHandling::try_from(subscription.retain_handling)
+            .map_err(|n| Failure::Usage(format!("retain handling must be 0, 1 or 2, not {n}")))?,
     };
     let subscriptions: Vec<(&str, SubscriptionOptions)> = args
         .topic

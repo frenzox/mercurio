@@ -9,13 +9,16 @@ use alloc::{string::String, vec::Vec};
 use bytes::{Buf, BufMut};
 
 use mercurio_core::{
-    codec::{Decoder, Encoder, VariableByteInteger},
+    codec::{Decoder, Encoder},
+    error::EncodeError,
+    error::Error,
     properties::*,
+    protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
 };
 
-use crate::PacketType;
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
@@ -27,9 +30,10 @@ pub struct SubscribeProperties {
 }
 
 impl Encoder for SubscribeProperties {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.subscription_id.encode(buffer);
-        self.user_property.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.subscription_id.encode(buffer)?;
+        self.user_property.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -72,17 +76,19 @@ pub enum RetainHandling {
     /// Send them only if the subscription didn't exist already.
     SendRetainedIfNonExisting = 0x01,
     DoNotSendRetained = 0x02,
-    /// Any value above 2. Decoding rejects it as a protocol error.
-    Invalid = 0xff,
 }
 
-impl From<u8> for RetainHandling {
-    fn from(n: u8) -> Self {
+/// The retain handling of a wire value, or the value itself when it is not
+/// 0, 1 or 2.
+impl TryFrom<u8> for RetainHandling {
+    type Error = u8;
+
+    fn try_from(n: u8) -> Result<Self, u8> {
         match n {
-            0x00 => Self::SendRetained,
-            0x01 => Self::SendRetainedIfNonExisting,
-            0x02 => Self::DoNotSendRetained,
-            _ => Self::Invalid,
+            0x00 => Ok(Self::SendRetained),
+            0x01 => Ok(Self::SendRetainedIfNonExisting),
+            0x02 => Ok(Self::DoNotSendRetained),
+            _ => Err(n),
         }
     }
 }
@@ -104,7 +110,7 @@ pub struct SubscriptionOptions {
 }
 
 impl Encoder for SubscriptionOptions {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
         let mut encoded: u8 = self.qos as u8;
 
         if self.no_local {
@@ -118,6 +124,7 @@ impl Encoder for SubscriptionOptions {
         encoded |= (self.retain_handling as u8) << 4;
 
         buffer.put_u8(encoded);
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -134,19 +141,11 @@ impl Decoder for SubscriptionOptions {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let qos: QoS = (opt & 0b0000_0011).into();
-
-        if qos == QoS::Invalid {
-            return Err(ReasonCode::ProtocolError.into());
-        }
-
+        let protocol_error = |_| Error::from(ReasonCode::ProtocolError);
+        let qos = QoS::try_from(opt & 0b0000_0011).map_err(protocol_error)?;
         let no_local = (opt & 0b0000_0100) != 0;
         let retain_as_pub = (opt & 0b0000_1000) != 0;
-        let retain_handling: RetainHandling = (opt >> 4).into();
-
-        if retain_handling == RetainHandling::Invalid {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+        let retain_handling = RetainHandling::try_from(opt >> 4).map_err(protocol_error)?;
 
         Ok(SubscriptionOptions {
             qos,
@@ -164,9 +163,10 @@ pub struct SubscribePayload {
 }
 
 impl Encoder for SubscribePayload {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.topic_filter.encode(buffer);
-        self.subs_opt.encode(buffer);
+    fn encode(&self, buffer: &mut bytes::BytesMut) -> Result<(), EncodeError> {
+        self.topic_filter.encode(buffer)?;
+        self.subs_opt.encode(buffer)?;
+        Ok(())
     }
 
     fn encoded_size(&self) -> usize {
@@ -201,33 +201,33 @@ pub struct SubscribePacket {
 
 const PACKET_TYPE: u8 = 0x08;
 
-impl Encoder for SubscribePacket {
-    fn encode(&self, buffer: &mut bytes::BytesMut) {
-        self.encode_inner(buffer, true);
+impl Packet for SubscribePacket {
+    fn encode(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), EncodeError> {
+        crate::write_packet(buffer, |buffer| {
+            if self.payload.is_empty() {
+                return Err(EncodeError::EmptyPayload(PacketType::Subscribe));
+            }
+            self.encode_inner(buffer, version.supports_properties())?;
+            Ok(())
+        })
     }
 
-    fn encoded_size(&self) -> usize {
-        crate::packet_size(self.remaining_len(true))
+    fn encoded_size(&self, version: ProtocolVersion) -> usize {
+        crate::packet_size(self.remaining_len(version.supports_properties()))
     }
-}
 
-impl Decoder for SubscribePacket {
-    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, true)
+    fn decode<T: Buf>(buffer: &mut T, version: ProtocolVersion) -> crate::Result<Self> {
+        crate::decode_packet(buffer, PacketType::Subscribe, version, |flags, body| {
+            Self::decode_body(flags, body, version.supports_properties())
+        })
     }
 }
 
 impl SubscribePacket {
-    /// Encodes the packet in MQTT 3.x format (no properties).
-    pub fn encode_v3(&self, buffer: &mut bytes::BytesMut) {
-        self.encode_inner(buffer, false);
-    }
-
-    /// Decodes the packet in MQTT 3.x format (no properties).
-    pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        Self::decode_inner(buffer, false)
-    }
-
     fn remaining_len(&self, with_properties: bool) -> usize {
         // MQTT 3.x writes the same one byte of options per filter
         let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
@@ -237,36 +237,35 @@ impl SubscribePacket {
         len
     }
 
-    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
+    fn encode_inner(
+        &self,
+        buffer: &mut bytes::BytesMut,
+        with_properties: bool,
+    ) -> Result<(), EncodeError> {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
-        fixed_header.encode(buffer);
+        fixed_header.encode(buffer)?;
 
-        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
+        crate::encode_length(self.remaining_len(with_properties), buffer)?;
 
-        self.packet_id.encode(buffer);
+        crate::encode_packet_id(self.packet_id, buffer)?;
         if with_properties {
-            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-            self.properties.encode(buffer);
-            self.payload.encode(buffer);
+            crate::encode_length(self.properties.encoded_size(), buffer)?;
+            self.properties.encode(buffer)?;
+            self.payload.encode(buffer)?;
         } else {
             // MQTT 3.x only has the QoS; the other option bits are reserved
             // and must be zero [MQTT-3.8.3-4]
             for sub in &self.payload {
-                sub.topic_filter.encode(buffer);
-                (sub.subs_opt.qos as u8).encode(buffer);
+                sub.topic_filter.encode(buffer)?;
+                (sub.subs_opt.qos as u8).encode(buffer)?;
             }
         }
+        Ok(())
     }
 
-    fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        crate::decode_packet(buffer, PacketType::Subscribe, |_, body| {
-            Self::decode_body(body, with_properties)
-        })
-    }
-
-    fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
+    fn decode_body<T: Buf>(_: u8, buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
         let packet_id = crate::decode_packet_id(buffer)?;
         let properties = if with_properties {
             crate::present(SubscribeProperties::decode(buffer)?)
@@ -329,7 +328,9 @@ mod tests {
             }],
         };
         let mut encoded = BytesMut::new();
-        packet.encode_v3(&mut encoded);
+        packet
+            .encode(&mut encoded, ProtocolVersion::V3_1_1)
+            .unwrap();
         assert_eq!(
             &encoded[..],
             [0x82, 0x06, 0x00, 0x01, 0x00, 0x01, b't', 0x01]
@@ -346,7 +347,7 @@ mod tests {
 
         let properties = SubscribeProperties {
             user_property: vec![UserProperty::new("key".to_string(), "value".to_string())].into(),
-            subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(32))),
+            subscription_id: SubscriptionIdentifier::new(32),
         };
 
         let subs_opt = SubscriptionOptions {
@@ -366,13 +367,14 @@ mod tests {
         };
 
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
 
         assert_eq!(encoded.to_vec(), expected);
 
         let mut bytes = Bytes::from(expected);
 
-        let new_packet = SubscribePacket::decode(&mut bytes).expect("Unexpected error");
+        let new_packet =
+            SubscribePacket::decode(&mut bytes, ProtocolVersion::V5).expect("Unexpected error");
         assert_eq!(packet, new_packet);
     }
 }

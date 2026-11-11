@@ -7,13 +7,16 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
+    error::{EncodeError, Error},
     reason::ReasonCode,
     topic::validate_publish_topic,
 };
 
 macro_rules! def_prop {
     ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*})  => {
+        def_prop!($t {$i: $a, $($n: $s),*} valid: |_p| true);
+    };
+    ($t:ident {$i:ident: $a:expr, $($n:tt: $s:ty),*} valid: |$p:ident| $valid:expr)  => {
         /// An MQTT 5 property. Its meaning is described on the [`Property`]
         /// variant of the same name.
         #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -28,21 +31,32 @@ macro_rules! def_prop {
                     $($n,)*
                 }
             }
+
+            /// Whether the spec allows the value; the decoder refuses the
+            /// others as a protocol error, and the encoder refuses them too.
+            pub fn is_valid(&self) -> bool {
+                let $p = self;
+                $valid
+            }
         }
 
         impl Encoder for $t {
-            fn encode(&self, buffer: &mut BytesMut) {
-                VariableByteInteger(Self::$i).encode(buffer);
+            fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+                if !self.is_valid() {
+                    return Err(EncodeError::InvalidProperty(Self::$i));
+                }
+                VariableByteInteger::from_id(Self::$i).encode(buffer)?;
 
                 $(
-                    self.$n.encode(buffer);
+                    self.$n.encode(buffer)?;
                 )*
+                Ok(())
             }
 
             fn encoded_size(&self) -> usize {
                 let mut len = 0;
 
-                len += VariableByteInteger(Self::$i).encoded_size();
+                len += VariableByteInteger::from_id(Self::$i).encoded_size();
 
                 $(
                     len += self.$n.encoded_size();
@@ -63,7 +77,7 @@ macro_rules! def_prop {
 def_prop!(PayloadFormatIndicator {
     ID: 0x01,
     value: u8
-});
+} valid: |p| p.value <= 1);
 
 def_prop!(MessageExpiryInterval {
     ID: 0x02,
@@ -78,17 +92,55 @@ def_prop!(ContentType {
 def_prop!(ResponseTopic {
     ID: 0x08,
     value: String
-});
+} valid: |p| validate_publish_topic(&p.value).is_ok());
 
 def_prop!(CorrelationData {
     ID: 0x09,
     value: Bytes
 });
 
-def_prop!(SubscriptionIdentifier {
-    ID: 0x0b,
-    value: VariableByteInteger
-});
+/// An MQTT 5 property. Its meaning is described on the [`Property`]
+/// variant of the same name.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct SubscriptionIdentifier {
+    value: VariableByteInteger,
+}
+
+impl SubscriptionIdentifier {
+    /// Property identifier, encoded as a Variable Byte Integer before the
+    /// value.
+    pub const ID: u32 = 0x0b;
+
+    /// The identifier `value`, or `None` outside 1 to 268,435,455.
+    pub fn new(value: u32) -> Option<Self> {
+        VariableByteInteger::new(value)
+            .filter(|_| value != 0)
+            .map(|value| SubscriptionIdentifier { value })
+    }
+
+    pub fn value(&self) -> u32 {
+        self.value.value()
+    }
+}
+
+impl Encoder for SubscriptionIdentifier {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        VariableByteInteger::from_id(Self::ID).encode(buffer)?;
+        self.value.encode(buffer)
+    }
+
+    fn encoded_size(&self) -> usize {
+        VariableByteInteger::from_id(Self::ID).encoded_size() + self.value.encoded_size()
+    }
+}
+
+/// An identifier of 0 is a protocol error.
+impl Decoder for SubscriptionIdentifier {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        SubscriptionIdentifier::new(VariableByteInteger::decode(buffer)?.value())
+            .ok_or_else(|| ReasonCode::ProtocolError.into())
+    }
+}
 
 def_prop!(SessionExpiryInterval {
     ID: 0x11,
@@ -118,7 +170,7 @@ def_prop!(AuthenticationData {
 def_prop!(RequestProblemInformation {
     ID: 0x17,
     value: u8
-});
+} valid: |p| p.value <= 1);
 
 def_prop!(WillDelayInterval {
     ID: 0x18,
@@ -128,7 +180,7 @@ def_prop!(WillDelayInterval {
 def_prop!(RequestResponseInformation {
     ID: 0x19,
     value: u8
-});
+} valid: |p| p.value <= 1);
 
 def_prop!(ResponseInformation {
     ID: 0x1a,
@@ -148,7 +200,7 @@ def_prop!(ReasonString {
 def_prop!(ReceiveMaximum {
     ID: 0x21,
     value: u16
-});
+} valid: |p| p.value != 0);
 
 def_prop!(TopicAliasMaximum {
     ID: 0x22,
@@ -158,12 +210,12 @@ def_prop!(TopicAliasMaximum {
 def_prop!(TopicAlias {
     ID: 0x23,
     value: u16
-});
+} valid: |p| p.value != 0);
 
 def_prop!(MaximumQoS {
     ID: 0x24,
     value: u8
-});
+} valid: |p| p.value <= 1);
 
 def_prop!(RetainAvailable {
     ID: 0x25,
@@ -179,7 +231,7 @@ def_prop!(UserProperty {
 def_prop!(MaximumPacketSize {
     ID: 0x27,
     value: u32
-});
+} valid: |p| p.value != 0);
 
 def_prop!(WildcardSubscriptionAvailable {
     ID: 0x28,
@@ -339,18 +391,17 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
         _ => return Err(ReasonCode::MalformedPacket.into()),
     };
 
-    // Values the spec rules out are protocol errors
+    // Values the spec rules out are protocol errors. A Response Topic is a
+    // topic name, never a filter [MQTT-3.3.2-14]
     let valid = match &property {
-        Property::PayloadFormatIndicator(p) => p.value <= 1,
-        Property::RequestProblemInformation(p) => p.value <= 1,
-        Property::RequestResponseInformation(p) => p.value <= 1,
-        Property::MaximumQoS(p) => p.value <= 1,
-        Property::SubscriptionIdentifier(p) => p.value.0 != 0,
-        Property::TopicAlias(p) => p.value != 0,
-        Property::ReceiveMaximum(p) => p.value != 0,
-        Property::MaximumPacketSize(p) => p.value != 0,
-        // A Response Topic is a topic name, never a filter [MQTT-3.3.2-14]
-        Property::ResponseTopic(p) => validate_publish_topic(&p.value).is_ok(),
+        Property::PayloadFormatIndicator(p) => p.is_valid(),
+        Property::RequestProblemInformation(p) => p.is_valid(),
+        Property::RequestResponseInformation(p) => p.is_valid(),
+        Property::MaximumQoS(p) => p.is_valid(),
+        Property::TopicAlias(p) => p.is_valid(),
+        Property::ReceiveMaximum(p) => p.is_valid(),
+        Property::MaximumPacketSize(p) => p.is_valid(),
+        Property::ResponseTopic(p) => p.is_valid(),
         _ => true,
     };
     if !valid {
@@ -362,7 +413,7 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
 
 /// Stores a property that may appear at most once in a packet; a repeat is
 /// a protocol error [MQTT-2.2.2-2].
-pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
     if slot.is_some() {
         return Err(ReasonCode::ProtocolError.into());
     }
@@ -370,20 +421,8 @@ pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
     Ok(())
 }
 
-/// Authentication Data only means something with an Authentication Method;
-/// alone it is a protocol error (section 3.1.2.11.10).
-pub fn check_authentication(
-    method: &Option<AuthenticationMethod>,
-    data: &Option<AuthenticationData>,
-) -> crate::Result<()> {
-    if data.is_some() && method.is_none() {
-        return Err(ReasonCode::ProtocolError.into());
-    }
-    Ok(())
-}
-
 /// Appends a User Property, which may appear any number of times.
-pub fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
+pub(crate) fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
     slot.get_or_insert_with(Vec::new).push(value);
 }
 
@@ -398,7 +437,7 @@ where
     T: Buf,
     F: FnMut(Property) -> crate::Result<()>,
 {
-    let len = VariableByteInteger::decode(buffer)?.0 as usize;
+    let len = VariableByteInteger::decode(buffer)?.value() as usize;
     if buffer.remaining() < len {
         return Err(ReasonCode::MalformedPacket.into());
     }
@@ -426,7 +465,7 @@ where
 
 impl Decoder for Property {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let id = VariableByteInteger::decode(buffer)?.0;
+        let id = VariableByteInteger::decode(buffer)?.value();
 
         decode_with_id(id, buffer)
     }
@@ -460,9 +499,7 @@ mod tests {
             assert!(
                 matches!(
                     decode(bytes),
-                    Err(crate::error::Error::MQTTReasonCode(
-                        ReasonCode::ProtocolError
-                    ))
+                    Err(crate::error::Error::Reason(ReasonCode::ProtocolError))
                 ),
                 "{bytes:02x?}"
             );
@@ -471,14 +508,53 @@ mod tests {
         // Response Topic "a/+"
         assert!(matches!(
             decode(&[0x08, 0x00, 0x03, b'a', b'/', b'+']),
-            Err(crate::error::Error::MQTTReasonCode(
-                ReasonCode::ProtocolError
-            ))
+            Err(crate::error::Error::Reason(ReasonCode::ProtocolError))
         ));
         assert!(decode(&[0x08, 0x00, 0x03, b'a', b'/', b'b']).is_ok());
 
         assert!(decode(&[0x01, 0x01]).is_ok());
         assert!(decode(&[0x25, 0x00]).is_ok());
         assert!(decode(&[0x23, 0x00, 0x01]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn test_subscription_identifier_is_1_to_268_435_455() {
+        assert_eq!(SubscriptionIdentifier::new(0), None);
+        assert_eq!(SubscriptionIdentifier::new(268_435_456), None);
+        let largest = SubscriptionIdentifier::new(268_435_455).unwrap();
+        let mut buffer = BytesMut::new();
+        largest.encode(&mut buffer).unwrap();
+        assert_eq!(
+            Property::decode(&mut buffer.freeze()).unwrap(),
+            Property::SubscriptionIdentifier(largest)
+        );
+    }
+
+    #[test]
+    fn test_values_the_decoder_refuses_are_not_encoded() {
+        let mut buffer = BytesMut::new();
+        assert_eq!(
+            TopicAlias::new(0).encode(&mut buffer),
+            Err(EncodeError::InvalidProperty(TopicAlias::ID))
+        );
+        assert_eq!(
+            PayloadFormatIndicator::new(2).encode(&mut buffer),
+            Err(EncodeError::InvalidProperty(PayloadFormatIndicator::ID))
+        );
+        assert_eq!(
+            ResponseTopic::new("a/#".into()).encode(&mut buffer),
+            Err(EncodeError::InvalidProperty(ResponseTopic::ID))
+        );
+        assert!(buffer.is_empty());
+        TopicAlias::new(1).encode(&mut buffer).unwrap();
+        assert_eq!(
+            Property::decode(&mut buffer.freeze()).unwrap(),
+            Property::TopicAlias(TopicAlias::new(1))
+        );
     }
 }

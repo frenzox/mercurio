@@ -487,10 +487,10 @@ impl Admin {
         client_id: &str,
         options: DisconnectOptions,
     ) -> Result<(), AdminError> {
-        if !DISCONNECT_ERRORS.contains(&options.reason.get_code()) {
+        if !DISCONNECT_ERRORS.contains(&options.reason.code()) {
             return Err(AdminError::invalid_argument(format!(
                 "0x{:02x} is not an error reason code a DISCONNECT may carry",
-                options.reason.get_code()
+                options.reason.code()
             )));
         }
         let close = Close::Admin {

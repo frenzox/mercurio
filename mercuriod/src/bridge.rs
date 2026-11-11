@@ -77,13 +77,12 @@ fn routes(config: &BridgeConfig) -> Result<(Vec<Route>, Vec<Route>), String> {
     let mut outbound = Vec::new();
     let mut inbound = Vec::new();
     for topic in &config.topics {
-        let qos = QoS::from(topic.qos);
-        if qos == QoS::Invalid {
-            return Err(format!(
+        let qos = QoS::try_from(topic.qos).map_err(|n| {
+            format!(
                 "Bridge {}: invalid QoS {} for `{}`",
-                config.name, topic.qos, topic.pattern
-            ));
-        }
+                config.name, n, topic.pattern
+            )
+        })?;
         if topic.direction != Direction::In {
             outbound.push(Route {
                 filter: format!("{}{}", topic.local_prefix, topic.pattern),

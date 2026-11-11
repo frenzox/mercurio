@@ -7,7 +7,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use mercurio_core::codec::VariableByteInteger;
 use mercurio_core::properties::{
     AuthenticationData, AuthenticationMethod, MaximumPacketSize, ReceiveMaximum,
     RequestProblemInformation, RequestResponseInformation, SessionExpiryInterval,
@@ -18,7 +17,7 @@ use mercurio_core::reason::ReasonCode;
 use mercurio_core::topic::{validate_publish_topic, validate_subscribe_filter};
 use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
-use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
+use mercurio_packets::connect::{self, ConnectPacket, ConnectPayload, ConnectProperties};
 use mercurio_packets::disconnect::{DisconnectPacket, DisconnectProperties};
 use mercurio_packets::pingreq::PingReqPacket;
 use mercurio_packets::puback::PubAckPacket;
@@ -44,7 +43,6 @@ use crate::event::{
 };
 use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, RequestOptions, SharedAuthenticator,
-    Will,
 };
 
 /// Topic filters with the options to subscribe to each with.
@@ -405,31 +403,22 @@ impl MqttClient {
             let mut authenticator = a.lock();
             (authenticator.method(), authenticator.start())
         });
-        let flags = ConnectFlags {
-            user_name: options.username.is_some(),
-            password: options.password.is_some(),
-            will_retain: options.will.as_ref().map(|w| w.retain).unwrap_or(false),
-            will_qos: options
-                .will
-                .as_ref()
-                .map(|w| w.qos)
-                .unwrap_or(QoS::AtMostOnce),
-            will_flag: options.will.is_some(),
-            clean_start: options.clean_start,
-        };
-
         let payload = ConnectPayload {
             client_id: options.client_id.clone().unwrap_or_default(),
-            will_properties: options.will.as_ref().map(Will::to_properties),
-            will_topic: options.will.as_ref().map(|w| w.topic.clone()),
-            will_payload: options.will.as_ref().map(|w| w.payload.clone()),
+            will: options.will.as_ref().map(|w| connect::Will {
+                qos: w.qos,
+                retain: w.retain,
+                properties: Some(w.to_properties()),
+                topic: w.topic.clone(),
+                payload: w.payload.clone(),
+            }),
             user_name: options.username.clone(),
             password: options.password.clone(),
         };
 
         Ok(ConnectPacket {
             protocol_version: options.protocol_version,
-            flags,
+            clean_start: options.clean_start,
             keepalive: options.keep_alive,
             properties: Some(ConnectProperties {
                 session_expiry_interval: (options.session_expiry > 0)
@@ -769,7 +758,7 @@ impl MqttClient {
         reason: ReasonCode,
         session_expiry: Option<u32>,
     ) -> Result<()> {
-        let code = reason.get_code();
+        let code = reason.code();
         if !self.reports_reasons {
             if code != 0 || session_expiry.is_some() {
                 return Err(ClientError::NotSupported(
@@ -1156,7 +1145,10 @@ impl BrokerLimits {
                 .map(|m| m.value),
             maximum_qos: p
                 .and_then(|p| p.maximum_qos.as_ref())
-                .map_or(QoS::ExactlyOnce, |q| q.value.into()),
+                // The decoder only lets 0 and 1 through
+                .map_or(QoS::ExactlyOnce, |q| {
+                    QoS::try_from(q.value).unwrap_or(QoS::AtMostOnce)
+                }),
             retain_available: p
                 .and_then(|p| p.retain_available.as_ref())
                 .is_none_or(|r| r.value),
@@ -1891,7 +1883,8 @@ impl EventLoop {
         let subscribe = SubscribePacket {
             packet_id,
             properties: subscription_id.map(|id| SubscribeProperties {
-                subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(id))),
+                // In range: `subscribe` checked it
+                subscription_id: SubscriptionIdentifier::new(id),
                 user_property: None,
             }),
             payload,
@@ -2025,7 +2018,7 @@ impl EventLoop {
     /// broker refused the message.
     fn complete_publish(&mut self, packet_id: u16, reason: ReasonCode) {
         if let Some(outgoing) = self.outgoing.remove(&packet_id) {
-            let result = if reason.get_code() >= 0x80 {
+            let result = if reason.code() >= 0x80 {
                 Err(ClientError::PublishRefused(reason))
             } else {
                 Ok(())
@@ -2053,7 +2046,7 @@ impl EventLoop {
             ControlPacket::PubAck(ack) => self.complete_publish(ack.packet_id, ack.reason),
             ControlPacket::PubRec(rec) => {
                 // A failure ends the exchange; otherwise release the message
-                if rec.reason.get_code() >= 0x80 {
+                if rec.reason.code() >= 0x80 {
                     self.complete_publish(rec.packet_id, rec.reason);
                 } else {
                     let reason = match self.outgoing.get_mut(&rec.packet_id) {
@@ -2094,15 +2087,12 @@ impl EventLoop {
                         .iter()
                         .zip(ack.payload)
                         .map(|((topic, _), granted)| {
-                            let code = granted.reason_code.get_code();
+                            // A failure code is no QoS
                             SubscribeResult {
                                 topic: topic.clone(),
-                                qos: if code < 0x80 {
-                                    code.into()
-                                } else {
-                                    QoS::AtMostOnce
-                                },
-                                success: code < 0x80,
+                                qos: QoS::try_from(granted.reason_code.code())
+                                    .unwrap_or(QoS::AtMostOnce),
+                                success: granted.reason_code.is_success(),
                                 reason: granted.reason_code,
                             }
                         })
@@ -2127,7 +2117,7 @@ impl EventLoop {
                         .zip(reasons)
                         .map(|(topic, reason)| UnsubscribeResult {
                             topic,
-                            success: reason.get_code() < 0x80,
+                            success: reason.code() < 0x80,
                             reason,
                         })
                         .collect::<Vec<_>>();
@@ -2286,7 +2276,7 @@ impl EventLoop {
                 .map(|p| {
                     p.subscription_identifiers
                         .iter()
-                        .map(|s| s.value.0)
+                        .map(|s| s.value())
                         .collect()
                 })
                 .unwrap_or_default();

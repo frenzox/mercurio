@@ -1318,10 +1318,8 @@ impl ServerConfig {
     }
 
     pub fn limits(&self) -> Result<Limits, String> {
-        let maximum_qos = QoS::from(self.max_qos);
-        if maximum_qos == QoS::Invalid {
-            return Err(format!("max_qos must be 0, 1 or 2, not {}", self.max_qos));
-        }
+        let maximum_qos = QoS::try_from(self.max_qos)
+            .map_err(|n| format!("max_qos must be 0, 1 or 2, not {n}"))?;
         if self.max_inflight == 0 {
             return Err("max_inflight must be at least 1".to_string());
         }

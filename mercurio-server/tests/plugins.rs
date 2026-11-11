@@ -2,14 +2,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{
-    codec::Encoder,
     properties::{CorrelationData, ResponseTopic, UserProperty},
     protocol::ProtocolVersion,
     qos::QoS,
     reason::ReasonCode,
 };
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -54,10 +53,7 @@ impl Client {
         client
             .send(ControlPacket::Connect(ConnectPacket {
                 protocol_version: ProtocolVersion::V5,
-                flags: ConnectFlags {
-                    clean_start: true,
-                    ..Default::default()
-                },
+                clean_start: true,
                 keepalive: 60,
                 properties: Some(ConnectProperties::default()),
                 payload: ConnectPayload {
@@ -75,15 +71,13 @@ impl Client {
 
     async fn send(&mut self, packet: ControlPacket) {
         let mut encoded = BytesMut::new();
-        packet.encode(&mut encoded);
+        packet.encode(&mut encoded, ProtocolVersion::V5).unwrap();
         self.stream.write_all(&encoded).await.unwrap();
     }
 
     async fn receive(&mut self) -> Option<ControlPacket> {
         loop {
-            if let Ok(packet) =
-                ControlPacket::parse_with_version(&mut self.buffer, ProtocolVersion::V5)
-            {
+            if let Ok(packet) = ControlPacket::parse(&mut self.buffer, ProtocolVersion::V5) {
                 return Some(packet);
             }
             let read = timeout(
