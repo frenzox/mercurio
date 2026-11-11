@@ -118,7 +118,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><th>mosquitto</th><th>Mercurio</th></tr>
 <tr><td><code>allow_anonymous</code></td><td><code>[auth] enabled = true</code> with <code>allow_anonymous</code></td></tr>
 <tr><td><code>password_file</code>, <code>acl_file</code></td><td>the same, in <code>[auth]</code></td></tr>
-<tr><td>dynamic security plugin</td><td><code>[auth] dynamic_security</code>, with the same commands; create the file with <code>mercuriod dynsec-init</code></td></tr>
+<tr><td>dynamic security plugin</td><td><code>[auth] dynamic_security</code>, with the same commands and the same order of roles, groups and priorities; convert mosquitto's <code>dynamic-security.json</code>, passwords included, with <code>mercuriod dynsec-import</code>, or start a new file with <code>mercuriod dynsec-init</code></td></tr>
 <tr><td><code>mosquitto_ctrl dynsec …</code></td><td><a href="mercurioctl.html#dynsec"><code>mercurioctl dynsec …</code></a>, with the same commands in kebab-case; <code>mosquitto_ctrl dynsec init</code> is <code>mercuriod dynsec-init</code></td></tr>
 <tr><td>mosquitto-go-auth HTTP backend</td><td><code>[auth.http]</code></td></tr>
 <tr><td><code>check_retain_source</code></td><td><code>check_retain_source</code></td></tr>
@@ -166,7 +166,6 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <li>A bridge's local side is trusted: this broker's ACLs don't restrict what it forwards in.</li>
 <li>Bridges to MQTT 3.1.1 brokers drop the remote broker's echo of what they forwarded, without mosquitto's <code>try_private</code> extension; see <a href="bridges.html">Bridges</a>.</li>
 <li>Over HTTP authentication, <code>clientid</code> is empty in login requests.</li>
-<li>Dynamic security has no client or group priorities for roles; the ACL priority decides, whichever role holds the ACL. <code>addClientRole</code>, <code>addGroupRole</code>, <code>addGroupClient</code>, and the role and group lists of <code>createClient</code> and <code>createGroup</code>, fail when they give a <code>priority</code> other than mosquitto's default of -1. It has no <code>modifyClient</code>, <code>modifyGroup</code> or <code>modifyRole</code>: change clients, groups and roles with the add, remove and set commands.</li>
 <li>When dynamic security's anonymous group changes, anonymous clients of Unix socket listeners stay connected; mosquitto disconnects every anonymous client. Their access still follows the new group at once.</li>
 <li>The answer to a <code>$CONTROL</code> request goes only to the client that sent it. Other clients subscribed to <code>…/response</code> don't see it.</li>
 <li>An MQTT 5 client that disconnects with an error reason code, 0x80 or above, gets its will published, as the specification says; only a normal disconnection (0x00) discards it. Mosquitto discards the will on any DISCONNECT except 0x04.</li></ul>

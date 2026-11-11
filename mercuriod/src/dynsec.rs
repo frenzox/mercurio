@@ -14,7 +14,7 @@ use std::{
 };
 
 use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
 use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
 
-use crate::credentials::unknown_user_hash;
+use crate::credentials::{self, unknown_user_hash};
 use crate::reload::Reload;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -68,14 +68,20 @@ impl Default for DefaultAccess {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Group {
     groupname: String,
+    #[serde(flatten)]
+    description: Description,
+    /// By priority, highest first
     #[serde(default)]
-    roles: Vec<String>,
+    roles: Vec<Ranked>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Client {
     username: String,
-    /// Argon2 hash; a client without one can't log in
+    #[serde(flatten)]
+    description: Description,
+    /// Argon2 hash, or the `$7$` PBKDF2 hash of a client imported from
+    /// mosquitto; a client without one can't log in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
     /// The only client id it may connect with, when set
@@ -83,17 +89,143 @@ struct Client {
     clientid: Option<String>,
     #[serde(default)]
     disabled: bool,
+    /// By priority, highest first
     #[serde(default)]
-    roles: Vec<String>,
+    roles: Vec<Ranked>,
+    /// By priority, highest first
     #[serde(default)]
-    groups: Vec<String>,
+    groups: Vec<Ranked>,
+}
+
+/// The free text mosquitto lets clients, groups and roles carry.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct Description {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    textname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    textdescription: Option<String>,
+}
+
+impl Description {
+    /// This one with the `textname` and `textdescription` of `args`, those
+    /// absent left as they are and empty ones cleared.
+    fn modified(&self, args: &Value) -> Result<Self, String> {
+        let field = |name: &str, current: &Option<String>| match args.get(name) {
+            None | Some(Value::Null) => Ok(current.clone()),
+            Some(Value::String(text)) => Ok((!text.is_empty()).then(|| text.clone())),
+            Some(_) => Err(format!("Invalid {name}")),
+        };
+        Ok(Self {
+            textname: field("textname", &self.textname)?,
+            textdescription: field("textdescription", &self.textdescription)?,
+        })
+    }
+}
+
+/// The priority of a role or group that mosquitto gives none.
+const DEFAULT_PRIORITY: i64 = -1;
+
+/// A role or group held by a client or group, with the priority that
+/// orders it among the others held. Stored as its bare name when the
+/// priority is the default, as files of mercuriod 0.4.5 and earlier hold
+/// every one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ranked {
+    name: String,
+    priority: i64,
+}
+
+impl Ranked {
+    fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            priority: DEFAULT_PRIORITY,
+        }
+    }
+
+    /// The entry of a `get` answer, under `key`; the default priority is
+    /// left out, as mosquitto does.
+    fn to_json(&self, key: &str) -> Value {
+        let mut entry = json!({ key: self.name });
+        if self.priority != DEFAULT_PRIORITY {
+            entry["priority"] = self.priority.into();
+        }
+        entry
+    }
+}
+
+impl Serialize for Ranked {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.priority == DEFAULT_PRIORITY {
+            return serializer.serialize_str(&self.name);
+        }
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("priority", &self.priority)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Ranked {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Name(String),
+            Ranked {
+                name: String,
+                #[serde(default = "default_priority")]
+                priority: i64,
+            },
+        }
+        Ok(match Stored::deserialize(deserializer)? {
+            Stored::Name(name) => Ranked::new(name),
+            Stored::Ranked { name, priority } => Ranked { name, priority },
+        })
+    }
+}
+
+fn default_priority() -> i64 {
+    DEFAULT_PRIORITY
+}
+
+/// Adds `name` to `list` with `priority`, or gives it that priority when
+/// it is there, keeping `list` ordered.
+fn rank(list: &mut Vec<Ranked>, name: String, priority: i64) {
+    list.retain(|entry| entry.name != name);
+    list.push(Ranked { name, priority });
+    by_priority(list);
+}
+
+/// Orders `list` by priority, highest first; entries of equal priority
+/// keep the order they were added in.
+fn by_priority(list: &mut [Ranked]) {
+    list.sort_by_key(|entry| std::cmp::Reverse(entry.priority));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Role {
     rolename: String,
+    #[serde(flatten)]
+    description: Description,
+    /// By priority, highest first
     #[serde(default)]
     acls: Vec<Acl>,
+}
+
+impl Role {
+    fn order(&mut self) {
+        self.acls.sort_by_key(|acl| std::cmp::Reverse(acl.priority));
+    }
+
+    /// What the first of its ACLs that applies says, if any.
+    fn decide(&self, topic: &str, access: Access) -> Option<bool> {
+        self.acls
+            .iter()
+            .find(|acl| acl.applies(topic, access))
+            .map(|acl| acl.allow)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,30 +282,36 @@ impl Data {
             .ok_or_else(|| "Group not found".to_string())
     }
 
-    /// The names of the roles of a client: its own, then its groups'.
-    fn roles_of(&self, username: Option<&str>) -> Vec<&str> {
-        let groups: Vec<&str> = match username {
-            Some(username) => {
-                let Some(client) = self.clients.iter().find(|c| c.username == username) else {
-                    return Vec::new();
-                };
-                let mut roles: Vec<&str> = client.roles.iter().map(String::as_str).collect();
-                let groups = client.groups.iter().map(String::as_str);
-                roles.extend(self.group_roles(groups));
-                return roles;
-            }
-            None => self.anonymous_group.as_deref().into_iter().collect(),
-        };
-        self.group_roles(groups.into_iter()).collect()
+    /// Orders every list a check walks, as a file written by hand or by an
+    /// earlier version may not be.
+    fn order(&mut self) {
+        for role in &mut self.roles {
+            role.order();
+        }
+        for client in &mut self.clients {
+            by_priority(&mut client.roles);
+            by_priority(&mut client.groups);
+        }
+        for group in &mut self.groups {
+            by_priority(&mut group.roles);
+        }
     }
 
-    fn group_roles<'a>(
-        &'a self,
-        groups: impl Iterator<Item = &'a str>,
-    ) -> impl Iterator<Item = &'a str> {
-        groups
+    /// The roles of `client` in the order mosquitto checks them: its own,
+    /// then those of each of its groups; without a client, those of the
+    /// anonymous group. Each list is ordered by priority.
+    fn roles_of<'a>(&'a self, client: Option<&'a Client>) -> impl Iterator<Item = &'a Role> {
+        let own = client.into_iter().flat_map(|c| &c.roles);
+        let groups: Vec<&str> = match client {
+            Some(client) => client.groups.iter().map(|g| g.name.as_str()).collect(),
+            None => self.anonymous_group.as_deref().into_iter().collect(),
+        };
+        let grouped = groups
+            .into_iter()
             .filter_map(|name| self.groups.iter().find(|g| g.groupname == name))
-            .flat_map(|group| group.roles.iter().map(String::as_str))
+            .flat_map(|group| &group.roles);
+        own.chain(grouped)
+            .filter_map(|held| self.roles.iter().find(|r| r.rolename == held.name))
     }
 
     fn authorize(&self, username: Option<&str>, topic: &str, access: Access) -> bool {
@@ -195,28 +333,21 @@ impl Data {
     }
 
     /// What the client's ACLs say about `access` to `topic`, None when no
-    /// ACL applies.
+    /// ACL applies. As in mosquitto, the first role in [`Self::roles_of`]'s
+    /// order with an ACL that applies decides, by its first such ACL.
     fn decide(&self, username: Option<&str>, topic: &str, access: Access) -> Option<bool> {
         // A client disabled or deleted while connected loses its access at
         // once; a user name from elsewhere, such as a client certificate,
         // needs a client of that name, as in mosquitto
-        if let Some(username) = username {
-            match self.clients.iter().find(|c| c.username == username) {
-                Some(client) if !client.disabled => {}
+        let client = match username {
+            Some(username) => match self.clients.iter().find(|c| c.username == username) {
+                Some(client) if !client.disabled => Some(client),
                 _ => return Some(false),
-            }
-        }
-        self.roles_of(username)
-            .into_iter()
-            .filter_map(|rolename| self.roles.iter().find(|r| r.rolename == rolename))
-            .flat_map(|role| &role.acls)
-            .filter(|acl| acl.applies(topic, access))
-            // The first of the highest priority wins
-            .fold(None::<&Acl>, |best, acl| match best {
-                Some(best) if best.priority >= acl.priority => Some(best),
-                _ => Some(acl),
-            })
-            .map(|acl| acl.allow)
+            },
+            None => None,
+        };
+        self.roles_of(client)
+            .find_map(|role| role.decide(topic, access))
     }
 
     /// The clients whose access `command` may change, to disconnect once it
@@ -230,22 +361,45 @@ impl Data {
             | "removeClientRole" | "addGroupClient" | "removeGroupClient" => {
                 affected.users.extend(text("username").map(str::to_string));
             }
+            // Only its text leaves access as it is
+            "modifyClient"
+                if ["password", "clientid", "roles", "groups"]
+                    .iter()
+                    .any(|name| present(args, name).is_some()) =>
+            {
+                affected.users.extend(text("username").map(str::to_string));
+            }
+            "modifyGroup" => {
+                if let Some(group) = text("groupname") {
+                    if present(args, "roles").is_some() || present(args, "clients").is_some() {
+                        self.add_members(group, &mut affected);
+                    }
+                }
+                // Those it gains, as well as those it loses
+                let gained = present(args, "clients")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("username").and_then(Value::as_str));
+                affected.users.extend(gained.map(str::to_string));
+            }
             "addGroupRole" | "removeGroupRole" | "deleteGroup" => {
                 if let Some(group) = text("groupname") {
                     self.add_members(group, &mut affected);
                 }
             }
-            "deleteRole" | "addRoleACL" | "removeRoleACL" => {
+            "modifyRole" if present(args, "acls").is_none() => {}
+            "deleteRole" | "addRoleACL" | "removeRoleACL" | "modifyRole" => {
                 if let Some(role) = text("rolename") {
                     let holders = self
                         .clients
                         .iter()
-                        .filter(|c| c.roles.iter().any(|r| r == role));
+                        .filter(|c| c.roles.iter().any(|r| r.name == role));
                     affected.users.extend(holders.map(|c| c.username.clone()));
                     for group in self
                         .groups
                         .iter()
-                        .filter(|g| g.roles.iter().any(|r| r == role))
+                        .filter(|g| g.roles.iter().any(|r| r.name == role))
                     {
                         self.add_members(&group.groupname, &mut affected);
                     }
@@ -261,7 +415,7 @@ impl Data {
         let members = self
             .clients
             .iter()
-            .filter(|c| c.groups.iter().any(|g| g == group));
+            .filter(|c| c.groups.iter().any(|g| g.name == group));
         affected.users.extend(members.map(|c| c.username.clone()));
         affected.anonymous |= self.anonymous_group.as_deref() == Some(group);
     }
@@ -281,14 +435,8 @@ impl Data {
                 if self.clients.iter().any(|c| c.username == username) {
                     return Err("Client already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename")?;
-                if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
-                    return Err(format!("Role {missing} not found"));
-                }
-                let groups = names(args.get("groups"), "groupname")?;
-                if let Some(missing) = groups.iter().find(|g| self.group(g).is_err()) {
-                    return Err(format!("Group {missing} not found"));
-                }
+                let roles = self.ranked_roles(args.get("roles"))?;
+                let groups = self.ranked_groups(args.get("groups"))?;
                 // Empty, as mosquitto takes it, binds no client id
                 let clientid = match args.get("clientid") {
                     None | Some(Value::Null) => None,
@@ -300,8 +448,10 @@ impl Data {
                     Some(password) => Some(hash_password(password)?),
                     None => None,
                 };
+                let description = Description::default().modified(args)?;
                 self.clients.push(Client {
                     username,
+                    description,
                     password,
                     clientid,
                     disabled: false,
@@ -321,41 +471,76 @@ impl Data {
                 self.client(&text("username")?)?.password = Some(hash);
                 Ok((None, true))
             }
+            "modifyClient" => {
+                let username = text("username")?;
+                let client = self.client(&username)?;
+                let description = client.description.modified(args)?;
+                let roles = present(args, "roles")
+                    .map(|roles| self.ranked_roles(Some(roles)))
+                    .transpose()?;
+                let groups = present(args, "groups")
+                    .map(|groups| self.ranked_groups(Some(groups)))
+                    .transpose()?;
+                let clientid = match present(args, "clientid") {
+                    None => None,
+                    Some(Value::String(id)) => Some((!id.is_empty()).then(|| id.clone())),
+                    Some(_) => return Err("Invalid clientid".to_string()),
+                };
+                // Empty, as mosquitto takes it, leaves the password as it is
+                let password = match present(args, "password") {
+                    None => None,
+                    Some(Value::String(password)) if password.is_empty() => None,
+                    Some(Value::String(password)) => Some(hash_password(password)?),
+                    Some(_) => return Err("Invalid password".to_string()),
+                };
+                let client = self.client(&username)?;
+                client.description = description;
+                if let Some(roles) = roles {
+                    client.roles = roles;
+                }
+                if let Some(groups) = groups {
+                    client.groups = groups;
+                }
+                if let Some(clientid) = clientid {
+                    client.clientid = clientid;
+                }
+                if password.is_some() {
+                    client.password = password;
+                }
+                Ok((None, true))
+            }
             "enableClient" | "disableClient" => {
                 self.client(&text("username")?)?.disabled = command == "disableClient";
                 Ok((None, true))
             }
             "addClientRole" => {
-                no_priority(args)?;
+                let priority = priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let client = self.client(&text("username")?)?;
-                if !client.roles.contains(&rolename) {
-                    client.roles.push(rolename);
-                }
+                rank(&mut client.roles, rolename, priority);
                 Ok((None, true))
             }
             "removeClientRole" => {
                 let rolename = text("rolename")?;
                 self.client(&text("username")?)?
                     .roles
-                    .retain(|r| *r != rolename);
+                    .retain(|r| r.name != rolename);
                 Ok((None, true))
             }
             "getClient" => {
                 let client = self.client(&text("username")?)?;
-                let roles: Vec<Value> = client
-                    .roles
-                    .iter()
-                    .map(|r| json!({ "rolename": r }))
-                    .collect();
+                let roles: Vec<Value> =
+                    client.roles.iter().map(|r| r.to_json("rolename")).collect();
                 let groups: Vec<Value> = client
                     .groups
                     .iter()
-                    .map(|g| json!({ "groupname": g }))
+                    .map(|g| g.to_json("groupname"))
                     .collect();
                 let data = json!({ "client": {
                     "username": client.username,
+                    "textname": client.description.textname,
+                    "textdescription": client.description.textdescription,
                     "clientid": client.clientid,
                     "disabled": client.disabled,
                     "roles": roles,
@@ -378,7 +563,13 @@ impl Data {
                         .map_err(|e| format!("Invalid acls: {e}"))?,
                     None => Vec::new(),
                 };
-                self.roles.push(Role { rolename, acls });
+                let mut role = Role {
+                    rolename,
+                    description: Description::default().modified(args)?,
+                    acls,
+                };
+                role.order();
+                self.roles.push(role);
                 Ok((None, true))
             }
             "deleteRole" => {
@@ -386,10 +577,10 @@ impl Data {
                 self.role(&rolename)?;
                 self.roles.retain(|r| r.rolename != rolename);
                 for client in &mut self.clients {
-                    client.roles.retain(|r| *r != rolename);
+                    client.roles.retain(|r| r.name != rolename);
                 }
                 for group in &mut self.groups {
-                    group.roles.retain(|r| *r != rolename);
+                    group.roles.retain(|r| r.name != rolename);
                 }
                 Ok((None, true))
             }
@@ -398,11 +589,13 @@ impl Data {
                 if self.groups.iter().any(|g| g.groupname == groupname) {
                     return Err("Group already exists".to_string());
                 }
-                let roles = names(args.get("roles"), "rolename")?;
-                if let Some(missing) = roles.iter().find(|r| self.role(r).is_err()) {
-                    return Err(format!("Role {missing} not found"));
-                }
-                self.groups.push(Group { groupname, roles });
+                let roles = self.ranked_roles(args.get("roles"))?;
+                let description = Description::default().modified(args)?;
+                self.groups.push(Group {
+                    groupname,
+                    description,
+                    roles,
+                });
                 Ok((None, true))
             }
             "deleteGroup" => {
@@ -410,7 +603,7 @@ impl Data {
                 self.group(&groupname)?;
                 self.groups.retain(|g| g.groupname != groupname);
                 for client in &mut self.clients {
-                    client.groups.retain(|g| *g != groupname);
+                    client.groups.retain(|g| g.name != groupname);
                 }
                 if self.anonymous_group.as_ref() == Some(&groupname) {
                     self.anonymous_group = None;
@@ -418,37 +611,33 @@ impl Data {
                 Ok((None, true))
             }
             "addGroupRole" => {
-                no_priority(args)?;
+                let priority = priority(args)?;
                 let rolename = text("rolename")?;
                 self.role(&rolename)?;
                 let group = self.group(&text("groupname")?)?;
-                if !group.roles.contains(&rolename) {
-                    group.roles.push(rolename);
-                }
+                rank(&mut group.roles, rolename, priority);
                 Ok((None, true))
             }
             "removeGroupRole" => {
                 let rolename = text("rolename")?;
                 self.group(&text("groupname")?)?
                     .roles
-                    .retain(|r| *r != rolename);
+                    .retain(|r| r.name != rolename);
                 Ok((None, true))
             }
             "addGroupClient" => {
-                no_priority(args)?;
+                let priority = priority(args)?;
                 let groupname = text("groupname")?;
                 self.group(&groupname)?;
                 let client = self.client(&text("username")?)?;
-                if !client.groups.contains(&groupname) {
-                    client.groups.push(groupname);
-                }
+                rank(&mut client.groups, groupname, priority);
                 Ok((None, true))
             }
             "removeGroupClient" => {
                 let groupname = text("groupname")?;
                 self.client(&text("username")?)?
                     .groups
-                    .retain(|g| *g != groupname);
+                    .retain(|g| g.name != groupname);
                 Ok((None, true))
             }
             "getGroup" => {
@@ -456,21 +645,59 @@ impl Data {
                 let members: Vec<Value> = self
                     .clients
                     .iter()
-                    .filter(|c| c.groups.contains(&groupname))
-                    .map(|c| json!({ "username": c.username }))
+                    .filter_map(|c| {
+                        let membership = c.groups.iter().find(|g| g.name == groupname)?;
+                        let mut member = json!({ "username": c.username });
+                        if membership.priority != DEFAULT_PRIORITY {
+                            member["priority"] = membership.priority.into();
+                        }
+                        Some(member)
+                    })
                     .collect();
                 let group = self.group(&groupname)?;
-                let roles: Vec<Value> = group
-                    .roles
-                    .iter()
-                    .map(|r| json!({ "rolename": r }))
-                    .collect();
+                let roles: Vec<Value> = group.roles.iter().map(|r| r.to_json("rolename")).collect();
                 let data = json!({ "group": {
                     "groupname": group.groupname,
+                    "textname": group.description.textname,
+                    "textdescription": group.description.textdescription,
                     "roles": roles,
                     "clients": members,
                 }});
                 Ok((Some(data), false))
+            }
+            "modifyGroup" => {
+                let groupname = text("groupname")?;
+                let description = self.group(&groupname)?.description.modified(args)?;
+                let roles = present(args, "roles")
+                    .map(|roles| self.ranked_roles(Some(roles)))
+                    .transpose()?;
+                let clients = match present(args, "clients") {
+                    Some(clients) => {
+                        let clients = ranked(Some(clients), "username")?;
+                        if let Some(missing) = clients
+                            .iter()
+                            .find(|c| !self.clients.iter().any(|client| client.username == c.name))
+                        {
+                            return Err(format!("Client {} not found", missing.name));
+                        }
+                        Some(clients)
+                    }
+                    None => None,
+                };
+                let group = self.group(&groupname)?;
+                group.description = description;
+                if let Some(roles) = roles {
+                    group.roles = roles;
+                }
+                if let Some(members) = clients {
+                    for client in &mut self.clients {
+                        client.groups.retain(|g| g.name != groupname);
+                        if let Some(member) = members.iter().find(|m| m.name == client.username) {
+                            rank(&mut client.groups, groupname.clone(), member.priority);
+                        }
+                    }
+                }
+                Ok((None, true))
             }
             "listGroups" => {
                 let names: Vec<&str> = self.groups.iter().map(|g| g.groupname.as_str()).collect();
@@ -494,6 +721,7 @@ impl Data {
                 role.acls
                     .retain(|a| !(a.acltype == acl.acltype && a.topic == acl.topic));
                 role.acls.push(acl);
+                role.order();
                 Ok((None, true))
             }
             "removeRoleACL" => {
@@ -506,6 +734,32 @@ impl Data {
                     .retain(|a| !(a.acltype == acltype && a.topic == topic));
                 if role.acls.len() == before {
                     return Err("ACL not found".to_string());
+                }
+                Ok((None, true))
+            }
+            "modifyRole" => {
+                let rolename = text("rolename")?;
+                let description = self.role(&rolename)?.description.modified(args)?;
+                let acls = match present(args, "acls") {
+                    Some(acls) => {
+                        let listed: Vec<Acl> = serde_json::from_value(acls.clone())
+                            .map_err(|e| format!("Invalid acls: {e}"))?;
+                        // One per type and topic, the last given, as
+                        // addRoleACL keeps
+                        let mut acls: Vec<Acl> = Vec::new();
+                        for acl in listed {
+                            acls.retain(|a| !(a.acltype == acl.acltype && a.topic == acl.topic));
+                            acls.push(acl);
+                        }
+                        Some(acls)
+                    }
+                    None => None,
+                };
+                let role = self.role(&rolename)?;
+                role.description = description;
+                if let Some(acls) = acls {
+                    role.acls = acls;
+                    role.order();
                 }
                 Ok((None, true))
             }
@@ -553,31 +807,63 @@ impl Data {
     }
 }
 
-/// Names given as `[{"rolename": ...}]` or `[{"groupname": ...}]`, as
-/// mosquitto does.
-fn names(list: Option<&Value>, key: &str) -> Result<Vec<String>, String> {
-    let entries = list.and_then(Value::as_array).into_iter().flatten();
+impl Data {
+    /// The roles of a `roles` argument, which must exist.
+    fn ranked_roles(&self, list: Option<&Value>) -> Result<Vec<Ranked>, String> {
+        let roles = ranked(list, "rolename")?;
+        match roles
+            .iter()
+            .find(|r| !self.roles.iter().any(|role| role.rolename == r.name))
+        {
+            Some(missing) => Err(format!("Role {} not found", missing.name)),
+            None => Ok(roles),
+        }
+    }
+
+    /// The groups of a `groups` argument, which must exist.
+    fn ranked_groups(&self, list: Option<&Value>) -> Result<Vec<Ranked>, String> {
+        let groups = ranked(list, "groupname")?;
+        match groups
+            .iter()
+            .find(|g| !self.groups.iter().any(|group| group.groupname == g.name))
+        {
+            Some(missing) => Err(format!("Group {} not found", missing.name)),
+            None => Ok(groups),
+        }
+    }
+}
+
+/// Names given as `[{"rolename": ..., "priority": ...}]`, under `key`, as
+/// mosquitto does, ordered by priority.
+fn ranked(list: Option<&Value>, key: &str) -> Result<Vec<Ranked>, String> {
+    let entries = match list {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => return Err(format!("Invalid {key} list")),
+    };
     let mut names = Vec::new();
     for entry in entries {
-        no_priority(entry)?;
-        if let Some(name) = entry.get(key).and_then(Value::as_str) {
-            names.push(name.to_string());
-        }
+        let name = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Invalid/missing {key}"))?;
+        rank(&mut names, name.to_string(), priority(entry)?);
     }
     Ok(names)
 }
 
-/// Refuses the `priority` mosquitto gives a client's roles and groups:
-/// here the matching ACL with the highest priority decides, whichever role
-/// it is in, so ordering roles would change nothing. Mosquitto's default,
-/// -1, is accepted.
-fn no_priority(args: &Value) -> Result<(), String> {
+/// The argument `name` of `args`, unless it is absent or null.
+fn present<'a>(args: &'a Value, name: &str) -> Option<&'a Value> {
+    args.get(name).filter(|value| !value.is_null())
+}
+
+/// The `priority` of `args`, mosquitto's default when it gives none.
+fn priority(args: &Value) -> Result<i64, String> {
     match args.get("priority") {
-        None | Some(Value::Null) => Ok(()),
-        Some(priority) if priority.as_i64() == Some(-1) => Ok(()),
-        Some(_) => {
-            Err("Role and group priorities are not supported; give the ACLs priorities".to_string())
-        }
+        None | Some(Value::Null) => Ok(DEFAULT_PRIORITY),
+        Some(priority) => priority
+            .as_i64()
+            .ok_or_else(|| "Invalid priority".to_string()),
     }
 }
 
@@ -649,14 +935,16 @@ impl DynamicSecurity {
         let data = Data {
             clients: vec![Client {
                 username: admin.to_string(),
+                description: Description::default(),
                 password: Some(hash_password(password)?),
                 clientid: None,
                 disabled: false,
-                roles: vec!["admin".to_string()],
+                roles: vec![Ranked::new("admin")],
                 groups: Vec::new(),
             }],
             roles: vec![Role {
                 rolename: "admin".to_string(),
+                description: Description::default(),
                 acls: vec![
                     acl(AclType::PublishClientSend, "$CONTROL/dynamic-security/#"),
                     acl(AclType::SubscribePattern, "$CONTROL/dynamic-security/#"),
@@ -670,11 +958,30 @@ impl DynamicSecurity {
             }],
             ..Default::default()
         };
-        write(path, &data)?;
-        #[cfg(unix)]
-        give_to_directory_owner(path)
-            .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
-        Ok(())
+        create(path, &data)
+    }
+
+    /// Writes a new state file from `source`, the `dynamic-security.json`
+    /// of mosquitto's plugin, with its clients, groups, roles, default
+    /// access and anonymous group, owned as [`Self::init`] owns its file.
+    /// Returns what could not be carried over, one line each.
+    pub fn import(source: &str, path: &str) -> Result<Vec<String>, String> {
+        if Path::new(path).exists() {
+            return Err(format!("{path} already exists"));
+        }
+        let contents =
+            std::fs::read_to_string(source).map_err(|e| format!("Failed to read {source}: {e}"))?;
+        // serde_json's errors quote values, which can be hashes
+        let file: Value = serde_json::from_str(&contents).map_err(|e| {
+            format!(
+                "{source} is not JSON: error at line {} column {}",
+                e.line(),
+                e.column()
+            )
+        })?;
+        let (data, notes) = from_mosquitto(&file).map_err(|e| format!("{source}: {e}"))?;
+        create(path, &data)?;
+        Ok(notes)
     }
 
     /// Runs a batch of commands, `{"commands": [...]}`, and returns the
@@ -777,7 +1084,7 @@ async fn disconnect(admin: Admin, affected: Affected) {
 fn read(path: &str) -> Result<Data, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read dynamic security file {path}: {e}"))?;
-    serde_json::from_str(&contents).map_err(|e| {
+    let mut data: Data = serde_json::from_str(&contents).map_err(|e| {
         // serde_json quotes the offending value, which can be a hash or a
         // salt, and the returned text reaches admin clients
         error!("Invalid dynamic security file {path}: {e}");
@@ -792,7 +1099,9 @@ fn read(path: &str) -> Result<Data, String> {
             e.line(),
             e.column()
         )
-    })
+    })?;
+    data.order();
+    Ok(data)
 }
 
 /// Replaces the file in one step, so a crash never leaves half of it. The
@@ -817,6 +1126,266 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
         .and_then(|()| std::fs::rename(&temporary, path))
         .and_then(|()| sync_directory(path))
         .map_err(|e| format!("Failed to write {path}: {e}"))
+}
+
+/// Writes `data` to a new file at `path`, given to the owner of its
+/// directory when [`adopted_owner`] says so.
+fn create(path: &str, data: &Data) -> Result<(), String> {
+    write(path, data)?;
+    #[cfg(unix)]
+    give_to_directory_owner(path)
+        .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
+    Ok(())
+}
+
+/// The state a mosquitto `dynamic-security.json` describes, with what
+/// could not be carried over. Names a client, group or role refers to that
+/// the file does not define are left out, as are ACL types Mercurio does
+/// not check. Errors name where the file is wrong without quoting it.
+fn from_mosquitto(file: &Value) -> Result<(Data, Vec<String>), String> {
+    let mut notes = Vec::new();
+    let mut data = Data::default();
+    let list = |value: &Value, key: &str, context: &str| -> Result<Vec<Value>, String> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(entries)) => Ok(entries.clone()),
+            Some(_) => Err(format!("{context}`{key}` is not a list")),
+        }
+    };
+    let name = |entry: &Value, key: &str, context: &str| -> Result<String, String> {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("{context}: `{key}` is missing or not text"))
+    };
+
+    for (n, entry) in list(file, "roles", "")?.iter().enumerate() {
+        let rolename = name(entry, "rolename", &format!("roles[{n}]"))?;
+        if data.roles.iter().any(|r| r.rolename == rolename) {
+            notes.push(format!("role {rolename}: defined twice; the first is kept"));
+            continue;
+        }
+        let context = format!("role {rolename}");
+        let mut acls = Vec::new();
+        for (n, acl) in list(entry, "acls", &format!("{context}: "))?
+            .iter()
+            .enumerate()
+        {
+            let at = format!("{context}, acls[{n}]");
+            let acltype = name(acl, "acltype", &at)?;
+            let topic = name(acl, "topic", &at)?;
+            let Ok(parsed) = serde_json::from_value::<AclType>(json!(acltype)) else {
+                notes.push(format!(
+                    "{context}: ACL {acltype} on {topic} left out, as Mercurio has no such check"
+                ));
+                continue;
+            };
+            let allow = match acl.get("allow") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(allow)) => *allow,
+                Some(_) => return Err(format!("{at}: `allow` is not true or false")),
+            };
+            let priority = match acl.get("priority") {
+                None | Some(Value::Null) => 0,
+                Some(priority) => priority
+                    .as_i64()
+                    .ok_or_else(|| format!("{at}: `priority` is not a whole number"))?,
+            };
+            acls.retain(|a: &Acl| !(a.acltype == parsed && a.topic == topic));
+            acls.push(Acl {
+                acltype: parsed,
+                topic,
+                priority,
+                allow,
+            });
+        }
+        data.roles.push(Role {
+            rolename,
+            description: mosquitto_description(entry),
+            acls,
+        });
+    }
+
+    let known = |names: Vec<Ranked>,
+                 kind: &str,
+                 exists: &dyn Fn(&str) -> bool,
+                 notes: &mut Vec<String>,
+                 context: &str| {
+        names
+            .into_iter()
+            .filter(|ranked| {
+                let found = exists(&ranked.name);
+                if !found {
+                    notes.push(format!(
+                        "{context}: {kind} {} is not defined, so it is left out",
+                        ranked.name
+                    ));
+                }
+                found
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut members = Vec::new();
+    for (n, entry) in list(file, "groups", "")?.iter().enumerate() {
+        let groupname = name(entry, "groupname", &format!("groups[{n}]"))?;
+        if data.groups.iter().any(|g| g.groupname == groupname) {
+            notes.push(format!(
+                "group {groupname}: defined twice; the first is kept"
+            ));
+            continue;
+        }
+        let context = format!("group {groupname}");
+        let roles =
+            ranked(entry.get("roles"), "rolename").map_err(|e| format!("{context}: {e}"))?;
+        let roles = known(
+            roles,
+            "role",
+            &|name| data.roles.iter().any(|r| r.rolename == name),
+            &mut notes,
+            &context,
+        );
+        let clients =
+            ranked(entry.get("clients"), "username").map_err(|e| format!("{context}: {e}"))?;
+        members.push((groupname.clone(), clients));
+        data.groups.push(Group {
+            groupname,
+            description: mosquitto_description(entry),
+            roles,
+        });
+    }
+
+    for (n, entry) in list(file, "clients", "")?.iter().enumerate() {
+        let username = name(entry, "username", &format!("clients[{n}]"))?;
+        if data.clients.iter().any(|c| c.username == username) {
+            notes.push(format!(
+                "client {username}: defined twice; the first is kept"
+            ));
+            continue;
+        }
+        let context = format!("client {username}");
+        let roles =
+            ranked(entry.get("roles"), "rolename").map_err(|e| format!("{context}: {e}"))?;
+        let roles = known(
+            roles,
+            "role",
+            &|name| data.roles.iter().any(|r| r.rolename == name),
+            &mut notes,
+            &context,
+        );
+        // Mosquitto keeps memberships with the groups; taken here too
+        let groups =
+            ranked(entry.get("groups"), "groupname").map_err(|e| format!("{context}: {e}"))?;
+        let groups = known(
+            groups,
+            "group",
+            &|name| data.groups.iter().any(|g| g.groupname == name),
+            &mut notes,
+            &context,
+        );
+        let clientid = match entry.get("clientid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => (!id.is_empty()).then(|| id.clone()),
+            Some(_) => return Err(format!("{context}: `clientid` is not text")),
+        };
+        let disabled = match entry.get("disabled") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(disabled)) => *disabled,
+            Some(_) => return Err(format!("{context}: `disabled` is not true or false")),
+        };
+        let password = mosquitto_password(entry);
+        if password.is_none() && entry.get("password").is_some_and(|p| !p.is_null()) {
+            notes.push(format!(
+                "{context}: its password is in a form Mercurio cannot check, so it has none \
+                 and cannot log in until one is set"
+            ));
+        }
+        data.clients.push(Client {
+            username,
+            description: mosquitto_description(entry),
+            password,
+            clientid,
+            disabled,
+            roles,
+            groups,
+        });
+    }
+
+    for (groupname, clients) in members {
+        for member in clients {
+            match data.clients.iter_mut().find(|c| c.username == member.name) {
+                Some(client) => rank(&mut client.groups, groupname.clone(), member.priority),
+                None => notes.push(format!(
+                    "group {groupname}: client {} is not defined, so it is left out",
+                    member.name
+                )),
+            }
+        }
+    }
+
+    match file.get("anonymousGroup") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(group)) if data.groups.iter().any(|g| &g.groupname == group) => {
+            data.anonymous_group = Some(group.clone());
+        }
+        Some(Value::String(group)) => notes.push(format!(
+            "anonymous group {group} is not defined, so none is set"
+        )),
+        Some(_) => return Err("`anonymousGroup` is not text".to_string()),
+    }
+
+    if let Some(access) = file.get("defaultACLAccess").filter(|a| !a.is_null()) {
+        let flag = |key: &str, default: bool| match access.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(Value::Bool(allow)) => Ok(*allow),
+            Some(_) => Err(format!("defaultACLAccess: `{key}` is not true or false")),
+        };
+        let defaults = DefaultAccess::default();
+        data.default_acl_access = DefaultAccess {
+            publish_client_send: flag("publishClientSend", defaults.publish_client_send)?,
+            publish_client_receive: flag("publishClientReceive", defaults.publish_client_receive)?,
+            subscribe: flag("subscribe", defaults.subscribe)?,
+        };
+        if !flag("unsubscribe", true)? {
+            notes.push(
+                "defaultACLAccess: unsubscribe is denied, but Mercurio lets every client \
+                 unsubscribe"
+                    .to_string(),
+            );
+        }
+    }
+
+    data.order();
+    Ok((data, notes))
+}
+
+/// The text of a client, group or role of mosquitto, which spells it
+/// `textname` and, in the file `mosquitto_ctrl dynsec init` writes,
+/// `textName`.
+fn mosquitto_description(entry: &Value) -> Description {
+    let text = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|key| entry.get(*key).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    Description {
+        textname: text(["textname", "textName"]),
+        textdescription: text(["textdescription", "textDescription"]),
+    }
+}
+
+/// The password of a mosquitto client as a `$7$` hash: mosquitto stores
+/// the PBKDF2-SHA512 hash and its salt in base64 with the iteration count
+/// beside them, the form `mosquitto_passwd` writes in one string. None
+/// when it has none or it is in another form.
+fn mosquitto_password(entry: &Value) -> Option<String> {
+    let hash = entry.get("password")?.as_str()?;
+    let salt = entry.get("salt")?.as_str()?;
+    let iterations = entry.get("iterations")?.as_u64()?;
+    let stored = format!("$7${iterations}${salt}${hash}");
+    credentials::check_hash(&stored).ok().map(|()| stored)
 }
 
 /// The directory holding `path`.
@@ -881,13 +1450,11 @@ impl DynamicSecurity {
                 _ => (None, None),
             }
         };
-        match hash
-            .as_deref()
-            .and_then(|hash| PasswordHash::new(hash).ok())
-        {
+        match hash {
+            // Argon2, or the PBKDF2 of a client imported from mosquitto
+            // that has not set its password since
             Some(hash) => {
-                let valid = Argon2::default().verify_password(password, &hash).is_ok();
-                valid && bound.is_none_or(|bound| bound == client_id)
+                credentials::verify(&hash, password) && bound.is_none_or(|bound| bound == client_id)
             }
             None => {
                 // As slow as a wrong password, so timing doesn't tell which
@@ -1554,6 +2121,32 @@ mod tests {
                 json!({ "command": "addRoleACL", "rolename": "r",
                         "acltype": "subscribePattern", "topic": "b/#", "allow": true }),
             ),
+            (
+                json!([]),
+                json!({ "command": "modifyClient", "username": "user", "password": "x" }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "modifyClient", "username": "user",
+                        "roles": [{ "rolename": "r" }] }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "modifyGroup", "groupname": "g", "roles": [] }),
+            ),
+            (
+                json!([{ "command": "addGroupClient", "username": "user", "groupname": "g" }]),
+                json!({ "command": "modifyGroup", "groupname": "g", "clients": [] }),
+            ),
+            (
+                json!([]),
+                json!({ "command": "modifyGroup", "groupname": "g",
+                        "clients": [{ "username": "user" }] }),
+            ),
+            (
+                json!([{ "command": "addClientRole", "username": "user", "rolename": "r" }]),
+                json!({ "command": "modifyRole", "rolename": "r", "acls": [] }),
+            ),
         ];
         for (n, (setup, change)) in cases.into_iter().enumerate() {
             let user = format!("user{n}");
@@ -1724,50 +2317,594 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A state with the administrator of `init`, at a path of its own.
+    struct Fixture {
+        path: String,
+        security: DynamicSecurity,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mercuriod-dynsec-{name}-{}", std::process::id()))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let _ = std::fs::remove_file(&path);
+            DynamicSecurity::init(&path, "admin", "secret").unwrap();
+            let security = DynamicSecurity::load(&path).unwrap();
+            Self { path, security }
+        }
+
+        /// Runs `commands`, failing on any error.
+        fn run_ok(&self, commands: Value) -> Vec<Value> {
+            let responses = run(&self.security, commands);
+            for response in &responses {
+                assert!(response.get("error").is_none(), "{responses:?}");
+            }
+            responses
+        }
+
+        /// Whether `username` may publish to `topic`.
+        fn publishes(&self, username: &str, topic: &str) -> bool {
+            let data = self.security.data.read().unwrap();
+            data.authorize(Some(username), topic, Access::Write)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// A role allowing or denying publishing to `t/#` with ACL priority
+    /// `acl_priority`.
+    fn publishing_role(rolename: &str, allow: bool, acl_priority: i64) -> Value {
+        json!({ "command": "createRole", "rolename": rolename, "acls": [
+            { "acltype": "publishClientSend", "topic": "t/#", "allow": allow,
+              "priority": acl_priority },
+        ]})
+    }
+
     #[test]
-    fn test_role_priorities_are_refused() {
-        let path =
-            std::env::temp_dir().join(format!("mercuriod-dynsec-priority-{}", std::process::id()));
-        let path = path.to_str().unwrap();
-        let _ = std::fs::remove_file(path);
-        DynamicSecurity::init(path, "admin", "secret").unwrap();
-        let security = DynamicSecurity::load(path).unwrap();
-        let responses = run(
-            &security,
+    fn test_own_roles_decide_before_group_roles() {
+        let fixture = Fixture::new("own-first");
+        fixture.run_ok(json!([
+            publishing_role("own", false, 0),
+            publishing_role("grouped", true, 100),
+            { "command": "createGroup", "groupname": "g", "roles": [{ "rolename": "grouped" }] },
+            { "command": "createClient", "username": "c",
+              "roles": [{ "rolename": "own" }], "groups": [{ "groupname": "g" }] },
+        ]));
+        // As in mosquitto, the ACL priority orders a role's ACLs only
+        assert!(!fixture.publishes("c", "t/1"));
+    }
+
+    #[test]
+    fn test_roles_are_checked_by_priority() {
+        let fixture = Fixture::new("role-priority");
+        fixture.run_ok(json!([
+            publishing_role("low", true, 100),
+            publishing_role("high", false, 0),
+            { "command": "createClient", "username": "c", "roles": [
+                { "rolename": "low", "priority": 1 },
+                { "rolename": "high", "priority": 5 },
+            ]},
+        ]));
+        assert!(!fixture.publishes("c", "t/1"));
+
+        fixture.run_ok(json!([
+            { "command": "addClientRole", "username": "c", "rolename": "low", "priority": 9 },
+        ]));
+        assert!(fixture.publishes("c", "t/1"));
+    }
+
+    #[test]
+    fn test_groups_and_their_roles_are_checked_by_priority() {
+        let fixture = Fixture::new("group-priority");
+        fixture.run_ok(json!([
+            publishing_role("allow", true, 0),
+            publishing_role("deny", false, 0),
+            { "command": "createGroup", "groupname": "allowing" },
+            { "command": "addGroupRole", "groupname": "allowing", "rolename": "allow" },
+            { "command": "createGroup", "groupname": "denying" },
+            { "command": "addGroupRole", "groupname": "denying", "rolename": "deny" },
+            { "command": "createClient", "username": "c" },
+            { "command": "addGroupClient", "groupname": "allowing", "username": "c",
+              "priority": 1 },
+            { "command": "addGroupClient", "groupname": "denying", "username": "c",
+              "priority": 2 },
+        ]));
+        assert!(!fixture.publishes("c", "t/1"));
+        fixture.run_ok(json!([
+            { "command": "addGroupClient", "groupname": "allowing", "username": "c",
+              "priority": 3 },
+        ]));
+        assert!(fixture.publishes("c", "t/1"));
+
+        // Within a group, its roles by their priority
+        fixture.run_ok(json!([
+            { "command": "createGroup", "groupname": "both", "roles": [
+                { "rolename": "allow", "priority": 1 },
+                { "rolename": "deny", "priority": 2 },
+            ]},
+            { "command": "createClient", "username": "d", "groups": [{ "groupname": "both" }] },
+        ]));
+        assert!(!fixture.publishes("d", "t/1"));
+        fixture.run_ok(json!([
+            { "command": "addGroupRole", "groupname": "both", "rolename": "allow",
+              "priority": 3 },
+        ]));
+        assert!(fixture.publishes("d", "t/1"));
+    }
+
+    #[test]
+    fn test_equal_priorities_keep_the_order_added_and_roles_without_a_match_pass_on() {
+        let fixture = Fixture::new("ties");
+        fixture.run_ok(json!([
+            { "command": "createRole", "rolename": "other", "acls": [
+                { "acltype": "publishClientSend", "topic": "elsewhere/#", "allow": false,
+                  "priority": 50 },
+            ]},
+            publishing_role("deny", false, 0),
+            publishing_role("allow", true, 0),
+            { "command": "createClient", "username": "c", "roles": [
+                { "rolename": "other" }, { "rolename": "deny" }, { "rolename": "allow" },
+            ]},
+        ]));
+        assert!(!fixture.publishes("c", "t/1"));
+    }
+
+    #[test]
+    fn test_priorities_are_shown_and_must_be_numbers() {
+        let fixture = Fixture::new("priority-shown");
+        fixture.run_ok(json!([
+            { "command": "createRole", "rolename": "r" },
+            { "command": "createRole", "rolename": "s" },
+            { "command": "createGroup", "groupname": "g",
+              "roles": [{ "rolename": "r", "priority": 4 }] },
+            { "command": "createClient", "username": "c", "roles": [
+                { "rolename": "r" }, { "rolename": "s", "priority": 2 },
+            ]},
+            { "command": "addGroupClient", "groupname": "g", "username": "c", "priority": 7 },
+        ]));
+        let shown = fixture.run_ok(json!([
+            { "command": "getClient", "username": "c" },
+            { "command": "getGroup", "groupname": "g" },
+        ]));
+        // Mosquitto's default, -1, is left out
+        assert_eq!(
+            shown[0]["data"]["client"]["roles"],
+            json!([{ "rolename": "s", "priority": 2 }, { "rolename": "r" }])
+        );
+        assert_eq!(
+            shown[0]["data"]["client"]["groups"],
+            json!([{ "groupname": "g", "priority": 7 }])
+        );
+        assert_eq!(
+            shown[1]["data"]["group"]["roles"],
+            json!([{ "rolename": "r", "priority": 4 }])
+        );
+
+        let refused = run(
+            &fixture.security,
             json!([
-                { "command": "createRole", "rolename": "r" },
-                { "command": "createGroup", "groupname": "g" },
-                { "command": "createClient", "username": "s1" },
-                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": 5 },
-                { "command": "addGroupRole", "groupname": "g", "rolename": "r", "priority": 5 },
-                { "command": "addGroupClient", "groupname": "g", "username": "s1", "priority": 5 },
-                { "command": "createClient", "username": "s2",
-                  "roles": [{ "rolename": "r", "priority": 5 }] },
-                { "command": "createGroup", "groupname": "g2",
-                  "roles": [{ "rolename": "r", "priority": 5 }] },
-                // Mosquitto's default, as tools may send it
-                { "command": "addClientRole", "username": "s1", "rolename": "r", "priority": -1 },
-                { "command": "getClient", "username": "s1" },
-                { "command": "getGroup", "groupname": "g" },
+                { "command": "addClientRole", "username": "c", "rolename": "r",
+                  "priority": "high" },
+                { "command": "createClient", "username": "d",
+                  "roles": [{ "rolename": "r", "priority": 1.5 }] },
+                { "command": "createClient", "username": "e", "roles": [{ "priority": 1 }] },
             ]),
         );
-        assert!(
-            responses[..3].iter().all(|r| r.get("error").is_none()),
-            "{responses:?}"
-        );
-        for response in &responses[3..8] {
-            assert!(response.get("error").is_some(), "{response}");
+        for response in &refused {
+            assert!(response.get("error").is_some(), "{refused:?}");
         }
-        assert!(responses[8].get("error").is_none(), "{responses:?}");
+        let listed = fixture.run_ok(json!([{ "command": "listClients" }]));
+        assert_eq!(listed[0]["data"]["clients"], json!(["admin", "c"]));
+    }
+
+    #[test]
+    fn test_modify_client_changes_what_it_is_given() {
+        let fixture = Fixture::new("modify-client");
+        fixture.run_ok(json!([
+            publishing_role("allow", true, 0),
+            publishing_role("deny", false, 0),
+            { "command": "createGroup", "groupname": "g1" },
+            { "command": "createGroup", "groupname": "g2" },
+            { "command": "createClient", "username": "c", "password": "old",
+              "clientid": "dev1", "textname": "Sensor", "roles": [{ "rolename": "deny" }],
+              "groups": [{ "groupname": "g1" }] },
+        ]));
+        assert!(fixture.security.check_password("c", b"old", "dev1"));
+
+        // Absent arguments leave things as they are
+        fixture.run_ok(json!([
+            { "command": "modifyClient", "username": "c", "textdescription": "Roof" },
+        ]));
+        let shown = fixture.run_ok(json!([{ "command": "getClient", "username": "c" }]));
+        let client = &shown[0]["data"]["client"];
+        assert_eq!(client["textname"], "Sensor");
+        assert_eq!(client["textdescription"], "Roof");
+        assert_eq!(client["clientid"], "dev1");
+        assert_eq!(client["roles"], json!([{ "rolename": "deny" }]));
+        assert!(fixture.security.check_password("c", b"old", "dev1"));
+
+        // Lists replace the whole list; an empty password changes nothing
+        // and an empty client id unbinds it
+        fixture.run_ok(json!([
+            { "command": "modifyClient", "username": "c", "password": "new", "clientid": "",
+              "textname": "Probe", "roles": [{ "rolename": "allow", "priority": 2 }],
+              "groups": [{ "groupname": "g2" }] },
+        ]));
+        let shown = fixture.run_ok(json!([{ "command": "getClient", "username": "c" }]));
+        let client = &shown[0]["data"]["client"];
+        assert_eq!(client["textname"], "Probe");
+        assert_eq!(client["clientid"], Value::Null);
         assert_eq!(
-            responses[9]["data"]["client"]["groups"],
-            json!([]),
-            "{responses:?}"
+            client["roles"],
+            json!([{ "rolename": "allow", "priority": 2 }])
         );
-        assert_eq!(responses[10]["data"]["group"]["roles"], json!([]));
-        let listed = run(&security, json!([{ "command": "listClients" }]));
-        assert_eq!(listed[0]["data"]["clients"], json!(["admin", "s1"]));
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(client["groups"], json!([{ "groupname": "g2" }]));
+        assert!(!fixture.security.check_password("c", b"old", "any"));
+        assert!(fixture.security.check_password("c", b"new", "any"));
+        assert!(fixture.publishes("c", "t/1"));
+        fixture.run_ok(json!([{ "command": "modifyClient", "username": "c", "password": "" }]));
+        assert!(fixture.security.check_password("c", b"new", "any"));
+
+        // One bad argument and nothing changes, the password included
+        for bad in [
+            json!({ "command": "modifyClient", "username": "c", "password": "other",
+                    "roles": [{ "rolename": "missing" }] }),
+            json!({ "command": "modifyClient", "username": "c", "password": "other",
+                    "groups": [{ "groupname": "missing" }] }),
+            json!({ "command": "modifyClient", "username": "c", "password": "other",
+                    "clientid": 7 }),
+            json!({ "command": "modifyClient", "username": "c", "password": "other",
+                    "textname": false }),
+            json!({ "command": "modifyClient", "username": "nobody", "password": "other" }),
+        ] {
+            let responses = run(&fixture.security, json!([bad]));
+            assert!(responses[0].get("error").is_some(), "{bad}");
+        }
+        assert!(fixture.security.check_password("c", b"new", "any"));
+        let shown = fixture.run_ok(json!([{ "command": "getClient", "username": "c" }]));
+        assert_eq!(shown[0]["data"]["client"]["textname"], "Probe");
+    }
+
+    #[test]
+    fn test_modify_role_replaces_its_acls() {
+        let fixture = Fixture::new("modify-role");
+        fixture.run_ok(json!([
+            publishing_role("r", false, 0),
+            { "command": "createClient", "username": "c", "roles": [{ "rolename": "r" }] },
+        ]));
+        assert!(!fixture.publishes("c", "t/1"));
+
+        fixture.run_ok(json!([
+            { "command": "modifyRole", "rolename": "r", "textname": "Writers" },
+        ]));
+        assert!(!fixture.publishes("c", "t/1"));
+
+        fixture.run_ok(json!([
+            { "command": "modifyRole", "rolename": "r", "textdescription": "May write", "acls": [
+                { "acltype": "publishClientSend", "topic": "t/#", "allow": true },
+                { "acltype": "publishClientSend", "topic": "t/secret", "allow": false,
+                  "priority": 1 },
+            ]},
+        ]));
+        assert!(fixture.publishes("c", "t/1"));
+        assert!(!fixture.publishes("c", "t/secret"));
+        let shown = fixture.run_ok(json!([{ "command": "getRole", "rolename": "r" }]));
+        let role = &shown[0]["data"]["role"];
+        assert_eq!(role["textname"], "Writers");
+        assert_eq!(role["textdescription"], "May write");
+        assert_eq!(role["acls"].as_array().unwrap().len(), 2);
+
+        for bad in [
+            json!({ "command": "modifyRole", "rolename": "r", "textname": "X",
+                    "acls": [{ "acltype": "bogus", "topic": "t", "allow": true }] }),
+            json!({ "command": "modifyRole", "rolename": "r", "textname": "X", "acls": 5 }),
+            json!({ "command": "modifyRole", "rolename": "missing", "textname": "X" }),
+        ] {
+            let responses = run(&fixture.security, json!([bad]));
+            assert!(responses[0].get("error").is_some(), "{bad}");
+        }
+        assert!(fixture.publishes("c", "t/1"));
+        let shown = fixture.run_ok(json!([{ "command": "getRole", "rolename": "r" }]));
+        assert_eq!(shown[0]["data"]["role"]["textname"], "Writers");
+    }
+
+    #[test]
+    fn test_modify_group_replaces_its_roles_and_clients() {
+        let fixture = Fixture::new("modify-group");
+        fixture.run_ok(json!([
+            publishing_role("allow", true, 0),
+            publishing_role("deny", false, 0),
+            { "command": "createGroup", "groupname": "g", "roles": [{ "rolename": "deny" }] },
+            { "command": "createClient", "username": "in" },
+            { "command": "createClient", "username": "out" },
+            { "command": "addGroupClient", "groupname": "g", "username": "in" },
+        ]));
+        assert!(!fixture.publishes("in", "t/1"));
+
+        fixture.run_ok(json!([
+            { "command": "modifyGroup", "groupname": "g", "textname": "Field",
+              "roles": [{ "rolename": "allow" }],
+              "clients": [{ "username": "out", "priority": 4 }] },
+        ]));
+        let shown = fixture.run_ok(json!([
+            { "command": "getGroup", "groupname": "g" },
+            { "command": "getClient", "username": "out" },
+            { "command": "getClient", "username": "in" },
+        ]));
+        let group = &shown[0]["data"]["group"];
+        assert_eq!(group["textname"], "Field");
+        assert_eq!(group["roles"], json!([{ "rolename": "allow" }]));
+        assert_eq!(
+            group["clients"],
+            json!([{ "username": "out", "priority": 4 }])
+        );
+        assert_eq!(
+            shown[1]["data"]["client"]["groups"],
+            json!([{ "groupname": "g", "priority": 4 }])
+        );
+        assert_eq!(shown[2]["data"]["client"]["groups"], json!([]));
+        assert!(fixture.publishes("out", "t/1"));
+
+        // Absent lists stay as they are
+        fixture.run_ok(json!([
+            { "command": "modifyGroup", "groupname": "g", "textdescription": "Outdoors" },
+        ]));
+        assert!(fixture.publishes("out", "t/1"));
+
+        for bad in [
+            json!({ "command": "modifyGroup", "groupname": "g", "textname": "X",
+                    "roles": [{ "rolename": "deny" }], "clients": [{ "username": "nobody" }] }),
+            json!({ "command": "modifyGroup", "groupname": "g", "textname": "X",
+                    "clients": [{ "username": "in" }], "roles": [{ "rolename": "missing" }] }),
+            json!({ "command": "modifyGroup", "groupname": "missing", "textname": "X" }),
+        ] {
+            let responses = run(&fixture.security, json!([bad]));
+            assert!(responses[0].get("error").is_some(), "{bad}");
+        }
+        let shown = fixture.run_ok(json!([{ "command": "getGroup", "groupname": "g" }]));
+        let group = &shown[0]["data"]["group"];
+        assert_eq!(group["textname"], "Field");
+        assert_eq!(group["textdescription"], "Outdoors");
+        assert_eq!(
+            group["clients"],
+            json!([{ "username": "out", "priority": 4 }])
+        );
+        assert!(fixture.publishes("out", "t/1"));
+    }
+
+    /// A file as mosquitto's plugin writes it. `admin`'s password is
+    /// "secret", hashed by mosquitto_passwd 2.0.18 as in `credentials.rs`.
+    const MOSQUITTO_FILE: &str = r##"{
+      "defaultACLAccess": {
+        "publishClientSend": true, "publishClientReceive": true,
+        "subscribe": false, "unsubscribe": false
+      },
+      "clients": [{
+        "username": "admin", "textName": "Dynsec admin user",
+        "roles": [{ "rolename": "admin" }],
+        "password": "1FhG/H49+FnZ9qx8YFDOUZOiE+Yd+yOKjQ9AzfsTHwepsiXOTbzCSojC7kA3U/VicSJdksyipSowQpvFhpo0iQ==",
+        "salt": "lT8RRynk8Dr5uL1b", "iterations": 101
+      }, {
+        "username": "sensor", "clientid": "dev1", "textname": "Sensor",
+        "textdescription": "On the roof", "disabled": true,
+        "roles": [{ "rolename": "reader", "priority": 3 }, { "rolename": "gone" }]
+      }, {
+        "username": "legacy", "password": "c2VjcmV0"
+      }],
+      "groups": [{
+        "groupname": "field", "textname": "Field devices",
+        "roles": [{ "rolename": "writer", "priority": 2 }],
+        "clients": [{ "username": "sensor", "priority": 5 }, { "username": "nobody" }]
+      }, {
+        "groupname": "guests", "roles": [{ "rolename": "reader" }]
+      }],
+      "roles": [{
+        "rolename": "admin",
+        "acls": [
+          { "acltype": "publishClientSend", "topic": "$CONTROL/dynamic-security/#",
+            "allow": true },
+          { "acltype": "unsubscribePattern", "topic": "#", "allow": true }
+        ]
+      }, {
+        "rolename": "reader", "textdescription": "Reads news",
+        "acls": [{ "acltype": "subscribePattern", "topic": "news/#", "priority": 1,
+                   "allow": true }]
+      }, {
+        "rolename": "writer",
+        "acls": [{ "acltype": "publishClientSend", "topic": "news/#", "allow": false }]
+      }],
+      "anonymousGroup": "guests"
+    }"##;
+
+    /// Paths for a mosquitto file holding `contents` and a target beside it.
+    fn import_paths(name: &str, contents: &str) -> (String, String) {
+        let dir = std::env::temp_dir();
+        let source = dir.join(format!(
+            "mercuriod-import-{name}-{}.json",
+            std::process::id()
+        ));
+        let target = dir.join(format!("mercuriod-imported-{name}-{}", std::process::id()));
+        std::fs::write(&source, contents).unwrap();
+        let _ = std::fs::remove_file(&target);
+        (
+            source.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_import_converts_a_mosquitto_file() {
+        let (source, target) = import_paths("full", MOSQUITTO_FILE);
+        let notes = DynamicSecurity::import(&source, &target).unwrap();
+        let security = DynamicSecurity::load(&target).unwrap();
+
+        // Mosquitto's PBKDF2 hashes keep working
+        assert!(security.check_password("admin", b"secret", "any"));
+        assert!(!security.check_password("admin", b"wrong", "any"));
+        assert_eq!(
+            security
+                .authorize_control(&identity("admin"), COMMAND_TOPIC)
+                .await,
+            Decision::Allow
+        );
+
+        let shown = run(
+            &security,
+            json!([
+                { "command": "getClient", "username": "sensor" },
+                { "command": "getGroup", "groupname": "field" },
+                { "command": "getRole", "rolename": "reader" },
+                { "command": "getAnonymousGroup" },
+                { "command": "getDefaultACLAccess" },
+                { "command": "getClient", "username": "admin" },
+            ]),
+        );
+        let sensor = &shown[0]["data"]["client"];
+        assert_eq!(sensor["clientid"], "dev1");
+        assert_eq!(sensor["textname"], "Sensor");
+        assert_eq!(sensor["textdescription"], "On the roof");
+        assert_eq!(sensor["disabled"], true);
+        assert_eq!(
+            sensor["roles"],
+            json!([{ "rolename": "reader", "priority": 3 }])
+        );
+        assert_eq!(
+            sensor["groups"],
+            json!([{ "groupname": "field", "priority": 5 }])
+        );
+        let field = &shown[1]["data"]["group"];
+        assert_eq!(field["textname"], "Field devices");
+        assert_eq!(
+            field["roles"],
+            json!([{ "rolename": "writer", "priority": 2 }])
+        );
+        let reader = &shown[2]["data"]["role"];
+        assert_eq!(reader["textdescription"], "Reads news");
+        assert_eq!(reader["acls"][0]["priority"], 1);
+        assert_eq!(shown[3]["data"]["group"]["groupname"], "guests");
+        assert_eq!(
+            shown[4]["data"]["acls"],
+            json!([
+                { "acltype": "publishClientSend", "allow": true },
+                { "acltype": "publishClientReceive", "allow": true },
+                { "acltype": "subscribe", "allow": false },
+            ])
+        );
+        assert_eq!(shown[5]["data"]["client"]["textname"], "Dynsec admin user");
+
+        // Anonymous clients get the anonymous group's roles
+        let anonymous = ClientInfo::new("a", None);
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Allow
+        );
+
+        // What could not come along is reported
+        for expected in [
+            "unsubscribe",
+            "unsubscribePattern",
+            "gone",
+            "nobody",
+            "legacy",
+        ] {
+            assert!(
+                notes.iter().any(|note| note.contains(expected)),
+                "{expected}: {notes:?}"
+            );
+        }
+        assert!(!security.check_password("legacy", b"secret", "any"));
+
+        // A password set again is hashed with Argon2
+        run(
+            &security,
+            json!([{ "command": "setClientPassword", "username": "admin", "password": "n3w" }]),
+        );
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let admin = saved["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["username"] == "admin")
+            .unwrap();
+        assert!(admin["password"].as_str().unwrap().starts_with("$argon2"));
+        assert!(security.check_password("admin", b"n3w", "any"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn test_import_refuses_to_overwrite_and_does_not_quote_the_file() {
+        let (source, target) = import_paths("exists", MOSQUITTO_FILE);
+        std::fs::write(&target, "keep").unwrap();
+        let error = DynamicSecurity::import(&source, &target).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        std::fs::remove_file(&target).unwrap();
+
+        std::fs::write(
+            &source,
+            r#"{"clients": [{"username": 5, "password": "SECRET"}]}"#,
+        )
+        .unwrap();
+        let error = DynamicSecurity::import(&source, &target).unwrap_err();
+        assert!(!error.contains("SECRET"), "{error}");
+        assert!(!Path::new(&target).exists());
+        std::fs::remove_file(&source).unwrap();
+    }
+
+    #[test]
+    fn test_files_without_priorities_still_load() {
+        let fixture = Fixture::new("released");
+        // As the released version writes it
+        std::fs::write(
+            &fixture.path,
+            r#"{
+              "defaultAclAccess": { "publishClientSend": false, "publishClientReceive": true,
+                                    "subscribe": false },
+              "clients": [{ "username": "c", "disabled": false, "roles": ["deny", "allow"],
+                            "groups": ["g"] }],
+              "roles": [
+                { "rolename": "deny", "acls": [{ "acltype": "publishClientSend",
+                  "topic": "t/#", "priority": 0, "allow": false }] },
+                { "rolename": "allow", "acls": [{ "acltype": "publishClientSend",
+                  "topic": "t/#", "priority": 9, "allow": true }] }
+              ],
+              "groups": [{ "groupname": "g", "roles": ["allow"] }]
+            }"#,
+        )
+        .unwrap();
+        fixture.security.reload().unwrap();
+        assert!(!fixture.publishes("c", "t/1"));
+
+        // Saved again, roles without a priority stay plain names
+        fixture.run_ok(json!([{ "command": "createRole", "rolename": "x" }]));
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture.path).unwrap()).unwrap();
+        assert_eq!(saved["clients"][0]["roles"], json!(["deny", "allow"]));
+        assert_eq!(saved["groups"][0]["roles"], json!(["allow"]));
+
+        fixture.run_ok(json!([
+            { "command": "addClientRole", "username": "c", "rolename": "allow", "priority": 1 },
+        ]));
+        fixture.security.reload().unwrap();
+        assert!(fixture.publishes("c", "t/1"));
     }
 
     #[test]

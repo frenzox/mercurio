@@ -1234,12 +1234,27 @@ pub struct HttpAuthConfig {
     #[serde(serialize_with = "redact_some_url")]
     pub acl_url: Option<String>,
 
+    /// Names superusers, whom no `acl_url` check restricts and who may
+    /// administer the broker
+    #[serde(serialize_with = "redact_some_url")]
+    pub superuser_url: Option<String>,
+
     #[serde(default = "default_http_timeout")]
     pub timeout_seconds: u64,
 
     /// How long ACL answers are reused
     #[serde(default = "default_http_cache")]
     pub cache_seconds: u64,
+
+    /// PEM certificates of the CAs that HTTPS endpoints' certificates must
+    /// chain to, in place of the bundled roots
+    pub ca_path: Option<String>,
+
+    /// PEM certificate chain presented to HTTPS endpoints that ask for one
+    pub cert_path: Option<String>,
+
+    /// PEM private key of `cert_path`
+    pub key_path: Option<String>,
 }
 
 fn default_http_timeout() -> u64 {
@@ -1785,7 +1800,9 @@ mod tests {
         let config = Config::deserialize(table).unwrap();
         assert!(config.include_dir.is_some());
         assert!(config.server.redirect.is_some());
-        assert!(config.auth.http.is_some());
+        let http = config.auth.http.as_ref().unwrap();
+        assert!(http.ca_path.is_some() && http.cert_path.is_some() && http.key_path.is_some());
+        assert!(http.superuser_url.is_some());
         assert!(config.listeners.iter().any(|l| l.auth.is_some()));
         assert!(config.listeners.iter().any(|l| l.health && l.metrics));
         assert!(config.bridges.iter().any(|b| !b.topics.is_empty()));
@@ -1893,6 +1910,7 @@ mod tests {
             [auth.http]
             user_url = "https://svc:SECRET-user@auth.example.com/user?token=SECRET-tok"
             acl_url = "https://auth.example.com/acl?api_key=SECRET-key"
+            superuser_url = "https://svc:SECRET-su@auth.example.com/su"
 
             [[listeners]]
             port = 1884

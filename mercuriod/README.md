@@ -36,6 +36,7 @@ cargo build --release --package mercuriod
 mercuriod [OPTIONS]
 mercuriod passwd -f <FILE> -u <USER> [-d]
 mercuriod dynsec-init -f <FILE> [-u <USER>]
+mercuriod dynsec-import <MOSQUITTO FILE> <FILE>
 ```
 
 | Option | Description | Default |
@@ -294,9 +295,19 @@ allow_anonymous = false
 # [auth.http]
 # user_url = "http://auth.internal/mqtt/user"
 # acl_url = "http://auth.internal/mqtt/acl"
+# A 2xx answer for a user name makes it a superuser: no acl_url check
+# restricts it, and it may administer the broker over $CONTROL. Only with
+# authentication enabled
+# superuser_url = "http://auth.internal/mqtt/superuser"
 # No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
+# For https:// endpoints: CA certificates their certificates must chain to,
+# in place of the bundled roots, and a client certificate with its key for
+# endpoints that ask for one. Each file is PEM.
+# ca_path = "/etc/mercurio/auth-ca.pem"
+# cert_path = "/etc/mercurio/auth-client.pem"
+# key_path = "/etc/mercurio/auth-client-key.pem"
 
 [admin]
 # Unix socket for administering the broker from this machine, as mercurioctl
@@ -317,7 +328,7 @@ group = "mercurio"
 # host = "0.0.0.0"
 # port = 8883
 # [listeners.tls]
-# enabled = true
+# authentication enabled
 # cert_path = "/etc/mercurio/server.crt"
 # key_path = "/etc/mercurio/server.key"
 #
@@ -379,7 +390,7 @@ group = "mercurio"
 # Names of the [[plugins]] its clients go through; all of them when unset
 # plugins = ["deny"]
 # [listeners.auth]
-# enabled = true
+# authentication enabled
 # allow_anonymous = false
 # password_file = "/etc/mercurio/tenant1.passwd"
 
@@ -401,7 +412,7 @@ group = "mercurio"
 # client id must be a single topic level, without `/`, `+` or `#`
 # [bridges.tls]
 # TLS with the system's root certificates
-# enabled = true
+# authentication enabled
 # A CA, or a client certificate, turns TLS on even without `enabled`
 # ca_path = "/etc/mercurio/cloud-ca.crt"
 # Client certificate, for brokers that require mutual TLS; both or neither
@@ -507,6 +518,20 @@ can read it. systemd creates that directory when the service first starts:
 start it once before, with `systemctl start mercuriod`, if it has never
 run.
 
+Coming from mosquitto, create it from the plugin's file instead:
+
+```bash
+sudo mercuriod dynsec-import /var/lib/mosquitto/dynamic-security.json \
+    /var/lib/mercurio/dynamic-security.json
+```
+
+It carries over clients, groups, roles, ACLs, priorities, the default
+access and the anonymous group, gives the file to its directory's owner as
+`dynsec-init` does, and never overwrites a file. Passwords keep working:
+mosquitto's PBKDF2-SHA512 hashes are checked as they are, and stored as
+Argon2 once set again. What it leaves out, such as unsubscribe ACLs, it
+lists.
+
 The administrator manages it with `mercurioctl`, which names mosquitto's
 commands in kebab-case, as `mosquitto_ctrl` does:
 
@@ -519,11 +544,12 @@ mercurioctl dynsec create-client s1 --role sensor   # asks for the password
 Underneath, these are JSON commands on `$CONTROL/dynamic-security/v1`, in
 the format of mosquitto's plugin.
 
-Supported commands: `createClient`, `deleteClient`, `setClientPassword`,
-`enableClient`, `disableClient`, `addClientRole`, `removeClientRole`,
-`getClient`, `listClients`, `createRole`, `deleteRole`, `addRoleACL`,
-`removeRoleACL`, `getRole`, `listRoles`, `setDefaultACLAccess` and
-`getDefaultACLAccess`, and for groups `createGroup`, `deleteGroup`,
+Supported commands: `createClient`, `modifyClient`, `deleteClient`,
+`setClientPassword`, `enableClient`, `disableClient`, `addClientRole`,
+`removeClientRole`, `getClient`, `listClients`, `createRole`, `modifyRole`,
+`deleteRole`, `addRoleACL`, `removeRoleACL`, `getRole`, `listRoles`,
+`setDefaultACLAccess` and `getDefaultACLAccess`, and for groups
+`createGroup`, `modifyGroup`, `deleteGroup`,
 `addGroupRole`, `removeGroupRole`, `addGroupClient`, `removeGroupClient`,
 `getGroup`, `listGroups`, `setAnonymousGroup` and `getAnonymousGroup`. A
 client created with a `clientid` may connect only with that client id. A
@@ -532,9 +558,11 @@ access at all; create a client of that name, without a password, to give
 it roles. A client has its own roles and those of its groups; clients without a user
 name get those of the anonymous group. ACLs of type `publishClientSend`
 decide publishing, `publishClientReceive` receiving, and
-`subscribePattern` and `subscribeLiteral` subscribing. The ACL with the
-highest `priority` wins, whichever role holds it; roles and groups have no
-priority of their own, and commands giving them one fail. Without a matching ACL, only receiving is allowed, unless
+`subscribePattern` and `subscribeLiteral` subscribing. As in mosquitto, a
+check walks the client's own roles, then its groups' roles, group by group,
+each list highest `priority` first (-1 when none is given), and within a
+role its ACLs by their `priority`; the first ACL that matches decides.
+Without a matching ACL, only receiving is allowed, unless
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
 As in mosquitto, a change that can take access away disconnects the
 connected clients it concerns, with Administrative Action (0x98), so they
@@ -554,7 +582,14 @@ topic check, it POSTs
 `{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
 receive, 2 to publish and 4 to subscribe. A 2xx status allows; anything else, a timeout
 included, denies. Topic answers are reused for `cache_seconds`, since
-every message is checked. `user_url` replaces `password_file` and
+every message is checked. With `superuser_url`, the broker first POSTs
+`{"username"}` there; a 2xx answer, cached like topic answers, makes the
+user a superuser, allowed every topic and `$CONTROL` without asking
+`acl_url`. Anything else, a failure included, means not a superuser. Over
+`https://`, `ca_path` names the CA
+certificates endpoints' certificates must chain to, in place of the bundled
+roots, and `cert_path` and `key_path` a client certificate for endpoints
+that ask for one. `user_url` replaces `password_file` and
 `acl_url` replaces `acl_file`.
 
 ### Reloading

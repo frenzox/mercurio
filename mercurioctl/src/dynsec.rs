@@ -50,12 +50,44 @@ pub enum Dynsec {
         #[command(flatten)]
         source: PasswordSource,
     },
+    /// Change what is given of a client; lists replace the whole list
+    ModifyClient {
+        username: String,
+        /// Its new password, which other users can see in `ps`
+        #[arg(long, conflicts_with_all = ["password_file", "password_stdin"])]
+        password: Option<String>,
+        #[command(flatten)]
+        source: PasswordSource,
+        /// The only client id it may connect with; "" for any
+        #[arg(long)]
+        clientid: Option<String>,
+        #[command(flatten)]
+        text: Text,
+        /// Its roles, all of them, with priority -1 (can be repeated)
+        #[arg(long = "role", value_name = "ROLENAME", conflicts_with = "no_roles")]
+        roles: Vec<String>,
+        /// Take every role from it
+        #[arg(long)]
+        no_roles: bool,
+        /// Its groups, all of them, with priority -1 (can be repeated)
+        #[arg(long = "group", value_name = "GROUPNAME", conflicts_with = "no_groups")]
+        groups: Vec<String>,
+        /// Take it out of every group
+        #[arg(long)]
+        no_groups: bool,
+    },
     /// Let a disabled client log in again
     EnableClient { username: String },
     /// Stop a client from logging in, and take its access away at once
     DisableClient { username: String },
-    /// Give a client a role
-    AddClientRole { username: String, rolename: String },
+    /// Give a client a role, or change the role's priority
+    AddClientRole {
+        username: String,
+        rolename: String,
+        /// Its roles are checked highest priority first [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Take a role from a client
     RemoveClientRole { username: String, rolename: String },
     /// Show a client with its roles and groups
@@ -71,16 +103,51 @@ pub enum Dynsec {
     },
     /// Delete a group
     DeleteGroup { groupname: String },
+    /// Change what is given of a group; lists replace the whole list
+    ModifyGroup {
+        groupname: String,
+        #[command(flatten)]
+        text: Text,
+        /// Its roles, all of them, with priority -1 (can be repeated)
+        #[arg(long = "role", value_name = "ROLENAME", conflicts_with = "no_roles")]
+        roles: Vec<String>,
+        /// Take every role from it
+        #[arg(long)]
+        no_roles: bool,
+        /// Its clients, all of them, with priority -1 (can be repeated)
+        #[arg(
+            long = "client",
+            value_name = "USERNAME",
+            conflicts_with = "no_clients"
+        )]
+        clients: Vec<String>,
+        /// Take every client out of it
+        #[arg(long)]
+        no_clients: bool,
+    },
     /// Show a group with its roles and clients
     GetGroup { groupname: String },
     /// List the groups
     ListGroups,
-    /// Give a group a role
-    AddGroupRole { groupname: String, rolename: String },
+    /// Give a group a role, or change the role's priority
+    AddGroupRole {
+        groupname: String,
+        rolename: String,
+        /// Its roles are checked highest priority first [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Take a role from a group
     RemoveGroupRole { groupname: String, rolename: String },
-    /// Add a client to a group
-    AddGroupClient { groupname: String, username: String },
+    /// Add a client to a group, or change the group's priority for it
+    AddGroupClient {
+        groupname: String,
+        username: String,
+        /// The client's groups are checked highest priority first
+        /// [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Remove a client from a group
     RemoveGroupClient { groupname: String, username: String },
     /// Give clients without a user name the roles of this group
@@ -91,6 +158,25 @@ pub enum Dynsec {
     CreateRole { rolename: String },
     /// Delete a role
     DeleteRole { rolename: String },
+    /// Change what is given of a role; ACLs replace all of its ACLs
+    ModifyRole {
+        rolename: String,
+        #[command(flatten)]
+        text: Text,
+        /// An ACL: its type, topic filter, `allow` or `deny`, and priority
+        /// (can be repeated)
+        #[arg(
+            long = "acl",
+            num_args = 4,
+            value_names = ["ACLTYPE", "TOPIC", "ACCESS", "PRIORITY"],
+            allow_negative_numbers = true,
+            conflicts_with = "no_acls"
+        )]
+        acls: Vec<String>,
+        /// Remove every ACL
+        #[arg(long)]
+        no_acls: bool,
+    },
     /// Show a role with its ACLs
     GetRole { rolename: String },
     /// List the roles
@@ -104,8 +190,8 @@ pub enum Dynsec {
         topic: String,
         #[arg(value_parser = ["allow", "deny"])]
         access: String,
-        /// The highest priority wins among a client's matching ACLs
-        /// [default: 0]
+        /// A role's ACLs are checked highest priority first [default: 0]
+        #[arg(allow_negative_numbers = true)]
         priority: Option<i64>,
     },
     /// Remove a role's ACL
@@ -124,6 +210,55 @@ pub enum Dynsec {
     },
     /// Show what clients may do where no ACL decides
     GetDefaultAclAccess,
+}
+
+/// The free text of a client, group or role; "" clears it.
+#[derive(Args, Debug)]
+pub struct Text {
+    /// A name for people
+    #[arg(long)]
+    textname: Option<String>,
+    /// A description for people
+    #[arg(long)]
+    textdescription: Option<String>,
+}
+
+/// The list a `modify-*` command sends: those given, none when `none` is
+/// set, or nothing, leaving the list as it is.
+fn list(names: Vec<String>, none: bool, key: &str) -> Option<Vec<Value>> {
+    (none || !names.is_empty())
+        .then(|| names.into_iter().map(|name| json!({ key: name })).collect())
+}
+
+/// The ACLs of `modify-role --acl`, each its type, topic, access and
+/// priority.
+fn acls(given: &[String]) -> Result<Vec<Value>, Failure> {
+    given
+        .chunks(4)
+        .map(|acl| {
+            let usage = |what: &str| Failure::Usage(format!("--acl {}: {what}", acl.join(" ")));
+            let [acltype, topic, access, priority] = acl else {
+                return Err(usage(
+                    "takes a type, a topic, allow or deny, and a priority",
+                ));
+            };
+            if !ACL_TYPES.contains(&acltype.as_str()) {
+                return Err(usage(&format!(
+                    "the type is one of {}",
+                    ACL_TYPES.join(", ")
+                )));
+            }
+            let allow = match access.as_str() {
+                "allow" => true,
+                "deny" => false,
+                _ => return Err(usage("the access is allow or deny")),
+            };
+            let priority: i64 = priority
+                .parse()
+                .map_err(|_| usage("the priority is a whole number"))?;
+            Ok(json!({ "acltype": acltype, "topic": topic, "allow": allow, "priority": priority }))
+        })
+        .collect()
 }
 
 /// Where a new client password comes from, for scripts, instead of the
@@ -232,13 +367,39 @@ pub fn command(
                 json!({ "username": username, "password": password }),
             )
         }
+        Dynsec::ModifyClient {
+            username,
+            password,
+            source,
+            clientid,
+            text,
+            roles,
+            no_roles,
+            groups,
+            no_groups,
+        } => named(
+            "modifyClient",
+            json!({
+                "username": username,
+                "password": password.or(source.read()?),
+                "clientid": clientid,
+                "textname": text.textname,
+                "textdescription": text.textdescription,
+                "roles": list(roles, no_roles, "rolename"),
+                "groups": list(groups, no_groups, "groupname"),
+            }),
+        ),
         Dynsec::EnableClient { username } => named("enableClient", json!({ "username": username })),
         Dynsec::DisableClient { username } => {
             named("disableClient", json!({ "username": username }))
         }
-        Dynsec::AddClientRole { username, rolename } => named(
+        Dynsec::AddClientRole {
+            username,
+            rolename,
+            priority,
+        } => named(
             "addClientRole",
-            json!({ "username": username, "rolename": rolename }),
+            json!({ "username": username, "rolename": rolename, "priority": priority }),
         ),
         Dynsec::RemoveClientRole { username, rolename } => named(
             "removeClientRole",
@@ -253,14 +414,32 @@ pub fn command(
         Dynsec::DeleteGroup { groupname } => {
             named("deleteGroup", json!({ "groupname": groupname }))
         }
+        Dynsec::ModifyGroup {
+            groupname,
+            text,
+            roles,
+            no_roles,
+            clients,
+            no_clients,
+        } => named(
+            "modifyGroup",
+            json!({
+                "groupname": groupname,
+                "textname": text.textname,
+                "textdescription": text.textdescription,
+                "roles": list(roles, no_roles, "rolename"),
+                "clients": list(clients, no_clients, "username"),
+            }),
+        ),
         Dynsec::GetGroup { groupname } => named("getGroup", json!({ "groupname": groupname })),
         Dynsec::ListGroups => named("listGroups", json!({})),
         Dynsec::AddGroupRole {
             groupname,
             rolename,
+            priority,
         } => named(
             "addGroupRole",
-            json!({ "groupname": groupname, "rolename": rolename }),
+            json!({ "groupname": groupname, "rolename": rolename, "priority": priority }),
         ),
         Dynsec::RemoveGroupRole {
             groupname,
@@ -272,9 +451,10 @@ pub fn command(
         Dynsec::AddGroupClient {
             groupname,
             username,
+            priority,
         } => named(
             "addGroupClient",
-            json!({ "groupname": groupname, "username": username }),
+            json!({ "groupname": groupname, "username": username, "priority": priority }),
         ),
         Dynsec::RemoveGroupClient {
             groupname,
@@ -289,6 +469,20 @@ pub fn command(
         Dynsec::GetAnonymousGroup => named("getAnonymousGroup", json!({})),
         Dynsec::CreateRole { rolename } => named("createRole", json!({ "rolename": rolename })),
         Dynsec::DeleteRole { rolename } => named("deleteRole", json!({ "rolename": rolename })),
+        Dynsec::ModifyRole {
+            rolename,
+            text,
+            acls: given,
+            no_acls,
+        } => named(
+            "modifyRole",
+            json!({
+                "rolename": rolename,
+                "textname": text.textname,
+                "textdescription": text.textdescription,
+                "acls": (no_acls || !given.is_empty()).then(|| acls(&given)).transpose()?,
+            }),
+        ),
         Dynsec::GetRole { rolename } => named("getRole", json!({ "rolename": rolename })),
         Dynsec::ListRoles => named("listRoles", json!({})),
         Dynsec::AddRoleAcl {
@@ -507,6 +701,161 @@ mod tests {
     }
 
     #[test]
+    fn modify_commands_send_only_what_is_given() {
+        assert_eq!(
+            sent(&["modify-client", "alice", "--textname", "Alice"]),
+            json!({"command": "modifyClient", "username": "alice", "textname": "Alice"})
+        );
+        assert_eq!(
+            sent(&[
+                "modify-client",
+                "alice",
+                "--password",
+                "n3w",
+                "--clientid",
+                "",
+                "--textdescription",
+                "Roof",
+                "--role",
+                "a",
+                "--role",
+                "b",
+                "--no-groups",
+            ]),
+            json!({
+                "command": "modifyClient", "username": "alice", "password": "n3w",
+                "clientid": "", "textdescription": "Roof",
+                "roles": [{"rolename": "a"}, {"rolename": "b"}], "groups": [],
+            })
+        );
+        assert_eq!(
+            sent(&["modify-client", "alice", "--group", "g", "--no-roles"]),
+            json!({
+                "command": "modifyClient", "username": "alice",
+                "roles": [], "groups": [{"groupname": "g"}],
+            })
+        );
+        assert_eq!(
+            sent(&["modify-group", "field", "--role", "r", "--client", "alice"]),
+            json!({
+                "command": "modifyGroup", "groupname": "field",
+                "roles": [{"rolename": "r"}], "clients": [{"username": "alice"}],
+            })
+        );
+        assert_eq!(
+            sent(&["modify-group", "field", "--textname", "F", "--no-clients"]),
+            json!({
+                "command": "modifyGroup", "groupname": "field", "textname": "F", "clients": [],
+            })
+        );
+        assert_eq!(
+            sent(&[
+                "modify-role",
+                "sensors",
+                "--acl",
+                "publishClientSend",
+                "sensors/#",
+                "allow",
+                "0",
+                "--acl",
+                "subscribeLiteral",
+                "admin",
+                "deny",
+                "-3",
+            ]),
+            json!({
+                "command": "modifyRole", "rolename": "sensors", "acls": [
+                    {"acltype": "publishClientSend", "topic": "sensors/#", "allow": true,
+                     "priority": 0},
+                    {"acltype": "subscribeLiteral", "topic": "admin", "allow": false,
+                     "priority": -3},
+                ],
+            })
+        );
+        assert_eq!(
+            sent(&["modify-role", "sensors", "--no-acls", "--textname", "S"]),
+            json!({"command": "modifyRole", "rolename": "sensors", "textname": "S", "acls": []})
+        );
+
+        for wrong in [
+            &["modify-client", "a", "--role", "r", "--no-roles"][..],
+            &["modify-group", "g", "--client", "c", "--no-clients"],
+            &["modify-role", "r", "--acl", "publish", "t", "allow", "0"],
+            &[
+                "modify-role",
+                "r",
+                "--acl",
+                "publishClientSend",
+                "t",
+                "maybe",
+                "0",
+            ],
+            &[
+                "modify-role",
+                "r",
+                "--acl",
+                "publishClientSend",
+                "t",
+                "allow",
+                "high",
+            ],
+            &[
+                "modify-role",
+                "r",
+                "--acl",
+                "publishClientSend",
+                "t",
+                "allow",
+            ],
+        ] {
+            let parsed = ["mercurioctl", "dynsec"]
+                .into_iter()
+                .chain(wrong.iter().copied());
+            let refused = match Cli::try_parse_from(parsed) {
+                Err(_) => true,
+                Ok(cli) => match cli.command {
+                    Command::Dynsec(command) => {
+                        super::command(command, |_| panic!("asked for a password")).is_err()
+                    }
+                    _ => false,
+                },
+            };
+            assert!(refused, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn roles_and_groups_take_a_priority() {
+        assert_eq!(
+            sent(&["add-client-role", "alice", "sensors", "5"]),
+            json!({
+                "command": "addClientRole", "username": "alice", "rolename": "sensors",
+                "priority": 5,
+            })
+        );
+        assert_eq!(
+            sent(&["add-group-role", "field", "sensors", "-2"]),
+            json!({
+                "command": "addGroupRole", "groupname": "field", "rolename": "sensors",
+                "priority": -2,
+            })
+        );
+        assert_eq!(
+            sent(&["add-group-client", "field", "alice", "3"]),
+            json!({
+                "command": "addGroupClient", "groupname": "field", "username": "alice",
+                "priority": 3,
+            })
+        );
+        assert_eq!(
+            sent(&["add-role-acl", "r", "subscribePattern", "t", "deny", "-1"])["priority"],
+            -1
+        );
+        let argv = ["mercurioctl", "dynsec", "add-client-role", "a", "r", "high"];
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+
+    #[test]
     fn passwords_come_from_a_file_or_standard_input() {
         let file = std::env::temp_dir().join(format!("mercurioctl-pw-{}", std::process::id()));
         std::fs::write(&file, "from-file\r\nignored\n").unwrap();
@@ -522,6 +871,12 @@ mod tests {
             |_| panic!("asked for a password"),
         )
         .unwrap();
+        let modified = super::command(
+            parse(&["modify-client", "alice", "--password-file", path]),
+            |_| panic!("asked for a password"),
+        )
+        .unwrap();
+        assert_eq!(modified["password"], "from-file");
         std::fs::remove_file(&file).unwrap();
         assert_eq!(changed["password"], "from-file");
 

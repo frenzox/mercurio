@@ -104,6 +104,13 @@ enum Commands {
         #[arg(short = 'u', long, default_value = "admin")]
         username: String,
     },
+    /// Create a dynamic security file from mosquitto's dynamic-security.json
+    DynsecImport {
+        /// The file of mosquitto's dynamic security plugin
+        mosquitto: String,
+        /// Path of the file to create
+        file: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -155,6 +162,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let password = prompt_new_password(&username)?;
             DynamicSecurity::init(&file, &username, &password)?;
             eprintln!("Created `{}` with administrator `{}`", file, username);
+            return Ok(());
+        }
+        Some(Commands::DynsecImport { mosquitto, file }) => {
+            for note in DynamicSecurity::import(&mosquitto, &file)? {
+                eprintln!("Not imported: {note}");
+            }
+            eprintln!("Created `{file}` from `{mosquitto}`");
             return Ok(());
         }
         None => {}
@@ -659,6 +673,13 @@ fn build_auth(
             "user_url",
             config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
         ),
+        (
+            "superuser_url",
+            config
+                .http
+                .as_ref()
+                .is_some_and(|h| h.superuser_url.is_some()),
+        ),
     ];
     if let Some((key, _)) = authenticating
         .iter()
@@ -686,15 +707,14 @@ fn build_auth(
         return Ok((value, vec![security.clone()], Some(security)));
     }
 
-    let http = config.http.as_ref().map(|http| {
-        let auth = Arc::new(HttpAuth::new(
-            http.user_url.clone(),
-            http.acl_url.clone(),
-            Duration::from_secs(http.timeout_seconds),
-            Duration::from_secs(http.cache_seconds),
-        ));
-        (auth, http.user_url.is_some(), http.acl_url.is_some())
-    });
+    let http = match &config.http {
+        Some(http) => Some((
+            Arc::new(HttpAuth::from_config(http)?),
+            http.user_url.is_some(),
+            http.acl_url.is_some(),
+        )),
+        None => None,
+    };
     let (http_users, http_acl) = http
         .as_ref()
         .map_or((false, false), |(_, users, acl)| (*users, *acl));
@@ -868,6 +888,11 @@ mod tests {
                 "dynamic_security",
             ),
             ("[http]\nuser_url = \"http://h/user\"\n", "user_url"),
+            // A user name nobody checked would make anyone a superuser
+            (
+                "[http]\nacl_url = \"http://h/acl\"\nsuperuser_url = \"http://h/su\"\n",
+                "superuser_url",
+            ),
         ] {
             for main in [true, false] {
                 let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
@@ -903,6 +928,18 @@ mod tests {
         std::fs::remove_file(&acl).unwrap();
         let (value, plugins, _) = result.map_err(|e| panic!("{e}")).unwrap();
         assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_a_superuser_endpoint_alone_is_used() {
+        let (_, plugins, _) = build_auth(
+            &auth("enabled = true\n[http]\nsuperuser_url = \"http://h/su\"\n"),
+            &mut Vec::new(),
+            true,
+        )
+        .map_err(|e| panic!("{e}"))
+        .unwrap();
         assert_eq!(plugins.len(), 1);
     }
 
