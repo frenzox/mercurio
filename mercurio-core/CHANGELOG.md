@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-core-v0.2.0...mercurio-core-v0.3.0) - 2026-11-11
+
+### Added
+
+- *(server)* [**breaking**] hand a departed share member's messages to its group
+- *(core)* [**breaking**] make encoding fallible and refuse what peers must reject
+- *(packets)* derive Clone on every packet and add packet_type()
+
+### Fixed
+
+- *(packets)* [**breaking**] refuse reason codes their packet type does not list
+- *(packets)* [**breaking**] refuse Authentication Data without Authentication Method
+- *(core)* [**breaking**] refuse Variable Byte Integers longer than their value needs
+- *(core)* [**breaking**] require every Encoder to compute its encoded size
+- check that a granted filter covers the filter a client subscribes to
+
+### Other
+
+- *(server)* [**breaking**] give the broker its own error type
+- Merge branch 'chore/workspace-manifests'
+- *(packets)* copy payloads and binary data as slices when encoding
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- *(packets)* [**breaking**] keep property decoding helpers private
+- *(core)* [**breaking**] check Variable Byte Integer and identifier ranges
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(core)* [**breaking**] rename Error::MQTTReasonCode to Error::Reason
+- *(core)* [**breaking**] give reason code 0x00 a single variant
+- *(packets)* decode every property list through one helper
+- build the core and packets tests without std
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-core-v0.1.1...mercurio-core-v0.2.0) - 2026-11-08
 
 ### Fixed

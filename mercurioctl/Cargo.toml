@@ -1,6 +1,6 @@
 [package]
 name = "mercurioctl"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Command-line administration for the Mercurio MQTT broker"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-mercurio-client = { path = "../mercurio-client", version = "0.4.1", features = ["clap", "websocket"] }
+mercurio-client = { path = "../mercurio-client", version = "0.5.0", features = ["clap", "websocket"] }
 
 clap = { workspace = true, features = ["env"] }
 clap_complete.workspace = true

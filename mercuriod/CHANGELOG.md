@@ -7,6 +7,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.5...mercuriod-v0.5.0) - 2026-11-11
+
+### Added
+
+- *(server)* [**breaking**] start brokers through Server::builder
+- *(server)* [**breaking**] hand a departed share member's messages to its group
+- *(auth)* [**breaking**] let a failed authentication tell the client why
+- *(plugin)* [**breaking**] name the mount point of an expired session in WIT 0.2
+- *(server)* disconnect clients that stay over their publish rate
+- *(mercurioctl)* name the mount point of a client
+- *(server)* [**breaking**] give each mount point its own client id space
+- *(mercuriod)* reload the HTTP auth certificate files
+- *(server)* limit publish rates per client and connection rates per listener
+- *(server)* [**breaking**] ban addresses that keep failing to log in
+- *(server)* per-listener limits and user names as client ids
+- *(server)* choose how shared subscriptions pick their member
+- *(mercuriod)* store SCRAM-SHA-256 keys with passwords and offer SCRAM
+- *(server)* [**breaking**] cap sessions and let mercuriod sessions expire after a week
+- *(server)* let a full queue drop its oldest messages instead
+- *(plugin)* [**breaking**] hand plugins their settings as a Config with get and require
+- *(plugin)* let WebAssembly plugins publish messages
+- *(plugin)* [**breaking**] move the WebAssembly plugin interface to 0.2
+- *(http-auth)* add a superuser endpoint
+- *(http-auth)* verify endpoints with a custom CA and a client certificate
+- *(mercuriod)* configure bridge sessions, remote state and counters
+- *(mercuriod)* [**breaking**] notify systemd of readiness and run as Type=notify
+- *(mercuriod)* import mosquitto's dynamic-security.json
+- *(dynsec)* add modifyClient, modifyGroup and modifyRole
+- *(server)* serve /healthz and Prometheus /metrics on WebSocket listeners
+- *(dynsec)* [**breaking**] check roles and groups in mosquitto's priority order
+- *(server)* [**breaking**] keep $SYS retained messages in memory
+- *(server)* choose how far client CRLs reach and what they must cover
+- *(server)* serve a caller-supplied rustls configuration
+- *(server)* accept clients without a certificate where it is optional
+- *(server)* [**breaking**] count messages the broker drops, by cause and per client
+- *(server)* [**breaking**] reload TLS certificates without a restart
+- *(client)* [**breaking**] let the connector open the stream asynchronously
+- *(mercuriod)* add --check and validate everything before binding
+- *(mercuriod)* give Unix socket listeners a mode and a group
+- *(mercuriod)* [**breaking**] make plugin_timeout and the tick interval configurable
+- *(client)* [**breaking**] take connect_timeout as a Duration
+- *(mercuriod)* back off exponentially between bridge connection attempts
+- *(client)* [**breaking**] add manual acknowledgement of received messages
+- *(storage)* [**breaking**] make the PostgreSQL pool size and wait configurable
+- *(mercuriod)* disconnect clients a dynamic security change concerns
+- *(mercuriod)* warn when HTTP auth sends passwords in clear
+- *(mercuriod)* bind a dynamic security client to its clientid
+
+### Fixed
+
+- *(mercuriod)* let plugin publishes wait for the broker to serve
+- *(mercuriod)* check bridges with --check and before binding
+- *(storage)* version the SQLite schema and keep one broker per database
+- *(mercuriod)* keep bridge acknowledgements across cancelled forwarding
+- *(server)* store a client whole again after a batch is given up
+- *(server)* [**breaking**] keep the queues of connected persistent sessions in storage
+- *(storage)* [**breaking**] store subscription changes one at a time
+- *(server)* [**breaking**] require proxy_from with proxy_protocol on TCP listeners
+- *(server)* [**breaking**] refuse unknown admin arguments and log who changes things
+- *(server)* [**breaking**] let enhanced authentication send final data on success
+- *(mercuriod)* refuse to take over an admin socket another process serves
+- *(server)* [**breaking**] require the mqtt subprotocol and add allowed_origins
+- *(server)* [**breaking**] decide $CONTROL publishes with a hook of their own
+- *(mercuriod)* never let a plugin's sockets listen
+- *(mercuriod)* cap a plugin copy's memory across all its memories
+- *(mercuriod)* count calls the broker cancels as plugin failures
+- *(mercuriod)* [**breaking**] refuse password file entries that are not hashes
+- *(recado)* report arguments the client refuses as usage errors
+- *(mercuriod)* [**breaking**] forward bridged QoS 1 and 2 messages at least once
+- *(mercuriod)* [**breaking**] refuse bridge settings that collide or can't work
+- *(mercuriod)* give dynsec-init's file to the owner of its directory
+- *(storage)* [**breaking**] require TLS for remote PostgreSQL and when a CA is set
+- *(mercuriod)* install config.toml readable by root and mercurio only
+- *(mercuriod)* raise the unit's file limit and tighten its sandbox
+- *(mercuriod)* reconnect to syslog after the daemon restarts
+- *(mercuriod)* keep a starting broker alive on SIGHUP
+- *(mercuriod)* [**breaking**] deny all access to user names dynsec has no client for
+- *(server)* [**breaking**] count connections per address before handshakes, IPv6 by /64
+- *(mercuriod)* make unknown dynsec users cost a password check
+- *(mercuriod)* bound HTTP auth requests and share identical ones
+- *(mercuriod)* [**breaking**] refuse role and group priorities dynsec does not apply
+- *(server)* [**breaking**] cap CONNECT at 64 KiB until the client is authenticated
+- *(mercuriod)* stop caching HTTP auth failures as denials
+- *(mercuriod)* flush the dynamic security file to disk before renaming it
+- *(mercuriod)* apply setDefaultACLAccess only when every entry is valid
+- *(mercuriod)* bring bridges back when this broker drops their connection
+- *(mercuriod)* name the file and table in configuration errors
+- *(server)* [**breaking**] check sent credentials even when auth is not required
+- *(mercurio-server)* bound socket writes and the client id takeover wait
+- *(server)* [**breaking**] cap unacknowledged messages per client with max_inflight
+- *(mercuriod)* keep other users when passwd cannot read the password file
+- check that a granted filter covers the filter a client subscribes to
+- *(mercuriod)* [**breaking**] refuse authentication settings while auth is disabled
+- *(storage)* open SQLite databases in WAL mode
+- *(mercuriod)* [**breaking**] refuse configuration keys the daemon does not know
+- *(mercuriod)* keep $CONTROL closed under a permissive dynsec default
+
+### Other
+
+- Merge branch 'build/rand-argon2'
+- Merge branch 'feat/mount-point-client-ids'
+- *(mercuriod)* bump argon2 to 0.6
+- *(server)* drop rand for getrandom and std's RandomState
+- Merge branch 'chore/workspace-manifests'
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- move mercuriod to toml 1
+- Merge branch 'master' into refactor/codec-api
+- Merge branch 'fix/storage-read'
+- Merge branch 'feat/limits'
+- Merge branch 'feat/scram'
+- Merge branch 'feat/plugin-interface-0.2'
+- *(server)* format the limits work and satisfy clippy
+- describe SCRAM-SHA-256 logins
+- *(mercuriod)* keep the plugin panic log test from losing its log lines
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(mercuriod)* allow for the refill while a publish flood test runs
+- *(plugin)* describe interface 0.2 and what changes for 0.1 plugins
+- *(core)* [**breaking**] give reason code 0x00 a single variant
+- *(server)* [**breaking**] report storage health under one $SYS prefix
+- Merge branch 'feat/client-features'
+- Merge branch 'feat/auth-backends'
+- Merge branch 'fix/durability'
+- Merge branch 'feat/observability'
+- *(plugins)* give every plugin crate its own workspace
+- Merge branch 'feat/tls-reload'
+- Merge branch 'feat/client-api'
+- Merge branch 'fix/auth-admin'
+- Merge branch 'fix/edge'
+- *(mercuriod)* name ureq as the client that sends URL user info
+- Merge branch 'fix/client-reconnect-bridge'
+- Merge branch 'fix/dynsec'
+- Merge branch 'fix/postgres'
+- Merge branch 'fix/httpauth-packaging'
+- Merge branch 'chore/ci-release-docs'
+- *(mercuriod)* describe HTTP auth failures, limits and https use
+- *(mercuriod)* correct the user_url client id and auto_id_prefix notes
+- *(mercuriod)* list the plugin keys in the sample config and README
+- Merge remote-tracking branch 'origin/master'
+- Merge branch 'fix/client-event-loop'
+- Merge branch 'fix/conn-loop-hardening'
+- Merge branch 'fix/daemon-config'
+- Merge branch 'fix/session-limits'
+- Merge branch 'fix/authorization'
+
 ## [0.4.5](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.4...mercuriod-v0.4.5) - 2026-11-10
 
 ### Fixed

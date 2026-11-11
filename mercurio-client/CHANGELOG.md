@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.4.1...mercurio-client-v0.5.0) - 2026-11-11
+
+### Added
+
+- *(server)* [**breaking**] start brokers through Server::builder
+- *(auth)* [**breaking**] let a failed authentication tell the client why
+- *(core)* [**breaking**] make encoding fallible and refuse what peers must reject
+- *(cli)* log in with SCRAM-SHA-256 in recado and mercurioctl
+- *(client)* add a SCRAM-SHA-256 authenticator
+- *(client)* add a request/response helper and use it in mercurioctl
+- *(client)* follow Server References with a hop limit
+- *(client)* make subscriptions again after a reconnect without session
+- *(client)* send repeated topics as outbound topic aliases
+- *(cli)* add --ws and --ws-path to the shared connect arguments
+- *(client)* send DISCONNECT with a reason and session expiry
+- *(client)* [**breaking**] expose the client id and what CONNACK settled
+- *(client)* add a WebSocket transport behind a websocket feature
+- *(client)* [**breaking**] let the connector open the stream asynchronously
+- *(client)* trust the OS certificate store and take a rustls config
+- *(client)* put TLS behind a default-on tls feature
+- *(client)* [**breaking**] mark public structs and struct-like variants non_exhaustive
+- *(client)* re-export the foreign types its public API uses
+- *(client)* [**breaking**] keep error sources and tell transient errors apart
+- *(client)* [**breaking**] take connect_timeout as a Duration
+- *(client)* start publishes without waiting for the previous one
+- *(client)* [**breaking**] add manual acknowledgement of received messages
+- *(client)* [**breaking**] back off exponentially with jitter between reconnections
+- *(client)* end with a Stopped event when reconnecting gives up
+- *(cli)* log in with a client certificate using --cert and --key
+- *(cli)* read the login password from a variable or a prompt in both tools
+
+### Fixed
+
+- *(mercuriod)* check bridges with --check and before binding
+- *(server)* name the crypto provider for the client certificate verifier
+- *(server)* [**breaking**] let enhanced authentication send final data on success
+- *(server)* set TCP_NODELAY, keepalive and TCP_USER_TIMEOUT on accept
+- *(client)* [**breaking**] cap inbound packets at 1 MiB and refuse them from the header
+- *(client)* [**breaking**] validate topics, filters and subscription ids before sending
+- *(client)* refuse a CONNACK with Session Present after a clean start
+- *(client)* check Maximum QoS and Retain Available for queued publishes
+- *(client)* fail a resent publish the broker's new size limit refuses
+- *(client)* keep reconnecting through transient CONNACK refusals
+- *(client)* [**breaking**] bound every socket write and treat a stalled one as lost
+- *(recado)* make up a client id where MQTT 3 refuses an empty one
+- *(client)* do not time out the broker for a stall of the client itself
+- *(client)* fail a pending re-authentication when the connection drops
+- *(client)* [**breaking**] turn TLS on when a CA or client certificate is set
+- *(client)* keep the event loop running while the event queue is full
+- *(client)* disconnect when the last client handle is dropped
+
+### Other
+
+- Merge branch 'chore/workspace-manifests'
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- depend on webpki-roots 1 in the client and storage
+- move mercurio-client and mercurio-server to thiserror 2
+- Merge branch 'master' into refactor/codec-api
+- *(core)* [**breaking**] check Variable Byte Integer and identifier ranges
+- *(packets)* [**breaking**] pass the protocol version to every encode and decode
+- *(packets)* [**breaking**] derive CONNECT flags from the payload
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(core)* [**breaking**] give reason code 0x00 a single variant
+- Merge branch 'feat/client-features'
+- Merge branch 'feat/client-api'
+- Merge branch 'fix/auth-admin'
+- *(client)* drop the unused tokio-util dependency
+- Merge branch 'fix/client-reconnect-bridge'
+- *(client)* list backoff and manual acknowledgement among the features
+- *(client)* format the tests added for the reconnect and limit fixes
+
 ## [0.4.1](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.4.0...mercurio-client-v0.4.1) - 2026-11-10
 
 ### Added

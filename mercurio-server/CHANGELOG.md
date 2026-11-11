@@ -7,6 +7,159 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.5.0...mercurio-server-v0.6.0) - 2026-11-11
+
+### Added
+
+- *(server)* [**breaking**] start brokers through Server::builder
+- *(server)* add with_* setters to the configuration structs
+- *(server)* [**breaking**] type the TLS and listener configuration errors
+- *(server)* [**breaking**] hand a departed share member's messages to its group
+- *(auth)* [**breaking**] let a failed authentication tell the client why
+- *(admin)* filter listClients by mount point
+- *(server)* disconnect clients that stay over their publish rate
+- *(server)* [**breaking**] give each mount point its own client id space
+- *(storage)* [**breaking**] key stored client state by mount point and client id
+- *(server)* limit publish rates per client and connection rates per listener
+- *(server)* [**breaking**] ban addresses that keep failing to log in
+- *(core)* [**breaking**] make encoding fallible and refuse what peers must reject
+- *(server)* per-listener limits and user names as client ids
+- *(server)* choose how shared subscriptions pick their member
+- *(server)* [**breaking**] cap sessions and let mercuriod sessions expire after a week
+- *(server)* add a built-in SCRAM-SHA-256 enhanced auth mechanism
+- *(server)* let a full queue drop its oldest messages instead
+- *(server)* report the plugin interface a WASM plugin was built for
+- *(server)* [**breaking**] tell plugins which connection a client came in on
+- *(server)* serve /healthz and Prometheus /metrics on WebSocket listeners
+- *(server)* [**breaking**] keep $SYS retained messages in memory
+- *(server)* choose how far client CRLs reach and what they must cover
+- *(server)* serve a caller-supplied rustls configuration
+- *(server)* accept clients without a certificate where it is optional
+- *(server)* [**breaking**] count messages the broker drops, by cause and per client
+- *(server)* [**breaking**] reload TLS certificates without a restart
+- *(storage)* [**breaking**] tell fenced and transient storage failures apart
+
+### Fixed
+
+- *(server)* substitute ACL pattern identities in one pass
+- *(server)* [**breaking**] end every task of a stopped broker with Server::run
+- *(server)* read a waiting packet before expiring the keep-alive
+- *(server)* store MQTT 3.x sessions with their configured expiry
+- *(server)* keep only the CONNECT settings a session reads later
+- *(server)* store a starting session's own expiry when reconciling
+- *(server)* keep a restored will stored until it is published
+- *(server)* keep a delayed will due when a takeover is abandoned
+- *(server)* unsubscribe a removed session even if its removal is cancelled
+- *(server)* set aside stored sessions that can't be read at restore
+- *(server)* stop blaming the previous connection when admissions are full
+- *(storage)* version the SQLite schema and keep one broker per database
+- *(server)* store a client whole again after a batch is given up
+- *(server)* name the crypto provider for the client certificate verifier
+- *(server)* [**breaking**] keep the queues of connected persistent sessions in storage
+- *(storage)* [**breaking**] store subscription changes one at a time
+- *(server)* [**breaking**] keep incoming QoS 2 state and record it only once accepted
+- *(storage)* [**breaking**] keep RETAIN and the expiry deadline of in-flight messages
+- *(server)* [**breaking**] publish the will when a client disconnects with an error
+- *(server)* [**breaking**] compare built-in plaintext passwords in constant time
+- *(server)* refuse wildcard mount points and misplaced WebSocket settings
+- *(server)* hold WebSocket clients to the CONNECT size before auth
+- *(server)* [**breaking**] require proxy_from with proxy_protocol on TCP listeners
+- *(server)* [**breaking**] refuse unknown admin arguments and log who changes things
+- *(server)* [**breaking**] let enhanced authentication send final data on success
+- *(server)* [**breaking**] require the mqtt subprotocol and add allowed_origins
+- *(server)* [**breaking**] decide $CONTROL publishes with a hook of their own
+- *(server)* leave a session to expire when its takeover is abandoned
+- *(server)* log client-caused connection failures below error
+- *(server)* record a session's expiry before giving its client id back
+- *(server)* set TCP_NODELAY, keepalive and TCP_USER_TIMEOUT on accept
+- *(server)* let go of a claim and its admission when start is abandoned
+- *(server)* stream http_dir files under their own timeout and limit
+- *(server)* exempt in-process connections from max_connections
+- *(server)* give the client id back when a connection lease is dropped
+- *(server)* [**breaking**] close banned clients with Administrative Action
+- *(server)* check the client's packet size limit after topic aliasing
+- *(server)* hold resumed retransmissions to the client's new limits
+- *(server)* send every retained message to a new subscription in pages
+- *(server)* keep storage reads out of the session manager's lock
+- *(server)* free the client id when stacked takeovers all give up
+- *(server)* end connections still connecting when the server shuts down
+- *(server)* give the client id back when a session fails to start
+- *(server)* [**breaking**] count connections per address before handshakes, IPv6 by /64
+- *(server)* [**breaking**] end an expiry-0 session even when a takeover waits
+- *(server)* make room in a full queue by dropping expired messages
+- *(server)* [**breaking**] cap CONNECT at 64 KiB until the client is authenticated
+- *(server)* send shared subscription messages to members that can take them
+- *(server)* give up a queued login once its connect time is up
+- *(mercurio-server)* refuse banned addresses before any handshake
+- *(server)* cap the session expiry a DISCONNECT asks for
+- *(server)* [**breaking**] check sent credentials even when auth is not required
+- *(mercurio-server)* bound socket writes and the client id takeover wait
+- *(server)* free superseded will-delay and session-expiry timers at once
+- *(server)* [**breaking**] cap unacknowledged messages per client with max_inflight
+- *(server)* [**breaking**] refuse a client id that belongs to another owner's session
+- check that a granted filter covers the filter a client subscribes to
+
+### Other
+
+- Merge branch 'refactor/server-structure'
+- *(server)* replace SessionManagerDropGuard with a constructor
+- *(server)* move the session manager's tests to their own file
+- *(server)* move address limits and publish pacing out of server/
+- *(server)* move the broker's configuration types to server/config.rs
+- *(server)* have acknowledgements hand back their storage writes
+- *(server)* give a session's in-flight messages their own type
+- *(server)* move subscription handling to session/subscriptions.rs
+- *(server)* move outbound delivery to session/outbound.rs
+- *(server)* move inbound publish handling to session/inbound.rs
+- *(server)* move retained delivery to session/retained.rs
+- *(server)* move session presence to session/presence.rs
+- *(server)* move the session's will handling to session/will.rs
+- *(server)* move the session tests out of session.rs
+- *(server)* drop unreachable ack persistence and restore stray docs
+- *(server)* [**breaking**] give the broker its own error type
+- Merge branch 'build/rand-argon2'
+- Merge branch 'feat/mount-point-client-ids'
+- *(server)* wait for a crashed broker to let go of its database
+- *(server)* drop rand for getrandom and std's RandomState
+- Merge branch 'chore/workspace-manifests'
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- ask tokio only for the features mercurio-server uses
+- *(mercurio-server)* drop the keep-alive from the write timeout test
+- move mercurio-client and mercurio-server to thiserror 2
+- Merge branch 'master' into refactor/codec-api
+- Merge branch 'fix/storage-read'
+- Merge branch 'feat/limits'
+- Merge branch 'feat/scram'
+- Merge branch 'feat/plugin-interface-0.2'
+- *(server)* format the limits work and satisfy clippy
+- *(core)* [**breaking**] check Variable Byte Integer and identifier ranges
+- *(storage)* [**breaking**] restore stored sessions in pages with one query per table
+- *(storage)* [**breaking**] look retained messages up by topic range, a page at a time
+- *(packets)* [**breaking**] pass the protocol version to every encode and decode
+- *(packets)* [**breaking**] derive CONNECT flags from the payload
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(core)* [**breaking**] rename Error::MQTTReasonCode to Error::Reason
+- *(storage)* [**breaking**] make apply the only write and share one conformance suite
+- *(core)* [**breaking**] give reason code 0x00 a single variant
+- *(server)* [**breaking**] report storage health under one $SYS prefix
+- Merge branch 'fix/durability'
+- *(server)* let the drop counter test's plugin grant admin commands
+- Merge branch 'feat/observability'
+- *(server)* let a writer held by a journal wait without polling
+- Merge branch 'feat/tls-reload'
+- *(server)* add a test PKI for TLS integration tests
+- Merge branch 'fix/auth-admin'
+- Merge branch 'fix/edge'
+- Merge branch 'fix/session-manager-cancellation'
+- Merge branch 'fix/delivery'
+- Merge branch 'fix/session-manager'
+- Merge branch 'fix/postgres'
+- Merge branch 'fix/conn-loop-hardening'
+- Merge branch 'fix/session-limits'
+- Merge branch 'fix/authorization'
+
 ## [0.5.0](https://github.com/frenzox/mercurio/compare/mercurio-server-v0.4.1...mercurio-server-v0.5.0) - 2026-11-10
 
 ### Added

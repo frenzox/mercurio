@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.3.3...mercurio-storage-v0.4.0) - 2026-11-11
+
+### Added
+
+- *(server)* [**breaking**] start brokers through Server::builder
+- *(server)* [**breaking**] hand a departed share member's messages to its group
+- *(storage)* [**breaking**] key stored client state by mount point and client id
+- *(core)* [**breaking**] make encoding fallible and refuse what peers must reject
+- *(storage)* [**breaking**] make the PostgreSQL pool size and wait configurable
+- *(storage)* [**breaking**] tell fenced and transient storage failures apart
+
+### Fixed
+
+- *(storage)* fail every undecodable stored value the same way
+- *(storage)* version the SQLite schema and keep one broker per database
+- *(server)* [**breaking**] keep the queues of connected persistent sessions in storage
+- *(storage)* [**breaking**] store subscription changes one at a time
+- *(server)* [**breaking**] keep incoming QoS 2 state and record it only once accepted
+- *(storage)* [**breaking**] keep RETAIN and the expiry deadline of in-flight messages
+- *(storage)* keep a PostgreSQL standby waiting and its schema hands off
+- *(storage)* [**breaking**] require TLS for remote PostgreSQL and when a CA is set
+- *(storage)* open SQLite databases in WAL mode
+- *(storage)* roll back the SQLite transaction when COMMIT fails
+
+### Other
+
+- Merge branch 'feat/mount-point-client-ids'
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- depend on webpki-roots 1 in the client and storage
+- Merge branch 'master' into refactor/codec-api
+- *(storage)* [**breaking**] restore stored sessions in pages with one query per table
+- *(storage)* [**breaking**] look retained messages up by topic range, a page at a time
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(storage)* [**breaking**] make apply the only write and share one conformance suite
+
 ## [0.3.3](https://github.com/frenzox/mercurio/compare/mercurio-storage-v0.3.2...mercurio-storage-v0.3.3) - 2026-11-10
 
 ### Added

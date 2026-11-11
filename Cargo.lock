@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-client"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1430,14 +1430,14 @@ dependencies = [
 
 [[package]]
 name = "mercurio-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "mercurio-packets"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "mercurio-core",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "wit-bindgen 0.63.0",
 ]
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-storage"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "mercurioctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "mercuriod"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "recado"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
