@@ -1,13 +1,7 @@
 name: release-plz
 
 on:
-  # The release PR only proposes changes, so it follows every push
   push:
-    branches: [master]
-  # Publishing waits for the build workflow to pass on the pushed commit
-  workflow_run:
-    workflows: [build]
-    types: [completed]
     branches: [master]
 
 permissions: {}
@@ -15,17 +9,29 @@ permissions: {}
 jobs:
   release:
     runs-on: ubuntu-latest
-    if: >-
-      github.repository_owner == 'frenzox'
-      && github.event_name == 'workflow_run'
-      && github.event.workflow_run.event == 'push'
-      && github.event.workflow_run.conclusion == 'success'
+    if: github.repository_owner == 'frenzox'
     permissions:
+      actions: read
       contents: write
       pull-requests: read
       # crates.io trusted publishing
       id-token: write
     steps:
+      # crates.io refuses trusted publishing from a workflow_run event, so
+      # the job starts on the push and waits here for that push's build. A
+      # failed or cancelled build fails the step and nothing is published.
+      - name: Wait for the build to pass on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 30); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build \
+              --commit "$GITHUB_SHA" --event push \
+              --json databaseId --jq '.[0].databaseId')
+            [ -n "$run" ] && break
+            sleep 10
+          done
+          gh run watch "$run" --repo "$GITHUB_REPOSITORY" --exit-status --interval 30
       # GITHUB_TOKEN's tags start no workflows, so packages.yml wouldn't run
       # for a mercuriod release; the app's token does
       - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -33,14 +39,10 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
-      # The commit the build passed on, which master may have moved past
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Put master on the built commit
-        run: git switch -C master
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
           toolchain: stable
@@ -52,7 +54,7 @@ jobs:
 
   release-pr:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'frenzox' && github.event_name == 'push'
+    if: github.repository_owner == 'frenzox'
     permissions:
       contents: write
       pull-requests: write
