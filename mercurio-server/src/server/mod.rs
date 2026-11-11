@@ -2,9 +2,8 @@
 //! configuration and limits, and in-process connections.
 
 use std::{
-    collections::HashMap,
     future::{poll_fn, Future},
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -75,7 +74,14 @@ use crate::{
     websocket,
 };
 
+mod address;
 mod config;
+mod pacing;
+
+pub(crate) use address::address_key;
+pub use address::AddressRange;
+use address::{AddressSlot, AddressSlots};
+use pacing::{Bucket, Pacing};
 
 #[cfg(unix)]
 pub use config::PeerFilter;
@@ -85,107 +91,6 @@ pub use config::{
     ShareStrategy, Socket, Transport, DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_INFLIGHT,
     DEFAULT_MAX_PACKET_SIZE, DEFAULT_MAX_SUBSCRIPTIONS, DEFAULT_MAX_TOPIC_FILTER_LENGTH,
 };
-
-/// A token bucket holding up to `burst` tokens, refilled at `per_second`.
-struct Bucket {
-    rate: f64,
-    burst: f64,
-    tokens: f64,
-    last: Instant,
-}
-
-impl Bucket {
-    fn new(rate: Rate) -> Self {
-        let burst = f64::from(rate.burst.max(1));
-        Bucket {
-            rate: f64::from(rate.per_second),
-            burst,
-            tokens: burst,
-            last: Instant::now(),
-        }
-    }
-
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        self.last = now;
-    }
-
-    /// Takes `amount` tokens, going into debt if there are fewer; how long
-    /// until the debt is paid back, if there is one.
-    fn take(&mut self, amount: f64) -> Option<Duration> {
-        self.refill();
-        self.tokens -= amount;
-        if self.tokens >= 0.0 {
-            return None;
-        }
-        if self.rate == 0.0 {
-            return Some(Duration::MAX);
-        }
-        Some(Duration::from_secs_f64(-self.tokens / self.rate))
-    }
-
-    /// Takes one token if there is one.
-    fn try_take(&mut self) -> bool {
-        self.refill();
-        if self.tokens < 1.0 {
-            return false;
-        }
-        self.tokens -= 1.0;
-        true
-    }
-}
-
-/// How fast one client may publish.
-struct Pacing {
-    messages: Option<Bucket>,
-    bytes: Option<Bucket>,
-    /// How long the client may stay over its rate
-    grace: Option<Duration>,
-    /// Since when the client is over its rate, if it is
-    over_since: Option<Instant>,
-}
-
-impl Pacing {
-    fn new(limits: &Limits) -> Self {
-        Pacing {
-            messages: limits.max_publish_rate.map(Bucket::new),
-            bytes: limits.max_publish_bytes_rate.map(Bucket::new),
-            grace: limits.publish_rate_grace,
-            over_since: None,
-        }
-    }
-
-    /// Counts a PUBLISH of `bytes`; how long to wait before reading the
-    /// next packet, if the client went over its rate.
-    fn publish(&mut self, bytes: usize) -> Option<Duration> {
-        let messages = self.messages.as_mut().and_then(|b| b.take(1.0));
-        let bytes = self.bytes.as_mut().and_then(|b| b.take(bytes as f64));
-        let wait = messages.max(bytes);
-        match wait {
-            Some(_) => {
-                self.over_since.get_or_insert_with(Instant::now);
-            }
-            None => self.over_since = None,
-        }
-        wait
-    }
-
-    /// Records that the client had nothing waiting once its rate allowed
-    /// reading from it again, so it is no longer over its rate.
-    fn caught_up(&mut self) {
-        self.over_since = None;
-    }
-
-    /// Whether the client has been over its rate for longer than allowed.
-    fn past_grace(&self) -> bool {
-        match (self.grace, self.over_since) {
-            (Some(grace), Some(since)) => since.elapsed() > grace,
-            _ => false,
-        }
-    }
-}
 
 /// A connection waiting to be served, with the index of its endpoint.
 enum Accepted {
@@ -2714,154 +2619,6 @@ where
     }
 }
 
-/// Connections each client address holds, keyed by `address_key`.
-#[derive(Default)]
-struct AddressSlots(std::sync::Mutex<HashMap<IpAddr, usize>>);
-
-/// Whom `ip` counts as for the per-address limit. An IPv4 client of an
-/// IPv6 socket counts as its IPv4 address. An IPv6 client counts as its
-/// /64, the block one subscriber is usually given, so it can't take a new
-/// address from it for every connection.
-pub(crate) fn address_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
-        },
-        v4 => v4,
-    }
-}
-
-impl AddressSlots {
-    /// A slot for `ip`, unless its address or block holds `max` already.
-    fn acquire(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<AddressSlot> {
-        let ip = address_key(ip);
-        let mut counts = self.0.lock().unwrap();
-        let count = counts.entry(ip).or_default();
-        if *count >= max {
-            return None;
-        }
-        *count += 1;
-        Some(AddressSlot {
-            slots: Arc::clone(self),
-            ip,
-        })
-    }
-}
-
-/// One connection's place in its address's count, freed when dropped.
-struct AddressSlot {
-    slots: Arc<AddressSlots>,
-    ip: IpAddr,
-}
-
-impl Drop for AddressSlot {
-    fn drop(&mut self) {
-        let mut counts = self.slots.0.lock().unwrap();
-        if let Some(count) = counts.get_mut(&self.ip) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&self.ip);
-            }
-        }
-    }
-}
-
-/// An address, or a block of them in CIDR form, such as `10.0.0.0/8`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AddressRange {
-    network: IpAddr,
-    prefix: u8,
-}
-
-impl AddressRange {
-    /// Whether `ip` is in the range. An IPv4 address mapped into IPv6, as
-    /// IPv4 clients of an IPv6 socket appear, counts as the IPv4 address.
-    pub fn contains(&self, ip: IpAddr) -> bool {
-        // An IPv4 client may reach an IPv6 socket as a mapped address
-        let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            v4 => v4,
-        };
-        match (self.network, ip) {
-            (IpAddr::V4(network), IpAddr::V4(ip)) => {
-                let mask = u32::MAX
-                    .checked_shl(32 - u32::from(self.prefix))
-                    .unwrap_or(0);
-                u32::from(network) & mask == u32::from(ip) & mask
-            }
-            (IpAddr::V6(network), IpAddr::V6(ip)) => {
-                let mask = u128::MAX
-                    .checked_shl(128 - u32::from(self.prefix))
-                    .unwrap_or(0);
-                u128::from(network) & mask == u128::from(ip) & mask
-            }
-            _ => false,
-        }
-    }
-}
-
-impl std::str::FromStr for AddressRange {
-    type Err = String;
-
-    fn from_str(text: &str) -> std::result::Result<Self, String> {
-        let invalid = || format!("`{text}` is not an address or a CIDR block");
-        let (address, prefix) = text.split_once('/').unwrap_or((text, ""));
-        let network: IpAddr = address.parse().map_err(|_| invalid())?;
-        let bits = if network.is_ipv4() { 32 } else { 128 };
-        let prefix = match prefix {
-            "" => bits,
-            prefix => prefix
-                .parse()
-                .ok()
-                .filter(|p| *p <= bits)
-                .ok_or_else(invalid)?,
-        };
-        // `contains` sees IPv4 clients as IPv4, so a mapped range has to be
-        // one too to match anyone
-        if let IpAddr::V6(v6) = network {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                if prefix < 96 {
-                    return Err(format!(
-                        "`{text}` is an IPv4-mapped block shorter than /96; write it as IPv4"
-                    ));
-                }
-                return Ok(AddressRange {
-                    network: IpAddr::V4(v4),
-                    prefix: prefix - 96,
-                });
-            }
-        }
-        Ok(AddressRange { network, prefix })
-    }
-}
-
-impl std::fmt::Display for AddressRange {
-    /// The range's first address, then its length unless it holds one
-    /// address: `10.0.0.0/8`, `192.0.2.7`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (first, bits) = match self.network {
-            IpAddr::V4(ip) => {
-                let mask = u32::MAX
-                    .checked_shl(32 - u32::from(self.prefix))
-                    .unwrap_or(0);
-                (IpAddr::V4((u32::from(ip) & mask).into()), 32)
-            }
-            IpAddr::V6(ip) => {
-                let mask = u128::MAX
-                    .checked_shl(128 - u32::from(self.prefix))
-                    .unwrap_or(0);
-                (IpAddr::V6((u128::from(ip) & mask).into()), 128)
-            }
-        };
-        if self.prefix == bits {
-            write!(f, "{first}")
-        } else {
-            write!(f, "{first}/{}", self.prefix)
-        }
-    }
-}
-
 /// A connection after its handshakes, with TLS or without.
 enum Secured<S> {
     Plain(S),
@@ -2997,52 +2754,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_address_slots_count_mapped_addresses_as_ipv4_and_ipv6_by_64() {
-        let slots = Arc::new(AddressSlots::default());
-        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
-
-        let _v4 = slots.acquire(ip("192.0.2.7"), 1).unwrap();
-        assert!(slots.acquire(ip("::ffff:192.0.2.7"), 1).is_none());
-        assert!(slots.acquire(ip("192.0.2.8"), 1).is_some());
-
-        let _v6 = slots.acquire(ip("2001:db8:0:1::1"), 1).unwrap();
-        assert!(slots.acquire(ip("2001:db8:0:1:ffff::2"), 1).is_none());
-        assert!(slots.acquire(ip("2001:db8:0:2::1"), 1).is_some());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_buckets_allow_a_burst_then_the_rate() {
-        let mut bucket = Bucket::new(Rate::new(10, 3));
-        for _ in 0..3 {
-            assert_eq!(bucket.take(1.0), None);
-        }
-        // In debt by one, paid back in a tenth of a second
-        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
-        time::advance(Duration::from_millis(100)).await;
-        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
-        // A long quiet spell refills no more than the burst
-        time::advance(Duration::from_secs(60)).await;
-        assert!(bucket.try_take() && bucket.try_take() && bucket.try_take());
-        assert!(!bucket.try_take());
-        time::advance(Duration::from_millis(100)).await;
-        assert!(bucket.try_take());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_pacing_waits_for_the_slower_of_messages_and_bytes() {
-        let limits = Limits {
-            max_publish_rate: Some(Rate::new(100, 1)),
-            max_publish_bytes_rate: Some(Rate::new(1000, 1000)),
-            ..Default::default()
-        };
-        let mut pacing = Pacing::new(&limits);
-        assert_eq!(pacing.publish(500), None);
-        // One message too many, and 1000 bytes too many
-        assert_eq!(pacing.publish(1500), Some(Duration::from_secs(1)));
-        assert_eq!(Pacing::new(&Limits::default()).publish(usize::MAX), None);
-    }
-
-    #[test]
     fn test_reason_strings_fit_the_client_maximum_packet_size() {
         let text = || Some("the token expired an hour ago".to_string());
         let explain = |max| explained(ReasonCode::NotAuthorized, text(), max).map(|r| r.value);
@@ -3053,50 +2764,5 @@ mod tests {
         // The method's text is longer than the reason code's own
         assert_eq!(explain(Some(40)).as_deref(), Some("Not authorized"));
         assert_eq!(explain(Some(20)), None);
-    }
-
-    #[test]
-    fn test_address_ranges_print_their_first_address() {
-        let print = |text: &str| text.parse::<AddressRange>().unwrap().to_string();
-        assert_eq!(print("10.1.2.3/8"), "10.0.0.0/8");
-        assert_eq!(print("192.0.2.7"), "192.0.2.7");
-        assert_eq!(print("192.0.2.7/32"), "192.0.2.7");
-        assert_eq!(print("2001:db8::1/32"), "2001:db8::/32");
-        assert_eq!(print("0.0.0.0/0"), "0.0.0.0/0");
-    }
-
-    #[test]
-    fn test_mapped_ranges_are_ipv4_ranges() {
-        let parse = |text: &str| text.parse::<AddressRange>();
-        assert_eq!(parse("::ffff:192.0.2.7").unwrap().to_string(), "192.0.2.7");
-        assert_eq!(
-            parse("::ffff:192.0.2.0/120").unwrap().to_string(),
-            "192.0.2.0/24"
-        );
-        assert!(parse("::ffff:192.0.2.7/95").is_err());
-    }
-
-    #[test]
-    fn test_address_ranges() {
-        let range: AddressRange = "10.0.0.0/8".parse().unwrap();
-        assert!(range.contains("10.200.0.1".parse().unwrap()));
-        assert!(!range.contains("11.0.0.1".parse().unwrap()));
-        // An IPv4 client on an IPv6 socket
-        assert!(range.contains("::ffff:10.0.0.1".parse().unwrap()));
-
-        let single: AddressRange = "192.0.2.7".parse().unwrap();
-        assert!(single.contains("192.0.2.7".parse().unwrap()));
-        assert!(!single.contains("192.0.2.8".parse().unwrap()));
-
-        let v6: AddressRange = "2001:db8::/32".parse().unwrap();
-        assert!(v6.contains("2001:db8:1::1".parse().unwrap()));
-        assert!(!v6.contains("2001:db9::1".parse().unwrap()));
-
-        let everything: AddressRange = "0.0.0.0/0".parse().unwrap();
-        assert!(everything.contains("203.0.113.1".parse().unwrap()));
-
-        for invalid in ["10.0.0.0/33", "example.com", "10.0.0.0/x", ""] {
-            assert!(invalid.parse::<AddressRange>().is_err(), "{invalid}");
-        }
     }
 }
