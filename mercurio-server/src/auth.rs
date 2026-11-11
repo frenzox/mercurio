@@ -261,9 +261,8 @@ impl<S: ScramCredentialStore + ?Sized> ScramAuth<S> {
 fn decoy_secret() -> &'static [u8; 32] {
     static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
     SECRET.get_or_init(|| {
-        use rand::RngCore;
         let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
+        getrandom::fill(&mut secret).expect("the operating system provides random bytes");
         secret
     })
 }
