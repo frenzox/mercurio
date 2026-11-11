@@ -39,6 +39,7 @@ where
         .then(|| {
             connection
                 .export_keying_material([0u8; TLS_EXPORTER_LEN], TLS_EXPORTER_LABEL, Some(&[]))
+                .inspect_err(|e| debug!("TLS exporter unavailable: {e}"))
                 .ok()
         })
         .flatten();

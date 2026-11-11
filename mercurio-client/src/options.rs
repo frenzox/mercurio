@@ -335,7 +335,7 @@ pub trait Authenticator: Send {
     /// The method name the broker knows it by.
     fn method(&self) -> String;
 
-    /// Called once per connection, before `start`, with the connection's
+    /// Called before every `start`, including a re-authentication, with the connection's
     /// tls-exporter channel binding data: None unless it is TLS 1.3.
     fn channel(&mut self, _tls_exporter: Option<[u8; 32]>) {}
 
