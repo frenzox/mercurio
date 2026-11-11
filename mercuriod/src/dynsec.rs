@@ -889,11 +889,17 @@ fn priority(args: &Value) -> Result<i64, String> {
 }
 
 /// The Argon2 hash of `password` and its SCRAM-SHA-256 credentials, which
-/// are found by the prepared form of `username`, so one that cannot be
-/// prepared is refused.
+/// are found by the prepared form of `username`. A name that is not already
+/// in that form is refused, as ACLs and roles are keyed by the written name
+/// while a SCRAM login uses the prepared one.
 fn hash_password(username: &str, password: &str) -> Result<(String, String), String> {
-    mercurio_scram::prepare_username(username)
+    let prepared = mercurio_scram::prepare_username(username)
         .ok_or("The user name cannot be prepared with SASLprep, for SCRAM-SHA-256")?;
+    if prepared != username {
+        return Err(format!(
+            "User name \"{username}\" is not in SASLprep form; use \"{prepared}\""
+        ));
+    }
     credentials::hash_new_password(password)
 }
 
@@ -2626,10 +2632,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scram_credentials_are_found_by_the_prepared_name() {
+    async fn test_scram_credentials_are_found_by_the_user_name() {
         let fixture = Fixture::new("scram-prepared");
         fixture.run_ok(json!([
-            { "command": "createClient", "username": "us\u{00AD}er", "password": "pw" },
+            { "command": "createClient", "username": "user", "password": "pw" },
         ]));
         let found = fixture
             .security
@@ -2643,6 +2649,22 @@ mod tests {
             ]),
         );
         assert!(refused[0].get("error").is_some(), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn test_password_for_a_name_not_in_saslprep_form_is_refused() {
+        let fixture = Fixture::new("scram-noncanonical");
+        let refused = run(
+            &fixture.security,
+            json!([
+                { "command": "createClient", "username": "us\u{00AD}er", "password": "pw" },
+            ]),
+        );
+        let error = refused[0]["error"].as_str().unwrap();
+        assert!(
+            error.contains("not in SASLprep form; use \"user\""),
+            "{error}"
+        );
     }
 
     #[tokio::test]

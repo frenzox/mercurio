@@ -908,8 +908,14 @@ fn load_credentials(path: &str) -> Result<HashedCredentialValidator, String> {
 /// Add or update a user in the password file.
 fn add_or_update_user(path: &str, username: &str) -> Result<(), Box<dyn std::error::Error>> {
     password_file::check_username(username)?;
-    if mercurio_scram::prepare_username(username).is_none() {
+    let Some(prepared) = mercurio_scram::prepare_username(username) else {
         return Err("The user name cannot be prepared with SASLprep, for SCRAM-SHA-256".into());
+    };
+    if prepared != username {
+        return Err(format!(
+            "user name \"{username}\" is not in SASLprep form; use \"{prepared}\""
+        )
+        .into());
     }
     let mut users = password_file::read_users(path)?;
     check_prepared_name_is_free(&users, username)?;
@@ -1171,6 +1177,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mercuriod-passwd-{}", std::process::id()));
         let error = add_or_update_user(path.to_str().unwrap(), "\u{00AD}").unwrap_err();
         assert!(error.to_string().contains("SASLprep"), "{error}");
+        let error = add_or_update_user(path.to_str().unwrap(), "us\u{00AD}er").unwrap_err();
+        assert!(error.to_string().contains("use \"user\""), "{error}");
     }
 
     fn argon2_hash(password: &str) -> String {
