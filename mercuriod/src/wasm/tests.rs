@@ -544,3 +544,18 @@ async fn test_list_plugins_shows_wasm_plugins() {
     assert_eq!(json["instances"], 1);
     assert!(json.get("lastError").is_none(), "{json}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_call_the_broker_cancels_counts_as_a_failure() {
+    // Like the broker's plugin_timeout, shorter than the plugin's own limit
+    let plugin = misbehave(|s| s.instances = 1).await;
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(200), control(&plugin, "sleep", b"")).await;
+    assert!(cancelled.is_err());
+    let status = plugin.status();
+    assert_eq!((status.instances, status.failures), (Some(0), Some(1)));
+    let last_error = status.last_error.expect("the cancelled call");
+    assert!(last_error.contains("on_control"), "{last_error}");
+    assert!(last_error.contains("plugin_timeout"), "{last_error}");
+    assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
+}
