@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use mercurio_client::{ClientError, ConnectOptions, DisconnectReason, Event, MqttClient};
-use mercurio_core::reason::ReasonCode;
+use mercurio_client::{
+    ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ReasonCode,
+};
 use mercurio_server::server::{Redirect, ServerConfig};
 use tokio::{net::TcpListener, time::timeout};
 

@@ -170,9 +170,8 @@ assert!(results[0].success);</pre>
 <p>A CA path, a client certificate or <code>danger_skip_tls_verify(true)</code> turns TLS on, so credentials never go out in the clear by mistake. <code>tls(true)</code> alone verifies the broker with the system's roots. A later <code>tls(false)</code> turns TLS off again. TLS isn't available over a Unix socket, and <code>connect</code> refuses these options there.</p>
 
 <h2>Enhanced authentication</h2>
-<p>Implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>bytes::Bytes</code>, from the <code>bytes</code> crate:</p>
-<pre>use bytes::Bytes;
-use mercurio_client::Authenticator;
+<p>Implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>Bytes</code>, which the crate re-exports from the <code>bytes</code> crate, as it does <code>ReasonCode</code>, <code>QoS</code> and <code>ProtocolVersion</code>:</p>
+<pre>use mercurio_client::{Authenticator, Bytes};
 
 struct Token(String);
 

@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS};
-use mercurio_core::reason::ReasonCode;
+use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS, ReasonCode};
 use mercurio_server::server::ServerConfig;
 use tokio::{net::TcpListener, time::timeout};
 

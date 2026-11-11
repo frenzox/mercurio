@@ -19,6 +19,10 @@ pub use event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeR
 pub use mercurio_packets::subscribe::{RetainHandling, SubscriptionOptions};
 pub use options::{Authenticator, Backoff, ConnectOptions, MessageProperties, Will};
 
-// Re-export commonly used types from mercurio-core
+// Types of the public API that come from other crates, so applications
+// need no direct dependency on them
+pub use bytes::Bytes;
+pub use mercurio_core::error::Error as PacketError;
 pub use mercurio_core::protocol::ProtocolVersion;
 pub use mercurio_core::qos::QoS;
+pub use mercurio_core::reason::ReasonCode;

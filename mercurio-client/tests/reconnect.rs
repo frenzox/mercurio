@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use mercurio_client::{
     ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ProtocolVersion, QoS,
+    ReasonCode,
 };
-use mercurio_core::reason::ReasonCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
