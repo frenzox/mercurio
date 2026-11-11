@@ -2168,8 +2168,9 @@ where
                 .await;
         }
 
-        let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
+        let keepalive =
+            effective_keepalive(connect_packet.keepalive, protocol_version, &self.limits);
         let client_maximum_packet_size = connect_packet
             .properties
             .as_ref()
