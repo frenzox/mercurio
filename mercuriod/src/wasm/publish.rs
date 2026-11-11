@@ -191,9 +191,14 @@ async fn send(
     broker: LocalConnector,
     mut queue: mpsc::Receiver<Message>,
 ) {
+    // The broker answers CONNECT once it serves, which a standby waiting
+    // for its database may put off indefinitely; meanwhile later messages
+    // wait in the queue. A broker that stops before serving closes the
+    // connection, which still ends the wait.
     let options = ConnectOptions::new("localhost", 0)
         .client_id(client_id)
         .reconnect(Duration::from_secs(1))
+        .connect_timeout(Duration::MAX)
         .connector(move || std::future::ready(broker.connect()));
     let mut client: Option<MqttClient> = None;
     loop {
@@ -344,6 +349,51 @@ mod tests {
         let mut other = local("local");
         other.client_id = "mercurio-plugin-q".into();
         assert!(!publisher.is_own(&other));
+    }
+
+    /// Takes over half a minute: it outwaits the client's default connect
+    /// timeout, and Tokio's paused clock isn't available to this crate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_messages_queued_before_the_broker_serves_wait_for_it() {
+        use mercurio_client::Event;
+        use mercurio_server::server::ServerConfig;
+
+        let (connector, listener) = LocalConnector::new();
+        let publisher = Publisher::new("p", Some(connector.clone()));
+        let mut early = message("early", 1);
+        early.retain = true;
+        publisher.publish(early).unwrap();
+        // As a standby waiting for the database, past the 30 s a client
+        // waits for CONNACK by default
+        tokio::time::sleep(Duration::from_secs(32)).await;
+
+        let mut config = ServerConfig::default();
+        config.sys_interval = None;
+        config.local_listener = Some(listener);
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(mercurio_server::server::run_with_config(
+            tcp,
+            config,
+            std::future::pending::<()>(),
+        ));
+        let options = ConnectOptions::new("localhost", 0)
+            .client_id("watcher")
+            .connector(move || std::future::ready(connector.connect()));
+        let watcher = MqttClient::connect(options).await.unwrap();
+        watcher
+            .subscribe(&[("early", QoS::AtMostOnce)])
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), watcher.recv())
+                .await
+                .expect("the message queued early never came")
+                .unwrap();
+            if let Event::Message { topic, .. } = event {
+                assert_eq!(topic, "early");
+                break;
+            }
+        }
     }
 
     #[test]
