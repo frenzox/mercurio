@@ -34,6 +34,8 @@ mod config;
 mod credentials;
 mod dynsec;
 mod http_auth;
+#[allow(dead_code)] // used once the plugin is registered
+mod jwt_auth;
 mod logging;
 mod notify;
 mod password_file;

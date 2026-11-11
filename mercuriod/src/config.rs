@@ -1508,6 +1508,9 @@ pub struct AuthConfig {
 
     /// Checks delegated to HTTP endpoints
     pub http: Option<HttpAuthConfig>,
+
+    /// JSON Web Tokens accepted as passwords
+    pub jwt: Option<JwtAuthConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1544,6 +1547,56 @@ pub struct HttpAuthConfig {
     pub key_path: Option<String>,
 }
 
+/// Exactly one of `secret_file`, `public_key_file` and `jwks_url` gives the
+/// keys that tokens are signed with.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtAuthConfig {
+    /// Shared secret of the HMAC algorithms
+    pub secret_file: Option<String>,
+
+    /// PEM public key of the RSA, ECDSA or EdDSA algorithms
+    pub public_key_file: Option<String>,
+
+    #[serde(serialize_with = "redact_some_url")]
+    pub jwks_url: Option<String>,
+
+    /// Algorithms a token may be signed with; its header never chooses
+    pub algorithms: Vec<jsonwebtoken::Algorithm>,
+
+    pub issuer: Option<String>,
+
+    pub audience: Option<String>,
+
+    /// Claim holding the user name, which must match the CONNECT user name
+    #[serde(default = "default_jwt_username_claim")]
+    pub username_claim: String,
+
+    /// Clock skew allowed on `exp` and `nbf`
+    #[serde(default = "default_jwt_leeway")]
+    pub leeway_seconds: u64,
+
+    /// Disconnects a client when its token expires
+    #[serde(default = "default_true")]
+    pub disconnect_on_expiry: bool,
+
+    /// Minimum time between two fetches of `jwks_url`
+    #[serde(default = "default_jwks_refresh")]
+    pub jwks_refresh_seconds: u64,
+}
+
+fn default_jwt_username_claim() -> String {
+    "sub".to_string()
+}
+
+fn default_jwt_leeway() -> u64 {
+    30
+}
+
+fn default_jwks_refresh() -> u64 {
+    300
+}
+
 fn default_http_timeout() -> u64 {
     5
 }
@@ -1561,6 +1614,7 @@ impl Default for AuthConfig {
             acl_file: None,
             dynamic_security: None,
             http: None,
+            jwt: None,
         }
     }
 }
@@ -2126,6 +2180,10 @@ mod tests {
             ("[logging]\nlvl = \"debug\"\n", "lvl"),
             ("[auth]\nenable = true\n", "enable"),
             ("[auth.http]\nuser_ur = \"http://h\"\n", "user_ur"),
+            (
+                "[auth.jwt]\nalgorithms = [\"HS256\"]\nsecret = \"s\"\n",
+                "secret",
+            ),
             ("[admin]\nsockets = \"/x\"\n", "sockets"),
             ("[storage]\nbackend = \"memory\"\npath = \"x\"\n", "path"),
             (
@@ -2262,6 +2320,55 @@ mod tests {
     }
 
     #[test]
+    fn test_jwt_auth_is_read_with_defaults() {
+        let config: Config = toml::from_str(
+            "[auth.jwt]\nsecret_file = \"/etc/mercurio/jwt.secret\"\nalgorithms = [\"HS256\", \"HS512\"]\n",
+        )
+        .unwrap();
+        let jwt = config.auth.jwt.unwrap();
+        assert_eq!(jwt.secret_file.as_deref(), Some("/etc/mercurio/jwt.secret"));
+        assert_eq!(
+            jwt.algorithms,
+            [
+                jsonwebtoken::Algorithm::HS256,
+                jsonwebtoken::Algorithm::HS512
+            ]
+        );
+        assert_eq!(jwt.username_claim, "sub");
+        assert_eq!(jwt.leeway_seconds, 30);
+        assert!(jwt.disconnect_on_expiry);
+        assert_eq!(jwt.jwks_refresh_seconds, 300);
+        assert!(jwt.issuer.is_none() && jwt.audience.is_none());
+
+        let config: Config = toml::from_str(
+            r#"
+            [auth.jwt]
+            jwks_url = "https://issuer.example/.well-known/jwks.json"
+            algorithms = ["ES256"]
+            issuer = "https://issuer.example"
+            audience = "mercurio"
+            username_claim = "preferred_username"
+            leeway_seconds = 5
+            disconnect_on_expiry = false
+            jwks_refresh_seconds = 60
+            "#,
+        )
+        .unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["auth"]["jwt"]["jwks_url"],
+            "https://issuer.example/.well-known/jwks.json"
+        );
+        assert_eq!(json["auth"]["jwt"]["algorithms"][0], "ES256");
+        assert_eq!(json["auth"]["jwt"]["audience"], "mercurio");
+        assert_eq!(json["auth"]["jwt"]["leeway_seconds"], 5);
+        assert_eq!(json["auth"]["jwt"]["disconnect_on_expiry"], false);
+
+        assert!(toml::from_str::<Config>("[auth.jwt]\nalgorithms = [\"none\"]\n").is_err());
+        assert!(toml::from_str::<Config>("[auth.jwt]\nsecret_file = \"s\"\n").is_err());
+    }
+
+    #[test]
     fn test_serialized_config_hides_secrets() {
         let config: Config = toml::from_str(
             r#"
@@ -2337,6 +2444,9 @@ mod tests {
             user_url = "https://svc:SECRET-user@auth.example.com/user?token=SECRET-tok"
             acl_url = "https://auth.example.com/acl?api_key=SECRET-key"
             superuser_url = "https://svc:SECRET-su@auth.example.com/su"
+            [auth.jwt]
+            jwks_url = "https://svc:SECRET-jwks@issuer.example/jwks.json?token=SECRET-q"
+            algorithms = ["RS256"]
 
             [[listeners]]
             port = 1884
