@@ -93,7 +93,8 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <ul>
 <li>A command that succeeds may return <code>data</code>. One that fails returns <code>error</code>, a message for people, and <code>code</code>, for scripts. A command's <code>correlationData</code> comes back in its response.</li>
 <li>The answer goes only to the client that sent the request: on the request's MQTT 5 Response Topic, with its Correlation Data, or on <code>$CONTROL/broker/v1/response</code> for a request without one, such as an MQTT 3.1.1 client's. Either way the client receives it only while subscribed to that topic, so one client must subscribe and publish. <code>mosquitto_rr</code> does; separate <code>mosquitto_sub</code> and <code>mosquitto_pub</code> commands never see an answer.</li>
-<li>A payload that isn't a list of commands gets one response, with an empty <code>command</code> and <code>invalidArgument</code>.</li>
+<li>A payload that isn't a list of commands gets one response, with an empty <code>command</code> and <code>invalidArgument</code>. So does a request with more than 100 commands, none of which run.</li>
+<li>The broker logs each command that changes something, such as <code>addBan</code> or <code>reload</code>, at <code>info</code>, with the client id and verified user name of the client that sent it, or the admin socket or in-process client that did.</li>
 <li>An answer larger than the client's Maximum Packet Size is dropped. Page through long lists instead of asking for everything in one message.</li>
 <li><code>v1</code> only gains commands, optional arguments and response fields. A change that would break scripts goes to a <code>v2</code>.</li>
 </ul>
@@ -103,7 +104,7 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <tr><th><code>code</code></th><th>Means</th></tr>
 <tr><td><code>notAuthorized</code></td><td>Access control doesn't grant <code>$CONTROL/broker/v1/&lt;command&gt;</code></td></tr>
 <tr><td><code>notFound</code></td><td>What the command names, such as a client, a ban or a retained message, doesn't exist</td></tr>
-<tr><td><code>invalidArgument</code></td><td>An unknown command, or a missing or malformed argument</td></tr>
+<tr><td><code>invalidArgument</code></td><td>An unknown command, an argument the command doesn't take, such as a misspelt one, or a missing or malformed argument</td></tr>
 <tr><td><code>conflict</code></td><td>The command can't run in the current state, such as deleting the session of a connected client</td></tr>
 <tr><td><code>unavailable</code></td><td>The broker can't serve it now: storage failed, a wait timed out, or the command is served by mercuriod and the broker runs without it</td></tr>
 </table>

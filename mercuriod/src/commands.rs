@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use mercurio_server::{
-    admin::{Admin, AdminError, AdminExtension, ErrorCode, Paging},
+    admin::{check_arguments, Admin, AdminError, AdminExtension, ErrorCode, Paging},
     plugin::BoxFuture,
 };
 use serde::{de::DeserializeOwned, Deserialize};
@@ -120,6 +120,15 @@ impl AdminExtension for DaemonCommands {
         args: &'a Value,
     ) -> BoxFuture<'a, Option<Result<Value, AdminError>>> {
         Box::pin(async move {
+            let known: &[&str] = match command {
+                "listBridges" => &["offset", "count"],
+                "setLogLevel" => &["level"],
+                "getLogLevel" | "reload" | "getConfig" => &[],
+                _ => return None,
+            };
+            if let Err(e) = check_arguments(args, known) {
+                return Some(Err(e));
+            }
             Some(match command {
                 "listBridges" => self.list_bridges(args).await,
                 "getLogLevel" => Ok(json!({ "level": self.log_level.get() })),
@@ -239,6 +248,30 @@ mod tests {
         let level = commands.handle("getLogLevel", &json!({})).await.unwrap();
         assert_eq!(level.unwrap()["level"], "warn");
         assert!(commands.handle("getlogLevel", &json!({})).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_arguments_are_refused_by_name() {
+        let (log_level, _filter) = LogLevel::new("info", true);
+        let commands = DaemonCommands::new(log_level);
+        for (command, args) in [
+            (
+                "setLogLevel",
+                json!({ "command": "setLogLevel", "level": "warn", "lvl": 1 }),
+            ),
+            ("reload", json!({ "command": "reload", "lvl": 1 })),
+            ("listBridges", json!({ "command": "listBridges", "lvl": 1 })),
+        ] {
+            let error = commands.handle(command, &args).await.unwrap().unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert!(error.message.contains("`lvl`"), "{}", error.message);
+        }
+        assert_eq!(log_level_of(&commands).await, "info");
+    }
+
+    async fn log_level_of(commands: &DaemonCommands) -> String {
+        let level = commands.handle("getLogLevel", &json!({})).await.unwrap();
+        level.unwrap()["level"].as_str().unwrap().to_string()
     }
 
     #[tokio::test(flavor = "multi_thread")]

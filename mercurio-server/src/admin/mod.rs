@@ -120,6 +120,28 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Most items a list command returns at once.
 pub const MAX_PAGE: usize = 1000;
 
+/// Most commands one `$CONTROL/broker/v1` request may carry; a request with
+/// more is refused whole.
+pub const MAX_COMMANDS: usize = 100;
+
+/// Fails, naming the first, when `args`, a whole command object, holds an
+/// argument other than `known`, `command` and `correlationData`, so a
+/// misspelt optional argument isn't silently ignored.
+pub fn check_arguments(args: &Value, known: &[&str]) -> Result<(), AdminError> {
+    let Some(object) = args.as_object() else {
+        return Ok(());
+    };
+    let unknown = object.keys().find(|key| {
+        !matches!(key.as_str(), "command" | "correlationData") && !known.contains(&key.as_str())
+    });
+    match unknown {
+        Some(key) => Err(AdminError::invalid_argument(format!(
+            "unknown argument `{key}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Which part of a list to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -234,7 +256,8 @@ impl NewBan {
 /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know, such
 /// as the ones `mercuriod` adds. Set in `ServerConfig::admin_extension`.
 pub trait AdminExtension: Send + Sync + 'static {
-    /// Runs `command`; `args` is the whole command object. `None` means the
+    /// Runs `command`; `args` is the whole command object, which
+    /// [`check_arguments`] checks for unknown arguments. `None` means the
     /// command is unknown. Returned data other than `null` becomes the
     /// response's `data`. The client's permission for the command was
     /// checked before, on its exact name: match `command` exactly, as

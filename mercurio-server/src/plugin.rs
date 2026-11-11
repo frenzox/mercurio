@@ -425,9 +425,10 @@ pub(crate) async fn guarded<'a, T>(
 pub(crate) struct Chain {
     plugins: Arc<[Arc<dyn Plugin>]>,
     timeout: Duration,
-    /// In-process connections: every topic is allowed, `$SYS` and
-    /// `$CONTROL` included, and nothing is authenticated
-    trusted: bool,
+    /// Set for in-process connections and trusted listeners, naming them
+    /// in logs: every topic is allowed, `$SYS` and `$CONTROL` included,
+    /// and nothing is authenticated
+    trusted: Option<&'static str>,
     /// Shared by the clones of a chain.
     events: Arc<Events>,
     /// Serves `$CONTROL/broker/v1`; set on every chain the server builds
@@ -457,7 +458,7 @@ impl Chain {
         Chain {
             plugins: plugins.into(),
             timeout,
-            trusted: false,
+            trusted: None,
             events: Arc::default(),
             admin: None,
         }
@@ -470,14 +471,20 @@ impl Chain {
         }
     }
 
-    pub(crate) fn trusted(&self) -> Chain {
+    /// The chain of trusted connections, which `origin` names in logs.
+    pub(crate) fn trusted(&self, origin: &'static str) -> Chain {
         Chain {
-            trusted: true,
+            trusted: Some(origin),
             ..self.clone()
         }
     }
 
     pub(crate) fn is_trusted(&self) -> bool {
+        self.trusted.is_some()
+    }
+
+    /// What trusted connections are, such as `in-process`; None for others.
+    pub(crate) fn trusted_origin(&self) -> Option<&'static str> {
         self.trusted
     }
 
@@ -543,7 +550,7 @@ impl Chain {
         topic: &str,
         access: Access,
     ) -> Decision {
-        if self.trusted {
+        if self.is_trusted() {
             return Decision::Allow;
         }
         for plugin in self.plugins.iter() {
@@ -567,7 +574,7 @@ impl Chain {
     /// Whether `client` may publish to the `$CONTROL` topic `topic`: only
     /// when a plugin allows it.
     pub(crate) async fn may_control(&self, client: &ClientInfo, topic: &str) -> bool {
-        if self.trusted {
+        if self.is_trusted() {
             return true;
         }
         for plugin in self.plugins.iter() {
@@ -798,7 +805,7 @@ mod tests {
         assert!(!chain(Vec::new()).may_control(&client(), topic).await);
         assert!(
             chain(Vec::new())
-                .trusted()
+                .trusted("in-process")
                 .may_control(&client(), topic)
                 .await
         );
@@ -806,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trusted_chains_allow_everything() {
-        let denying = chain(vec![fixed("a", Decision::Deny)]).trusted();
+        let denying = chain(vec![fixed("a", Decision::Deny)]).trusted("in-process");
         assert_eq!(
             denying.authorize(&client(), "$SYS/x", Access::Write).await,
             Decision::Allow

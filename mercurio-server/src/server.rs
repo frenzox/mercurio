@@ -1064,7 +1064,7 @@ impl<St: MqttStore + 'static> Server<St> {
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
             endpoint.settings.chain = match endpoint.trusted {
-                true => Some(chain.trusted()),
+                true => Some(chain.trusted("admin socket")),
                 false => endpoint
                     .settings
                     .chain
@@ -1076,7 +1076,7 @@ impl<St: MqttStore + 'static> Server<St> {
         let server = Listener {
             endpoints,
             local_listener,
-            trusted_chain: chain.trusted(),
+            trusted_chain: chain.trusted("in-process"),
             next_endpoint: 0,
             broker,
             session_manager_holder,

@@ -1220,6 +1220,51 @@ async fn bans_are_added_listed_and_removed() {
 }
 
 #[tokio::test]
+async fn unknown_arguments_are_refused_by_name() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    for (request, argument) in [
+        // Would otherwise ban for ever
+        (
+            json!({"command": "addBan", "type": "clientid", "value": "c", "durration": 60}),
+            "durration",
+        ),
+        (json!({"command": "listClients", "cuont": 1}), "cuont"),
+        (json!({"command": "listRetained", "ofset": 1}), "ofset"),
+        (
+            json!({"command": "getBrokerInfo", "verbose": true}),
+            "verbose",
+        ),
+    ] {
+        let response = admin.run(request.clone()).await;
+        assert_eq!(response["code"], "invalidArgument", "{request}");
+        let error = response["error"].as_str().unwrap();
+        assert!(error.contains(argument), "{error}");
+    }
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 0);
+}
+
+#[tokio::test]
+async fn too_many_commands_are_refused_together() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let ban = |n: usize| json!({"command": "addBan", "type": "clientid", "value": format!("c{n}")});
+    let envelope = json!({ "commands": (0..101).map(ban).collect::<Vec<_>>() });
+    let reply = admin.request(Bytes::from(envelope.to_string())).await;
+    let responses = reply["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["code"], "invalidArgument");
+    assert!(responses[0]["error"].as_str().unwrap().contains("100"));
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 0);
+
+    let envelope = json!({ "commands": (0..100).map(ban).collect::<Vec<_>>() });
+    let reply = admin.request(Bytes::from(envelope.to_string())).await;
+    assert_eq!(reply["responses"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
 async fn malformed_bans_are_invalid_arguments() {
     let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
     let mut admin = admin_client(addr).await;
