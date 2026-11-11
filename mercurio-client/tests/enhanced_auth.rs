@@ -49,6 +49,7 @@ impl AuthExchange for ChallengeExchange {
                 }
                 (true, Some(d)) if d == "nonce-signed" => AuthResult::Success {
                     username: Some("u".into()),
+                    data: None,
                 },
                 _ => AuthResult::Failed(ReasonCode::NotAuthorized),
             },

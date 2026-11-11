@@ -1165,7 +1165,7 @@ impl<St: MqttStore + 'static> Server<St> {
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
             endpoint.settings.chain = match endpoint.trusted {
-                true => Some(chain.trusted()),
+                true => Some(chain.trusted("admin socket")),
                 false => endpoint
                     .settings
                     .chain
@@ -1177,7 +1177,7 @@ impl<St: MqttStore + 'static> Server<St> {
         let server = Listener {
             endpoints,
             local_listener,
-            trusted_chain: chain.trusted(),
+            trusted_chain: chain.trusted("in-process"),
             next_endpoint: 0,
             broker,
             session_manager_holder,
@@ -1668,6 +1668,8 @@ where
         // The user name access control can rely on: only one that was
         // verified, by enhanced authentication or the password check
         let mut verified_user = None;
+        // What enhanced authentication sends the client with its CONNACK
+        let mut auth_data = None;
 
         // MQTT 5 enhanced authentication replaces the user name and password
         // check when the client asks for it
@@ -1678,7 +1680,10 @@ where
             // Boxed, like the rest of the connect phase, so its state isn't
             // kept for the whole connection
             match Box::pin(self.authenticate_enhanced(&connect_packet, &method)).await? {
-                Some(username) => verified_user = username,
+                Some((username, data)) => {
+                    verified_user = username;
+                    auth_data = data;
+                }
                 None => return Ok(()),
             }
         } else {
@@ -1902,6 +1907,7 @@ where
                 &mut self.connection,
                 start_result.resume,
                 start_result.assigned_client_id,
+                auth_data,
                 &self.limits,
                 &self.policy,
             ))
@@ -2035,13 +2041,13 @@ where
     }
 
     /// Runs the AUTH exchange of MQTT 5 enhanced authentication during
-    /// CONNECT. Returns the user name the method verified, if any, or None
-    /// having refused the connection.
+    /// CONNECT. Returns the user name the method verified, if any, and the
+    /// data for the CONNACK, or None having refused the connection.
     async fn authenticate_enhanced(
         &mut self,
         connect_packet: &ConnectPacket,
         method: &str,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<Option<(Option<String>, Option<bytes::Bytes>)>> {
         let client = ClientInfo {
             client_id: connect_packet.payload.client_id.clone(),
             username: connect_packet.payload.user_name.clone(),
@@ -2063,7 +2069,7 @@ where
 
         loop {
             let challenge = match result {
-                AuthResult::Success { username } => return Ok(Some(username)),
+                AuthResult::Success { username, data } => return Ok(Some((username, data))),
                 AuthResult::Failed(reason) => {
                     warn!("Enhanced authentication with `{}` failed", method);
                     self.reject_connect(connect_packet, reason).await?;
@@ -2466,8 +2472,11 @@ where
                                 .then(|| Duration::from_secs(interval.into()));
                         }
 
-                        // Reason 0x04 asks for the will to be published anyway
-                        if disconnect.reason != ReasonCode::DisconnectWithWillMessage {
+                        // Only a normal disconnection discards the will
+                        // [MQTT-3.14.4-3]: 0x04 asks for it, and an error
+                        // code means the client didn't end as it meant to.
+                        // MQTT 3.x has no reason and reads as normal.
+                        if disconnect.reason == ReasonCode::NormalDisconnection {
                             session.clear_will().await;
                             let client_id = session.get_client_id().await;
                             self.session_manager.delete_will(&client_id);

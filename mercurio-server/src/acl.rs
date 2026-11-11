@@ -16,6 +16,10 @@
 //! ```
 //!
 //! Anything not granted is denied, and `deny` overrides any grant.
+//!
+//! Publishing to `$CONTROL/...`, which administers the broker, needs a
+//! rule granting write access to that topic by name: a first-level
+//! wildcard, as in `topic #`, never matches topics starting with `$`.
 
 use std::collections::HashMap;
 
@@ -197,7 +201,8 @@ impl Plugin for AclFile {
     }
 
     fn status(&self) -> PluginStatus {
-        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&["authorize"])
+        PluginStatus::new(self.name(), PluginKind::Builtin)
+            .with_hooks(&["authorize", "authorize_control"])
     }
 
     /// Never defers: anything the file doesn't grant is denied.
@@ -212,6 +217,15 @@ impl Plugin for AclFile {
         } else {
             Decision::Deny
         })
+    }
+
+    /// Allows what a rule grants write access to, as for other topics.
+    fn authorize_control<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        self.authorize(client, topic, Access::Write)
     }
 }
 
@@ -304,6 +318,29 @@ mod tests {
         // `+` in the rule covers one level, `#` in the filter many
         assert!(!acl.allows(&alice, "feeds/#", Access::Subscribe));
         assert!(!acl.allows(&alice, "feeds/news/#", Access::Subscribe));
+    }
+
+    #[tokio::test]
+    async fn test_control_needs_a_rule_naming_it() {
+        let acl = AclFile::parse("topic readwrite #\nuser admin\ntopic write $CONTROL/broker/v1/#")
+            .unwrap();
+        let anonymous = client("c", None);
+        let admin = client("a", Some("admin"));
+        assert_eq!(
+            acl.authorize_control(&anonymous, "$CONTROL/broker/v1")
+                .await,
+            Decision::Deny
+        );
+        assert_eq!(
+            acl.authorize_control(&admin, "$CONTROL/broker/v1/listClients")
+                .await,
+            Decision::Allow
+        );
+        assert_eq!(
+            acl.authorize_control(&admin, "$CONTROL/dynamic-security/v1")
+                .await,
+            Decision::Deny
+        );
     }
 
     #[test]

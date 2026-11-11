@@ -125,3 +125,44 @@ async fn disconnect_with_will_message_publishes_the_will() {
         [0x30, 0x07, 0x00, 0x01, b'w', 0x00, b'b', b'y', b'e']
     );
 }
+
+/// A subscriber to the will topic `w`, its SUBACK read.
+async fn will_watcher(addr: SocketAddr, client_id: u8) -> TcpStream {
+    let (mut subscriber, _) = connect(addr, client_id, true, 0, false).await;
+    // SUBSCRIBE packet id 1, "w" at QoS 0
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'w', 0x00])
+        .await
+        .unwrap();
+    read(&mut subscriber, 6).await;
+    subscriber
+}
+
+#[tokio::test]
+async fn disconnect_with_an_error_publishes_the_will() {
+    let addr = start_broker().await;
+    // Unspecified error, Implementation specific error
+    for (client_id, reason) in [(b'e', 0x80), (b'f', 0x83)] {
+        let mut subscriber = will_watcher(addr, b't').await;
+        let (mut client, _) = connect(addr, client_id, true, 0, true).await;
+        client.write_all(&disconnect(reason, None)).await.unwrap();
+
+        assert_eq!(
+            read(&mut subscriber, 9).await,
+            [0x30, 0x07, 0x00, 0x01, b'w', 0x00, b'b', b'y', b'e'],
+            "reason {reason:#04x}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn normal_disconnect_discards_the_will() {
+    let addr = start_broker().await;
+    let mut subscriber = will_watcher(addr, b'u').await;
+    let (mut client, _) = connect(addr, b'n', true, 0, true).await;
+    client.write_all(&disconnect(0x00, None)).await.unwrap();
+    wait_for_close(&mut client).await;
+
+    let read = timeout(Duration::from_millis(300), subscriber.read(&mut [0u8; 1])).await;
+    assert!(read.is_err(), "the will was published");
+}

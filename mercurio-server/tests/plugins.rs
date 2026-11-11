@@ -282,6 +282,14 @@ impl Plugin for Echo {
         ready(mercurio_server::plugin::Decision::Allow)
     }
 
+    fn authorize_control<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a str,
+    ) -> BoxFuture<'a, mercurio_server::plugin::Decision> {
+        ready(mercurio_server::plugin::Decision::Allow)
+    }
+
     fn on_control<'a>(
         &'a self,
         _: &'a ClientInfo,

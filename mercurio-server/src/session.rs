@@ -55,7 +55,7 @@ use crate::{
     broker::Broker,
     connection::Connection,
     plugin::{
-        AuthResult, Chain, ClientInfo, Decision, Event, Exchange, MessageAction, PluginMessage,
+        is_control, AuthResult, Chain, ClientInfo, Event, Exchange, MessageAction, PluginMessage,
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
@@ -164,7 +164,10 @@ async fn publisher_may_write(chain: &Chain, message: &Message) -> bool {
         return true;
     };
     let publisher = ClientInfo::new(origin.client_id.clone(), origin.username.clone());
-    chain.may(&publisher, &message.topic, Access::Write).await
+    match is_control(&message.topic) {
+        true => chain.may_control(&publisher, &message.topic).await,
+        false => chain.may(&publisher, &message.topic, Access::Write).await,
+    }
 }
 
 fn publish_properties(
@@ -576,6 +579,7 @@ impl Session {
         connection: &mut Connection<S>,
         resume: bool,
         assigned_client_id: bool,
+        auth_data: Option<Bytes>,
         limits: &Limits,
         policy: &ConnectPolicy,
     ) -> Result<()>
@@ -623,6 +627,7 @@ impl Session {
                         .properties
                         .as_ref()
                         .and_then(|p| p.authentication_method.clone()),
+                    authentication_data: auth_data.map(AuthenticationData::new),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
                     response_information: policy
                         .response_information
@@ -734,21 +739,20 @@ impl Session {
                 .await;
         }
 
-        let control = packet.topic_name == "$CONTROL" || packet.topic_name.starts_with("$CONTROL/");
+        let control = is_control(&packet.topic_name);
         // A trusted chain allows everything, and an empty one only refuses
         // $CONTROL, so the session lock is taken only when needed
         if control || (!chain.is_empty() && !chain.is_trusted()) {
             let identity = self.identity().await;
-            let decision = chain
-                .authorize(&identity, &packet.topic_name, Access::Write)
-                .await;
-            // $CONTROL topics administer the broker, so publishing to them
-            // needs a plugin to allow it, not only none to refuse it
-            let refused = match control {
-                true => decision != Decision::Allow,
-                false => decision == Decision::Deny,
+            let allowed = match control {
+                true => chain.may_control(&identity, &packet.topic_name).await,
+                false => {
+                    chain
+                        .may(&identity, &packet.topic_name, Access::Write)
+                        .await
+                }
             };
-            if refused {
+            if !allowed {
                 warn!(
                     "Client `{}` may not publish to `{}`",
                     identity.client_id, packet.topic_name
@@ -1468,12 +1472,17 @@ impl Session {
         };
 
         match result {
-            AuthResult::Success { username } => {
+            AuthResult::Success { username, data } => {
                 session.auth_exchange = None;
                 session.verified_user = username;
+                // An AUTH with properties names its method [MQTT-3.15.2-1]
                 Ok(Some(ControlPacket::Auth(AuthPacket {
                     reason: ReasonCode::Success,
-                    properties: AuthProperties::default(),
+                    properties: AuthProperties {
+                        auth_method: Some(AuthenticationMethod::new(method)),
+                        auth_data: data.map(AuthenticationData::new),
+                        ..Default::default()
+                    },
                 })))
             }
             AuthResult::Continue(challenge) => Ok(Some(ControlPacket::Auth(AuthPacket {

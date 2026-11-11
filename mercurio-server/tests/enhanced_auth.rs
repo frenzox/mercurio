@@ -30,7 +30,8 @@ use tokio::{
 };
 
 /// Challenges each client with a fresh nonce and expects it back signed,
-/// which needs state kept between the steps of an exchange.
+/// which needs state kept between the steps of an exchange. Success carries
+/// the nonce, countersigned, as the server's final data.
 #[derive(Default)]
 struct Challenge {
     issued: AtomicU32,
@@ -72,6 +73,7 @@ impl AuthExchange for ChallengeExchange {
             {
                 AuthResult::Success {
                     username: Some("challenger".into()),
+                    data: Some(Bytes::from(format!("{nonce}-countersigned"))),
                 }
             }
             _ => AuthResult::Failed(ReasonCode::NotAuthorized),
@@ -176,8 +178,12 @@ async fn challenge_response_during_connect() {
         panic!("Expected CONNACK");
     };
     assert_eq!(connack.reason_code, ReasonCode::Success);
-    let method = connack.properties.unwrap().authentication_method.unwrap();
-    assert_eq!(method.value, "CHALLENGE");
+    let properties = connack.properties.unwrap();
+    assert_eq!(properties.authentication_method.unwrap().value, "CHALLENGE");
+    assert_eq!(
+        properties.authentication_data.unwrap().value,
+        [first_nonce.as_ref(), b"-countersigned"].concat()
+    );
 
     // Re-authentication runs a new exchange, with its own nonce
     send(&mut stream, auth(ReasonCode::ReAuthenticate, Bytes::new())).await;
@@ -187,6 +193,12 @@ async fn challenge_response_during_connect() {
         panic!("Expected AUTH");
     };
     assert_eq!(done.reason, ReasonCode::Success);
+    // The AUTH ending an exchange names its method [MQTT-3.15.2-1]
+    assert_eq!(done.properties.auth_method.unwrap().value, "CHALLENGE");
+    assert_eq!(
+        done.properties.auth_data.unwrap().value,
+        [second_nonce.as_ref(), b"-countersigned"].concat()
+    );
 
     // The plugin knows who is authenticating: at CONNECT nobody is
     // verified yet, and re-authentication names the verified user

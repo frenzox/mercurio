@@ -155,7 +155,13 @@ pub(crate) fn auth_result(result: wit::AuthResult) -> (AuthResult, Option<Vec<u8
             AuthResult::Continue(challenge.data.into()),
             Some(challenge.state),
         ),
-        wit::AuthResult::Success(username) => (AuthResult::Success { username }, None),
+        wit::AuthResult::Success(username) => (
+            AuthResult::Success {
+                username,
+                data: None,
+            },
+            None,
+        ),
         wit::AuthResult::Failed(code) => (AuthResult::Failed(failure(code)), None),
     }
 }

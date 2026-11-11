@@ -168,6 +168,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <li>Dynamic security has no client or group priorities for roles; the ACL priority decides, whichever role holds the ACL. <code>addClientRole</code>, <code>addGroupRole</code>, <code>addGroupClient</code>, and the role and group lists of <code>createClient</code> and <code>createGroup</code>, fail when they give a <code>priority</code> other than mosquitto's default of -1. It has no <code>modifyClient</code>, <code>modifyGroup</code> or <code>modifyRole</code>: change clients, groups and roles with the add, remove and set commands.</li>
 <li>When dynamic security's anonymous group changes, anonymous clients of Unix socket listeners stay connected; mosquitto disconnects every anonymous client. Their access still follows the new group at once.</li>
 <li>The answer to a <code>$CONTROL</code> request goes only to the client that sent it. Other clients subscribed to <code>…/response</code> don't see it.</li>
+<li>An MQTT 5 client that disconnects with an error reason code, 0x80 or above, gets its will published, as the specification says; only a normal disconnection (0x00) discards it. Mosquitto discards the will on any DISCONNECT except 0x04.</li></ul>
 </ul>
 <footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
 </main>

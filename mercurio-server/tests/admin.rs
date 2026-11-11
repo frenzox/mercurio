@@ -62,6 +62,10 @@ impl Plugin for AllowAll {
         "allow-all"
     }
 
+    fn authorize_control<'a>(&'a self, _: &'a ClientInfo, _: &'a str) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+
     fn authorize<'a>(
         &'a self,
         _: &'a ClientInfo,
@@ -123,6 +127,10 @@ impl Plugin for BansDuringConnect {
             Decision::Allow
         })
     }
+
+    fn authorize_control<'a>(&'a self, _: &'a ClientInfo, _: &'a str) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
 }
 
 /// Authenticates a client as `alice` when it connects and as `mallory` when
@@ -150,6 +158,7 @@ impl AuthExchange for SwitchExchange {
     fn step<'a>(&'a mut self, _: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
         ready(AuthResult::Success {
             username: Some(self.0.into()),
+            data: None,
         })
     }
 }
@@ -443,6 +452,39 @@ async fn each_command_needs_its_own_permission() {
     let reply = admin.request(Bytes::from(envelope.to_string())).await;
     assert!(reply["responses"][0].get("error").is_none());
     assert_eq!(reply["responses"][1]["code"], "notAuthorized");
+}
+
+/// Allows every login and every topic, and says nothing about `$CONTROL`.
+struct AllowTopics;
+
+impl Plugin for AllowTopics {
+    fn name(&self) -> &str {
+        "allow-topics"
+    }
+
+    fn authorize<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        _: &'a str,
+        _: Access,
+    ) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+}
+
+#[tokio::test]
+async fn allowing_every_topic_grants_no_admin_commands() {
+    let (addr, _) = start(config(vec![Arc::new(AllowTopics)])).await;
+    let mut client = admin_client(addr).await;
+    let request = br#"{"commands":[{"command":"listClients"}]}"#;
+    assert_eq!(
+        client.publish("$CONTROL/broker/v1", request, false).await,
+        ReasonCode::NotAuthorized
+    );
+    assert_eq!(
+        client.publish("$CONTROL/other/v1", b"x", false).await,
+        ReasonCode::NotAuthorized
+    );
 }
 
 #[tokio::test]
@@ -1108,7 +1150,7 @@ async fn plugins_are_listed_in_chain_order() {
     assert_eq!(
         listed["data"]["plugins"],
         json!([
-            {"name": "acl-file", "kind": "builtin", "hooks": ["authorize"]},
+            {"name": "acl-file", "kind": "builtin", "hooks": ["authorize", "authorize_control"]},
             {"name": "custom", "kind": "rust", "hooks": []},
         ])
     );
@@ -1175,6 +1217,51 @@ async fn bans_are_added_listed_and_removed() {
     let listed = admin.run(json!({"command": "listBans"})).await;
     assert_eq!(listed["data"]["totalCount"], 1);
     assert_eq!(listed["data"]["bans"][0]["value"], "spammer");
+}
+
+#[tokio::test]
+async fn unknown_arguments_are_refused_by_name() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    for (request, argument) in [
+        // Would otherwise ban for ever
+        (
+            json!({"command": "addBan", "type": "clientid", "value": "c", "durration": 60}),
+            "durration",
+        ),
+        (json!({"command": "listClients", "cuont": 1}), "cuont"),
+        (json!({"command": "listRetained", "ofset": 1}), "ofset"),
+        (
+            json!({"command": "getBrokerInfo", "verbose": true}),
+            "verbose",
+        ),
+    ] {
+        let response = admin.run(request.clone()).await;
+        assert_eq!(response["code"], "invalidArgument", "{request}");
+        let error = response["error"].as_str().unwrap();
+        assert!(error.contains(argument), "{error}");
+    }
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 0);
+}
+
+#[tokio::test]
+async fn too_many_commands_are_refused_together() {
+    let (addr, _) = start(config(vec![Arc::new(AllowAll)])).await;
+    let mut admin = admin_client(addr).await;
+    let ban = |n: usize| json!({"command": "addBan", "type": "clientid", "value": format!("c{n}")});
+    let envelope = json!({ "commands": (0..101).map(ban).collect::<Vec<_>>() });
+    let reply = admin.request(Bytes::from(envelope.to_string())).await;
+    let responses = reply["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["code"], "invalidArgument");
+    assert!(responses[0]["error"].as_str().unwrap().contains("100"));
+    let listed = admin.run(json!({"command": "listBans"})).await;
+    assert_eq!(listed["data"]["totalCount"], 0);
+
+    let envelope = json!({ "commands": (0..100).map(ban).collect::<Vec<_>>() });
+    let reply = admin.request(Bytes::from(envelope.to_string())).await;
+    assert_eq!(reply["responses"].as_array().unwrap().len(), 100);
 }
 
 #[tokio::test]

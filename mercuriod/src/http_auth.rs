@@ -4,7 +4,8 @@
 //!
 //! - `user_url` receives `{"username", "password", "clientid"}`
 //! - `acl_url` receives `{"username", "clientid", "topic", "acc"}`, where
-//!   `acc` is 1 to receive, 2 to publish and 4 to subscribe
+//!   `acc` is 1 to receive, 2 to publish and 4 to subscribe, and 8 to
+//!   publish to a `$CONTROL/...` topic, which administers the broker
 //!
 //! ACL answers are cached for `cache_seconds`, as every message is checked.
 //! Only 2xx (allow) and 4xx (deny) are answers: other statuses and failed
@@ -25,6 +26,9 @@ use tokio::sync::{OnceCell, Semaphore};
 use tracing::warn;
 
 use crate::config::redacted_http_url;
+
+/// The `acc` of a request to publish to a `$CONTROL` topic.
+const CONTROL_ACC: u8 = 8;
 
 /// Most ACL answers kept; the oldest goes first once full.
 const CACHE_LIMIT: usize = 10_000;
@@ -268,7 +272,7 @@ impl Plugin for HttpAuth {
             hooks.push("authenticate");
         }
         if self.acl_url.is_some() {
-            hooks.push("authorize");
+            hooks.extend(["authorize", "authorize_control"]);
         }
         PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&hooks)
     }
@@ -300,19 +304,40 @@ impl Plugin for HttpAuth {
         topic: &'a str,
         access: Access,
     ) -> BoxFuture<'a, Decision> {
-        let Some(url) = &self.acl_url else {
-            return ready(Decision::Defer);
-        };
-        let decision = |allowed| match allowed {
-            true => Decision::Allow,
-            false => Decision::Deny,
-        };
         let acc = match access {
             Access::Read => 1,
             Access::Write => 2,
             Access::Subscribe => 4,
             // A kind of access added later is denied until handled
             _ => return ready(Decision::Deny),
+        };
+        self.check(client, topic, acc)
+    }
+
+    /// Asks the ACL endpoint with an `acc` of its own, so a backend that
+    /// grants publishing to every topic doesn't grant this as well.
+    fn authorize_control<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        self.check(client, topic, CONTROL_ACC)
+    }
+}
+
+impl HttpAuth {
+    fn check<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+        acc: u8,
+    ) -> BoxFuture<'a, Decision> {
+        let Some(url) = &self.acl_url else {
+            return ready(Decision::Defer);
+        };
+        let decision = |allowed| match allowed {
+            true => Decision::Allow,
+            false => Decision::Deny,
         };
         let key = (
             client.username.clone(),
@@ -424,6 +449,24 @@ mod tests {
             }
         });
         (backend.url, backend.requests)
+    }
+
+    #[tokio::test]
+    async fn test_control_is_asked_with_its_own_access() {
+        let (acl_url, _) = serve("\"acc\":8");
+        let auth = HttpAuth::new(
+            None,
+            Some(acl_url),
+            Duration::from_secs(2),
+            Duration::from_secs(60),
+        );
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let topic = "$CONTROL/broker/v1";
+        assert_eq!(
+            auth.authorize(&alice, topic, Access::Write).await,
+            Decision::Deny
+        );
+        assert_eq!(auth.authorize_control(&alice, topic).await, Decision::Allow);
     }
 
     async fn check(auth: &HttpAuth, password: &str) -> Decision {
@@ -681,8 +724,11 @@ mod tests {
         let both = status(Some("http://u"), Some("http://a"));
         assert_eq!(
             both,
-            PluginStatus::new("http-auth", PluginKind::Builtin)
-                .with_hooks(&["authenticate", "authorize"])
+            PluginStatus::new("http-auth", PluginKind::Builtin).with_hooks(&[
+                "authenticate",
+                "authorize",
+                "authorize_control"
+            ])
         );
         assert_eq!(
             status(Some("http://u"), None),
@@ -690,7 +736,8 @@ mod tests {
         );
         assert_eq!(
             status(None, Some("http://a")),
-            PluginStatus::new("http-auth", PluginKind::Builtin).with_hooks(&["authorize"])
+            PluginStatus::new("http-auth", PluginKind::Builtin)
+                .with_hooks(&["authorize", "authorize_control"])
         );
     }
 }

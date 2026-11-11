@@ -6,12 +6,14 @@ use mercurio_core::{codec::Decoder, reason::ReasonCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use tracing::info;
+
 use super::{
-    Admin, AdminError, BanKey, BanKind, ClientQuery, DisconnectOptions, ErrorCode, NewBan, Page,
-    Paging,
+    check_arguments, Admin, AdminError, BanKey, BanKind, ClientQuery, DisconnectOptions, ErrorCode,
+    NewBan, Page, Paging, MAX_COMMANDS,
 };
 use crate::{
-    plugin::{Access, Chain, ClientInfo, Decision},
+    plugin::{Chain, ClientInfo},
     server::AddressRange,
 };
 
@@ -23,6 +25,57 @@ const DAEMON_COMMANDS: [&str; 5] = [
     "setLogLevel",
     "reload",
 ];
+
+/// The commands that change something, logged with who ran them.
+const CHANGING_COMMANDS: [&str; 7] = [
+    "disconnectClient",
+    "deleteSession",
+    "addBan",
+    "removeBan",
+    "deleteRetained",
+    "setLogLevel",
+    "reload",
+];
+
+/// The arguments of the broker's own commands.
+fn arguments_of(command: &str) -> Option<&'static [&'static str]> {
+    const PAGE: &[&str] = &["offset", "count"];
+    Some(match command {
+        "getBrokerInfo" => &[],
+        "listListeners" | "listBans" | "listPlugins" => PAGE,
+        "listClients" => &[
+            "connected",
+            "clientidPrefix",
+            "username",
+            "address",
+            "offset",
+            "count",
+        ],
+        "getClient" => &["clientid"],
+        "disconnectClient" => &["clientid", "sendWill", "reasonCode"],
+        "deleteSession" => &["clientid", "disconnect"],
+        "addBan" => &["type", "value", "prefix", "duration", "reason"],
+        "removeBan" => &["type", "value", "prefix"],
+        "listRetained" => &["filter", "offset", "count"],
+        "getRetained" => &["topic"],
+        "deleteRetained" => &["filter"],
+        "listSubscriptions" => &["filterPrefix", "offset", "count"],
+        "getSubscribers" => &["filter"],
+        _ => return None,
+    })
+}
+
+/// Who sent a request, for the log.
+fn actor(chain: &Chain, client: &ClientInfo) -> String {
+    let mut actor = match chain.trusted_origin() {
+        Some(origin) => format!("{origin} client `{}`", client.client_id),
+        None => format!("client `{}`", client.client_id),
+    };
+    if let Some(username) = &client.username {
+        actor.push_str(&format!(" (user `{username}`)"));
+    }
+    actor
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,6 +223,14 @@ pub(crate) async fn handle(
     payload: &[u8],
 ) -> Bytes {
     let responses = match serde_json::from_slice::<Envelope>(payload) {
+        Ok(envelope) if envelope.commands.len() > MAX_COMMANDS => vec![Response::new(
+            String::new(),
+            None,
+            Err(AdminError::invalid_argument(format!(
+                "a request carries at most {MAX_COMMANDS} commands, not {}",
+                envelope.commands.len()
+            ))),
+        )],
         Ok(envelope) => {
             let mut responses = Vec::with_capacity(envelope.commands.len());
             for request in envelope.commands {
@@ -237,11 +298,17 @@ async fn run(
     }
     // A trusted chain allows every topic
     let topic = format!("$CONTROL/broker/v1/{command}");
-    if chain.authorize(client, &topic, Access::Write).await != Decision::Allow {
+    if !chain.may_control(client, &topic).await {
         return Err(AdminError::new(
             ErrorCode::NotAuthorized,
             format!("not allowed to run {command}"),
         ));
+    }
+    if let Some(known) = arguments_of(command) {
+        check_arguments(args, known)?;
+    }
+    if CHANGING_COMMANDS.contains(&command) {
+        info!("Admin command {} from {}", command, actor(chain, client));
     }
     Ok(match command {
         "getBrokerInfo" => json(admin.info().await),
@@ -369,4 +436,24 @@ fn listing<T: Serialize>(key: &str, page: Page<T>) -> Value {
     object.insert(key.to_string(), json(page.items));
     object.insert("totalCount".to_string(), page.total_count.into());
     Value::Object(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_the_log_names_who_sent_a_command() {
+        let chain = Chain::new(Vec::new(), Duration::from_secs(1));
+        let alice = ClientInfo::new("ops", Some("alice".into()));
+        assert_eq!(actor(&chain, &alice), "client `ops` (user `alice`)");
+        let anonymous = ClientInfo::new("ops", None);
+        assert_eq!(actor(&chain, &anonymous), "client `ops`");
+        assert_eq!(
+            actor(&chain.trusted("admin socket"), &anonymous),
+            "admin socket client `ops`"
+        );
+    }
 }
