@@ -40,8 +40,7 @@ const SALT_LEN: usize = 16;
 /// Random bytes in a nonce, before base64.
 const NONCE_LEN: usize = 18;
 
-/// The GS2 header of a client that supports no channel binding, the only
-/// kind this implementation speaks.
+/// The GS2 header of a client that does not use channel binding.
 const GS2_HEADER: &str = "n,,";
 const GS2_HEADER_TLS_EXPORTER: &str = "p=tls-exporter,,";
 
@@ -522,8 +521,8 @@ pub enum ServerError {
     ExtensionsNotSupported,
     InvalidProof,
     ChannelBindingsDontMatch,
-    /// The client requires channel binding, which this implementation
-    /// does not offer.
+    /// The client requires channel binding, and the connection has no
+    /// channel binding data.
     ChannelBindingNotSupported,
     /// The client asked for a channel binding type other than
     /// `tls-exporter`.
@@ -738,31 +737,6 @@ impl AwaitingProof {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn user_names_are_prepared_with_saslprep() {
-        // U+2168 ROMAN NUMERAL NINE maps to "IX"; U+00AD SOFT HYPHEN maps to nothing
-        let mut client = ScramClient::new("us\u{00AD}er\u{2168}", "pencil");
-        let first = client.start_with_nonce("rOprNGfwEbeRWgbNEkqO").unwrap();
-        assert_eq!(first, "n,,n=userIX,r=rOprNGfwEbeRWgbNEkqO");
-
-        let parsed = ClientFirst::parse("n,,n=us\u{00AD}er\u{2168},r=abc".as_bytes()).unwrap();
-        assert_eq!(parsed.username(), "userIX");
-    }
-
-    #[test]
-    fn user_names_saslprep_refuses_fail_the_exchange() {
-        // U+0007 is a prohibited control character
-        let mut client = ScramClient::new("us\u{0007}er", "pencil");
-        assert!(matches!(
-            client.start_with_nonce("rOprNGfwEbeRWgbNEkqO"),
-            Err(Error::InvalidUsername)
-        ));
-        assert_eq!(
-            ClientFirst::parse("n,,n=us\u{0007}er,r=abc".as_bytes()).err(),
-            Some(ServerError::InvalidUsernameEncoding)
-        );
-    }
     use super::*;
 
     // RFC 7677, section 3
@@ -1088,5 +1062,30 @@ mod tests {
         let b = StoredCredentials::generate("pencil", MIN_ITERATIONS).unwrap();
         assert_ne!(a.salt, b.salt);
         assert_eq!(a.salt.len(), SALT_LEN);
+    }
+
+    #[test]
+    fn user_names_are_prepared_with_saslprep() {
+        // U+2168 ROMAN NUMERAL NINE maps to "IX"; U+00AD SOFT HYPHEN maps to nothing
+        let mut client = ScramClient::new("us\u{00AD}er\u{2168}", "pencil");
+        let first = client.start_with_nonce("rOprNGfwEbeRWgbNEkqO").unwrap();
+        assert_eq!(first, "n,,n=userIX,r=rOprNGfwEbeRWgbNEkqO");
+
+        let parsed = ClientFirst::parse("n,,n=us\u{00AD}er\u{2168},r=abc".as_bytes()).unwrap();
+        assert_eq!(parsed.username(), "userIX");
+    }
+
+    #[test]
+    fn user_names_saslprep_refuses_fail_the_exchange() {
+        // U+0007 is a prohibited control character
+        let mut client = ScramClient::new("us\u{0007}er", "pencil");
+        assert!(matches!(
+            client.start_with_nonce("rOprNGfwEbeRWgbNEkqO"),
+            Err(Error::InvalidUsername)
+        ));
+        assert_eq!(
+            ClientFirst::parse("n,,n=us\u{0007}er,r=abc".as_bytes()).err(),
+            Some(ServerError::InvalidUsernameEncoding)
+        );
     }
 }
