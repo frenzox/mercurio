@@ -16,6 +16,7 @@ use uuid::Uuid;
 use mercurio_core::{
     message::{unix_millis, Message},
     protocol::ProtocolVersion,
+    qos::QoS,
     reason::ReasonCode,
 };
 use mercurio_packets::connect::ConnectPacket;
@@ -1251,7 +1252,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     }
 
     /// Schedules the expiry of sessions persisted by a previous run, and
-    /// discards those that expired while the broker was down. Returns the
+    /// ends those that expired while the broker was down, once the others
+    /// are back. Returns the
     /// wills those sessions left behind, with when they are due.
     pub(crate) async fn restore_from_storage<B: RetainedMessageStore>(
         &self,
@@ -1259,6 +1261,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     ) -> mercurio_storage::Result<Vec<(SessionKey, WillMessage, Duration)>> {
         let now = unix_millis();
         let mut wills = Vec::new();
+        let mut expired = Vec::new();
         let mut after: Option<SessionKey> = None;
         loop {
             let page = self
@@ -1269,24 +1272,35 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             after = page.last().map(|loaded| loaded.key.clone());
             for LoadedClient { key, stored } in page {
                 match stored {
-                    Ok(stored) => wills.extend(self.restore_client(key, stored, now, broker).await),
+                    Ok(stored) => wills.extend(
+                        self.restore_client(key, stored, now, broker, &mut expired)
+                            .await,
+                    ),
                     Err(e) => self.set_aside(&key, &e.to_string()).await,
                 }
             }
             if last_page {
-                return Ok(wills);
+                break;
             }
         }
+        // Ended once every live member of their share groups is subscribed
+        // again, so what they held finds one
+        for key in expired {
+            self.schedule_end(key, 0, Duration::ZERO).await;
+        }
+        Ok(wills)
     }
 
     /// Restores a session a previous run stored, if it hasn't expired, and
-    /// schedules its end. Returns its will, with when it is due.
+    /// schedules its end; one that has expired goes into `expired`, to be
+    /// ended by the caller. Returns its will, with when it is due.
     async fn restore_client<B: RetainedMessageStore>(
         &self,
         key: SessionKey,
         stored: StoredClient,
         now: u64,
         broker: &Broker<B>,
+        expired: &mut Vec<SessionKey>,
     ) -> Option<(SessionKey, WillMessage, Duration)> {
         let StoredClient {
             session: state,
@@ -1303,8 +1317,16 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let until_expiry = deadline.map(|d| Duration::from_millis(d.saturating_sub(now)));
 
         // Live sessions go back in memory, subscribed, so messages keep
-        // being queued for their clients until they reconnect
-        if deadline.is_none_or(|d| d > now) {
+        // being queued for their clients until they reconnect. An expired
+        // one does too while it holds messages of share groups, which go to
+        // another member as it ends; a QoS 2 message it was sent goes to no
+        // one else [MQTT-4.8.2-5]
+        let live = deadline.is_none_or(|d| d > now);
+        let holds_shared = queue.iter().any(|(_, m)| m.share_group.is_some())
+            || inflight
+                .iter()
+                .any(|m| m.share_group.is_some() && m.qos == QoS::AtLeastOnce);
+        if live || holds_shared {
             self.restore_session(&key, state, (queue, inflight, incoming_qos2), broker)
                 .await;
         }
@@ -1326,8 +1348,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
 
         if let Some(delay) = until_expiry {
-            // Generation 0 predates every connection of this run
-            self.schedule_end(key.clone(), 0, delay).await;
+            if live {
+                // Generation 0 predates every connection of this run
+                self.schedule_end(key.clone(), 0, delay).await;
+            } else {
+                expired.push(key.clone());
+            }
         }
         due_will.map(|(_, will, due)| (key, will, due))
     }

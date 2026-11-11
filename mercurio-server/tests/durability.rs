@@ -624,3 +624,45 @@ async fn shared_messages_go_to_another_member_after_a_crash() {
     );
     broker.stop().await;
 }
+
+/// The same, but the member's session expires while the broker is down:
+/// the restarted broker hands its messages to the other member, whose
+/// session it restores too, whatever order it reads them in.
+#[tokio::test]
+async fn shared_messages_of_a_session_that_expired_while_down_go_to_another_member() {
+    let db = database("shared-expired");
+    let broker = Broker::start(&db);
+    let (mut staying, _) = Client::connect(broker.addr, "staying", Connect::default()).await;
+    staying.subscribe("$share/g/jobs", QoS::AtLeastOnce).await;
+    drop(staying);
+    let member = Connect {
+        receive_maximum: 1,
+        session_expiry: 1,
+        ..Default::default()
+    };
+    let (mut leaving, _) = Client::connect(broker.addr, "leaving", member).await;
+    leaving.subscribe("$share/g/jobs", QoS::AtLeastOnce).await;
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    // Both members are disconnected or busy, so the first two go to `leaving`
+    publisher.publish(message("jobs", "one")).await;
+    let sent = leaving.next_publish().await.unwrap();
+    assert_eq!(sent.payload.unwrap(), "one");
+    publisher.publish(message("jobs", "two")).await;
+    drop(leaving);
+    broker.crash().await;
+    sleep(Duration::from_millis(1500)).await;
+
+    let broker = Broker::start(&db);
+    let resume = Connect {
+        clean_start: false,
+        ..Default::default()
+    };
+    let (mut staying, resumed) = Client::connect(broker.addr, "staying", resume).await;
+    assert!(resumed);
+    let received = drain(&mut staying).await;
+    assert_eq!(
+        received,
+        [("one".to_string(), false), ("two".to_string(), false)]
+    );
+    broker.stop().await;
+}
