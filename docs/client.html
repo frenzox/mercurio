@@ -93,7 +93,9 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>clean_start(bool)</code>, <code>session_expiry(seconds)</code></td><td>Start a new session or resume one, and how long the broker keeps it</td></tr>
 <tr><td><code>will(Will)</code></td><td>Message the broker publishes if the client disappears</td></tr>
 <tr><td><code>reconnect(delay)</code>, <code>reconnect_max(max)</code></td><td>Reconnect automatically after losing the connection, waiting from <code>delay</code> up to <code>max</code> (60 seconds by default) between attempts</td></tr>
-<tr><td><code>tls(true)</code>, <code>ca_path(path)</code></td><td>TLS, verified with the system's roots or the given CA; <code>ca_path</code> turns TLS on</td></tr>
+<tr><td><code>tls(true)</code>, <code>ca_path(path)</code></td><td>TLS, verified with the operating system's certificate store or only the given CA; <code>ca_path</code> turns TLS on</td></tr>
+<tr><td><code>alpn_protocols(protocols)</code></td><td>Protocols to offer in ALPN, as brokers sharing port 443 may need; turns TLS on</td></tr>
+<tr><td><code>tls_config(Arc&lt;rustls::ClientConfig&gt;)</code></td><td>A rustls configuration of your own, replacing the other TLS settings; turns TLS on</td></tr>
 <tr><td><code>client_cert(cert, key)</code></td><td>Authenticate with a client certificate; turns TLS on</td></tr>
 <tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker; packets over <code>maximum_packet_size</code>, 1 MiB by default as on the broker, are refused from their header</td></tr>
 <tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
@@ -167,7 +169,18 @@ assert!(results[0].success);</pre>
 <pre>let options = ConnectOptions::new("iot.example.com", 8883)
     .ca_path("/etc/ssl/my-ca.pem")
     .client_cert("/etc/device/cert.pem", "/etc/device/key.pem");</pre>
-<p>A CA path, a client certificate or <code>danger_skip_tls_verify(true)</code> turns TLS on, so credentials never go out in the clear by mistake. <code>tls(true)</code> alone verifies the broker with the system's roots. A later <code>tls(false)</code> turns TLS off again. TLS isn't available over a Unix socket, and <code>connect</code> refuses these options there.</p>
+<p>A CA path, a client certificate, ALPN protocols or <code>danger_skip_tls_verify(true)</code> turns TLS on, so credentials never go out in the clear by mistake. <code>tls(true)</code> alone verifies the broker with the operating system's certificate store (on Linux the system CA bundle, such as /etc/ssl/certs; the Keychain on macOS; the certificate store on Windows), or, when that holds no usable certificate, the Mozilla roots bundled with the client; the client logs a warning when it falls back. With <code>ca_path</code>, the certificates in that file are the only ones trusted. A later <code>tls(false)</code> turns TLS off again. TLS isn't available over a Unix socket, and <code>connect</code> refuses these options there.</p>
+<p>For full control, such as certificates held in memory, a verifier of your own or other TLS versions, build a <code>rustls::ClientConfig</code>, which the crate re-exports as <code>mercurio_client::rustls</code>, and pass it to <code>tls_config</code>. The broker's host name is still the name checked. It replaces the CA path, the client certificate, ALPN and skipped verification: setting any of them as well makes <code>connect</code> fail with <code>InvalidArgument</code>.</p>
+<pre>use std::sync::Arc;
+use mercurio_client::rustls;
+
+let mut roots = rustls::RootCertStore::empty();
+roots.add_parsable_certificates(my_ca_certificates);
+let mut config = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+config.alpn_protocols = vec![b"mqtt".to_vec()];
+let options = ConnectOptions::new("iot.example.com", 443).tls_config(Arc::new(config));</pre>
 
 <h2>Enhanced authentication</h2>
 <p>Implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>Bytes</code>, which the crate re-exports from the <code>bytes</code> crate, as it does <code>ReasonCode</code>, <code>QoS</code> and <code>ProtocolVersion</code>:</p>

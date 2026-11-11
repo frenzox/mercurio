@@ -30,7 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   at-least-once processing with the broker's flow control.
 - MQTT 5 properties, subscription options and identifiers, topic
   aliases, and enhanced authentication.
-- TLS with the system's roots or your own CA, and client certificates.
+- TLS verified with the operating system's certificate store or your
+  own CA, client certificates, ALPN, or a rustls `ClientConfig` of
+  your own.
 - Unix sockets, with `ConnectOptions::unix`.
 - TLS sits behind the default `tls` feature; turn it off for plain TCP
   and Unix sockets without rustls and aws-lc.

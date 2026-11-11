@@ -31,3 +31,6 @@ pub use mercurio_core::error::Error as PacketError;
 pub use mercurio_core::protocol::ProtocolVersion;
 pub use mercurio_core::qos::QoS;
 pub use mercurio_core::reason::ReasonCode;
+/// The TLS library, for [`ConnectOptions::tls_config`].
+#[cfg(feature = "tls")]
+pub use rustls;

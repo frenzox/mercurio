@@ -323,18 +323,32 @@ impl fmt::Debug for Connector {
 
 /// TLS configuration for client connections.
 #[derive(Debug, Clone, Default)]
-pub struct TlsOptions {
-    /// Enable TLS for the connection.
+pub(crate) struct TlsOptions {
     pub enabled: bool,
-    /// Path to custom CA certificate file (PEM format).
-    /// If not set, system root certificates are used.
+    /// The only CA trusted, in place of the operating system's store
     pub ca_path: Option<String>,
-    /// Skip server certificate verification (insecure, for testing only).
     pub danger_skip_verify: bool,
     /// Client certificate chain (PEM) to authenticate with.
     pub cert_path: Option<String>,
     /// Private key (PEM) of the client certificate.
     pub key_path: Option<String>,
+    /// Protocols offered in ALPN
+    pub alpn: Vec<Vec<u8>>,
+    /// The caller's own rustls configuration, replacing all of the above
+    #[cfg(feature = "tls")]
+    pub config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl TlsOptions {
+    /// Whether settings the caller's own configuration replaces were made.
+    #[cfg(feature = "tls")]
+    fn has_settings(&self) -> bool {
+        self.ca_path.is_some()
+            || self.cert_path.is_some()
+            || self.key_path.is_some()
+            || self.danger_skip_verify
+            || !self.alpn.is_empty()
+    }
 }
 
 /// Options for connecting to an MQTT broker.
@@ -417,6 +431,14 @@ impl ConnectOptions {
                 None,
             ));
         }
+        #[cfg(feature = "tls")]
+        if self.tls.config.is_some() && self.tls.has_settings() {
+            return Err(ClientError::InvalidArgument(
+                "tls_config replaces the CA path, client certificate, ALPN and \
+                 skipping verification; set them in the configuration instead"
+                    .into(),
+            ));
+        }
         #[cfg(not(feature = "tls"))]
         if self.tls.enabled {
             return Err(ClientError::tls(
@@ -481,16 +503,19 @@ impl ConnectOptions {
         }
     }
 
-    /// Enable TLS for the connection. Setting a CA path, a client
-    /// certificate or skipping verification enables it too; the last call
-    /// wins.
+    /// Enable TLS for the connection. The broker is verified with the
+    /// operating system's certificate store, or with the Mozilla roots
+    /// bundled with the client if that store holds no usable certificate,
+    /// unless [`ca_path`](Self::ca_path) names the CA to trust. Setting a
+    /// CA path, a client certificate, ALPN protocols or skipping
+    /// verification enables it too; the last call wins.
     pub fn tls(mut self, enabled: bool) -> Self {
         self.tls.enabled = enabled;
         self
     }
 
-    /// Set custom CA certificate file path for TLS verification, and
-    /// enable TLS.
+    /// Trust only the CA certificates in this PEM file, in place of the
+    /// operating system's store, and enable TLS.
     pub fn ca_path(mut self, path: impl Into<String>) -> Self {
         self.tls.enabled = true;
         self.tls.ca_path = Some(path.into());
@@ -515,6 +540,31 @@ impl ConnectOptions {
     pub fn danger_skip_tls_verify(mut self, skip: bool) -> Self {
         self.tls.enabled |= skip;
         self.tls.danger_skip_verify = skip;
+        self
+    }
+
+    /// Offer these protocols in the TLS handshake's ALPN, as brokers that
+    /// share port 443 with other services may need, and enable TLS.
+    pub fn alpn_protocols<I, P>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<Vec<u8>>,
+    {
+        self.tls.enabled = true;
+        self.tls.alpn = protocols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Use this rustls configuration for TLS, and enable TLS: for full
+    /// control over trust, client certificates held in memory, ALPN or
+    /// certificate verification. It replaces the CA path, the client
+    /// certificate, ALPN and skipping verification, and connecting with
+    /// any of them set as well fails as contradictory. The broker's host
+    /// name is still the server name checked.
+    #[cfg(feature = "tls")]
+    pub fn tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls.enabled = true;
+        self.tls.config = Some(config);
         self
     }
 
@@ -771,6 +821,41 @@ mod tests {
         // The last call wins
         assert!(!options().ca_path("ca.pem").tls(false).tls.enabled);
         assert!(options().tls(false).ca_path("ca.pem").tls.enabled);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_a_tls_configuration_of_its_own_excludes_the_other_tls_settings() {
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let options = || ConnectOptions::new("broker", 8883).tls_config(config.clone());
+        assert!(options().tls.enabled);
+        assert!(options().check().is_ok());
+        for contradictory in [
+            options().ca_path("ca.pem"),
+            options().client_cert("c.pem", "k.pem"),
+            options().danger_skip_tls_verify(true),
+            options().alpn_protocols(["mqtt"]),
+        ] {
+            let Err(error @ ClientError::InvalidArgument(_)) = contradictory.check() else {
+                panic!("contradictory TLS settings were accepted");
+            };
+            assert!(error.to_string().contains("tls_config"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_alpn_protocols_turn_tls_on() {
+        let options = ConnectOptions::new("broker", 443).alpn_protocols(["x-amzn-mqtt-ca"]);
+        assert!(options.tls.enabled);
+        assert_eq!(options.tls.alpn, [b"x-amzn-mqtt-ca".to_vec()]);
     }
 
     #[cfg(not(feature = "tls"))]

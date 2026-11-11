@@ -140,8 +140,8 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
 <tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code>; also <code>3.1.1</code>, <code>3.1</code> and mosquitto's <code>mqttv5</code>, <code>mqttv311</code>, <code>mqttv31</code>. Anything else is an error</td><td><code>5</code></td></tr>
-<tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
-<tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with; implies <code>--tls</code></td><td>system roots</td></tr>
+<tr><td><code>--tls</code></td><td>Connect with TLS, verifying the broker with the operating system's certificate store (on Linux the system CA bundle, such as /etc/ssl/certs; the Keychain on macOS; the certificate store on Windows), or, when that holds no usable certificate, the Mozilla roots bundled with the client</td><td></td></tr>
+<tr><td><code>--cafile</code></td><td>CA certificates (PEM) to verify the broker with, the only ones then trusted; implies <code>--tls</code></td><td>the operating system's store</td></tr>
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
 <tr><td><code>--cert PATH</code>, <code>--key PATH</code></td><td>Client certificate and its private key, both PEM, for brokers that authenticate clients by certificate; each needs the other, and they imply <code>--tls</code></td><td></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>

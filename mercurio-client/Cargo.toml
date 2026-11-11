@@ -17,8 +17,9 @@ all-features = true
 default = ["tls"]
 # Command-line arguments for connecting, shared by the Mercurio tools
 clap = ["dep:clap", "dep:rpassword"]
-# TLS connections, through rustls
-tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+# TLS connections, through rustls, trusting the operating system's
+# certificate store
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
@@ -28,6 +29,7 @@ bytes = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt", "io-util"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 tracing = "0.1"
 thiserror = "1"
