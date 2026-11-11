@@ -4,9 +4,19 @@
 #[cfg(unix)]
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
-use crate::ConnectOptions;
+use crate::{ConnectOptions, ScramSha256};
+
+/// How the user name and password log in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
+pub enum AuthMethod {
+    /// SCRAM-SHA-256 enhanced authentication, MQTT 5 only: the password
+    /// never reaches the broker, and the broker proves it knows it
+    #[value(name = "scram-sha-256")]
+    ScramSha256,
+}
 
 /// Where the broker is and how to log in to it. Flatten it into a clap
 /// command with `#[command(flatten)]`.
@@ -43,6 +53,11 @@ pub struct ConnectArgs {
     /// prefer the tool's variable, or leave it out with -u to be asked
     #[arg(short = 'P', long)]
     pub password: Option<String>,
+
+    /// Log in with this enhanced authentication method instead of sending
+    /// the user name and password in CONNECT; needs -u
+    #[arg(long, value_name = "METHOD", requires = "username")]
+    pub auth_method: Option<AuthMethod>,
 
     /// Enable TLS for the connection, verifying the broker with the
     /// operating system's certificate store, or with the Mozilla roots
@@ -89,6 +104,7 @@ impl std::fmt::Debug for ConnectArgs {
             .field("client_id", &self.client_id)
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("auth_method", &self.auth_method)
             .field("tls", &self.tls)
             .field("cafile", &self.cafile)
             .field("insecure", &self.insecure)
@@ -132,11 +148,19 @@ impl ConnectArgs {
         if let Some(id) = &self.client_id {
             options = options.client_id(id);
         }
-        if let Some(user) = &self.username {
-            options = options.username(user);
-        }
-        if let Some(password) = &self.password {
-            options = options.password(password.as_bytes().to_vec());
+        match (self.auth_method, &self.username) {
+            (Some(AuthMethod::ScramSha256), Some(user)) => {
+                let password = self.password.clone().unwrap_or_default();
+                options = options.authenticator(ScramSha256::new(user, password));
+            }
+            _ => {
+                if let Some(user) = &self.username {
+                    options = options.username(user);
+                }
+                if let Some(password) = &self.password {
+                    options = options.password(password.as_bytes().to_vec());
+                }
+            }
         }
         if self.tls {
             options = options.tls(true);
@@ -172,7 +196,7 @@ impl ConnectArgs {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::ConnectArgs;
+    use super::{AuthMethod, ConnectArgs};
 
     #[derive(Parser)]
     struct Cli {
@@ -272,6 +296,32 @@ mod tests {
         assert_eq!(options.username.as_deref(), Some("alice"));
         assert_eq!(options.password.as_deref(), Some(&b"secret"[..]));
         assert!(options.tls.danger_skip_verify);
+    }
+
+    #[test]
+    fn scram_takes_the_credentials_out_of_connect() {
+        let args = parse(&[
+            "--auth-method",
+            "scram-sha-256",
+            "-u",
+            "alice",
+            "-P",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(args.auth_method, Some(AuthMethod::ScramSha256));
+        let options = args.to_connect_options();
+        assert_eq!(options.username, None);
+        assert_eq!(options.password, None);
+        let shown = format!("{options:?}");
+        assert!(shown.contains("SCRAM-SHA-256"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+
+        assert!(
+            parse(&["--auth-method", "scram-sha-256"]).is_err(),
+            "SCRAM without a user name"
+        );
+        assert!(parse(&["--auth-method", "plain", "-u", "a"]).is_err());
     }
 
     #[test]
