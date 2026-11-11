@@ -351,8 +351,9 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// The task holding the will of the last connection until its delay
-    /// passes, with a copy of that will; a newer generation aborts it
-    pending_will: Option<(AbortHandle, WillMessage)>,
+    /// passes, with a copy of that will and the connection's generation; a
+    /// connection that takes the session over aborts it
+    pending_will: Option<(AbortHandle, WillMessage, u64)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
@@ -543,7 +544,23 @@ impl Session {
     pub(crate) async fn set_generation(&self, generation: u64) {
         let mut state = self.shared.state.lock().await;
         self.shared.generation.store(generation, Ordering::Release);
-        if let Some((will, _)) = state.pending_will.take() {
+        if let Some((will, _, _)) = state.pending_will.take() {
+            will.abort();
+        }
+    }
+
+    /// Hands the session to `generation`, a connection that has yet to
+    /// start it, keeping the will an earlier connection left waiting: if
+    /// that connection is abandoned, the will is still due.
+    pub(crate) async fn hand_over(&self, generation: u64) {
+        let _state = self.shared.state.lock().await;
+        self.shared.generation.store(generation, Ordering::Release);
+    }
+
+    /// Drops the will an earlier connection left waiting for its delay, as
+    /// its client is back.
+    pub(crate) async fn drop_pending_will(&self) {
+        if let Some((will, _, _)) = self.shared.state.lock().await.pending_will.take() {
             will.abort();
         }
     }
@@ -559,7 +576,7 @@ impl Session {
     ) {
         let mut state = self.shared.state.lock().await;
         if self.generation() == generation {
-            state.pending_will = Some((task, will));
+            state.pending_will = Some((task, will, generation));
         } else {
             task.abort();
         }
@@ -570,7 +587,7 @@ impl Session {
     /// will is never cut off half published.
     pub(crate) async fn claim_pending_will(&self, generation: u64) -> bool {
         let mut state = self.shared.state.lock().await;
-        if self.generation() != generation {
+        if state.pending_will.as_ref().map(|(_, _, g)| *g) != Some(generation) {
             return false;
         }
         state.pending_will = None;
@@ -1237,7 +1254,7 @@ impl Session {
             expires_at: state.presence.expires_at,
             owner: state.owner.clone(),
         })];
-        let pending = state.pending_will.as_ref().map(|(_, will)| will);
+        let pending = state.pending_will.as_ref().map(|(_, will, _)| will);
         if let Some(will) = state.will_message.as_ref().or(pending) {
             writes.push(Write::StoreWill(will.clone().into()));
         }

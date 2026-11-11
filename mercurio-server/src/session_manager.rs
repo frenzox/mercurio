@@ -601,9 +601,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             // connection's from here on, so abandoned, the start ends the
             // session as this connection would have
             claim.on_drop = OnDrop::End(expiry);
-            existing.set_generation(generation).await;
+            existing.hand_over(generation).await;
         }
 
+        let superseded = existing.clone();
         let resumed = existing.filter(|_| !clean_start);
         let mut stored = None;
         if !clean_start && resumed.is_none() {
@@ -632,7 +633,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     .session()
             }
         };
-        session.set_generation(generation).await;
+        session.hand_over(generation).await;
         session.set_owner(owner.clone()).await;
         session.restore_incoming_qos2(incoming_qos2).await;
 
@@ -705,6 +706,12 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     .write(&client_id, Write::StoreWill(stored_will));
             }
             None => self.writers.write(&client_id, Write::DeleteWill),
+        }
+
+        // The client is back: the will its previous connection left
+        // waiting is no longer due [MQTT-3.1.3-9]
+        if let Some(superseded) = &superseded {
+            superseded.drop_pending_will().await;
         }
 
         Ok(SessionStartResult {
@@ -3194,6 +3201,54 @@ mod tests {
         let _ = release.send(());
 
         assert!(gone(&manager, "c").await, "the session never expires");
+    }
+
+    #[tokio::test]
+    async fn test_a_takeover_abandoned_midway_leaves_the_delayed_will_due() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let first = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let generation = first.lease.generation;
+        let will = WillMessage::from(stored_will(1));
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let (session, published) = (first.session.clone(), Arc::clone(&published));
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if session.claim_pending_will(generation).await {
+                    published.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        };
+        first
+            .session
+            .set_pending_will(generation, task.abort_handle(), will)
+            .await;
+
+        // Takes the session over, then is abandoned before it is in place
+        let mut taking_over = manager.clone();
+        let mut second = Box::pin(async move {
+            taking_over
+                .start_session(resuming("c"), SessionOwner::default())
+                .await
+                .map(|_| ())
+        });
+        assert!(poll_briefly(&mut second).await.is_none());
+        manager
+            .end_connection(first.lease, Some(Duration::from_secs(3600)))
+            .await;
+        let held = manager.shared.state.lock().await;
+        assert!(poll_briefly(&mut second).await.is_none());
+        let release = queue_for_lock(&manager).await;
+        drop(held);
+        assert!(poll_briefly(&mut second).await.is_none());
+        drop(second);
+        let _ = release.send(());
+
+        let _ = task.await;
+        assert!(published.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]
