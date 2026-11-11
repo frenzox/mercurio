@@ -330,7 +330,8 @@ pub fn redacted_url(url: &str) -> Cow<'_, str> {
 }
 
 /// `url` of an HTTP auth service with any user info and query redacted, as
-/// reqwest sends the first as basic auth and the second may carry a key; the
+/// ureq sends the first, as it is, in a basic `Authorization` header and the
+/// second may carry a key; the
 /// whole URL when an `@` appears elsewhere than in a clean authority, and
 /// secrets in the path are not recognised.
 pub fn redacted_http_url(url: &str) -> Cow<'_, str> {
