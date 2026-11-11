@@ -3,8 +3,9 @@
 Persistence for the [Mercurio](https://github.com/frenzox/mercurio) MQTT broker: sessions, subscriptions,
 retained messages, wills, in-flight messages and offline queues.
 
-It defines one trait per kind of state, gathered in `MqttStore`, with three
-implementations:
+It defines `BatchStore` for what the broker keeps per client,
+`RetainedMessageStore` for retained messages and `BanStore` for bans,
+the first two gathered in `MqttStore`, with three implementations:
 
 - `memory::MemoryStore`: everything in memory, lost on restart.
 - `sqlite::SqliteStore`: a SQLite database, behind the `sqlite` feature.
@@ -25,11 +26,11 @@ run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;
 ```
 
 Implement the traits to keep the broker's state anywhere else. The broker
-writes each client's changes through `BatchStore::apply`, in batches; its
-default applies them one at a time, and stores that can should apply a
-batch in one transaction. A store overriding it can pass the changes it
-has no batch form for, including kinds added in later versions, to
-`apply_each`.
+writes each client's changes through `BatchStore::apply`, in batches,
+which is the one method that writes; stores that can should apply a batch
+in one transaction. The other methods read. The `test-util` feature adds
+`testing::conformance`, the suite the three stores here pass: run it
+against a store of your own from its tests.
 
 The broker retries a batch that fails with `StorageError::Transient`, such
 as on a lost connection, until storage recovers, and gives up others after
@@ -40,7 +41,10 @@ database over: the broker drops the batch, and should stop.
 
 - `sqlite`: the SQLite store, with schema migrations applied on open.
 - `postgres`: the PostgreSQL store, for PostgreSQL 12 or later, which
-  creates and updates its tables on connect.
+  creates and updates its tables on connect. Its tests run when
+  `MERCURIO_TEST_POSTGRES_URL` names a database they may empty, set when
+  they are built; without it they are listed as ignored.
+- `test-util`: the `testing` module.
 
 ## License
 

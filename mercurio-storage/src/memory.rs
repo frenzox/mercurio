@@ -5,7 +5,7 @@
 //! across restarts is not required.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -13,24 +13,121 @@ use async_trait::async_trait;
 use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
-    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionState, SessionStore, StorageError, StoredBan, StoredWillMessage, WillStore,
+    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionState,
+    StorageError, StoredBan, StoredWillMessage, Write,
 };
 
 /// A ban's kind, value and prefix flag.
 type BanKey = (String, String, bool);
+
+/// What the store holds for the clients.
+#[derive(Debug, Default)]
+struct Clients {
+    sessions: HashMap<String, SessionState>,
+    wills: HashMap<String, StoredWillMessage>,
+    inflight: HashMap<String, HashMap<u16, InflightMessage>>,
+    incoming_qos2: HashMap<String, HashSet<u16>>,
+}
+
+impl Clients {
+    fn apply(&mut self, client_id: &str, write: &Write) {
+        match write {
+            Write::SaveSession(session) => {
+                self.sessions.insert(client_id.to_string(), session.clone());
+            }
+            Write::AddSubscription(subscription) => {
+                if let Some(session) = self.sessions.get_mut(client_id) {
+                    session
+                        .subscriptions
+                        .retain(|s| s.topic_filter != subscription.topic_filter);
+                    session.subscriptions.push(subscription.clone());
+                }
+            }
+            Write::RemoveSubscription(topic_filter) => {
+                if let Some(session) = self.sessions.get_mut(client_id) {
+                    session
+                        .subscriptions
+                        .retain(|s| s.topic_filter != *topic_filter);
+                }
+            }
+            Write::SetExpiry {
+                interval,
+                expires_at,
+            } => {
+                if let Some(session) = self.sessions.get_mut(client_id) {
+                    session.expiry_interval = Some(*interval);
+                    session.expires_at = Some(*expires_at);
+                }
+            }
+            Write::StoreWill(will) => {
+                self.wills.insert(client_id.to_string(), will.clone());
+            }
+            Write::DeleteWill => {
+                self.wills.remove(client_id);
+            }
+            Write::StoreInflight(message) => {
+                self.inflight
+                    .entry(client_id.to_string())
+                    .or_default()
+                    .insert(message.packet_id, message.clone());
+            }
+            Write::ReleaseInflight(packet_id) => {
+                if let Some(message) = self
+                    .inflight
+                    .get_mut(client_id)
+                    .and_then(|messages| messages.get_mut(packet_id))
+                {
+                    message.released = true;
+                    message.payload = None;
+                }
+            }
+            Write::RemoveInflight(packet_id) => {
+                if let Some(messages) = self.inflight.get_mut(client_id) {
+                    messages.remove(packet_id);
+                    if messages.is_empty() {
+                        self.inflight.remove(client_id);
+                    }
+                }
+            }
+            Write::StoreIncomingQos2(packet_id) => {
+                self.incoming_qos2
+                    .entry(client_id.to_string())
+                    .or_default()
+                    .insert(*packet_id);
+            }
+            Write::RemoveIncomingQos2(packet_id) => {
+                if let Some(ids) = self.incoming_qos2.get_mut(client_id) {
+                    ids.remove(packet_id);
+                    if ids.is_empty() {
+                        self.incoming_qos2.remove(client_id);
+                    }
+                }
+            }
+            // Everything in memory is lost on restart anyway, so queues are
+            // not copied
+            Write::Enqueue(..) | Write::Dequeue(_) | Write::ClearQueue => {}
+            Write::DeleteSession => {
+                self.sessions.remove(client_id);
+                self.wills.remove(client_id);
+                self.inflight.remove(client_id);
+                self.incoming_qos2.remove(client_id);
+            }
+        }
+    }
+}
 
 /// In-memory storage backend implementing all storage traits.
 ///
 /// Uses `RwLock` for thread-safe concurrent access. All data is lost on restart.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStore {
-    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    retained: Arc<RwLock<HashMap<String, Message>>>,
-    wills: Arc<RwLock<HashMap<String, StoredWillMessage>>>,
-    inflight: Arc<RwLock<HashMap<String, HashMap<u16, InflightMessage>>>>,
-    incoming_qos2: Arc<RwLock<HashMap<String, HashSet<u16>>>>,
+    clients: Arc<RwLock<Clients>>,
+    retained: Arc<RwLock<BTreeMap<String, Message>>>,
     bans: Arc<RwLock<HashMap<BanKey, StoredBan>>>,
+}
+
+fn poisoned(error: impl std::fmt::Display) -> StorageError {
+    StorageError::OperationFailed(error.to_string())
 }
 
 impl MemoryStore {
@@ -38,8 +135,13 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn read<T>(&self, f: impl FnOnce(&Clients) -> T) -> Result<T> {
+        Ok(f(&*self.clients.read().map_err(poisoned)?))
+    }
 }
 
+#[async_trait]
 impl BatchStore for MemoryStore {
     fn backend_name(&self) -> &'static str {
         "memory"
@@ -48,23 +150,66 @@ impl BatchStore for MemoryStore {
     fn ban_store(self: Arc<Self>) -> Option<Arc<dyn BanStore>> {
         Some(self)
     }
+
+    fn is_durable(&self) -> bool {
+        false
+    }
+
+    /// Applies the batch under one lock, so readers see all of it or none.
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+        let mut clients = self.clients.write().map_err(poisoned)?;
+        for write in writes {
+            clients.apply(client_id, write);
+        }
+        Ok(())
+    }
+
+    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
+        self.read(|clients| clients.sessions.get(client_id).cloned())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<String>> {
+        self.read(|clients| clients.sessions.keys().cloned().collect())
+    }
+
+    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
+        self.read(|clients| clients.wills.get(client_id).cloned())
+    }
+
+    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
+        self.read(|clients| {
+            clients
+                .inflight
+                .get(client_id)
+                .map(|messages| messages.values().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        self.read(|clients| {
+            clients
+                .incoming_qos2
+                .get(client_id)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    async fn load_queue(&self, _client_id: &str) -> Result<Vec<(u64, Message)>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
 impl BanStore for MemoryStore {
     async fn load_bans(&self) -> Result<Vec<StoredBan>> {
-        let bans = self
-            .bans
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        let bans = self.bans.read().map_err(poisoned)?;
         Ok(bans.values().cloned().collect())
     }
 
     async fn store_ban(&self, ban: &StoredBan) -> Result<()> {
-        let mut bans = self
-            .bans
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        let mut bans = self.bans.write().map_err(poisoned)?;
         bans.insert(
             (ban.kind.clone(), ban.value.clone(), ban.prefix),
             ban.clone(),
@@ -73,60 +218,16 @@ impl BanStore for MemoryStore {
     }
 
     async fn delete_ban(&self, kind: &str, value: &str, prefix: bool) -> Result<()> {
-        let mut bans = self
-            .bans
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        let mut bans = self.bans.write().map_err(poisoned)?;
         bans.remove(&(kind.to_string(), value.to_string(), prefix));
         Ok(())
     }
 }
 
 #[async_trait]
-impl SessionStore for MemoryStore {
-    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        sessions.insert(client_id.to_string(), session.clone());
-        Ok(())
-    }
-
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
-        let sessions = self
-            .sessions
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(sessions.get(client_id).cloned())
-    }
-
-    async fn delete_session(&self, client_id: &str) -> Result<()> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        sessions.remove(client_id);
-        Ok(())
-    }
-
-    async fn list_sessions(&self) -> Result<Vec<String>> {
-        let sessions = self
-            .sessions
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(sessions.keys().cloned().collect())
-    }
-}
-
-#[async_trait]
 impl RetainedMessageStore for MemoryStore {
     async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()> {
-        let mut retained = self
-            .retained
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
+        let mut retained = self.retained.write().map_err(poisoned)?;
         match message {
             Some(msg) => {
                 retained.insert(topic.to_string(), msg);
@@ -139,10 +240,7 @@ impl RetainedMessageStore for MemoryStore {
     }
 
     async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
-        let mut retained = self
-            .retained
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        let mut retained = self.retained.write().map_err(poisoned)?;
 
         // Expired messages are dropped for good, not just skipped
         retained.retain(|_, msg| !msg.is_expired());
@@ -161,380 +259,28 @@ impl RetainedMessageStore for MemoryStore {
     }
 
     async fn clear_all_retained(&self) -> Result<()> {
-        let mut retained = self
-            .retained
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        retained.clear();
+        self.retained.write().map_err(poisoned)?.clear();
         Ok(())
     }
 
     async fn count_retained(&self) -> Result<usize> {
-        let retained = self
-            .retained
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(retained.len())
-    }
-}
-
-#[async_trait]
-impl WillStore for MemoryStore {
-    async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()> {
-        let mut wills = self
-            .wills
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        wills.insert(client_id.to_string(), will.clone());
-        Ok(())
-    }
-
-    async fn get_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        let wills = self
-            .wills
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(wills.get(client_id).cloned())
-    }
-
-    async fn delete_will(&self, client_id: &str) -> Result<()> {
-        let mut wills = self
-            .wills
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        wills.remove(client_id);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl InflightStore for MemoryStore {
-    async fn store_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-        message: &InflightMessage,
-    ) -> Result<()> {
-        let mut inflight = self
-            .inflight
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
-        inflight
-            .entry(client_id.to_string())
-            .or_default()
-            .insert(packet_id, message.clone());
-        Ok(())
-    }
-
-    async fn get_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-    ) -> Result<Option<InflightMessage>> {
-        let inflight = self
-            .inflight
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
-        Ok(inflight
-            .get(client_id)
-            .and_then(|msgs| msgs.get(&packet_id).cloned()))
-    }
-
-    async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        let mut inflight = self
-            .inflight
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
-        if let Some(msgs) = inflight.get_mut(client_id) {
-            msgs.remove(&packet_id);
-        }
-        Ok(())
-    }
-
-    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        let mut inflight = self
-            .inflight
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
-        if let Some(message) = inflight
-            .get_mut(client_id)
-            .and_then(|msgs| msgs.get_mut(&packet_id))
-        {
-            message.released = true;
-            message.payload = None;
-        }
-        Ok(())
-    }
-
-    async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
-        let inflight = self
-            .inflight
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-
-        Ok(inflight
-            .get(client_id)
-            .map(|msgs| msgs.values().cloned().collect())
-            .unwrap_or_default())
-    }
-
-    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.incoming_qos2
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?
-            .entry(client_id.to_string())
-            .or_default()
-            .insert(packet_id);
-        Ok(())
-    }
-
-    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        let mut incoming = self
-            .incoming_qos2
-            .write()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        if let Some(ids) = incoming.get_mut(client_id) {
-            ids.remove(&packet_id);
-            if ids.is_empty() {
-                incoming.remove(client_id);
-            }
-        }
-        Ok(())
-    }
-
-    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
-        let incoming = self
-            .incoming_qos2
-            .read()
-            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
-        Ok(incoming
-            .get(client_id)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default())
-    }
-}
-
-/// Everything in memory is lost on restart anyway, so queues are not
-/// copied.
-#[async_trait]
-impl QueueStore for MemoryStore {
-    fn is_durable(&self) -> bool {
-        false
-    }
-
-    async fn enqueue(&self, _client_id: &str, _sequence: u64, _message: &Message) -> Result<()> {
-        Ok(())
-    }
-
-    async fn dequeue(&self, _client_id: &str, _sequence: u64) -> Result<()> {
-        Ok(())
-    }
-
-    async fn load_queue(&self, _client_id: &str) -> Result<Vec<(u64, Message)>> {
-        Ok(Vec::new())
-    }
-
-    async fn clear_queue(&self, _client_id: &str) -> Result<()> {
-        Ok(())
+        Ok(self.retained.read().map_err(poisoned)?.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StoredSubscription;
+
+    #[tokio::test]
+    async fn test_conformance() {
+        crate::testing::conformance(&MemoryStore::new()).await;
+    }
 
     #[tokio::test]
     async fn test_bans() {
         let store = Arc::new(MemoryStore::new());
-        crate::testing::bans_round_trip(store.as_ref()).await;
+        crate::testing::bans(store.as_ref()).await;
         assert!(store.ban_store().is_some());
-    }
-    use bytes::Bytes;
-    use mercurio_core::qos::QoS;
-    use std::sync::Arc;
-
-    fn create_test_message(topic: &str, payload: &str) -> Message {
-        Message {
-            packet_id: None,
-            topic: Arc::from(topic),
-            dup: false,
-            qos: QoS::AtMostOnce,
-            retain: false,
-            payload: Some(Bytes::from(payload.to_string())),
-            properties: Default::default(),
-            expires_at: None,
-            subscription_identifiers: Vec::new(),
-            origin: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_session_store() {
-        let store = MemoryStore::new();
-
-        let session = SessionState {
-            client_id: "client1".to_string(),
-            subscriptions: vec![
-                StoredSubscription::new("topic/a", QoS::AtMostOnce),
-                StoredSubscription::new("topic/b", QoS::AtLeastOnce),
-            ],
-            expiry_interval: None,
-            expires_at: None,
-            owner: Default::default(),
-        };
-
-        // Save and load
-        store.save_session("client1", &session).await.unwrap();
-        let loaded = store.load_session("client1").await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().subscriptions.len(), 2);
-
-        // List sessions
-        let sessions = store.list_sessions().await.unwrap();
-        assert_eq!(sessions.len(), 1);
-
-        // Delete
-        store.delete_session("client1").await.unwrap();
-        let loaded = store.load_session("client1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_retained_message_store() {
-        let store = MemoryStore::new();
-
-        let msg = create_test_message("sensors/temp", "22.5");
-        store
-            .store_retained("sensors/temp", Some(msg))
-            .await
-            .unwrap();
-
-        // Exact match
-        let retained = store.get_retained("sensors/temp").await.unwrap();
-        assert_eq!(retained.len(), 1);
-
-        // Wildcard match
-        let retained = store.get_retained("sensors/+").await.unwrap();
-        assert_eq!(retained.len(), 1);
-
-        // Clear specific
-        store.store_retained("sensors/temp", None).await.unwrap();
-        let retained = store.get_retained("sensors/temp").await.unwrap();
-        assert!(retained.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_will_store() {
-        let store = MemoryStore::new();
-
-        let will = StoredWillMessage {
-            topic: "client/status".to_string(),
-            payload: Bytes::from("offline"),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-            delay_secs: 0,
-            properties: Default::default(),
-        };
-
-        store.store_will("client1", &will).await.unwrap();
-        let loaded = store.get_will("client1").await.unwrap();
-        assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().topic, "client/status");
-
-        store.delete_will("client1").await.unwrap();
-        let loaded = store.get_will("client1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_inflight_store() {
-        let store = MemoryStore::new();
-
-        let msg = InflightMessage {
-            packet_id: 1,
-            topic: "test/topic".to_string(),
-            payload: Some(Bytes::from("data")),
-            qos: QoS::ExactlyOnce,
-            dup: false,
-            retain: true,
-            expires_at: Some(1_700_000_000_000),
-            sequence: 7,
-            released: false,
-            properties: Default::default(),
-            subscription_identifiers: Vec::new(),
-        };
-
-        store.store_inflight("client1", 1, &msg).await.unwrap();
-
-        let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
-        assert_eq!(loaded.sequence, 7);
-        assert!(!loaded.released);
-        assert!(loaded.retain);
-        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
-
-        store.release_inflight("client1", 1).await.unwrap();
-        let all = store.get_all_inflight("client1").await.unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all[0].released);
-        assert!(all[0].payload.is_none());
-        assert_eq!(all[0].sequence, 7);
-
-        store.remove_inflight("client1", 1).await.unwrap();
-        let loaded = store.get_inflight("client1", 1).await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_subscriptions() {
-        crate::testing::subscriptions_round_trip(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn test_incoming_qos2() {
-        crate::testing::incoming_qos2_round_trip(&MemoryStore::new()).await;
-    }
-
-    #[tokio::test]
-    async fn test_expired_retained_messages_are_removed() {
-        let store = MemoryStore::new();
-        let mut expired = create_test_message("old", "x");
-        expired.expires_at = Some(1);
-        store.store_retained("old", Some(expired)).await.unwrap();
-        store
-            .store_retained("new", Some(create_test_message("new", "y")))
-            .await
-            .unwrap();
-
-        let retained = store.get_retained("#").await.unwrap();
-        assert_eq!(retained.len(), 1);
-        assert_eq!(&*retained[0].topic, "new");
-        assert_eq!(store.retained.read().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_clear_all_retained() {
-        let store = MemoryStore::new();
-
-        store
-            .store_retained("a", Some(create_test_message("a", "1")))
-            .await
-            .unwrap();
-        store
-            .store_retained("b", Some(create_test_message("b", "2")))
-            .await
-            .unwrap();
-
-        let retained = store.get_retained("#").await.unwrap();
-        assert_eq!(retained.len(), 2);
-
-        store.clear_all_retained().await.unwrap();
-
-        let retained = store.get_retained("#").await.unwrap();
-        assert!(retained.is_empty());
     }
 }

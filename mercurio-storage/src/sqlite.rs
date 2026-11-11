@@ -21,9 +21,8 @@ use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, InflightStore, QueueStore, Result, RetainedMessageStore,
-    SessionOwner, SessionState, SessionStore, StorageError, StoredBan, StoredSubscription,
-    StoredWillMessage, WillStore, Write,
+    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionOwner,
+    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -529,6 +528,140 @@ impl BatchStore for SqliteStore {
         })
         .await
     }
+
+    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            let Some(mut session) = conn
+                .query_row(
+                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point
+                     FROM sessions WHERE client_id = ?1",
+                    params![client_id],
+                    |row| {
+                        Ok(SessionState {
+                            client_id: client_id.clone(),
+                            subscriptions: Vec::new(),
+                            expiry_interval: row.get(0)?,
+                            expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
+                            owner: SessionOwner {
+                                username: row.get(2)?,
+                                mount_point: row.get(3)?,
+                            },
+                        })
+                    },
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                "SELECT topic_filter, qos, no_local, retain_as_published, subscription_identifier
+                 FROM subscriptions WHERE client_id = ?1",
+            )?;
+            session.subscriptions = stmt
+                .query_map(params![client_id], |row| {
+                    Ok(StoredSubscription {
+                        topic_filter: row.get(0)?,
+                        qos: int_to_qos(row.get(1)?),
+                        no_local: row.get(2)?,
+                        retain_as_published: row.get(3)?,
+                        subscription_identifier: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(Some(session))
+        })
+        .await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<String>> {
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare("SELECT client_id FROM sessions")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            conn.query_row(
+                "SELECT topic, payload, qos, retain, delay_secs, properties
+                 FROM will_messages WHERE client_id = ?1",
+                params![client_id],
+                |row| {
+                    let payload: Vec<u8> = row.get(1)?;
+                    let properties: Vec<u8> = row.get(5)?;
+                    Ok(StoredWillMessage {
+                        topic: row.get(0)?,
+                        payload: Bytes::from(payload),
+                        qos: int_to_qos(row.get(2)?),
+                        retain: row.get(3)?,
+                        delay_secs: row.get(4)?,
+                        properties: decode_properties(properties)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare(&format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1"))?;
+            let rows = stmt.query_map(params![client_id], inflight_from_row)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        let client_id = client_id.to_string();
+        self.blocking(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?;
+            let rows = stmt.query_map(params![client_id], |row| row.get(0))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
+        let client_id = client_id.to_string();
+
+        self.blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence, topic, payload, qos, retain, properties, expires_at,
+                        subscription_identifiers
+                 FROM queued_messages WHERE client_id = ?1 ORDER BY sequence",
+            )?;
+            let rows = stmt.query_map(params![client_id], |row| {
+                let topic: String = row.get(1)?;
+                let payload: Option<Vec<u8>> = row.get(2)?;
+                let message = Message {
+                    packet_id: None,
+                    topic: Arc::from(topic.as_str()),
+                    dup: false,
+                    qos: int_to_qos(row.get(3)?),
+                    retain: row.get(4)?,
+                    payload: payload.map(Bytes::from),
+                    properties: decode_properties(row.get(5)?)?,
+                    expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
+                    subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
+                    origin: None,
+                };
+                Ok((row.get::<_, i64>(0)? as u64, message))
+            })?;
+            rows.collect()
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -581,90 +714,6 @@ impl BanStore for SqliteStore {
                 params![kind, value, prefix],
             )?;
             Ok(())
-        })
-        .await
-    }
-}
-
-#[async_trait]
-impl SessionStore for SqliteStore {
-    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()> {
-        self.apply(client_id, &[Write::SaveSession(session.clone())])
-            .await
-    }
-
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            let Some(mut session) = conn
-                .query_row(
-                    "SELECT expiry_interval, expires_at, owner_username, owner_mount_point
-                     FROM sessions WHERE client_id = ?1",
-                    params![client_id],
-                    |row| {
-                        Ok(SessionState {
-                            client_id: client_id.clone(),
-                            subscriptions: Vec::new(),
-                            expiry_interval: row.get(0)?,
-                            expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
-                            owner: SessionOwner {
-                                username: row.get(2)?,
-                                mount_point: row.get(3)?,
-                            },
-                        })
-                    },
-                )
-                .optional()?
-            else {
-                return Ok(None);
-            };
-            let mut stmt = conn.prepare(
-                "SELECT topic_filter, qos, no_local, retain_as_published, subscription_identifier
-                 FROM subscriptions WHERE client_id = ?1",
-            )?;
-            session.subscriptions = stmt
-                .query_map(params![client_id], |row| {
-                    Ok(StoredSubscription {
-                        topic_filter: row.get(0)?,
-                        qos: int_to_qos(row.get(1)?),
-                        no_local: row.get(2)?,
-                        retain_as_published: row.get(3)?,
-                        subscription_identifier: row.get(4)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(Some(session))
-        })
-        .await
-    }
-
-    async fn delete_session(&self, client_id: &str) -> Result<()> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            for table in ["sessions", "subscriptions"] {
-                tx.execute(
-                    &format!("DELETE FROM {table} WHERE client_id = ?1"),
-                    params![client_id],
-                )?;
-            }
-            tx.commit()
-        })
-        .await
-    }
-
-    async fn list_sessions(&self) -> Result<Vec<String>> {
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare("SELECT client_id FROM sessions")?;
-            let rows = stmt.query_map([], |row| row.get(0))?;
-
-            let mut sessions = Vec::new();
-            for row in rows {
-                sessions.push(row?);
-            }
-            Ok(sessions)
         })
         .await
     }
@@ -789,195 +838,77 @@ impl RetainedMessageStore for SqliteStore {
     }
 }
 
-#[async_trait]
-impl WillStore for SqliteStore {
-    async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()> {
-        self.apply(client_id, &[Write::StoreWill(will.clone())])
-            .await
-    }
-
-    async fn get_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, retain, delay_secs, properties
-                 FROM will_messages WHERE client_id = ?1",
-            )?;
-
-            let result = stmt
-                .query_row(params![client_id], |row| {
-                    let payload: Vec<u8> = row.get(1)?;
-                    let properties: Vec<u8> = row.get(5)?;
-                    Ok(StoredWillMessage {
-                        topic: row.get(0)?,
-                        payload: Bytes::from(payload),
-                        qos: int_to_qos(row.get(2)?),
-                        retain: row.get(3)?,
-                        delay_secs: row.get(4)?,
-                        properties: decode_properties(properties)?,
-                    })
-                })
-                .optional()?;
-
-            Ok(result)
-        })
-        .await
-    }
-
-    async fn delete_will(&self, client_id: &str) -> Result<()> {
-        self.apply(client_id, &[Write::DeleteWill]).await
-    }
-}
-
-#[async_trait]
-impl InflightStore for SqliteStore {
-    async fn store_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-        message: &InflightMessage,
-    ) -> Result<()> {
-        let message = InflightMessage {
-            packet_id,
-            ..message.clone()
-        };
-        self.apply(client_id, &[Write::StoreInflight(message)])
-            .await
-    }
-
-    async fn get_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-    ) -> Result<Option<InflightMessage>> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            conn.query_row(
-                &format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1 AND packet_id = ?2"),
-                params![client_id, packet_id],
-                inflight_from_row,
-            )
-            .optional()
-        })
-        .await
-    }
-
-    async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::RemoveInflight(packet_id)])
-            .await
-    }
-
-    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::ReleaseInflight(packet_id)])
-            .await
-    }
-
-    async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare(&format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1"))?;
-            let rows = stmt.query_map(params![client_id], inflight_from_row)?;
-            rows.collect()
-        })
-        .await
-    }
-
-    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::StoreIncomingQos2(packet_id)])
-            .await
-    }
-
-    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
-        self.apply(client_id, &[Write::RemoveIncomingQos2(packet_id)])
-            .await
-    }
-
-    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
-        let client_id = client_id.to_string();
-        self.blocking(move |conn| {
-            let mut stmt =
-                conn.prepare("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?;
-            let rows = stmt.query_map(params![client_id], |row| row.get(0))?;
-            rows.collect()
-        })
-        .await
-    }
-}
-
-#[async_trait]
-impl QueueStore for SqliteStore {
-    async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()> {
-        self.apply(client_id, &[Write::Enqueue(sequence, message.clone())])
-            .await
-    }
-
-    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()> {
-        self.apply(client_id, &[Write::Dequeue(sequence)]).await
-    }
-
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
-        let client_id = client_id.to_string();
-
-        self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT sequence, topic, payload, qos, retain, properties, expires_at,
-                        subscription_identifiers
-                 FROM queued_messages WHERE client_id = ?1 ORDER BY sequence",
-            )?;
-            let rows = stmt.query_map(params![client_id], |row| {
-                let topic: String = row.get(1)?;
-                let payload: Option<Vec<u8>> = row.get(2)?;
-                let message = Message {
-                    packet_id: None,
-                    topic: Arc::from(topic.as_str()),
-                    dup: false,
-                    qos: int_to_qos(row.get(3)?),
-                    retain: row.get(4)?,
-                    payload: payload.map(Bytes::from),
-                    properties: decode_properties(row.get(5)?)?,
-                    expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
-                    subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
-                    origin: None,
-                };
-                Ok((row.get::<_, i64>(0)? as u64, message))
-            })?;
-
-            let mut queue = Vec::new();
-            for row in rows {
-                queue.push(row?);
-            }
-            Ok(queue)
-        })
-        .await
-    }
-
-    async fn clear_queue(&self, client_id: &str) -> Result<()> {
-        self.apply(client_id, &[Write::ClearQueue]).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use mercurio_core::qos::QoS;
 
     use super::*;
-    use crate::StoredSubscription;
+    use crate::testing::message;
+
+    /// A database file of this test only, removed when dropped.
+    struct TempPath(std::path::PathBuf);
+
+    impl TempPath {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mercurio-{name}-{}.db", std::process::id()));
+            let path = TempPath(path);
+            path.remove();
+            path
+        }
+
+        fn remove(&self) {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
+                let mut name = self.0.clone().into_os_string();
+                name.push(suffix);
+                let _ = std::fs::remove_file(name);
+            }
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    impl AsRef<Path> for TempPath {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn session(client_id: &str) -> SessionState {
+        SessionState {
+            client_id: client_id.to_string(),
+            subscriptions: Vec::new(),
+            expiry_interval: None,
+            expires_at: None,
+            owner: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conformance() {
+        crate::testing::conformance(&SqliteStore::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn test_conformance_on_disk() {
+        let path = TempPath::new("conformance");
+        crate::testing::conformance(&SqliteStore::new(&path).unwrap()).await;
+    }
 
     #[tokio::test]
     async fn test_bans() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        crate::testing::bans_round_trip(store.as_ref()).await;
+        crate::testing::bans(store.as_ref()).await;
         assert!(store.ban_store().is_some());
     }
 
     #[tokio::test]
     async fn test_bans_survive_reopening() {
-        let path =
-            std::env::temp_dir().join(format!("mercurio-store-bans-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("store-bans");
         let ban = crate::testing::ban("username", "guest", true);
         SqliteStore::new(&path)
             .unwrap()
@@ -987,8 +918,6 @@ mod tests {
 
         let reopened = SqliteStore::new(&path).unwrap();
         assert_eq!(reopened.load_bans().await.unwrap(), vec![ban]);
-        drop(reopened);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -996,47 +925,9 @@ mod tests {
         assert_eq!(SqliteStore::in_memory().unwrap().backend_name(), "sqlite");
     }
 
-    fn create_test_message(topic: &str, payload: &str) -> Message {
-        Message {
-            packet_id: None,
-            topic: Arc::from(topic),
-            dup: false,
-            qos: QoS::AtMostOnce,
-            retain: false,
-            payload: Some(Bytes::from(payload.to_string())),
-            properties: Default::default(),
-            expires_at: None,
-            subscription_identifiers: Vec::new(),
-            origin: None,
-        }
-    }
-
     #[tokio::test]
-    async fn test_retained_keeps_its_origin() {
-        let store = SqliteStore::in_memory().unwrap();
-        let mut message = create_test_message("a/b", "payload");
-        message.origin = Some(Arc::new(MessageOrigin {
-            client_id: "c".into(),
-            username: Some("alice".into()),
-        }));
-        store.store_retained("a/b", Some(message)).await.unwrap();
-        store
-            .store_retained("a/c", Some(create_test_message("a/c", "x")))
-            .await
-            .unwrap();
-
-        let mut retained = store.get_retained("a/+").await.unwrap();
-        retained.sort_by(|a, b| a.topic.cmp(&b.topic));
-        let origin = retained[0].origin.as_deref().unwrap();
-        assert_eq!(origin.client_id, "c");
-        assert_eq!(origin.username.as_deref(), Some("alice"));
-        assert!(retained[1].origin.is_none());
-    }
-
-    #[test]
-    fn test_older_databases_gain_the_owner_columns() {
-        let path = std::env::temp_dir().join(format!("mercurio-owner-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    async fn test_older_databases_gain_the_owner_columns() {
+        let path = TempPath::new("owner");
         Connection::open(&path)
             .unwrap()
             .execute_batch(
@@ -1049,23 +940,14 @@ mod tests {
             .unwrap();
 
         let store = SqliteStore::new(&path).unwrap();
-        let loaded = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(store.load_session("old"))
-            .unwrap()
-            .unwrap();
+        let loaded = store.load_session("old").await.unwrap().unwrap();
         // Sessions from before owners were kept count as anonymous ones
         assert_eq!(loaded.owner, SessionOwner::default());
-        drop(store);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]
     async fn test_older_in_flight_messages_load_without_retain_or_expiry() {
-        let path =
-            std::env::temp_dir().join(format!("mercurio-inflight-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("inflight");
         Connection::open(&path)
             .unwrap()
             .execute_batch(
@@ -1081,19 +963,16 @@ mod tests {
             .unwrap();
 
         let store = SqliteStore::new(&path).unwrap();
-        let loaded = store.get_all_inflight("c").await.unwrap();
+        let loaded = store.load_inflight("c").await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
         assert!(!loaded[0].retain);
         assert_eq!(loaded[0].expires_at, None);
-        drop(store);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn test_older_databases_gain_the_origin_columns() {
-        let path = std::env::temp_dir().join(format!("mercurio-migrate-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("migrate");
         Connection::open(&path)
             .unwrap()
             .execute_batch(
@@ -1109,30 +988,6 @@ mod tests {
         assert!(conn
             .prepare("SELECT origin_client_id, origin_username FROM retained_messages")
             .is_ok());
-        drop(conn);
-        drop(store);
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_retained_keeps_properties() {
-        use mercurio_core::properties::{ResponseTopic, UserProperty};
-
-        let store = SqliteStore::in_memory().unwrap();
-        let mut message = create_test_message("a/b", "payload");
-        message.properties = MessageProperties {
-            response_topic: Some(ResponseTopic::new("reply".into())),
-            user_property: Some(vec![UserProperty::new("k".into(), "v".into())]),
-            ..Default::default()
-        };
-
-        store
-            .store_retained("a/b", Some(message.clone()))
-            .await
-            .unwrap();
-
-        let retained = store.get_retained("a/#").await.unwrap();
-        assert_eq!(retained[0].properties, message.properties);
     }
 
     #[tokio::test]
@@ -1154,189 +1009,11 @@ mod tests {
         assert!(store.get_retained("t").await.is_err());
     }
 
-    #[tokio::test]
-    async fn test_queue_store() {
-        let store = SqliteStore::in_memory().unwrap();
-        let mut second = create_test_message("b", "2");
-        second.subscription_identifiers = vec![4, 268_435_455];
-        store.enqueue("c", 2, &second).await.unwrap();
-        store
-            .enqueue("c", 1, &create_test_message("a", "1"))
-            .await
-            .unwrap();
-        store
-            .enqueue("other", 1, &create_test_message("x", "x"))
-            .await
-            .unwrap();
-
-        let queue = store.load_queue("c").await.unwrap();
-        let topics: Vec<(u64, &str)> = queue.iter().map(|(s, m)| (*s, &*m.topic)).collect();
-        assert_eq!(topics, [(1, "a"), (2, "b")]);
-        assert_eq!(queue[1].1.subscription_identifiers, [4, 268_435_455]);
-        assert!(queue[0].1.subscription_identifiers.is_empty());
-
-        store.clear_queue("c").await.unwrap();
-        assert!(store.load_queue("c").await.unwrap().is_empty());
-        assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_session_store() {
-        let store = SqliteStore::in_memory().unwrap();
-
-        let session = SessionState {
-            client_id: "client1".to_string(),
-            subscriptions: vec![
-                // Commas are valid in topic filters
-                StoredSubscription::new("topic/a,b", QoS::AtLeastOnce),
-                StoredSubscription {
-                    no_local: true,
-                    retain_as_published: true,
-                    subscription_identifier: Some(268_435_455),
-                    ..StoredSubscription::new("topic/+:x", QoS::ExactlyOnce)
-                },
-            ],
-            expiry_interval: Some(60),
-            expires_at: Some(1_700_000_000_000),
-            owner: SessionOwner {
-                username: Some("alice".into()),
-                mount_point: Some("tenant/".into()),
-            },
-        };
-
-        // Save and load
-        store.save_session("client1", &session).await.unwrap();
-        let mut loaded = store.load_session("client1").await.unwrap().unwrap();
-        // Subscriptions are a set, loaded in no particular order
-        loaded
-            .subscriptions
-            .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
-        assert_eq!(loaded.subscriptions, session.subscriptions);
-        assert_eq!(loaded.expiry_interval, Some(60));
-        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
-        assert_eq!(loaded.owner, session.owner);
-
-        // List sessions
-        let sessions = store.list_sessions().await.unwrap();
-        assert_eq!(sessions.len(), 1);
-
-        // Delete
-        store.delete_session("client1").await.unwrap();
-        let loaded = store.load_session("client1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_retained_message_store() {
-        let store = SqliteStore::in_memory().unwrap();
-
-        let msg = create_test_message("sensors/temp", "22.5");
-        store
-            .store_retained("sensors/temp", Some(msg))
-            .await
-            .unwrap();
-
-        // Exact match
-        let retained = store.get_retained("sensors/temp").await.unwrap();
-        assert_eq!(retained.len(), 1);
-
-        // Wildcard match
-        let retained = store.get_retained("sensors/+").await.unwrap();
-        assert_eq!(retained.len(), 1);
-
-        // Clear specific
-        store.store_retained("sensors/temp", None).await.unwrap();
-        let retained = store.get_retained("sensors/temp").await.unwrap();
-        assert!(retained.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_will_store() {
-        let store = SqliteStore::in_memory().unwrap();
-
-        let will = StoredWillMessage {
-            topic: "client/status".to_string(),
-            payload: Bytes::from("offline"),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-            delay_secs: 30,
-            properties: MessageProperties {
-                content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
-                ..Default::default()
-            },
-        };
-
-        store.store_will("client1", &will).await.unwrap();
-        let loaded = store.get_will("client1").await.unwrap().unwrap();
-        assert_eq!(loaded.topic, "client/status");
-        assert_eq!(loaded.delay_secs, 30);
-        assert_eq!(loaded.properties, will.properties);
-
-        store.delete_will("client1").await.unwrap();
-        let loaded = store.get_will("client1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_inflight_store() {
-        let store = SqliteStore::in_memory().unwrap();
-
-        let msg = InflightMessage {
-            packet_id: 1,
-            topic: "test/topic".to_string(),
-            payload: Some(Bytes::from("data")),
-            qos: QoS::ExactlyOnce,
-            dup: false,
-            retain: true,
-            expires_at: Some(1_700_000_000_000),
-            sequence: 7,
-            released: false,
-            properties: Default::default(),
-            subscription_identifiers: vec![3],
-        };
-
-        store.store_inflight("client1", 1, &msg).await.unwrap();
-
-        let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
-        assert_eq!(loaded.sequence, 7);
-        assert_eq!(loaded.subscription_identifiers, [3]);
-        assert!(!loaded.released);
-        assert!(loaded.retain);
-        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
-
-        store.release_inflight("client1", 1).await.unwrap();
-        let all = store.get_all_inflight("client1").await.unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all[0].released);
-        assert!(all[0].payload.is_none());
-        assert_eq!(all[0].sequence, 7);
-
-        store.remove_inflight("client1", 1).await.unwrap();
-        let loaded = store.get_inflight("client1", 1).await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_incoming_qos2() {
-        crate::testing::incoming_qos2_round_trip(&SqliteStore::in_memory().unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn test_subscriptions() {
-        crate::testing::subscriptions_round_trip(&SqliteStore::in_memory().unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn test_queued_messages_leave_one_at_a_time() {
-        crate::testing::queue_round_trip(&SqliteStore::in_memory().unwrap()).await;
-    }
-
     /// Sessions of databases from before subscriptions had a table of
     /// their own keep their subscriptions.
     #[tokio::test]
     async fn test_encoded_subscriptions_move_to_their_table() {
-        let path = std::env::temp_dir().join(format!("mercurio-subs-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("subs");
         let subscriptions = vec![
             StoredSubscription {
                 no_local: true,
@@ -1346,25 +1023,23 @@ mod tests {
             },
             StoredSubscription::new("$share/g/a/#", QoS::AtMostOnce),
         ];
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "CREATE TABLE sessions (
-                    client_id TEXT PRIMARY KEY, subscriptions TEXT NOT NULL,
-                    clean_start INTEGER NOT NULL, expiry_interval INTEGER, expires_at INTEGER,
-                    owner_username TEXT, owner_mount_point TEXT
-                )",
-                [],
-            )
-            .unwrap();
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO sessions VALUES ('old', ?1, 0, 60, NULL, 'alice', NULL),
-                                             ('none', '', 0, 60, NULL, NULL, NULL)",
-                params![crate::encoding::encode_subscriptions(&subscriptions)],
-            )
-            .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE sessions (
+                client_id TEXT PRIMARY KEY, subscriptions TEXT NOT NULL,
+                clean_start INTEGER NOT NULL, expiry_interval INTEGER, expires_at INTEGER,
+                owner_username TEXT, owner_mount_point TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('old', ?1, 0, 60, NULL, 'alice', NULL),
+                                         ('none', '', 0, 60, NULL, NULL, NULL)",
+            params![crate::encoding::encode_subscriptions(&subscriptions)],
+        )
+        .unwrap();
+        drop(conn);
 
         let store = SqliteStore::new(&path).unwrap();
         let mut loaded = store.load_session("old").await.unwrap().unwrap();
@@ -1392,18 +1067,16 @@ mod tests {
         assert_eq!(blobs, 0);
         let loaded = store.load_session("old").await.unwrap().unwrap();
         assert_eq!(loaded.subscriptions.len(), 2);
-        drop(store);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]
     async fn test_expired_retained_messages_are_removed() {
         let store = SqliteStore::in_memory().unwrap();
-        let mut expired = create_test_message("old", "x");
+        let mut expired = message("old", "x");
         expired.expires_at = Some(1);
         store.store_retained("old", Some(expired)).await.unwrap();
         store
-            .store_retained("new", Some(create_test_message("new", "y")))
+            .store_retained("new", Some(message("new", "y")))
             .await
             .unwrap();
 
@@ -1420,31 +1093,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clear_all_retained() {
-        let store = SqliteStore::in_memory().unwrap();
-
-        store
-            .store_retained("a", Some(create_test_message("a", "1")))
-            .await
-            .unwrap();
-        store
-            .store_retained("b", Some(create_test_message("b", "2")))
-            .await
-            .unwrap();
-
-        let retained = store.get_retained("#").await.unwrap();
-        assert_eq!(retained.len(), 2);
-
-        store.clear_all_retained().await.unwrap();
-
-        let retained = store.get_retained("#").await.unwrap();
-        assert!(retained.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_readers_do_not_block_writes() {
-        let path = std::env::temp_dir().join(format!("mercurio-wal-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("wal");
         let store = SqliteStore::new(&path).unwrap();
         {
             let conn = store.conn.lock().unwrap();
@@ -1468,13 +1118,10 @@ mod tests {
             })
             .unwrap();
         store
-            .store_retained("a", Some(create_test_message("a", "1")))
+            .store_retained("a", Some(message("a", "1")))
             .await
             .unwrap();
         reader.execute_batch("COMMIT").unwrap();
-        drop(reader);
-        drop(store);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1489,8 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_commit_does_not_wedge_the_store() {
-        let path = std::env::temp_dir().join(format!("mercurio-commit-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = TempPath::new("commit");
         let store = SqliteStore::new(&path).unwrap();
         {
             let conn = store.conn.lock().unwrap();
@@ -1498,12 +1144,13 @@ mod tests {
             conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
             conn.busy_timeout(std::time::Duration::ZERO).unwrap();
         }
-        let session = |client_id: &str| SessionState {
-            client_id: client_id.to_string(),
-            subscriptions: Vec::new(),
-            expiry_interval: None,
-            expires_at: None,
-            owner: Default::default(),
+        let save = |client_id: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .apply(client_id, &[Write::SaveSession(session(client_id))])
+                    .await
+            }
         };
 
         let reader = Connection::open(&path).unwrap();
@@ -1513,16 +1160,10 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .unwrap();
-        assert!(store
-            .save_session("blocked", &session("blocked"))
-            .await
-            .is_err());
+        assert!(save("blocked").await.is_err());
         reader.execute_batch("COMMIT").unwrap();
 
-        store
-            .save_session("after", &session("after"))
-            .await
-            .unwrap();
+        save("after").await.unwrap();
         drop(store);
         let fresh = Connection::open(&path).unwrap();
         let saved: Vec<String> = fresh
@@ -1533,45 +1174,25 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(saved, ["after"]);
-        drop(fresh);
-        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]
     async fn test_persistence_across_instances() {
-        // Test that data persists when we create a new store instance
-        // pointing to the same file
-        let temp_dir = std::env::temp_dir();
-        let db_path = temp_dir.join("mercurio_test.db");
+        let path = TempPath::new("persistence");
+        let stored = SessionState {
+            subscriptions: vec![StoredSubscription::new("topic/test", QoS::AtMostOnce)],
+            ..session("persistent_client")
+        };
+        SqliteStore::new(&path)
+            .unwrap()
+            .apply("persistent_client", &[Write::SaveSession(stored.clone())])
+            .await
+            .unwrap();
 
-        // Clean up any existing test database
-        let _ = std::fs::remove_file(&db_path);
-
-        // Create first store and add data
-        {
-            let store = SqliteStore::new(&db_path).unwrap();
-            let session = SessionState {
-                client_id: "persistent_client".to_string(),
-                subscriptions: vec![StoredSubscription::new("topic/test", QoS::AtMostOnce)],
-                expiry_interval: None,
-                expires_at: None,
-                owner: Default::default(),
-            };
-            store
-                .save_session("persistent_client", &session)
-                .await
-                .unwrap();
-        }
-
-        // Create second store instance and verify data persists
-        {
-            let store = SqliteStore::new(&db_path).unwrap();
-            let loaded = store.load_session("persistent_client").await.unwrap();
-            assert!(loaded.is_some());
-            assert_eq!(loaded.unwrap().client_id, "persistent_client");
-        }
-
-        // Clean up
-        let _ = std::fs::remove_file(&db_path);
+        let store = SqliteStore::new(&path).unwrap();
+        assert_eq!(
+            store.load_session("persistent_client").await.unwrap(),
+            Some(stored)
+        );
     }
 }
