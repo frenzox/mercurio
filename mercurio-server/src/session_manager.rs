@@ -238,14 +238,89 @@ pub(crate) struct ClientEntry {
     pub restored_will: bool,
 }
 
-/// Ownership of a client id for the lifetime of one connection.
+/// Ownership of a client id for the lifetime of one connection. Dropped
+/// without `end_connection`, as when the connection's task panics, it ends
+/// the connection as its CONNECT asked, so the client id isn't left
+/// claimed by a connection that is gone.
 pub(crate) struct ConnectionLease {
-    guard: OwnedMutexGuard<()>,
+    /// Taken once the client id is being given back
+    guard: Option<OwnedMutexGuard<()>>,
     client_id: String,
     pub generation: u64,
     /// Changes when the connection is to close, for a takeover or the
     /// admin API
     pub close: watch::Receiver<Option<Close>>,
+    on_drop: OnDrop,
+    manager: Box<dyn Abandon>,
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let on_drop = std::mem::replace(&mut self.on_drop, OnDrop::Nothing);
+        self.manager.abandon(
+            self.guard.take(),
+            std::mem::take(&mut self.client_id),
+            self.generation,
+            on_drop,
+        );
+    }
+}
+
+/// What is left to do for a claim or lease dropped midway.
+#[derive(Clone, Copy)]
+enum OnDrop {
+    Nothing,
+    /// Give the client id back
+    LetGo,
+    /// End the connection with this session expiry, then give the client
+    /// id back
+    End(Option<Duration>),
+}
+
+/// Finishes, in a task of its own, what a dropped claim or lease left
+/// undone. Drop can't wait for the manager's lock.
+trait Abandon: Send + Sync {
+    fn abandon(
+        &self,
+        guard: Option<OwnedMutexGuard<()>>,
+        client_id: String,
+        generation: u64,
+        on_drop: OnDrop,
+    );
+}
+
+impl<S: BatchStore + 'static> Abandon for SessionManager<S> {
+    fn abandon(
+        &self,
+        guard: Option<OwnedMutexGuard<()>>,
+        client_id: String,
+        generation: u64,
+        on_drop: OnDrop,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let manager = self.clone();
+        match on_drop {
+            OnDrop::Nothing => {}
+            OnDrop::LetGo => {
+                drop(guard);
+                runtime.spawn(async move { manager.let_go(&client_id, generation).await });
+            }
+            // The lease stays held until the session is dealt with, so a
+            // connection waiting to take over finds it as it is left
+            OnDrop::End(expiry) => {
+                runtime.spawn(async move {
+                    manager
+                        .end_own_session(&client_id, generation, expiry)
+                        .await;
+                    drop(guard);
+                    manager.let_go(&client_id, generation).await;
+                    manager.expire_after(client_id, generation, expiry).await;
+                });
+            }
+        }
+    }
 }
 
 /// A connection's claim on a client id until its session has started.
@@ -258,22 +333,26 @@ struct Claim<S: BatchStore + 'static> {
     close: watch::Receiver<Option<Close>>,
     /// Held once the connection that had the id before has finished
     guard: Option<OwnedMutexGuard<()>>,
-    kept: bool,
+    on_drop: OnDrop,
 }
 
 impl<S: BatchStore + 'static> Claim<S> {
-    fn keep(mut self) -> ConnectionLease {
-        self.kept = true;
+    /// Turns the claim into the lease of a connection, which does
+    /// `on_drop` if dropped before it is ended.
+    fn keep(mut self, on_drop: OnDrop) -> ConnectionLease {
+        self.on_drop = OnDrop::Nothing;
         ConnectionLease {
-            guard: self.guard.take().expect("a claim is kept once leased"),
+            guard: Some(self.guard.take().expect("a claim is kept once leased")),
             client_id: std::mem::take(&mut self.client_id),
             generation: self.generation,
             close: self.close.clone(),
+            on_drop,
+            manager: Box::new(self.manager.clone()),
         }
     }
 
     async fn let_go(mut self) {
-        self.kept = true;
+        self.on_drop = OnDrop::Nothing;
         drop(self.guard.take());
         self.manager.let_go(&self.client_id, self.generation).await;
     }
@@ -281,16 +360,13 @@ impl<S: BatchStore + 'static> Claim<S> {
 
 impl<S: BatchStore + 'static> Drop for Claim<S> {
     fn drop(&mut self) {
-        if self.kept {
-            return;
-        }
-        drop(self.guard.take());
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let manager = self.manager.clone();
-            let client_id = std::mem::take(&mut self.client_id);
-            let generation = self.generation;
-            runtime.spawn(async move { manager.let_go(&client_id, generation).await });
-        }
+        let on_drop = std::mem::replace(&mut self.on_drop, OnDrop::Nothing);
+        self.manager.abandon(
+            self.guard.take(),
+            std::mem::take(&mut self.client_id),
+            self.generation,
+            on_drop,
+        );
     }
 }
 
@@ -387,7 +463,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             connect_packet.payload.client_id = Uuid::new_v4().hyphenated().to_string();
         }
 
-        let expiry_interval = session_expiry(&connect_packet).map(|e| e.as_secs() as u32);
+        let expiry = session_expiry(&connect_packet);
+        let expiry_interval = expiry.map(|e| e.as_secs() as u32);
         let persistent = expiry_interval != Some(0);
 
         let storage_error =
@@ -528,7 +605,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             resume,
             assigned_client_id,
             subscriptions_to_restore,
-            lease: claim.keep(),
+            lease: claim.keep(OnDrop::End(expiry)),
             inflight_to_retry,
         })
     }
@@ -676,7 +753,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             Self::claim(&mut manager, client_id, reason, None)
         };
         let claim = self.wait_for_lease(pending, wait).await?;
-        Some((claim.keep(), held))
+        Some((claim.keep(OnDrop::LetGo), held))
     }
 
     /// Waits until the connection that held the id before `pending` claimed
@@ -700,7 +777,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             generation,
             close,
             guard: None,
-            kept: false,
+            on_drop: OnDrop::LetGo,
         };
         let guard = match wait {
             Some(wait) => match time::timeout(wait, lease.lock_owned()).await {
@@ -765,31 +842,46 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     /// Releases the client id once its connection has finished and ends the
     /// session after `expiry`, unless a new connection resumes it first.
     /// `None` keeps the session forever.
-    pub(crate) async fn end_connection(&self, lease: ConnectionLease, expiry: Option<Duration>) {
-        let ConnectionLease {
-            guard,
-            client_id,
-            generation,
-            ..
-        } = lease;
+    pub(crate) async fn end_connection(
+        &self,
+        mut lease: ConnectionLease,
+        expiry: Option<Duration>,
+    ) {
+        // Dropped midway, the lease starts over in a task of its own
+        lease.on_drop = OnDrop::End(expiry);
+        self.end_own_session(&lease.client_id, lease.generation, expiry)
+            .await;
+        self.release(&mut lease).await;
+        self.expire_after(
+            std::mem::take(&mut lease.client_id),
+            lease.generation,
+            expiry,
+        )
+        .await;
+    }
 
+    /// What ending its connection does to the session of `client_id` while
+    /// the connection of `generation` still holds the client id.
+    async fn end_own_session(&self, client_id: &str, generation: u64, expiry: Option<Duration>) {
         // Ending before releasing the id means a connection waiting to take
         // over can never observe a session that is about to vanish
         if expiry == Some(Duration::ZERO) {
-            self.end_session(&client_id, generation, None).await;
+            self.end_session(client_id, generation, None).await;
         } else if self.storage.is_durable() {
             // Messages for the client now wait in its queue until it returns;
             // keep them on disk meanwhile, unless another connection already
             // took the session over
             let manager = self.shared.state.lock().await;
-            if let Some(session) = manager.sessions.get(&client_id).map(|s| s.session()) {
+            if let Some(session) = manager.sessions.get(client_id).map(|s| s.session()) {
                 if session.generation() == generation {
-                    session.start_queue_journal(self.writers.get(&client_id));
+                    session.start_queue_journal(self.writers.get(client_id));
                 }
             }
         }
-        self.release(guard, &client_id, generation).await;
+    }
 
+    /// Ends the session of a connection that has ended after its `expiry`.
+    async fn expire_after(&self, client_id: String, generation: u64, expiry: Option<Duration>) {
         if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
             // Recorded so a restarted broker still expires the session
             self.writers.write(
@@ -803,11 +895,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
     }
 
-    /// Gives the client id back once the connection of `generation` has
+    /// Gives the client id back once the connection holding `lease` has
     /// finished with it.
-    async fn release(&self, guard: OwnedMutexGuard<()>, client_id: &str, generation: u64) {
-        drop(guard);
-        self.let_go(client_id, generation).await;
+    async fn release(&self, lease: &mut ConnectionLease) {
+        lease.on_drop = OnDrop::LetGo;
+        drop(lease.guard.take());
+        self.let_go(&lease.client_id, lease.generation).await;
+        lease.on_drop = OnDrop::Nothing;
     }
 
     async fn let_go(&self, client_id: &str, generation: u64) {
@@ -871,17 +965,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             reason: ReasonCode::AdministrativeAction,
             send_will: false,
         };
-        let Some((
-            ConnectionLease {
-                guard, generation, ..
-            },
-            was_connected,
-        )) = self
+        let Some((mut lease, was_connected)) = self
             .claim_client_id(client_id, close, !disconnect, None)
             .await
         else {
             return Err(DeleteRefused::Connected);
         };
+        let generation = lease.generation;
         let (removed, was_restored) = {
             let mut manager = self.shared.state.lock().await;
             manager.stop_expiry_timer(client_id);
@@ -902,7 +992,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             self.writers.write(client_id, Write::DeleteSession);
             self.writers.close(client_id);
         }
-        self.release(guard, client_id, generation).await;
+        self.release(&mut lease).await;
         // A clean session is gone by the time the closed connection lets go
         if !removed && !was_connected {
             return Err(DeleteRefused::NotFound);
@@ -1573,7 +1663,8 @@ mod tests {
             .start_session(resuming("c"), SessionOwner::default())
             .await
             .unwrap();
-        assert_eq!(sleeping_timers(&manager, 0).await, 0);
+        // What is left is the new connection's lease
+        assert_eq!(sleeping_timers(&manager, 1).await, 1);
 
         // Replaced
         manager.end_connection(started.lease, Some(hour)).await;
@@ -2345,6 +2436,90 @@ mod tests {
         assert!(!manager.entry("c").await.unwrap().connected);
     }
 
+    /// Waits for `client_id` to have neither a session nor a connection,
+    /// giving up after a second.
+    async fn gone<S: BatchStore + 'static>(manager: &SessionManager<S>, client_id: &str) -> bool {
+        for _ in 0..100 {
+            {
+                let state = manager.shared.state.lock().await;
+                if !state.connections.contains_key(client_id)
+                    && !state.sessions.contains_key(client_id)
+                {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Polls `future` until it waits on something that won't come soon.
+    async fn poll_briefly<F: std::future::Future + Unpin>(future: &mut F) -> Option<F::Output> {
+        tokio::time::timeout(Duration::from_millis(20), future)
+            .await
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_lease_gives_the_client_id_back() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(connect_packet("c"), owned_by("alice"))
+            .await
+            .unwrap();
+
+        // As when the connection's task panics
+        drop(started.lease);
+        assert!(gone(&manager, "c").await, "the client id stayed claimed");
+        manager
+            .start_session(clean("c"), owned_by("mallory"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_abandoned_end_of_connection_gives_the_client_id_back() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(connect_packet("c"), owned_by("alice"))
+            .await
+            .unwrap();
+
+        let held = manager.shared.state.lock().await;
+        let mut ending = Box::pin(manager.end_connection(started.lease, Some(Duration::ZERO)));
+        assert!(poll_briefly(&mut ending).await.is_none());
+        drop(ending);
+        drop(held);
+
+        assert!(gone(&manager, "c").await, "the client id stayed claimed");
+    }
+
+    #[tokio::test]
+    async fn test_an_abandoned_deletion_gives_the_client_id_back() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let started = manager
+            .start_session(connect_packet("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let mut deletion = Box::pin(manager.delete_session("c", true));
+        assert!(poll_briefly(&mut deletion).await.is_none());
+        manager.end_connection(started.lease, None).await;
+
+        // Holds the lease, and waits for the manager's lock
+        let held = manager.shared.state.lock().await;
+        assert!(poll_briefly(&mut deletion).await.is_none());
+        drop(deletion);
+        drop(held);
+
+        for _ in 0..100 {
+            if manager.shared.state.lock().await.connections.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the client id stayed claimed");
+    }
+
     #[tokio::test]
     async fn test_a_session_without_expiry_ends_under_a_waiting_takeover() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
@@ -2426,7 +2601,7 @@ mod tests {
 
         let mut fresh = connect_packet("c");
         fresh.flags.clean_start = true;
-        manager
+        let _connected = manager
             .start_session(fresh, SessionOwner::default())
             .await
             .unwrap();
