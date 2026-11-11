@@ -211,6 +211,9 @@ enabled = false
 # key_path = "/etc/mercurio/server.key"
 # Require clients to present a certificate signed by this CA (mutual TLS)
 # ca_path = "/etc/mercurio/ca.crt"
+# With ca_path, let clients without a certificate in to log in by password;
+# a certificate that is presented must still be valid
+# require_certificate = true
 # Reject client certificates revoked in these CRLs (PEM); needs ca_path
 # crl_path = "/etc/mercurio/crl.pem"
 # Use the client certificate's Common Name as the user name, instead of
@@ -565,10 +568,13 @@ describes every command, its permissions and what changed since 0.4.
 Set `enabled = true` under `[server.tls]` with a certificate and key to serve
 TLS on `port`, and on `websocket_port` when it is set. With `ca_path`, the
 broker also requires a client certificate signed by that CA.
-`crl_path` rejects revoked client certificates. With
+`require_certificate = false` makes it optional: clients without one log
+in by user name and password, while a certificate that is presented must
+still be valid. `crl_path` rejects revoked client certificates. With
 `identity_as_username`, the certificate's Common Name becomes the client's
 user name: it counts as authenticated, and `user` rules in `acl_file`
-apply to it. The user name and password in CONNECT are then ignored.
+apply to it. The user name and password in CONNECT are then ignored,
+except from clients that present no certificate where it is optional.
 `subject_as_username` uses the whole subject instead, written as RFC 2253
 does and as mosquitto's `use_subject_as_username` gives it:
 `CN=alice,O=Example,C=PT`.

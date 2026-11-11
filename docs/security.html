@@ -105,6 +105,7 @@ identity_as_username = true
 min_version = "1.3"</pre>
 <ul>
 <li>With <code>ca_path</code>, clients must present a certificate signed by that CA, or the handshake fails.</li>
+<li><code>require_certificate = false</code> still asks for a certificate but lets clients without one connect, to log in by user name and password like on a listener without <code>ca_path</code>. A client that presents an invalid certificate is still refused. <code>identity_as_username</code> and <code>subject_as_username</code> then apply only to clients that presented one.</li>
 <li><code>crl_path</code> refuses certificates revoked in the given CRLs.</li>
 <li><code>identity_as_username</code> makes the certificate's Common Name the client's user name. The client counts as authenticated, the user name and password in CONNECT are ignored, and <code>user</code> rules in the ACL file apply to it.</li>
 <li><code>subject_as_username</code> uses the whole subject instead, in RFC 2253 form as mosquitto and OpenSSL print it, such as <code>CN=alice,O=Acme\, Inc,C=PT</code>.</li>

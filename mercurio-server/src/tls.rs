@@ -19,6 +19,10 @@ pub struct TlsConfig {
     pub key_path: String,
     /// Optional path to CA certificate for client authentication (mTLS)
     pub ca_path: Option<String>,
+    /// With `ca_path`, refuse clients that present no certificate. When
+    /// false, they connect and authenticate as on a listener without
+    /// `ca_path`; a certificate that is presented must still be valid.
+    pub require_certificate: bool,
     /// Certificate revocation lists (PEM) to check client certificates
     /// against; requires `ca_path`
     pub crl_path: Option<String>,
@@ -56,6 +60,7 @@ impl TlsConfig {
             cert_path: cert_path.into(),
             key_path: key_path.into(),
             ca_path: None,
+            require_certificate: true,
             crl_path: None,
             min_version: TlsVersion::default(),
             username_from_certificate: None,
@@ -70,11 +75,13 @@ impl TlsConfig {
 
     /// Reads the files and builds the rustls configuration they describe.
     pub fn server_config(&self) -> Result<Arc<ServerConfig>, ServerError> {
-        let certificate_options =
-            self.crl_path.is_some() || self.username_from_certificate.is_some();
+        let certificate_options = self.crl_path.is_some()
+            || self.username_from_certificate.is_some()
+            || !self.require_certificate;
         if self.ca_path.is_none() && certificate_options {
             return Err(ServerError::Tls(
-                "Revocation lists and certificate identities need a CA to verify clients with"
+                "Revocation lists, optional client certificates and certificate identities \
+                 need a CA to verify clients with"
                     .to_string(),
             ));
         }
@@ -104,6 +111,9 @@ impl TlsConfig {
             let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
             if let Some(crl_path) = &self.crl_path {
                 verifier = verifier.with_crls(load_crls(crl_path)?);
+            }
+            if !self.require_certificate {
+                verifier = verifier.allow_unauthenticated();
             }
             let verifier = verifier
                 .build()

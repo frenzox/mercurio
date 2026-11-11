@@ -143,6 +143,9 @@ enabled = false
 # key_path = "/etc/mercurio/server.key"
 # Require clients to present a certificate signed by this CA (mutual TLS)
 # ca_path = "/etc/mercurio/ca.crt"
+# With ca_path, let clients without a certificate in to log in by password;
+# a certificate that is presented must still be valid
+# require_certificate = true
 # Reject client certificates revoked in these CRLs (PEM); needs ca_path
 # crl_path = "/etc/mercurio/crl.pem"
 # Use the client certificate's Common Name as the user name, instead of

@@ -3,8 +3,9 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use mercurio_server::{
+    auth::SimpleCredentialValidator,
     server::{run_with_config, ServerConfig},
-    tls::{Tls, TlsConfig},
+    tls::{CertificateName, Tls, TlsConfig},
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 use tokio::{
@@ -178,4 +179,72 @@ fn unusable_files_are_refused_up_front() {
     assert!(Tls::new(missing).is_err());
     let mismatched = TlsConfig::new(fixture("server.pem"), fixture("server2.key"));
     assert!(Tls::new(mismatched).is_err());
+}
+
+/// A listener asking for client certificates signed by the test root CA,
+/// naming clients by their certificate's Common Name, with `user` and
+/// password `secret` for clients without one.
+async fn start_with_client_certificates(files: TlsConfig) -> SocketAddr {
+    let mut files = files.with_client_auth(fixture("root.pem"));
+    files.username_from_certificate = Some(CertificateName::CommonName);
+    let mut config = ServerConfig::default();
+    config.tls = Some(Tls::new(files).unwrap());
+    config.auth.require_auth = true;
+    let users = [("user".to_string(), "secret".to_string())].into();
+    config.plugins = vec![Arc::new(SimpleCredentialValidator::new(users))];
+    start(config).await
+}
+
+fn server_files() -> TlsConfig {
+    TlsConfig::new(fixture("server.pem"), fixture("server.key"))
+}
+
+/// Whether the broker refuses the client, at the handshake or by closing
+/// the connection right after it, as TLS 1.3 servers do.
+async fn refused(addr: SocketAddr, identity: Option<&str>) -> bool {
+    match handshake(addr, identity).await {
+        Ok(mut stream) => mqtt_connect(&mut stream, "refused", None).await.is_none(),
+        Err(_) => true,
+    }
+}
+
+#[tokio::test]
+async fn required_client_certificates_refuse_clients_without_one() {
+    let addr = start_with_client_certificates(server_files()).await;
+
+    assert!(refused(addr, None).await);
+    assert!(refused(addr, Some("mallory")).await);
+    let mut alice = handshake(addr, Some("alice")).await.unwrap();
+    assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
+}
+
+#[tokio::test]
+async fn optional_client_certificates_let_clients_log_in_by_password() {
+    let mut files = server_files();
+    files.require_certificate = false;
+    let addr = start_with_client_certificates(files).await;
+
+    let mut password = handshake(addr, None).await.unwrap();
+    let login = Some(("user", "secret"));
+    assert_eq!(
+        mqtt_connect(&mut password, "password", login).await,
+        Some(0)
+    );
+
+    // Without a certificate the user name is not taken from one
+    let mut anonymous = handshake(addr, None).await.unwrap();
+    let refusal = mqtt_connect(&mut anonymous, "anonymous", None).await;
+    assert!(matches!(refusal, Some(code) if code >= 0x80), "{refusal:?}");
+
+    let mut alice = handshake(addr, Some("alice")).await.unwrap();
+    assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
+
+    assert!(refused(addr, Some("mallory")).await);
+}
+
+#[test]
+fn optional_client_certificates_need_a_ca() {
+    let mut files = server_files();
+    files.require_certificate = false;
+    assert!(Tls::new(files).is_err());
 }

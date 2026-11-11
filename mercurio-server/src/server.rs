@@ -731,11 +731,14 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
                 debug!(target: CONNECTIONS, "TLS handshake completed for {:?}", peer_addr);
-                if let Some(part) = tls.username_from_certificate() {
-                    let certs = tls_stream.get_ref().1.peer_certificates();
-                    self.cert_identity = certs
-                        .and_then(|c| c.first())
-                        .and_then(|cert| certificate_name(cert, part));
+                // Clients without a certificate, where it is optional, log
+                // in as on a listener that asks for none
+                let certificate = tls_stream.get_ref().1.peer_certificates();
+                if let (Some(part), Some(cert)) = (
+                    tls.username_from_certificate(),
+                    certificate.and_then(|c| c.first()),
+                ) {
+                    self.cert_identity = certificate_name(cert, part);
                     if self.cert_identity.is_none() {
                         warn!(
                             target: CONNECTIONS,

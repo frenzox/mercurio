@@ -106,6 +106,7 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><th>mosquitto</th><th>Mercurio, in <code>[server.tls]</code> or <code>[listeners.tls]</code></th></tr>
 <tr><td><code>certfile</code>, <code>keyfile</code></td><td><code>cert_path</code>, <code>key_path</code>, with <code>enabled = true</code></td></tr>
 <tr><td><code>cafile</code> with <code>require_certificate true</code></td><td><code>ca_path</code></td></tr>
+<tr><td><code>cafile</code> with <code>require_certificate false</code></td><td><code>ca_path</code> with <code>require_certificate = false</code></td></tr>
 <tr><td><code>crlfile</code></td><td><code>crl_path</code></td></tr>
 <tr><td><code>use_identity_as_username</code></td><td><code>identity_as_username</code></td></tr>
 <tr><td><code>use_subject_as_username</code></td><td><code>subject_as_username</code></td></tr>
