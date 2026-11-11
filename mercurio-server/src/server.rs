@@ -24,7 +24,6 @@ use tokio::{
     sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore},
     time::{self, Duration, Instant},
 };
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -71,7 +70,7 @@ use crate::{
     },
     shutdown::Shutdown,
     sys::{self, ConnectedGuard, Stats},
-    tls::{certificate_name, CertificateName, TlsConfig},
+    tls::{certificate_name, Tls},
     websocket,
 };
 
@@ -205,7 +204,7 @@ impl Default for Limits {
 #[non_exhaustive]
 pub struct ServerConfig {
     /// Serve TLS instead of plain TCP on the main listener when set.
-    pub tls: Option<TlsConfig>,
+    pub tls: Option<Tls>,
     /// For the main listener, and listeners without their own
     pub auth: AuthConfig,
     pub limits: Limits,
@@ -279,7 +278,7 @@ pub struct ListenerConfig {
     pub listener: Socket,
     pub transport: Transport,
     /// Serve TLS instead of plain TCP when set.
-    pub tls: Option<TlsConfig>,
+    pub tls: Option<Tls>,
     /// Expect every connection to start with a PROXY protocol header, as
     /// sent by load balancers, and take the client's address from it.
     pub proxy_protocol: bool,
@@ -440,8 +439,7 @@ impl Drop for ListenerSlot {
 #[derive(Clone)]
 struct EndpointSettings {
     transport: Transport,
-    tls_acceptor: Option<TlsAcceptor>,
-    username_from_certificate: Option<CertificateName>,
+    tls: Option<Tls>,
     proxy_protocol: bool,
     proxy_from: Arc<[AddressRange]>,
     mount_point: Option<String>,
@@ -543,11 +541,6 @@ impl Endpoint {
             },
             connections: AtomicUsize::new(0),
         });
-        let username_from_certificate = config
-            .tls
-            .as_ref()
-            .and_then(|tls| tls.username_from_certificate);
-        let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             state,
             trusted: config.trusted,
@@ -557,8 +550,7 @@ impl Endpoint {
             connection_slots: config.max_connections.map(connection_slots),
             settings: EndpointSettings {
                 transport: config.transport,
-                tls_acceptor,
-                username_from_certificate,
+                tls: config.tls,
                 proxy_protocol: config.proxy_protocol,
                 proxy_from: config.proxy_from.into(),
                 mount_point: config.mount_point,
@@ -732,18 +724,21 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         if let Some(chain) = settings.chain {
             self.chain = chain;
         }
-        let Some(acceptor) = settings.tls_acceptor else {
+        let Some(tls) = settings.tls else {
             return Some((*self, Secured::Plain(socket), peer_addr));
         };
-        let accept = acceptor.accept(socket);
+        let accept = tls.acceptor().accept(socket);
         match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
                 debug!(target: CONNECTIONS, "TLS handshake completed for {:?}", peer_addr);
-                if let Some(part) = settings.username_from_certificate {
-                    let certs = tls_stream.get_ref().1.peer_certificates();
-                    self.cert_identity = certs
-                        .and_then(|c| c.first())
-                        .and_then(|cert| certificate_name(cert, part));
+                // Clients without a certificate, where it is optional, log
+                // in as on a listener that asks for none
+                let certificate = tls_stream.get_ref().1.peer_certificates();
+                if let (Some(part), Some(cert)) = (
+                    tls.username_from_certificate(),
+                    certificate.and_then(|c| c.first()),
+                ) {
+                    self.cert_identity = certificate_name(cert, part);
                     if self.cert_identity.is_none() {
                         warn!(
                             target: CONNECTIONS,

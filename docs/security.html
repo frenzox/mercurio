@@ -105,7 +105,13 @@ identity_as_username = true
 min_version = "1.3"</pre>
 <ul>
 <li>With <code>ca_path</code>, clients must present a certificate signed by that CA, or the handshake fails.</li>
-<li><code>crl_path</code> refuses certificates revoked in the given CRLs.</li>
+<li><code>require_certificate = false</code> still asks for a certificate but lets clients without one connect, to log in by user name and password like on a listener without <code>ca_path</code>. A client that presents an invalid certificate is still refused. <code>identity_as_username</code> and <code>subject_as_username</code> then apply only to clients that presented one.</li>
+<li><code>crl_path</code> refuses certificates revoked in the given CRLs. Each certificate of the client's chain, its intermediate CAs included, must be covered by a CRL from its issuer: a client issued by an intermediate CA is refused unless the file holds the CRLs of both the root and the intermediate. Two settings relax this, for a PKI where some CA publishes no CRL:
+<ul>
+<li><code>crl_end_entity_only = true</code> checks only the client's own certificate, so the CRL of the CA that issued it is enough.</li>
+<li><code>crl_allow_unknown = true</code> accepts certificates whose issuer has no CRL in the file, and refuses only those a CRL revokes.</li>
+</ul>
+A CRL past its next update date is still used. Like the certificates, the CRLs are reread on <a href="#reloading">reload</a>.</li>
 <li><code>identity_as_username</code> makes the certificate's Common Name the client's user name. The client counts as authenticated, the user name and password in CONNECT are ignored, and <code>user</code> rules in the ACL file apply to it.</li>
 <li><code>subject_as_username</code> uses the whole subject instead, in RFC 2253 form as mosquitto and OpenSSL print it, such as <code>CN=alice,O=Acme\, Inc,C=PT</code>.</li>
 </ul>
@@ -218,10 +224,11 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <p>A session left by a previous owner blocks the id until it expires. To give the id to someone else sooner, delete the session with <code>mercurioctl client delete-session &lt;clientid&gt;</code>.</p>
 
 <h2 id="reloading">Reloading</h2>
-<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
+<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, and the TLS certificate, key, CA and CRL files, those of listeners included, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
 <ul>
 <li>New ACL rules apply to every later publish, subscribe and delivery, connected clients included.</li>
 <li>Password changes apply to later logins.</li>
+<li>TLS changes apply to later connections, so a renewed certificate takes over without a restart. Connected clients keep the session they started with. A certificate whose key does not match, or a file that is missing, keeps the previous certificate, key, CA and CRLs of that listener.</li>
 <li>If a file fails to load, the broker logs the error and keeps the previous version, so a typo never locks everyone out.</li>
 <li>Other settings need a restart.</li>
 </ul>

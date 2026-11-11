@@ -17,7 +17,7 @@ use mercurio_server::server::{
     AddressRange, AuthConfig as ServerAuthConfig, ConnectPolicy, Limits, ListenerConfig,
     LocalConnector, Redirect, Server, ServerConfig, Socket, Transport,
 };
-use mercurio_server::tls::TlsConfig;
+use mercurio_server::tls::Tls;
 use mercurio_storage::{
     memory::MemoryStore,
     postgres::{DatabaseLock, PostgresStore},
@@ -408,7 +408,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct Prepared {
     limits: Limits,
     policy: ConnectPolicy,
-    tls: Option<TlsConfig>,
+    tls: Option<Tls>,
     auth: ServerAuthConfig,
     plugins: Vec<Arc<dyn Plugin>>,
     dynsec: Option<Arc<DynamicSecurity>>,
@@ -418,7 +418,7 @@ struct Prepared {
 }
 
 struct PreparedListener {
-    tls: Option<TlsConfig>,
+    tls: Option<Tls>,
     proxy_from: Vec<AddressRange>,
     auth: Option<ServerAuthConfig>,
     plugins: Option<Vec<Arc<dyn Plugin>>>,
@@ -441,8 +441,8 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     policy.client_id_prefixes = config.server.clientid_prefixes.clone();
     config.storage.postgres_options()?;
 
-    let tls = build_tls(&config.server.tls)?;
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
+    let tls = build_tls(&config.server.tls, &mut reloadable)?;
     let (auth, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
     let wasm = load_plugins(
         &config.plugins,
@@ -473,7 +473,7 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
             None => (None, names.map(|_| chain(&builtins, names))),
         };
         listeners.push(PreparedListener {
-            tls: build_tls(&extra.tls)?,
+            tls: build_tls(&extra.tls, &mut reloadable)?,
             proxy_from: extra
                 .proxy_from
                 .iter()
@@ -495,14 +495,18 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     })
 }
 
-/// The TLS settings of `config`, with its certificate, key and CA files
-/// loaded once to check them.
-fn build_tls(config: &config::TlsServerConfig) -> Result<Option<TlsConfig>, String> {
-    let tls = config.build()?;
-    if let Some(tls) = &tls {
-        tls.build_acceptor().map_err(|e| e.to_string())?;
-    }
-    Ok(tls)
+/// The TLS settings of `config`, with its certificate, key, CA and CRL
+/// files loaded, and added to `reloadable`.
+fn build_tls(
+    config: &config::TlsServerConfig,
+    reloadable: &mut Vec<Arc<dyn Reload>>,
+) -> Result<Option<Tls>, String> {
+    let Some(files) = config.build()? else {
+        return Ok(None);
+    };
+    let tls = Tls::new(files).map_err(|e| e.to_string())?;
+    reloadable.push(Arc::new(tls.clone()));
+    Ok(Some(tls))
 }
 
 /// Sets the broker up, hands its `Admin` to the daemon's commands and to
@@ -768,10 +772,10 @@ async fn load_plugins(
     }
 }
 
-/// Rereads the ACL, password and dynamic security files and the
-/// WebAssembly plugins on SIGHUP, as the `reload` command does. ACL and
-/// plugin changes apply to every later check or call; password changes
-/// apply to later connections.
+/// Rereads the ACL, password and dynamic security files, the TLS
+/// certificates, keys and CRLs and the WebAssembly plugins on SIGHUP, as
+/// the `reload` command does. ACL and plugin changes apply to every later
+/// check or call; password and TLS changes apply to later connections.
 #[cfg(unix)]
 async fn reload_on_sighup(mut hangup: signal::unix::Signal, files: Arc<[Arc<dyn Reload>]>) {
     while hangup.recv().await.is_some() {

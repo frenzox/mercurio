@@ -1,6 +1,6 @@
 //! TLS support for the MQTT broker.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
@@ -19,9 +19,22 @@ pub struct TlsConfig {
     pub key_path: String,
     /// Optional path to CA certificate for client authentication (mTLS)
     pub ca_path: Option<String>,
+    /// With `ca_path`, refuse clients that present no certificate. When
+    /// false, they connect and authenticate as on a listener without
+    /// `ca_path`; a certificate that is presented must still be valid.
+    pub require_certificate: bool,
     /// Certificate revocation lists (PEM) to check client certificates
-    /// against; requires `ca_path`
+    /// against; requires `ca_path`. Every certificate of a client's chain
+    /// below the CA must be covered by a CRL from its issuer, or the client
+    /// is refused, unless `crl_end_entity_only` or `crl_allow_unknown`
+    /// relax it. CRLs past their next update are still used.
     pub crl_path: Option<String>,
+    /// Check only the client's own certificate against `crl_path`, and
+    /// not the intermediate CAs that issued it
+    pub crl_end_entity_only: bool,
+    /// Accept certificates whose issuer has no CRL in `crl_path`, instead
+    /// of refusing them as their revocation status is unknown
+    pub crl_allow_unknown: bool,
     /// Oldest TLS version accepted
     pub min_version: TlsVersion,
     /// Take the client's user name from its certificate, in place of the
@@ -56,7 +69,10 @@ impl TlsConfig {
             cert_path: cert_path.into(),
             key_path: key_path.into(),
             ca_path: None,
+            require_certificate: true,
             crl_path: None,
+            crl_end_entity_only: false,
+            crl_allow_unknown: false,
             min_version: TlsVersion::default(),
             username_from_certificate: None,
         }
@@ -68,14 +84,21 @@ impl TlsConfig {
         self
     }
 
-    /// Build a TLS acceptor from this configuration.
-    pub fn build_acceptor(&self) -> Result<TlsAcceptor, ServerError> {
-        let certificate_options =
-            self.crl_path.is_some() || self.username_from_certificate.is_some();
+    /// Reads the files and builds the rustls configuration they describe.
+    pub fn server_config(&self) -> Result<Arc<ServerConfig>, ServerError> {
+        let certificate_options = self.crl_path.is_some()
+            || self.username_from_certificate.is_some()
+            || !self.require_certificate;
         if self.ca_path.is_none() && certificate_options {
             return Err(ServerError::Tls(
-                "Revocation lists and certificate identities need a CA to verify clients with"
+                "Revocation lists, optional client certificates and certificate identities \
+                 need a CA to verify clients with"
                     .to_string(),
+            ));
+        }
+        if self.crl_path.is_none() && (self.crl_end_entity_only || self.crl_allow_unknown) {
+            return Err(ServerError::Tls(
+                "How revocation lists are checked needs revocation lists to check".to_string(),
             ));
         }
         let certs = load_certs(&self.cert_path)?;
@@ -105,6 +128,15 @@ impl TlsConfig {
             if let Some(crl_path) = &self.crl_path {
                 verifier = verifier.with_crls(load_crls(crl_path)?);
             }
+            if self.crl_end_entity_only {
+                verifier = verifier.only_check_end_entity_revocation();
+            }
+            if self.crl_allow_unknown {
+                verifier = verifier.allow_unknown_revocation_status();
+            }
+            if !self.require_certificate {
+                verifier = verifier.allow_unauthenticated();
+            }
             let verifier = verifier
                 .build()
                 .map_err(|e| ServerError::Tls(format!("Failed to build client verifier: {}", e)))?;
@@ -118,7 +150,86 @@ impl TlsConfig {
             .with_single_cert(certs, key)
             .map_err(|e| ServerError::Tls(format!("Failed to configure TLS: {}", e)))?;
 
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        Ok(Arc::new(config))
+    }
+}
+
+/// The TLS a listener serves. Clones share their settings: a reload
+/// through any of them reaches every listener given one. Connections
+/// already up keep the settings they started with.
+#[derive(Clone)]
+pub struct Tls {
+    current: Arc<RwLock<Arc<ServerConfig>>>,
+    /// None for a configuration the embedder built
+    files: Option<Arc<TlsConfig>>,
+    username_from_certificate: Option<CertificateName>,
+}
+
+impl std::fmt::Debug for Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tls")
+            .field("files", &self.files)
+            .field("username_from_certificate", &self.username_from_certificate)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Tls {
+    /// Reads the files of `config`, failing if they can't be used.
+    pub fn new(config: TlsConfig) -> Result<Self, ServerError> {
+        Ok(Self {
+            current: Arc::new(RwLock::new(config.server_config()?)),
+            username_from_certificate: config.username_from_certificate,
+            files: Some(Arc::new(config)),
+        })
+    }
+
+    /// Serves a rustls configuration built by the caller, for settings
+    /// [`TlsConfig`] has no field for. With `username_from_certificate`,
+    /// clients that present a certificate are named by it; whether they
+    /// must present one, and what makes it valid, is up to `config`'s
+    /// client verifier. [`Tls::reload`] has no files to read:
+    /// [`Tls::set_server_config`] replaces the configuration instead.
+    pub fn from_rustls(
+        config: Arc<ServerConfig>,
+        username_from_certificate: Option<CertificateName>,
+    ) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(config)),
+            files: None,
+            username_from_certificate,
+        }
+    }
+
+    /// Reads the files again, for connections from now on. On error the
+    /// settings in use are kept.
+    pub fn reload(&self) -> Result<(), ServerError> {
+        let Some(files) = &self.files else {
+            return Err(ServerError::Tls(
+                "the TLS configuration was not read from files".to_string(),
+            ));
+        };
+        self.set_server_config(files.server_config()?);
+        Ok(())
+    }
+
+    /// Serves `config` to connections from now on.
+    pub fn set_server_config(&self, config: Arc<ServerConfig>) {
+        *self.current.write().unwrap() = config;
+    }
+
+    /// The files read, as given to [`Tls::new`]; None for a configuration
+    /// from [`Tls::from_rustls`].
+    pub fn files(&self) -> Option<&TlsConfig> {
+        self.files.as_deref()
+    }
+
+    pub(crate) fn username_from_certificate(&self) -> Option<CertificateName> {
+        self.username_from_certificate
+    }
+
+    pub(crate) fn acceptor(&self) -> TlsAcceptor {
+        TlsAcceptor::from(Arc::clone(&self.current.read().unwrap()))
     }
 }
 
@@ -221,7 +332,7 @@ mod tests {
     fn test_client_certificate_options_need_a_ca() {
         let mut config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem");
         config.username_from_certificate = Some(CertificateName::CommonName);
-        let Err(ServerError::Tls(message)) = config.build_acceptor() else {
+        let Err(ServerError::Tls(message)) = Tls::new(config) else {
             panic!("accepted identity_as_username without a CA");
         };
         assert!(message.contains("need a CA"), "{message}");

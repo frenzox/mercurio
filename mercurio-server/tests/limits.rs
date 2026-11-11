@@ -370,10 +370,13 @@ async fn an_address_holds_its_slots_through_the_tls_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
-    config.tls = Some(mercurio_server::tls::TlsConfig::new(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
-    ));
+    config.tls = Some(
+        mercurio_server::tls::Tls::new(mercurio_server::tls::TlsConfig::new(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cert.pem"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key.pem"),
+        ))
+        .unwrap(),
+    );
     config.limits.max_connections_per_ip = Some(1);
     config.limits.connect_timeout = Duration::from_secs(30);
     tokio::spawn(mercurio_server::server::run_with_config(

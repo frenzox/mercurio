@@ -101,7 +101,7 @@ mercuriod -v</pre>
 <table>
 <tr><th>Signal</th><th>Effect</th></tr>
 <tr><td><code>SIGTERM</code>, Ctrl+C</td><td>Graceful shutdown: every client is sent a DISCONNECT saying the server is shutting down, and the broker waits up to five seconds for connections to close.</td></tr>
-<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files and the dynamic security file, without dropping connections. See <a href="security.html#reloading">reloading</a>. <code>mercurioctl broker reload</code> does the same and reports each file. Received while the broker starts, for example while a standby waits for the database, it reloads once the broker serves.</td></tr>
+<tr><td><code>SIGHUP</code></td><td>Rereads password files, ACL files, the dynamic security file and the TLS certificates, keys, CAs and CRLs, without dropping connections. See <a href="security.html#reloading">reloading</a>. <code>mercurioctl broker reload</code> does the same and reports each file. Received while the broker starts, for example while a standby waits for the database, it reloads once the broker serves.</td></tr>
 </table>
 <p>A non-zero exit status means the broker failed to start, for example on an unusable TLS certificate or a port already in use, so service managers notice.</p>
 

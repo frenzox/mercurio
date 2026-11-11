@@ -211,8 +211,17 @@ enabled = false
 # key_path = "/etc/mercurio/server.key"
 # Require clients to present a certificate signed by this CA (mutual TLS)
 # ca_path = "/etc/mercurio/ca.crt"
+# With ca_path, let clients without a certificate in to log in by password;
+# a certificate that is presented must still be valid
+# require_certificate = true
 # Reject client certificates revoked in these CRLs (PEM); needs ca_path
 # crl_path = "/etc/mercurio/crl.pem"
+# Every certificate of a client's chain needs a CRL from its issuer in
+# crl_path, or the client is refused. Check only the client's own
+# certificate, leaving its intermediate CAs unchecked
+# crl_end_entity_only = false
+# Accept certificates whose issuer has no CRL in crl_path
+# crl_allow_unknown = false
 # Use the client certificate's Common Name as the user name, instead of
 # the user name and password the client sends; needs ca_path
 # identity_as_username = false
@@ -537,10 +546,12 @@ every message is checked. `user_url` replaces `password_file` and
 
 Send `SIGHUP` (`systemctl reload mercuriod`), or run
 `mercurioctl broker reload`, to reread `password_file`,
-`acl_file`, `dynamic_security` and the `.wasm` file of each `[[plugins]]`
+`acl_file`, `dynamic_security`, the TLS `cert_path`, `key_path`, `ca_path`
+and `crl_path` of each listener and the `.wasm` file of each `[[plugins]]`
 entry without dropping connections. New ACL rules apply to every later
 publish and subscribe, including those of connected clients. Password
-changes apply to later logins. A reloaded plugin takes over once its
+and TLS changes apply to later connections; connected clients keep the
+certificate they were served. A reloaded plugin takes over once its
 `init` has run; calls already running finish on the old code. If a file
 fails to load, the broker logs the error and keeps the previous version.
 Other settings, the other `[[plugins]]` keys among them, still need a
@@ -563,10 +574,18 @@ describes every command, its permissions and what changed since 0.4.
 Set `enabled = true` under `[server.tls]` with a certificate and key to serve
 TLS on `port`, and on `websocket_port` when it is set. With `ca_path`, the
 broker also requires a client certificate signed by that CA.
-`crl_path` rejects revoked client certificates. With
+`require_certificate = false` makes it optional: clients without one log
+in by user name and password, while a certificate that is presented must
+still be valid. `crl_path` rejects revoked client certificates. Each
+certificate of the client's chain, intermediate CAs included, must be
+covered by a CRL from its issuer, or the client is refused: give the CRLs
+of the root and of every intermediate CA. `crl_end_entity_only = true`
+checks only the client's own certificate, and `crl_allow_unknown = true`
+accepts certificates whose issuer has no CRL in the file. With
 `identity_as_username`, the certificate's Common Name becomes the client's
 user name: it counts as authenticated, and `user` rules in `acl_file`
-apply to it. The user name and password in CONNECT are then ignored.
+apply to it. The user name and password in CONNECT are then ignored,
+except from clients that present no certificate where it is optional.
 `subject_as_username` uses the whole subject instead, written as RFC 2253
 does and as mosquitto's `use_subject_as_username` gives it:
 `CN=alice,O=Example,C=PT`.

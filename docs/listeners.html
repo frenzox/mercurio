@@ -141,7 +141,7 @@ enabled = true
 allow_anonymous = false
 password_file = "/etc/mercurio/public.passwd"
 acl_file = "/etc/mercurio/public.acl"</pre>
-<p>A listener's files are reloaded on <code>SIGHUP</code> like the main ones.</p>
+<p>A listener's files, its TLS certificate, key, CA and CRLs included, are reloaded on <code>SIGHUP</code> like the main ones.</p>
 
 <h2 id="limits">Per-listener connection limits</h2>
 <pre>[[listeners]]

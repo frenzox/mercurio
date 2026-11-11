@@ -860,7 +860,7 @@ impl Default for ServerConfig {
 }
 
 /// TLS configuration for the server.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct TlsServerConfig {
@@ -877,8 +877,22 @@ pub struct TlsServerConfig {
     /// Optional path to CA certificate for client authentication (mTLS)
     pub ca_path: Option<String>,
 
+    /// With `ca_path`, refuse clients without a certificate; when false,
+    /// they log in as on a listener without `ca_path`
+    #[serde(default = "default_true")]
+    pub require_certificate: bool,
+
     /// Revocation lists to check client certificates against
     pub crl_path: Option<String>,
+
+    /// Check only the client's own certificate against `crl_path`, not
+    /// the intermediate CAs that issued it
+    #[serde(default)]
+    pub crl_end_entity_only: bool,
+
+    /// Accept certificates whose issuer has no CRL in `crl_path`
+    #[serde(default)]
+    pub crl_allow_unknown: bool,
 
     /// Oldest TLS version accepted: "1.2" or "1.3"
     #[serde(default)]
@@ -902,6 +916,24 @@ pub enum MinTlsVersion {
     Tls13,
 }
 
+impl Default for TlsServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            ca_path: None,
+            require_certificate: true,
+            crl_path: None,
+            crl_end_entity_only: false,
+            crl_allow_unknown: false,
+            min_version: MinTlsVersion::default(),
+            identity_as_username: false,
+            subject_as_username: false,
+        }
+    }
+}
+
 impl TlsServerConfig {
     /// The TLS settings to serve with, or `None` when TLS is disabled.
     pub fn build(&self) -> Result<Option<TlsConfig>, String> {
@@ -920,7 +952,10 @@ impl TlsServerConfig {
         if let Some(ca_path) = &self.ca_path {
             tls = tls.with_client_auth(ca_path.clone());
         }
+        tls.require_certificate = self.require_certificate;
         tls.crl_path = self.crl_path.clone();
+        tls.crl_end_entity_only = self.crl_end_entity_only;
+        tls.crl_allow_unknown = self.crl_allow_unknown;
         tls.min_version = match self.min_version {
             MinTlsVersion::Tls12 => TlsVersion::Tls12,
             MinTlsVersion::Tls13 => TlsVersion::Tls13,
@@ -1241,7 +1276,37 @@ mod tests {
         ))
         .unwrap();
         let tls = config.server.tls.build().unwrap().unwrap();
-        assert!(tls.build_acceptor().is_ok());
+        assert!(mercurio_server::tls::Tls::new(tls).is_ok());
+    }
+
+    #[test]
+    fn test_client_certificates_are_required_unless_turned_off() {
+        let tls = |extra: &str| {
+            let config: Config = toml::from_str(&format!(
+                "[server.tls]\nenabled = true\ncert_path = \"c.pem\"\nkey_path = \"k.pem\"\n\
+                 ca_path = \"ca.pem\"\n{extra}"
+            ))
+            .unwrap();
+            config.server.tls.build().unwrap().unwrap()
+        };
+        assert!(tls("").require_certificate);
+        assert!(!tls("require_certificate = false").require_certificate);
+    }
+
+    #[test]
+    fn test_crls_cover_the_whole_chain_unless_relaxed() {
+        let tls = |extra: &str| {
+            let config: Config = toml::from_str(&format!(
+                "[server.tls]\nenabled = true\ncert_path = \"c.pem\"\nkey_path = \"k.pem\"\n\
+                 ca_path = \"ca.pem\"\ncrl_path = \"crl.pem\"\n{extra}"
+            ))
+            .unwrap();
+            config.server.tls.build().unwrap().unwrap()
+        };
+        let strict = tls("");
+        assert!(!strict.crl_end_entity_only && !strict.crl_allow_unknown);
+        let relaxed = tls("crl_end_entity_only = true\ncrl_allow_unknown = true");
+        assert!(relaxed.crl_end_entity_only && relaxed.crl_allow_unknown);
     }
 
     #[test]

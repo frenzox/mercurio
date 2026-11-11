@@ -129,7 +129,10 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>cert_path</code></td><td></td><td>Certificate chain, PEM.</td></tr>
 <tr><td><code>key_path</code></td><td></td><td>Private key, PEM: PKCS#1, PKCS#8 or SEC1.</td></tr>
 <tr><td><code>ca_path</code></td><td></td><td>Require clients to present a certificate signed by this CA.</td></tr>
-<tr><td><code>crl_path</code></td><td></td><td>Refuse client certificates revoked in these CRLs, PEM. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>require_certificate</code></td><td><code>true</code></td><td>When <code>false</code>, clients without a certificate connect and log in by user name and password; a certificate that is presented must still be valid. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>crl_path</code></td><td></td><td>Refuse client certificates revoked in these CRLs, PEM. Every certificate of the client's chain needs a CRL from its issuer here, or the client is refused. Needs <code>ca_path</code>.</td></tr>
+<tr><td><code>crl_end_entity_only</code></td><td><code>false</code></td><td>Check only the client's own certificate against <code>crl_path</code>, not the intermediate CAs that issued it. Needs <code>crl_path</code>.</td></tr>
+<tr><td><code>crl_allow_unknown</code></td><td><code>false</code></td><td>Accept certificates whose issuer has no CRL in <code>crl_path</code>, instead of refusing them. Needs <code>crl_path</code>.</td></tr>
 <tr><td><code>identity_as_username</code></td><td><code>false</code></td><td>Use the client certificate's Common Name as the user name. Needs <code>ca_path</code>.</td></tr>
 <tr><td><code>subject_as_username</code></td><td><code>false</code></td><td>Use the whole certificate subject as the user name, in RFC 2253 form. Needs <code>ca_path</code>.</td></tr>
 <tr><td><code>min_version</code></td><td><code>"1.2"</code></td><td>Oldest TLS version accepted: <code>"1.2"</code> or <code>"1.3"</code>.</td></tr>

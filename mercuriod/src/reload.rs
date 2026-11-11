@@ -2,8 +2,9 @@
 
 use std::sync::{Arc, OnceLock, RwLock};
 
-use mercurio_server::plugin::{
-    Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginStatus,
+use mercurio_server::{
+    plugin::{Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginStatus},
+    tls::Tls,
 };
 use serde::Serialize;
 use tracing::{error, info};
@@ -66,6 +67,22 @@ impl<T: Plugin> Reload for Reloadable<T> {
 
     fn item(&self) -> &str {
         Plugin::name(self)
+    }
+}
+
+/// A listener's certificate, key, CA and CRL files, reported by the
+/// certificate's path.
+impl Reload for Tls {
+    fn reload(&self) -> Result<(), String> {
+        Tls::reload(self).map_err(|e| e.to_string())
+    }
+
+    fn path(&self) -> &str {
+        self.files().map_or("", |files| &files.cert_path)
+    }
+
+    fn item(&self) -> &str {
+        "tls"
     }
 }
 
@@ -176,6 +193,44 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(value.reload().is_err());
         assert_eq!(*value.get(), "two");
+    }
+
+    #[test]
+    fn test_tls_reload_keeps_the_previous_files_on_error() {
+        use mercurio_server::tls::{Tls, TlsConfig};
+
+        let fixtures = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mercurio-server/tests/fixtures"
+        );
+        let dir = std::env::temp_dir().join(format!("mercuriod-reload-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::copy(format!("{fixtures}/cert.pem"), &cert).unwrap();
+        std::fs::copy(format!("{fixtures}/key.pem"), &key).unwrap();
+        let tls = Tls::new(TlsConfig::new(
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+        ))
+        .unwrap();
+        let files: Vec<std::sync::Arc<dyn super::Reload>> = vec![std::sync::Arc::new(tls)];
+
+        let [ok] = &super::reload_all(&files)[..] else {
+            panic!("one file to reload");
+        };
+        assert!(ok.ok);
+        assert_eq!(
+            (ok.item.as_str(), ok.path.as_str()),
+            ("tls", cert.to_str().unwrap())
+        );
+
+        std::fs::copy(format!("{fixtures}/pki/server.key"), &key).unwrap();
+        let [mismatched] = &super::reload_all(&files)[..] else {
+            panic!("one file to reload");
+        };
+        assert!(!mismatched.ok);
+        assert!(mismatched.error.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
