@@ -1199,6 +1199,15 @@ impl Session {
         state.presence.expires_at = expiry.map(|e| now + e.as_millis() as u64);
     }
 
+    /// Records that a connection is starting the session to outlive it by
+    /// `expiry`, so storing the session whole before the connection is
+    /// attached keeps that expiry.
+    pub(crate) async fn set_expiry(&self, expiry: Option<Duration>) {
+        let presence = &mut self.shared.state.lock().await.presence;
+        presence.session_expiry = expiry;
+        presence.expires_at = None;
+    }
+
     /// Records a session restored from storage as disconnected from now on.
     pub(crate) async fn mark_restored(&self, expiry: Option<Duration>, expires_at: Option<u64>) {
         let presence = &mut self.shared.state.lock().await.presence;

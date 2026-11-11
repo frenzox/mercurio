@@ -635,6 +635,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         session.hand_over(generation).await;
         session.set_owner(owner.clone()).await;
+        session.set_expiry(expiry).await;
         session.restore_incoming_qos2(incoming_qos2).await;
 
         claim.on_drop = OnDrop::End(expiry);
@@ -2101,6 +2102,36 @@ mod tests {
     fn failures<S: BatchStore + 'static>(manager: &SessionManager<S>) -> (u64, usize) {
         let health = manager.storage_health();
         (health.dropped, health.dirty)
+    }
+
+    /// A dirty client stored whole before its connection attached keeps
+    /// the expiry its CONNECT asked for.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_dirty_client_stored_before_it_attaches_keeps_its_expiry() {
+        let storage = FailingWrites::new();
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        storage.fail(true);
+        manager.delete_will("c");
+        manager.flush().await;
+        assert_eq!(failures(&manager), (1, 1));
+
+        let mut connect = resuming("c");
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
+                3600,
+            )),
+            ..Default::default()
+        });
+        let _started = manager
+            .start_session(connect, SessionOwner::default())
+            .await
+            .unwrap();
+        storage.fail(false);
+        manager.flush().await;
+        assert_eq!(failures(&manager), (1, 0));
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert_eq!(stored.expiry_interval, Some(3600));
+        assert_eq!(stored.expires_at, None);
     }
 
     fn mark_persistent<S: BatchStore>(manager: &SessionManager<S>, client_id: &str) {
