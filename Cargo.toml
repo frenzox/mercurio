@@ -9,6 +9,7 @@ members = [
     "mercurio-storage",
     "mercurio-plugin",
     "mercuriod",
+    "mercurioctl",
 ]
 exclude = ["examples/plugins", "mercuriod/test-plugins"]
 
