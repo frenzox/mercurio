@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/frenzox/mercurio/compare/mercuriod-v0.5.0...mercuriod-v0.5.1) - 2026-11-11
+
+### Added
+
+- *(mercuriod)* disconnect clients whose token expired
+- *(mercuriod)* authenticate clients with JSON Web Tokens
+- *(mercuriod)* take JWT keys from a JWKS URL
+- *(mercuriod)* verify JSON Web Tokens
+- *(mercuriod)* require SCRAM channel binding with one setting
+- *(mercuriod)* keep the SCRAM decoy secret in a file
+
+### Fixed
+
+- *(mercuriod)* refuse user names that are not in SASLprep form
+- *(mercuriod)* refuse and drop SCRAM users that share a prepared name
+- *(mercuriod)* key SCRAM credentials by the prepared user name
+
+### Other
+
+- *(mercuriod)* wait for the real Connected events before faking lost ones
+- Merge branch 'feat/jwt-auth'
+- describe JWT authentication
+
 ## [0.5.0](https://github.com/frenzox/mercurio/compare/mercuriod-v0.4.5...mercuriod-v0.5.0) - 2026-11-11
 
 ### Added

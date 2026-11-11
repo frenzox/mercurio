@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "clap",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-scram"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "mercurio-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "mercurioctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "mercuriod"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "recado"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.23.1",
  "clap",
