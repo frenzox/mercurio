@@ -362,6 +362,12 @@ struct Message {
 #[derive(Default)]
 struct Pipeline {
     messages: VecDeque<Message>,
+    /// Acknowledgements owed to the source, in order. They are kept here
+    /// until sent, since the forwarding may be cancelled at any await: an
+    /// acknowledgement lost then would hold back every later one, and with
+    /// them the source's Receive Maximum, for as long as its connection
+    /// lasts.
+    acks: VecDeque<AckToken>,
 }
 
 /// Why forwarding in one direction stopped.
@@ -536,6 +542,10 @@ impl Bridge {
         // Publishes of the first messages of the pipeline, in order
         let mut started: VecDeque<PendingPublish> = VecDeque::new();
         loop {
+            while let Some(token) = pipeline.acks.front() {
+                let _ = from.ack(*token).await;
+                pipeline.acks.pop_front();
+            }
             // Start what the pipeline holds, as far as the window allows
             while started.len() < pipeline.messages.len() && started.len() < window {
                 let message = &pipeline.messages[started.len()];
@@ -576,7 +586,7 @@ impl Bridge {
                         }
                     }
                     if let Some(token) = message.ack {
-                        let _ = from.ack(token).await;
+                        pipeline.acks.push_back(token);
                     }
                 }
                 event = from.recv(), if pipeline.messages.len() < window => {
@@ -598,7 +608,7 @@ impl Bridge {
                                 self.take(&topic, &payload, &subscription_ids, routes, outbound)
                             else {
                                 if let Some(token) = ack {
-                                    let _ = from.ack(token).await;
+                                    pipeline.acks.push_back(token);
                                 }
                                 continue;
                             };
