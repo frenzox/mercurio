@@ -20,6 +20,8 @@ clap = ["dep:clap", "dep:rpassword"]
 # TLS connections, through rustls, trusting the operating system's
 # certificate store
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
+# MQTT over WebSocket, ws:// and, with tls, wss://
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 mercurio-core = { path = "../mercurio-core", version = "0.2.0" }
@@ -31,6 +33,8 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 tracing = "0.1"
 thiserror = "1"
 clap = { version = "4", features = ["derive", "env"], optional = true }

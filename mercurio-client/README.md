@@ -33,7 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - TLS verified with the operating system's certificate store or your
   own CA, client certificates, ALPN, or a rustls `ClientConfig` of
   your own.
-- Unix sockets, with `ConnectOptions::unix`.
+- Unix sockets, with `ConnectOptions::unix`, and WebSocket (`ws://` and
+  `wss://`) behind the optional `websocket` feature.
 - TLS sits behind the default `tls` feature; turn it off for plain TCP
   and Unix sockets without rustls and aws-lc.
 - An optional `clap` feature with the connection options of recado and

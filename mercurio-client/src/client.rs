@@ -137,10 +137,20 @@ impl MqttClient {
             .map_err(ClientError::ConnectionFailed)?;
 
         #[cfg(feature = "tls")]
-        if options.tls.enabled {
-            return Ok(Box::new(crate::tls::handshake(options, stream).await?));
+        let stream: Box<dyn Stream> = if options.tls.enabled {
+            Box::new(crate::tls::handshake(options, stream).await?)
+        } else {
+            Box::new(stream)
+        };
+        #[cfg(not(feature = "tls"))]
+        let stream: Box<dyn Stream> = Box::new(stream);
+        #[cfg(feature = "websocket")]
+        if let Some(path) = &options.websocket_path {
+            return Ok(Box::new(
+                crate::websocket::handshake(options, stream, path).await?,
+            ));
         }
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 
     /// Perform the MQTT CONNECT handshake.

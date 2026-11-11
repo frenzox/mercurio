@@ -6,6 +6,9 @@
 //!   On by default. Without it the TLS settings of [`ConnectOptions`] stay,
 //!   but connecting with any of them fails with [`ClientError::Tls`], and
 //!   plain TCP and Unix socket users don't build rustls and aws-lc.
+//! - `websocket`: MQTT over WebSocket with
+//!   [`ConnectOptions::websocket`], `ws://` or, with TLS, `wss://`. Off by
+//!   default.
 //! - `clap`: the `cli` module, with command-line arguments for connecting
 //!   that tools can flatten into their own `clap` command. Off by default.
 #[cfg(feature = "clap")]
@@ -17,6 +20,8 @@ mod event;
 mod options;
 #[cfg(feature = "tls")]
 mod tls;
+#[cfg(feature = "websocket")]
+mod websocket;
 
 pub use client::{MqttClient, PendingPublish};
 pub use error::{ClientError, Result};

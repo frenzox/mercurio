@@ -44,7 +44,7 @@
 <pre>[dependencies]
 mercurio-client = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }</pre>
-<p>Features: <code>tls</code>, on by default, adds TLS through rustls and its aws-lc-rs provider; plain TCP and Unix socket users can turn it off with <code>default-features = false</code> to skip building rustls and aws-lc, and then connecting with any TLS setting fails with <code>ClientError::Tls</code>. <code>clap</code>, off by default, adds the command-line arguments described below.</p>
+<p>Features: <code>tls</code>, on by default, adds TLS through rustls and its aws-lc-rs provider; plain TCP and Unix socket users can turn it off with <code>default-features = false</code> to skip building rustls and aws-lc, and then connecting with any TLS setting fails with <code>ClientError::Tls</code>. <code>websocket</code>, off by default, adds MQTT over WebSocket. <code>clap</code>, off by default, adds the command-line arguments described below.</p>
 
 <h2>Connecting, publishing, subscribing</h2>
 <pre>use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
@@ -101,6 +101,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
 <tr><td><code>manual_acks(bool)</code></td><td>Acknowledge QoS 1 and 2 messages when the application calls <code>ack</code>, not on receipt</td></tr>
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
+<tr><td><code>websocket(path)</code></td><td>MQTT over a WebSocket at <code>path</code>, such as <code>/mqtt</code>: <code>ws://</code>, or <code>wss://</code> with TLS on and the same TLS settings. Needs the <code>websocket</code> feature</td></tr>
 <tr><td><code>connector(f)</code></td><td>Open the stream with the future <code>f</code> returns instead of TCP, as for a proxy or an in-process broker; the connect timeout bounds it</td></tr>
 <tr><td><code>connect_timeout(Duration)</code></td><td>Longest wait for the connection, CONNACK included, 30 seconds by default</td></tr>
 <tr><td><code>write_timeout(duration)</code></td><td>Longest a packet may take to write before the connection counts as lost; the keep-alive by default, or 30 seconds with a keep-alive of 0</td></tr>
@@ -181,6 +182,15 @@ let mut config = rustls::ClientConfig::builder()
     .with_no_client_auth();
 config.alpn_protocols = vec![b"mqtt".to_vec()];
 let options = ConnectOptions::new("iot.example.com", 443).tls_config(Arc::new(config));</pre>
+
+<h2>WebSocket</h2>
+<p>With the <code>websocket</code> feature, <code>websocket(path)</code> reaches brokers that serve MQTT over WebSocket, such as Mercurio's <code>websocket</code> listeners, or ones behind an HTTP proxy that only lets WebSocket through:</p>
+<pre>mercurio-client = { version = "0.4", features = ["websocket"] }
+
+let options = ConnectOptions::new("broker.example.com", 443)
+    .tls(true)
+    .websocket("/mqtt");</pre>
+<p>The client asks for the <code>mqtt</code> subprotocol, sends packets in binary frames, and refuses a server that doesn't select <code>mqtt</code>. With TLS on, the connection is <code>wss://</code>, verified as any TLS connection. recado and mercurioctl don't offer WebSocket yet.</p>
 
 <h2>Enhanced authentication</h2>
 <p>Implement <code>Authenticator</code> for a challenge-response method such as SCRAM. The exchange starts on every connection, reconnection and call to <code>reauthenticate()</code>. Authentication data is <code>Bytes</code>, which the crate re-exports from the <code>bytes</code> crate, as it does <code>ReasonCode</code>, <code>QoS</code> and <code>ProtocolVersion</code>:</p>

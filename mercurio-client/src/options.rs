@@ -382,6 +382,9 @@ pub struct ConnectOptions {
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
     pub(crate) connector: Option<Connector>,
+    /// Speak MQTT over a WebSocket at this path
+    #[cfg(feature = "websocket")]
+    pub(crate) websocket_path: Option<String>,
     /// Connect through this Unix socket instead of TCP
     #[cfg(unix)]
     pub(crate) unix_path: Option<PathBuf>,
@@ -420,6 +423,8 @@ impl std::fmt::Debug for ConnectOptions {
             )
             .field("authenticator", &self.authenticator)
             .field("connector", &self.connector);
+        #[cfg(feature = "websocket")]
+        debug.field("websocket_path", &self.websocket_path);
         #[cfg(unix)]
         debug.field("unix_path", &self.unix_path);
         debug.finish()
@@ -450,6 +455,20 @@ impl ConnectOptions {
                 "TLS needs the client built with its `tls` feature",
                 None,
             ));
+        }
+        #[cfg(feature = "websocket")]
+        if let Some(path) = &self.websocket_path {
+            if !path.starts_with('/') {
+                return Err(ClientError::InvalidArgument(format!(
+                    "WebSocket path `{path}` doesn't start with /"
+                )));
+            }
+            #[cfg(unix)]
+            if self.unix_path.is_some() {
+                return Err(ClientError::InvalidArgument(
+                    "WebSocket isn't supported over a Unix socket".into(),
+                ));
+            }
         }
         if let Some(client_id) = &self.client_id {
             check_length("client id", client_id)?;
@@ -492,6 +511,8 @@ impl ConnectOptions {
             request_problem_information: true,
             authenticator: None,
             connector: None,
+            #[cfg(feature = "websocket")]
+            websocket_path: None,
             #[cfg(unix)]
             unix_path: None,
         }
@@ -748,6 +769,16 @@ impl ConnectOptions {
                     .map(|stream| Box::new(stream) as Box<dyn Stream>)
             })
         })));
+        self
+    }
+
+    /// Speak MQTT over a WebSocket at `path`, such as `/mqtt`, on the host
+    /// and port: `ws://`, or `wss://` with TLS on, verified with the same
+    /// TLS settings. The client asks for the `mqtt` subprotocol and refuses
+    /// a broker that doesn't select it. Needs the `websocket` feature.
+    #[cfg(feature = "websocket")]
+    pub fn websocket(mut self, path: impl Into<String>) -> Self {
+        self.websocket_path = Some(path.into());
         self
     }
 
