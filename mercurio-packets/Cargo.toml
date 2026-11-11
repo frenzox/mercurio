@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-packets"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "MQTT packet encoding and decoding for the Mercurio MQTT implementation"
@@ -20,4 +20,4 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 
-mercurio-core = { path = "../mercurio-core", version = "0.2.0", default-features = false }
+mercurio-core = { path = "../mercurio-core", version = "0.3.0", default-features = false }

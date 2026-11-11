@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/frenzox/mercurio/compare/mercurio-packets-v0.2.1...mercurio-packets-v0.3.0) - 2026-11-11
+
+### Added
+
+- *(core)* [**breaking**] make encoding fallible and refuse what peers must reject
+- *(packets)* derive Clone on every packet and add packet_type()
+
+### Fixed
+
+- *(packets)* accept DUP on PUBREL, SUBSCRIBE and UNSUBSCRIBE in MQTT 3.1
+- *(packets)* [**breaking**] refuse reason codes their packet type does not list
+- *(packets)* [**breaking**] refuse an MQTT 3.x SUBACK without return codes
+- *(packets)* [**breaking**] refuse packet identifier 0 in every packet that carries one
+- *(packets)* [**breaking**] refuse Authentication Data without Authentication Method
+- *(core)* [**breaking**] require every Encoder to compute its encoded size
+- *(packets)* [**breaking**] make the per-packet decoders safe to call on any input
+
+### Other
+
+- Merge branch 'chore/workspace-manifests'
+- *(packets)* copy payloads and binary data as slices when encoding
+- share one lint configuration across the workspace
+- inherit shared package metadata from [workspace.package]
+- declare shared third-party dependencies once for the workspace
+- *(packets)* [**breaking**] keep property decoding helpers private
+- *(core)* [**breaking**] check Variable Byte Integer and identifier ranges
+- *(packets)* [**breaking**] pass the protocol version to every encode and decode
+- *(packets)* [**breaking**] derive CONNECT flags from the payload
+- *(core)* [**breaking**] replace QoS and RetainHandling Invalid with TryFrom
+- *(core)* [**breaking**] rename Error::MQTTReasonCode to Error::Reason
+- *(core)* [**breaking**] give reason code 0x00 a single variant
+- *(packets)* decode every property list through one helper
+- build the core and packets tests without std
+
 ## [0.2.1](https://github.com/frenzox/mercurio/compare/mercurio-packets-v0.2.0...mercurio-packets-v0.2.1) - 2026-11-10
 
 ### Added
