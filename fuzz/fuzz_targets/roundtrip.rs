@@ -23,7 +23,7 @@ use mercurio_core::{
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
     connack::{ConnAckFlags, ConnAckPacket, ConnAckProperties},
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties, WillProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, WillProperties},
     disconnect::{DisconnectPacket, DisconnectProperties},
     pingreq::PingReqPacket,
     pingresp::PingRespPacket,
@@ -262,37 +262,31 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
 
             // MQTT 3.x has no password without a user name [MQTT-3.1.2-22]
             let password = password.filter(|_| v5 || user_name.is_some());
-            let mut flags = ConnectFlags {
-                user_name: user_name.is_some(),
-                password: password.is_some(),
-                clean_start,
-                ..Default::default()
-            };
-            let mut payload = ConnectPayload {
+            let payload = ConnectPayload {
                 client_id: text(client_id),
+                will: will.map(|will| mercurio_packets::connect::Will {
+                    qos: qos(will.qos),
+                    retain: will.retain,
+                    properties: v5
+                        .then(|| {
+                            present(WillProperties {
+                                will_delay_interval: will.delay.map(WillDelayInterval::new),
+                                content_type: will.content_type.map(|s| ContentType::new(text(s))),
+                                user_property: user_properties(will.user),
+                                ..Default::default()
+                            })
+                        })
+                        .flatten(),
+                    topic: topic(will.topic),
+                    payload: Bytes::from(will.payload),
+                }),
                 user_name: user_name.map(text),
                 password: password.map(Bytes::from),
-                ..Default::default()
             };
-            if let Some(will) = will {
-                flags.will_flag = true;
-                flags.will_retain = will.retain;
-                flags.will_qos = qos(will.qos);
-                payload.will_topic = Some(topic(will.topic));
-                payload.will_payload = Some(Bytes::from(will.payload));
-                if v5 {
-                    payload.will_properties = present(WillProperties {
-                        will_delay_interval: will.delay.map(WillDelayInterval::new),
-                        content_type: will.content_type.map(|s| ContentType::new(text(s))),
-                        user_property: user_properties(will.user),
-                        ..Default::default()
-                    });
-                }
-            }
 
             ControlPacket::Connect(ConnectPacket {
                 protocol_version: version,
-                flags,
+                clean_start,
                 keepalive,
                 properties,
                 payload,

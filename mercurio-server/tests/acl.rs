@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{codec::Encoder, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, Will},
     publish::PublishPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -60,22 +60,19 @@ impl Client {
     ) -> (Self, ReasonCode) {
         let connect = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                clean_start: true,
-                user_name: credentials.is_some(),
-                password: credentials.is_some(),
-                will_flag: will.is_some(),
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: Some(ConnectProperties::default()),
             payload: ConnectPayload {
                 client_id: client_id.into(),
                 user_name: credentials.map(|(user, _)| user.into()),
                 password: credentials.map(|(_, password)| Bytes::from(password.to_string())),
-                will_properties: will.map(|_| Default::default()),
-                will_topic: will.map(Into::into),
-                will_payload: will.map(|_| Bytes::from_static(b"bye")),
+                will: will.map(|topic| Will {
+                    properties: Some(Default::default()),
+                    topic: topic.into(),
+                    payload: Bytes::from_static(b"bye"),
+                    ..Default::default()
+                }),
             },
         };
         let mut client = Client {

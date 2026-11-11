@@ -14,7 +14,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     puback::PubAckPacket,
     publish::{PublishPacket, PublishProperties},
     pubrel::PubRelPacket,
@@ -133,10 +133,7 @@ impl Client {
         let v5 = options.protocol_version == ProtocolVersion::V5;
         let connect = ConnectPacket {
             protocol_version: options.protocol_version,
-            flags: ConnectFlags {
-                clean_start: options.clean_start,
-                ..Default::default()
-            },
+            clean_start: options.clean_start,
             keepalive: 60,
             properties: v5.then(|| ConnectProperties {
                 session_expiry_interval: Some(
@@ -496,7 +493,7 @@ async fn dropped_queued_messages_stay_dropped_after_a_crash() {
     let mut stream = TcpStream::connect(broker.addr).await.unwrap();
     let connect = ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags::default(),
+        clean_start: false,
         keepalive: 60,
         properties: Some(ConnectProperties {
             session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(

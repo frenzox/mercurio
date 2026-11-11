@@ -1805,7 +1805,7 @@ where
         // MQTT 3.x servers must reject a zero-length client id unless the
         // session is clean, as there would be no way to resume it [MQTT-3.1.3-8]
         if connect_packet.payload.client_id.is_empty()
-            && !connect_packet.flags.clean_start
+            && !connect_packet.clean_start
             && !connect_packet.protocol_version.supports_properties()
         {
             return self
@@ -1857,13 +1857,13 @@ where
         }
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
-        if let Some(will_topic) = &connect_packet.payload.will_topic {
+        if let Some(will) = &connect_packet.payload.will {
             let identity = ClientInfo {
                 client_id: connect_packet.payload.client_id.clone(),
                 username: verified_user.clone(),
                 peer: self.peer,
             };
-            if !self.chain.may(&identity, will_topic, Access::Write).await {
+            if !self.chain.may(&identity, &will.topic, Access::Write).await {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
                     .await;
@@ -2242,23 +2242,16 @@ where
     /// Why a will the broker can't honour is refused [MQTT-3.2.2-12]
     /// [MQTT-3.2.2-13]
     fn refused_will(&self, connect_packet: &ConnectPacket) -> Option<ReasonCode> {
-        let flags = &connect_packet.flags;
-        if !flags.will_flag {
-            return None;
-        }
-        if flags.will_qos as u8 > self.limits.maximum_qos as u8 {
+        let will = connect_packet.payload.will.as_ref()?;
+        if will.qos as u8 > self.limits.maximum_qos as u8 {
             return Some(ReasonCode::QoSNotSupported);
         }
-        if flags.will_retain && !self.limits.retain_available {
+        if will.retain && !self.limits.retain_available {
             return Some(ReasonCode::RetainNotSupported);
         }
         // A will is published like a PUBLISH, so its topic must be one;
         // `$` topics belong to the broker
-        let topic = connect_packet
-            .payload
-            .will_topic
-            .as_deref()
-            .unwrap_or_default();
+        let topic = will.topic.as_str();
         if validate_publish_topic(topic).is_err() || topic.starts_with('$') {
             return Some(ReasonCode::TopicNameInvalid);
         }

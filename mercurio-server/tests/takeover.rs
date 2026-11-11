@@ -9,7 +9,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     connack::ConnAckPacket,
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, Will},
     disconnect::DisconnectPacket,
     publish::PublishPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
@@ -219,13 +219,7 @@ impl Client {
         let password = options.user.map(|user| format!("{user}-pw"));
         let connect = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                clean_start: options.clean_start,
-                user_name: options.user.is_some(),
-                password: options.user.is_some(),
-                will_flag: options.will.is_some(),
-                ..Default::default()
-            },
+            clean_start: options.clean_start,
             keepalive: 60,
             properties: Some(ConnectProperties {
                 session_expiry_interval: options.session_expiry.map(SessionExpiryInterval::new),
@@ -235,9 +229,12 @@ impl Client {
                 client_id: client_id.into(),
                 user_name: options.user.map(Into::into),
                 password: password.map(Bytes::from),
-                will_properties: options.will.map(|_| Default::default()),
-                will_topic: options.will.map(Into::into),
-                will_payload: options.will.map(|_| Bytes::from_static(b"bye")),
+                will: options.will.map(|topic| Will {
+                    properties: Some(Default::default()),
+                    topic: topic.into(),
+                    payload: Bytes::from_static(b"bye"),
+                    ..Default::default()
+                }),
             },
         };
         let mut client = Client {

@@ -128,8 +128,8 @@ fn mount(packet: &mut ControlPacket, mount_point: &str) {
     };
     match packet {
         ControlPacket::Connect(connect) => {
-            if let Some(topic) = &mut connect.payload.will_topic {
-                mounted(topic);
+            if let Some(will) = &mut connect.payload.will {
+                mounted(&mut will.topic);
             }
         }
         ControlPacket::Publish(publish) => mounted(&mut publish.topic_name),

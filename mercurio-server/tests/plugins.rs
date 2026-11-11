@@ -9,7 +9,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -52,10 +52,7 @@ impl Client {
         client
             .send(ControlPacket::Connect(ConnectPacket {
                 protocol_version: ProtocolVersion::V5,
-                flags: ConnectFlags {
-                    clean_start: true,
-                    ..Default::default()
-                },
+                clean_start: true,
                 keepalive: 60,
                 properties: Some(ConnectProperties::default()),
                 payload: ConnectPayload {

@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{protocol::ProtocolVersion, qos::QoS, reason::ReasonCode};
 use mercurio_packets::{
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     publish::PublishPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -36,10 +36,7 @@ async fn start(mut config: ServerConfig) -> SocketAddr {
 fn connect_packet(client_id: &str, version: ProtocolVersion) -> ConnectPacket {
     ConnectPacket {
         protocol_version: version,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 1,
         properties: (version == ProtocolVersion::V5).then(ConnectProperties::default),
         payload: ConnectPayload {

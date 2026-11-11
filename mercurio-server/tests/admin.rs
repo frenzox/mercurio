@@ -9,7 +9,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties, Will},
     publish::{PublishPacket, PublishProperties},
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
@@ -167,10 +167,7 @@ impl AuthExchange for SwitchExchange {
 fn connect_packet(client_id: &str) -> ConnectPacket {
     ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 60,
         properties: Some(ConnectProperties::default()),
         payload: ConnectPayload {
@@ -325,10 +322,12 @@ fn persistent(client_id: &str) -> ConnectPacket {
 /// A persistent session with a will on `wills/<client id>`.
 fn with_will(client_id: &str) -> ConnectPacket {
     let mut packet = persistent(client_id);
-    packet.flags.will_flag = true;
-    packet.payload.will_properties = Some(Default::default());
-    packet.payload.will_topic = Some(format!("wills/{client_id}"));
-    packet.payload.will_payload = Some(Bytes::from_static(b"gone"));
+    packet.payload.will = Some(Will {
+        properties: Some(Default::default()),
+        topic: format!("wills/{client_id}"),
+        payload: Bytes::from_static(b"gone"),
+        ..Default::default()
+    });
     packet
 }
 
@@ -1034,7 +1033,7 @@ async fn disconnect_client_closes_mqtt311_connections() {
     let mut packet = connect_packet("old");
     packet.protocol_version = ProtocolVersion::V3_1_1;
     packet.properties = None;
-    packet.flags.clean_start = false;
+    packet.clean_start = false;
     let mut old = Client::connect_with(addr, packet).await;
 
     admin.disconnect("old", Default::default()).await.unwrap();
@@ -1407,8 +1406,6 @@ async fn user_name_bans_match_the_verified_user() {
 
     let as_user = |client_id: &str, user: &str| {
         let mut packet = connect_packet(client_id);
-        packet.flags.user_name = true;
-        packet.flags.password = true;
         packet.payload.user_name = Some(user.into());
         packet.payload.password = Some(Bytes::from_static(b"secret"));
         packet
@@ -1453,8 +1450,6 @@ async fn address_bans_refuse_before_authentication() {
 
     let as_alice = || {
         let mut packet = connect_packet("a");
-        packet.flags.user_name = true;
-        packet.flags.password = true;
         packet.payload.user_name = Some("alice".into());
         packet.payload.password = Some(Bytes::from_static(b"secret"));
         packet

@@ -80,15 +80,10 @@ pub struct WillMessage {
 }
 
 impl WillMessage {
-    /// Extract will message from a ConnectPacket if will_flag is set.
+    /// Extract will message from a ConnectPacket if it has one.
     fn from_connect_packet(packet: &ConnectPacket) -> Option<Self> {
-        if !packet.flags.will_flag {
-            return None;
-        }
-
-        let topic = packet.payload.will_topic.as_ref()?;
-        let payload = packet.payload.will_payload.clone().unwrap_or_default();
-        let will_properties = packet.payload.will_properties.as_ref();
+        let will = packet.payload.will.as_ref()?;
+        let will_properties = will.properties.as_ref();
         let delay = will_properties
             .and_then(|p| p.will_delay_interval.as_ref())
             .map_or(0, |d| d.value);
@@ -104,10 +99,10 @@ impl WillMessage {
             .unwrap_or_default();
 
         Some(WillMessage {
-            topic: topic.clone(),
-            payload,
-            qos: packet.flags.will_qos,
-            retain: packet.flags.will_retain,
+            topic: will.topic.clone(),
+            payload: will.payload.clone(),
+            qos: will.qos,
+            retain: will.retain,
             delay: Duration::from_secs(delay.into()),
             properties,
         })
@@ -1165,7 +1160,7 @@ impl Session {
             listener: presence.listener.clone(),
             protocol_version: seen.then_some(state.connect_packet.protocol_version),
             keepalive: seen.then_some(presence.keepalive),
-            clean_start: seen.then_some(state.connect_packet.flags.clean_start),
+            clean_start: seen.then_some(state.connect_packet.clean_start),
             connected_at: presence
                 .connected_at
                 .filter(|_| presence.disconnected_at.is_none()),
@@ -2190,7 +2185,7 @@ mod tests {
     use super::*;
     use mercurio_core::protocol::ProtocolVersion;
     use mercurio_packets::{
-        connect::{ConnectFlags, ConnectPayload},
+        connect::{self, ConnectPayload},
         subscribe::{RetainHandling, SubscribePayload, SubscriptionOptions},
         unsubscribe::UnsubscribePayload,
     };
@@ -2204,14 +2199,12 @@ mod tests {
     fn create_test_session() -> Session {
         let connect_packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags::default(),
+            clean_start: false,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
                 client_id: "test-client".to_string(),
-                will_properties: None,
-                will_topic: None,
-                will_payload: None,
+                will: None,
                 user_name: None,
                 password: None,
             },
@@ -2226,19 +2219,18 @@ mod tests {
     fn create_connect_packet_with_will() -> ConnectPacket {
         ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                will_flag: true,
-                will_qos: QoS::AtLeastOnce,
-                will_retain: true,
-                clean_start: true,
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
                 client_id: "test-client".to_string(),
-                will_topic: Some("will/topic".to_string()),
-                will_payload: Some(Bytes::from("goodbye")),
+                will: Some(connect::Will {
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    properties: None,
+                    topic: "will/topic".to_string(),
+                    payload: Bytes::from("goodbye"),
+                }),
                 ..Default::default()
             },
         }
@@ -2247,11 +2239,7 @@ mod tests {
     fn create_connect_packet_without_will() -> ConnectPacket {
         ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags {
-                will_flag: false,
-                clean_start: true,
-                ..Default::default()
-            },
+            clean_start: true,
             keepalive: 60,
             properties: None,
             payload: ConnectPayload {
@@ -3633,10 +3621,11 @@ mod tests {
     #[test]
     fn test_will_message_keeps_will_properties() {
         let mut packet = create_connect_packet_with_will();
-        packet.payload.will_properties = Some(mercurio_packets::connect::WillProperties {
-            content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
-            ..Default::default()
-        });
+        packet.payload.will.as_mut().unwrap().properties =
+            Some(mercurio_packets::connect::WillProperties {
+                content_type: Some(mercurio_core::properties::ContentType::new("text".into())),
+                ..Default::default()
+            });
 
         let will = WillMessage::from_connect_packet(&packet).unwrap();
         assert_eq!(will.properties.content_type.unwrap().value, "text");

@@ -19,7 +19,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 use mercurio_packets::connect::ConnectPacket;
-use mercurio_packets::connect::{ConnectFlags, ConnectPayload};
+use mercurio_packets::connect::ConnectPayload;
 use mercurio_storage::{
     BatchStore, InflightMessage, RetainedMessageStore, SessionOwner, SessionState,
     StoredSubscription, StoredWillMessage, Write,
@@ -546,7 +546,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         // in place
         let generation = claim.generation;
         let client_id = connect_packet.payload.client_id.clone();
-        let clean_start = connect_packet.flags.clean_start;
+        let clean_start = connect_packet.clean_start;
         let existing = self
             .shared
             .state
@@ -1192,7 +1192,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         // Stands in for the client's CONNECT until it sends a new one
         let connect_packet = ConnectPacket {
             protocol_version: ProtocolVersion::V5,
-            flags: ConnectFlags::default(),
+            clean_start: false,
             keepalive: 0,
             properties: None,
             payload: ConnectPayload {
@@ -1471,7 +1471,7 @@ impl Snapshots for StoredState {
 pub(crate) fn session_expiry(connect_packet: &ConnectPacket) -> Option<Duration> {
     if !connect_packet.protocol_version.supports_properties() {
         // MQTT 3.x: a clean session ends with the connection, others persist
-        return connect_packet.flags.clean_start.then_some(Duration::ZERO);
+        return connect_packet.clean_start.then_some(Duration::ZERO);
     }
 
     let interval = connect_packet
@@ -2025,7 +2025,7 @@ mod tests {
     fn connect_packet(client_id: &str) -> ConnectPacket {
         ConnectPacket {
             protocol_version: mercurio_core::protocol::ProtocolVersion::V5,
-            flags: Default::default(),
+            clean_start: false,
             keepalive: 60,
             properties: None,
             payload: mercurio_packets::connect::ConnectPayload {
@@ -2293,7 +2293,7 @@ mod tests {
         // A new manager over the same storage, as after a restart
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(storage);
         let mut connect = connect_packet("c");
-        connect.flags.clean_start = false;
+        connect.clean_start = false;
         let started = manager
             .start_session(connect, SessionOwner::default())
             .await
@@ -2509,7 +2509,7 @@ mod tests {
 
         // Reconnecting before the will is due cancels it
         let mut reconnect = connect_packet("b");
-        reconnect.flags.clean_start = false;
+        reconnect.clean_start = false;
         manager
             .start_session(reconnect, SessionOwner::default())
             .await
@@ -2770,7 +2770,7 @@ mod tests {
 
     fn resuming(client_id: &str) -> ConnectPacket {
         let mut connect = connect_packet(client_id);
-        connect.flags.clean_start = false;
+        connect.clean_start = false;
         connect
     }
 
@@ -2780,7 +2780,7 @@ mod tests {
 
     fn clean(client_id: &str) -> ConnectPacket {
         let mut connect = connect_packet(client_id);
-        connect.flags.clean_start = true;
+        connect.clean_start = true;
         connect
     }
 
@@ -3267,7 +3267,7 @@ mod tests {
         manager.end_connection(started.lease, None).await;
 
         let mut fresh = connect_packet("c");
-        fresh.flags.clean_start = true;
+        fresh.clean_start = true;
         let _connected = manager
             .start_session(fresh, SessionOwner::default())
             .await

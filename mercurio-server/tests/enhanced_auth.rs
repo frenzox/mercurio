@@ -16,7 +16,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     auth::{AuthPacket, AuthProperties},
-    connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
+    connect::{ConnectPacket, ConnectPayload, ConnectProperties},
     ControlPacket,
 };
 use mercurio_server::{
@@ -132,10 +132,7 @@ async fn connect_with(addr: SocketAddr, method: &str) -> (TcpStream, BytesMut) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let connect = ConnectPacket {
         protocol_version: ProtocolVersion::V5,
-        flags: ConnectFlags {
-            clean_start: true,
-            ..Default::default()
-        },
+        clean_start: true,
         keepalive: 60,
         properties: Some(ConnectProperties {
             authentication_method: Some(AuthenticationMethod::new(method.into())),
