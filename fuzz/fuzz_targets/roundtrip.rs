@@ -1,20 +1,21 @@
-//! Every packet the encoder can write for valid field values must decode
-//! back to the same packet, in each protocol version.
+//! Encoding any packet either fails, leaving the buffer as it was, or
+//! writes bytes that decode back to the same packet, in each protocol
+//! version.
 //!
-//! Generation stays inside what the encoder documents as valid and in the
-//! canonical form the decoder returns: a property block that sets nothing
-//! is `None`, reason code 0x00 is named as the packet names it, and fields
-//! a version cannot carry are left at their defaults. Values the encoder
-//! writes but the decoder refuses (packet identifier 0, a reason code the
-//! packet does not list, an empty SUBSCRIBE, a NUL in a string, ...) are
-//! left out on purpose: the encoder can't refuse them yet.
+//! Field values are left as generated, including those the receiver must
+//! refuse (packet identifier 0, a reason code the packet does not list, an
+//! empty SUBSCRIBE, a NUL in a string, ...): the encoder has to refuse
+//! them itself. Generation only keeps to the canonical form the decoder
+//! returns, where an encoding has two: a property block that sets nothing
+//! is `None`. Fields a version cannot carry (the reason codes and
+//! properties of MQTT 3.x) are left at their defaults, as encoding for that
+//! version drops them by design.
 #![no_main]
 
 use arbitrary::Arbitrary;
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use mercurio_core::{
-    codec::Decoder,
     properties::*,
     protocol::{PacketType, ProtocolVersion},
     qos::QoS,
@@ -62,12 +63,13 @@ struct Will {
     payload: Vec<u8>,
     delay: Option<u32>,
     content_type: Option<String>,
+    response_topic: Option<String>,
     user: Vec<(String, String)>,
 }
 
 #[derive(Arbitrary, Debug)]
 struct Auth {
-    method: String,
+    method: Option<String>,
     data: Option<Vec<u8>>,
 }
 
@@ -83,17 +85,19 @@ enum Packet {
         session_expiry: Option<u32>,
         receive_maximum: Option<u16>,
         maximum_packet_size: Option<u32>,
-        request_problem_information: Option<bool>,
-        auth: Option<Auth>,
+        request_problem_information: Option<u8>,
+        request_response_information: Option<u8>,
+        auth: Auth,
         user: Vec<(String, String)>,
     },
     ConnAck {
         session_present: bool,
         reason: u8,
-        maximum_qos: Option<bool>,
+        maximum_qos: Option<u8>,
+        receive_maximum: Option<u16>,
         assigned_client_id: Option<String>,
         server_keepalive: Option<u16>,
-        auth: Option<Auth>,
+        auth: Auth,
         common: Common,
     },
     Publish {
@@ -101,9 +105,9 @@ enum Packet {
         qos: u8,
         retain: bool,
         topic: String,
-        packet_id: u16,
+        packet_id: Option<u16>,
         payload: Vec<u8>,
-        payload_format: Option<bool>,
+        payload_format: Option<u8>,
         message_expiry: Option<u32>,
         topic_alias: Option<u16>,
         response_topic: Option<String>,
@@ -120,27 +124,23 @@ enum Packet {
     },
     Subscribe {
         packet_id: u16,
-        first: (String, u8),
-        rest: Vec<(String, u8)>,
+        filters: Vec<(String, u8)>,
         subscription_id: Option<u32>,
         user: Vec<(String, String)>,
     },
     SubAck {
         packet_id: u16,
-        first: u8,
-        rest: Vec<u8>,
+        codes: Vec<u8>,
         common: Common,
     },
     Unsubscribe {
         packet_id: u16,
-        first: String,
-        rest: Vec<String>,
+        filters: Vec<String>,
         user: Vec<(String, String)>,
     },
     UnsubAck {
         packet_id: u16,
-        first: u8,
-        rest: Vec<u8>,
+        codes: Vec<u8>,
         common: Common,
     },
     PingReq,
@@ -153,41 +153,20 @@ enum Packet {
     },
     Auth {
         reason: u8,
-        auth: Option<Auth>,
+        auth: Auth,
         common: Common,
     },
 }
 
-/// MQTT strings never hold U+0000 [MQTT-1.5.4-2].
-fn text(s: String) -> String {
-    s.replace('\0', "")
-}
-
-/// A topic name: no wildcards, never empty.
-fn topic(s: String) -> String {
-    let s = s.replace(['\0', '+', '#'], "");
-    if s.is_empty() {
-        "t".into()
-    } else {
-        s
-    }
-}
-
-fn packet_id(id: u16) -> u16 {
-    id.max(1)
-}
-
+/// Any QoS. The reserved value 3 can't be built, so it wraps.
 fn qos(n: u8) -> QoS {
     [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce][usize::from(n % 3)]
 }
 
-/// One of the reason codes `packet_type` lists, picked by `n`.
-fn reason(n: u8, packet_type: PacketType) -> ReasonCode {
-    let valid: Vec<ReasonCode> = (0..=u8::MAX)
-        .filter_map(|byte| ReasonCode::decode(&mut &[byte][..]).ok())
-        .filter(|code| code.is_valid_for(packet_type))
-        .collect();
-    valid[usize::from(n) % valid.len()]
+/// The reason code of a byte, or `None` for a byte that encodes none, as
+/// no `ReasonCode` can hold it.
+fn reason(n: u8) -> Option<ReasonCode> {
+    ReasonCode::try_from(n).ok()
 }
 
 /// A property block that sets nothing is the same as none.
@@ -198,28 +177,23 @@ fn present<P: Default + PartialEq>(properties: P) -> Option<P> {
 fn user_properties(user: Vec<(String, String)>) -> Option<Vec<UserProperty>> {
     let user: Vec<_> = user
         .into_iter()
-        .map(|(key, value)| UserProperty::new(text(key), text(value)))
+        .map(|(key, value)| UserProperty::new(key, value))
         .collect();
     (!user.is_empty()).then_some(user)
 }
 
-fn auth_properties(
-    auth: Option<Auth>,
-) -> (Option<AuthenticationMethod>, Option<AuthenticationData>) {
-    match auth {
-        Some(auth) => (
-            Some(AuthenticationMethod::new(text(auth.method))),
-            auth.data
-                .map(|data| AuthenticationData::new(Bytes::from(data))),
-        ),
-        None => (None, None),
-    }
+fn auth_properties(auth: Auth) -> (Option<AuthenticationMethod>, Option<AuthenticationData>) {
+    (
+        auth.method.map(AuthenticationMethod::new),
+        auth.data
+            .map(|data| AuthenticationData::new(Bytes::from(data))),
+    )
 }
 
 /// Reason String and User Properties, the properties of the acknowledgements.
 fn common(common: Common) -> (Option<ReasonString>, Option<Vec<UserProperty>>) {
     (
-        common.reason_string.map(|s| ReasonString::new(text(s))),
+        common.reason_string.map(ReasonString::new),
         user_properties(common.user),
     )
 }
@@ -239,6 +213,7 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             receive_maximum,
             maximum_packet_size,
             request_problem_information,
+            request_response_information,
             auth,
             user,
         } => {
@@ -247,11 +222,12 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .then(|| {
                     present(ConnectProperties {
                         session_expiry_interval: session_expiry.map(SessionExpiryInterval::new),
-                        receive_maximum: receive_maximum.map(|n| ReceiveMaximum::new(n.max(1))),
-                        maximum_packet_size: maximum_packet_size
-                            .map(|n| MaximumPacketSize::new(n.max(1))),
+                        receive_maximum: receive_maximum.map(ReceiveMaximum::new),
+                        maximum_packet_size: maximum_packet_size.map(MaximumPacketSize::new),
                         request_problem_information: request_problem_information
-                            .map(|b| RequestProblemInformation::new(b as u8)),
+                            .map(RequestProblemInformation::new),
+                        request_response_information: request_response_information
+                            .map(RequestResponseInformation::new),
                         user_property: user_properties(user),
                         authentication_method,
                         authentication_data,
@@ -260,10 +236,8 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 })
                 .flatten();
 
-            // MQTT 3.x has no password without a user name [MQTT-3.1.2-22]
-            let password = password.filter(|_| v5 || user_name.is_some());
             let payload = ConnectPayload {
-                client_id: text(client_id),
+                client_id,
                 will: will.map(|will| mercurio_packets::connect::Will {
                     qos: qos(will.qos),
                     retain: will.retain,
@@ -271,16 +245,17 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                         .then(|| {
                             present(WillProperties {
                                 will_delay_interval: will.delay.map(WillDelayInterval::new),
-                                content_type: will.content_type.map(|s| ContentType::new(text(s))),
+                                content_type: will.content_type.map(ContentType::new),
+                                response_topic: will.response_topic.map(ResponseTopic::new),
                                 user_property: user_properties(will.user),
                                 ..Default::default()
                             })
                         })
                         .flatten(),
-                    topic: topic(will.topic),
+                    topic: will.topic,
                     payload: Bytes::from(will.payload),
                 }),
-                user_name: user_name.map(text),
+                user_name,
                 password: password.map(Bytes::from),
             };
 
@@ -296,13 +271,14 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             session_present,
             reason: code,
             maximum_qos,
+            receive_maximum,
             assigned_client_id,
             server_keepalive,
             auth,
             common: c,
         } => {
             let reason_code = if v5 {
-                reason(code, PacketType::ConnAck)
+                reason(code)?
             } else {
                 // The codes MQTT 3.x CONNACK can carry (section 3.2.2.3)
                 [
@@ -319,9 +295,9 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             let properties = v5
                 .then(|| {
                     present(ConnAckProperties {
-                        maximum_qos: maximum_qos.map(|b| MaximumQoS::new(b as u8)),
-                        assigned_client_id: assigned_client_id
-                            .map(|s| AssignedClientIdentifier::new(text(s))),
+                        maximum_qos: maximum_qos.map(MaximumQoS::new),
+                        receive_maximum: receive_maximum.map(ReceiveMaximum::new),
+                        assigned_client_id: assigned_client_id.map(AssignedClientIdentifier::new),
                         server_keepalive: server_keepalive.map(ServerKeepAlive::new),
                         authentication_method,
                         authentication_data,
@@ -342,8 +318,8 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             dup,
             qos: q,
             retain,
-            topic: name,
-            packet_id: id,
+            topic,
+            packet_id,
             payload,
             payload_format,
             message_expiry,
@@ -354,41 +330,43 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             content_type,
             user,
         } => {
-            let qos_level = qos(q);
-            let at_most_once = qos_level == QoS::AtMostOnce;
-            // The MQTT 5 decoder always returns the property block
-            let properties = v5.then(|| PublishProperties {
-                payload_format_indicator: payload_format
-                    .map(|b| PayloadFormatIndicator::new(b as u8)),
-                message_expiry_interval: message_expiry.map(MessageExpiryInterval::new),
-                topic_alias: topic_alias.map(|n| TopicAlias::new(n.max(1))),
-                response_topic: response_topic.map(|s| ResponseTopic::new(topic(s))),
-                correlation_data: correlation_data.map(|d| CorrelationData::new(Bytes::from(d))),
-                user_property: user_properties(user),
-                subscription_identifiers: subscription_identifiers
-                    .into_iter()
-                    .filter_map(|n| SubscriptionIdentifier::new((n % 268_435_455) + 1))
-                    .collect(),
-                content_type: content_type.map(|s| ContentType::new(text(s))),
-            });
+            let properties = v5
+                .then(|| {
+                    present(PublishProperties {
+                        payload_format_indicator: payload_format.map(PayloadFormatIndicator::new),
+                        message_expiry_interval: message_expiry.map(MessageExpiryInterval::new),
+                        topic_alias: topic_alias.map(TopicAlias::new),
+                        response_topic: response_topic.map(ResponseTopic::new),
+                        correlation_data: correlation_data
+                            .map(|d| CorrelationData::new(Bytes::from(d))),
+                        user_property: user_properties(user),
+                        // An identifier out of range can't be built
+                        subscription_identifiers: subscription_identifiers
+                            .into_iter()
+                            .map(SubscriptionIdentifier::new)
+                            .collect::<Option<_>>()?,
+                        content_type: content_type.map(ContentType::new),
+                    })
+                })
+                .flatten();
 
             ControlPacket::Publish(PublishPacket {
-                dup: dup && !at_most_once,
-                qos_level,
+                dup,
+                qos_level: qos(q),
                 retain,
-                topic_name: topic(name),
-                packet_id: (!at_most_once).then(|| packet_id(id)),
+                topic_name: topic,
+                packet_id,
                 properties,
+                // The decoder reads a missing payload as an empty one
                 payload: Some(Bytes::from(payload)),
             })
         }
         Packet::Ack {
             kind,
-            packet_id: id,
+            packet_id,
             reason: code,
             common: c,
         } => {
-            let packet_id = packet_id(id);
             let packet_type = [
                 PacketType::PubAck,
                 PacketType::PubRec,
@@ -397,7 +375,7 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             ][usize::from(kind) % 4];
             // MQTT 3.x acknowledgements carry only the packet id
             let (reason, (reason_string, user_property)) = if v5 {
-                (reason(code, packet_type), common(c))
+                (reason(code)?, common(c))
             } else {
                 (ReasonCode::Success, (None, None))
             };
@@ -437,67 +415,67 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             }
         }
         Packet::Subscribe {
-            packet_id: id,
-            first,
-            rest,
+            packet_id,
+            filters,
             subscription_id,
             user,
         } => {
-            let payload = std::iter::once(first)
-                .chain(rest)
-                .map(|(filter, options)| SubscribePayload {
-                    topic_filter: text(filter),
-                    subs_opt: if v5 {
-                        SubscriptionOptions {
-                            qos: qos(options),
-                            no_local: options & 0b0000_0100 != 0,
-                            retain_as_pub: options & 0b0000_1000 != 0,
-                            retain_handling: [
-                                RetainHandling::SendRetained,
-                                RetainHandling::SendRetainedIfNonExisting,
-                                RetainHandling::DoNotSendRetained,
-                            ][usize::from((options >> 4) % 3)],
-                        }
-                    } else {
-                        // MQTT 3.x has only the QoS
-                        SubscriptionOptions {
-                            qos: qos(options),
-                            ..Default::default()
-                        }
-                    },
+            let payload = filters
+                .into_iter()
+                .map(|(filter, options)| {
+                    let retain_handling = [
+                        RetainHandling::SendRetained,
+                        RetainHandling::SendRetainedIfNonExisting,
+                        RetainHandling::DoNotSendRetained,
+                    ][usize::from((options >> 4) % 3)];
+                    SubscribePayload {
+                        topic_filter: filter,
+                        subs_opt: if v5 {
+                            SubscriptionOptions {
+                                qos: qos(options),
+                                no_local: options & 0b0000_0100 != 0,
+                                retain_as_pub: options & 0b0000_1000 != 0,
+                                retain_handling,
+                            }
+                        } else {
+                            // MQTT 3.x has only the QoS
+                            SubscriptionOptions {
+                                qos: qos(options),
+                                ..Default::default()
+                            }
+                        },
+                    }
                 })
                 .collect();
+            let subscription_id = match subscription_id {
+                Some(n) => Some(SubscriptionIdentifier::new(n)?),
+                None => None,
+            };
             let properties = v5
                 .then(|| {
                     present(SubscribeProperties {
-                        subscription_id: subscription_id
-                            .and_then(|n| SubscriptionIdentifier::new((n % 268_435_455) + 1)),
+                        subscription_id,
                         user_property: user_properties(user),
                     })
                 })
                 .flatten();
 
             ControlPacket::Subscribe(SubscribePacket {
-                packet_id: packet_id(id),
+                packet_id,
                 properties,
                 payload,
             })
         }
         Packet::SubAck {
-            packet_id: id,
-            first,
-            rest,
+            packet_id,
+            codes,
             common: c,
         } => {
-            let payload = std::iter::once(first)
-                .chain(rest)
+            let payload = codes
+                .into_iter()
                 .map(|code| {
                     let reason_code = if v5 {
-                        match reason(code, PacketType::SubAck) {
-                            // 0x00 is Granted QoS 0 in SUBACK
-                            ReasonCode::Success => ReasonCode::GrantedQoS0,
-                            code => code,
-                        }
+                        reason(code)?
                     } else {
                         // MQTT 3.x has one failure code, read back as this
                         [
@@ -507,9 +485,9 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                             ReasonCode::UnspecifiedError,
                         ][usize::from(code) % 4]
                     };
-                    SubAckPayload { reason_code }
+                    Some(SubAckPayload { reason_code })
                 })
-                .collect();
+                .collect::<Option<_>>()?;
             let (reason_string, user_property) = common(c);
             let properties = v5
                 .then(|| {
@@ -521,21 +499,20 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::SubAck(SubAckPacket {
-                packet_id: packet_id(id),
+                packet_id,
                 properties,
                 payload,
             })
         }
         Packet::Unsubscribe {
-            packet_id: id,
-            first,
-            rest,
+            packet_id,
+            filters,
             user,
         } => {
-            let payload = std::iter::once(first)
-                .chain(rest)
+            let payload = filters
+                .into_iter()
                 .map(|filter| UnsubscribePayload {
-                    topic_filter: text(filter),
+                    topic_filter: filter,
                 })
                 .collect();
             let properties = v5
@@ -547,25 +524,26 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::Unsubscribe(UnsubscribePacket {
-                packet_id: packet_id(id),
+                packet_id,
                 properties,
                 payload,
             })
         }
         Packet::UnsubAck {
-            packet_id: id,
-            first,
-            rest,
+            packet_id,
+            codes,
             common: c,
         } => {
             // A 3.x UNSUBACK is only the packet id
             let payload = if v5 {
-                std::iter::once(first)
-                    .chain(rest)
-                    .map(|code| UnsubAckPayload {
-                        reason_code: reason(code, PacketType::UnsubAck),
+                codes
+                    .into_iter()
+                    .map(|code| {
+                        Some(UnsubAckPayload {
+                            reason_code: reason(code)?,
+                        })
                     })
-                    .collect()
+                    .collect::<Option<_>>()?
             } else {
                 Vec::new()
             };
@@ -580,7 +558,7 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 .flatten();
 
             ControlPacket::UnsubAck(UnsubAckPacket {
-                packet_id: packet_id(id),
+                packet_id,
                 properties,
                 payload,
             })
@@ -600,19 +578,14 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                     properties: None,
                 }));
             }
-            let reason = match reason(code, PacketType::Disconnect) {
-                // 0x00 is Normal disconnection in DISCONNECT
-                ReasonCode::Success => ReasonCode::NormalDisconnection,
-                code => code,
-            };
             let (reason_string, user_property) = common(c);
             ControlPacket::Disconnect(DisconnectPacket {
-                reason,
+                reason: reason(code)?,
                 properties: present(DisconnectProperties {
                     session_expiry_interval: session_expiry.map(SessionExpiryInterval::new),
                     reason_string,
                     user_property,
-                    server_reference: server_reference.map(|s| ServerReference::new(text(s))),
+                    server_reference: server_reference.map(ServerReference::new),
                 }),
             })
         }
@@ -621,14 +594,10 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             auth,
             common: c,
         } => {
-            // AUTH only exists in MQTT 5
-            if !v5 {
-                return None;
-            }
             let (auth_method, auth_data) = auth_properties(auth);
             let (reason_string, user_property) = common(c);
             ControlPacket::Auth(AuthPacket {
-                reason: reason(code, PacketType::Auth),
+                reason: reason(code)?,
                 properties: AuthProperties {
                     auth_method,
                     auth_data,
@@ -654,9 +623,10 @@ fuzz_target!(|input: (Version, Packet)| {
     };
 
     let mut encoded = BytesMut::new();
-    packet
-        .encode(&mut encoded, version)
-        .unwrap_or_else(|e| panic!("{packet:?} fails to encode with {e:?}"));
+    if packet.encode(&mut encoded, version).is_err() {
+        assert!(encoded.is_empty(), "a refused {packet:?} left bytes behind");
+        return;
+    }
     assert_eq!(encoded.len(), packet.encoded_size(version), "{packet:?}");
 
     let decoded = ControlPacket::parse(&mut encoded, version)
