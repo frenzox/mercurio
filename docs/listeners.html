@@ -77,6 +77,12 @@ protocol = "websocket"</pre>
 <pre>const client = mqtt.connect("ws://broker.example.com:8080/mqtt");
 client.on("connect", () =&gt; client.subscribe("sensors/#"));
 client.on("message", (topic, payload) =&gt; console.log(topic, payload.toString()));</pre>
+<p>Clients must offer the <code>mqtt</code> subprotocol, as MQTT.js does; an upgrade without it is refused with 400 Bad Request. A page on any site can open a WebSocket to the broker through its visitor's browser, which matters for a broker on an internal network that allows anonymous clients. <code>allowed_origins</code> lists the pages that may:</p>
+<pre>[[listeners]]
+port = 8080
+protocol = "websocket"
+allowed_origins = ["https://dashboard.example.com"]</pre>
+<p>An upgrade whose <code>Origin</code> header names another site is refused with 403 Forbidden. Clients other than browsers send no <code>Origin</code> and are not affected.</p>
 
 <h3 id="http-dir">Serving a web page</h3>
 <p>A WebSocket listener can also serve static files, so a dashboard or test page needs no separate web server:</p>
@@ -85,7 +91,7 @@ host = "0.0.0.0"
 port = 8080
 protocol = "websocket"
 http_dir = "/var/www/mercurio"</pre>
-<p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. Paths leaving the directory are refused. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
+<p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. A directory named without its trailing slash is redirected to the slash form, and paths leaving the directory are refused. Files are streamed; each response may take a minute, apart from the connect timeout, and a listener sends 32 at once, answering further requests with 503 Service Unavailable. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
 
 <h2 id="unix">Unix domain sockets</h2>
 <p>For clients on the same machine: no TCP overhead, and access restricted by file permissions.</p>
@@ -106,7 +112,7 @@ backend mqtt
     mode tcp
     server mercurio 10.0.0.5:1884 send-proxy-v2</pre>
 <p>Connections without a valid header are closed. TLS, when enabled on the listener, starts after the header.</p>
-<p>A header can claim any address, so name the balancers in <code>proxy_from</code>: connections from other addresses are closed. That matters most with <code>max_connections_per_ip</code>, which counts the address the header gives.</p>
+<p>A header can claim any address, so <code>proxy_from</code> is required and names the balancers: connections from other addresses are closed. That matters most with <code>max_connections_per_ip</code>, which counts the address the header gives. When every peer that reaches the port is a proxy, say so with <code>proxy_from = ["0.0.0.0/0", "::/0"]</code>. A Unix socket listener takes no <code>proxy_from</code>: its file permissions decide who may connect. Version 2 headers with a command other than LOCAL or PROXY are refused.</p>
 
 <h2 id="mount-points">Mount points</h2>
 <p>A mount point gives a listener's clients their own part of the topic tree, for example one per tenant:</p>

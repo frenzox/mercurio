@@ -63,9 +63,11 @@ async fn read_v2<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<SocketAd
     let mut addresses = vec![0u8; u16::from_be_bytes(length).into()];
     stream.read_exact(&mut addresses).await?;
 
-    // LOCAL connections come from the load balancer itself
-    if version_command & 0x0f == 0 {
-        return Ok(None);
+    match version_command & 0x0f {
+        // LOCAL connections come from the load balancer itself
+        0 => return Ok(None),
+        1 => {}
+        _ => return Err(invalid("unknown PROXY command")),
     }
     let source = match family >> 4 {
         1 if addresses.len() >= 12 => {
@@ -135,6 +137,13 @@ mod tests {
         let (header, rest) = read(&bytes).await;
         assert_eq!(header.unwrap(), None);
         assert_eq!(rest, b"\x10");
+
+        // Commands other than LOCAL and PROXY are refused
+        let mut bytes = super::V2_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0x2f, 0x11, 0x00, 0x0c]);
+        bytes.extend_from_slice(&[192, 0, 2, 1, 198, 51, 100, 1, 0xdc, 0x04, 0x07, 0x5b]);
+        let (header, _) = read(&bytes).await;
+        assert!(header.is_err());
     }
 
     #[tokio::test]

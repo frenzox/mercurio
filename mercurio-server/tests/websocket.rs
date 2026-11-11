@@ -197,6 +197,70 @@ async fn websocket_listeners_serve_files_and_mqtt() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The status a WebSocket upgrade with `headers` is refused with, if any.
+async fn upgrade_status(addr: SocketAddr, headers: &[(&'static str, &'static str)]) -> Option<u16> {
+    let mut request = format!("ws://{addr}/mqtt").into_client_request().unwrap();
+    for (name, value) in headers {
+        request
+            .headers_mut()
+            .insert(*name, HeaderValue::from_static(value));
+    }
+    let stream = TcpStream::connect(addr).await.unwrap();
+    match client_async(request, stream).await {
+        Ok(_) => None,
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Some(response.status().as_u16())
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Without the subprotocol the client isn't speaking MQTT [MQTT-6.0.0-3],
+/// and a browser page couldn't tell the broker apart from another server.
+#[tokio::test]
+async fn upgrades_without_the_mqtt_subprotocol_are_refused() {
+    let (_, websocket_addr) = start_broker().await;
+    assert_eq!(upgrade_status(websocket_addr, &[]).await, Some(400));
+    let other = [("Sec-WebSocket-Protocol", "chat")];
+    assert_eq!(upgrade_status(websocket_addr, &other).await, Some(400));
+    let both = [("Sec-WebSocket-Protocol", "chat, mqtt")];
+    assert_eq!(upgrade_status(websocket_addr, &both).await, None);
+}
+
+/// A page from another site can open a WebSocket to an intranet broker;
+/// its browser says where the page came from.
+#[tokio::test]
+async fn only_allowed_origins_may_upgrade() {
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = websocket_listener.local_addr().unwrap();
+    let mut listener = ListenerConfig::new(websocket_listener, Transport::WebSocket);
+    listener.allowed_origins = Some(vec!["https://app.example".into()]);
+    let mut config = ServerConfig::default();
+    config.listeners = vec![listener];
+    tokio::spawn(mercurio_server::server::run_with_config(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let mqtt = ("Sec-WebSocket-Protocol", "mqtt");
+    let from = |origin| [mqtt, ("Origin", origin)];
+    assert_eq!(
+        upgrade_status(addr, &from("https://evil.example")).await,
+        Some(403)
+    );
+    assert_eq!(
+        upgrade_status(addr, &from("https://app.example")).await,
+        None
+    );
+    assert_eq!(
+        upgrade_status(addr, &from("HTTPS://APP.example")).await,
+        None
+    );
+    // Clients other than browsers send no Origin
+    assert_eq!(upgrade_status(addr, &[mqtt]).await, None);
+}
+
 /// Frames are reassembled before the MQTT packet size is known, so a
 /// message growing past the largest packet is refused as it arrives,
 /// before the rest of it is sent.
@@ -214,7 +278,15 @@ async fn messages_larger_than_the_largest_packet_are_refused() {
         false,
     );
     let _ = websocket.send(Message::Frame(fragment)).await;
-    let closed = timeout(Duration::from_secs(2), async {
+    assert!(
+        closed(&mut websocket).await,
+        "still waiting for the rest of the message"
+    );
+}
+
+/// Whether the broker closes `websocket` within two seconds.
+async fn closed(websocket: &mut WebSocketStream<TcpStream>) -> bool {
+    timeout(Duration::from_secs(2), async {
         loop {
             match websocket.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
@@ -222,6 +294,67 @@ async fn messages_larger_than_the_largest_packet_are_refused() {
             }
         }
     })
-    .await;
-    assert!(closed.is_ok(), "still waiting for the rest of the message");
+    .await
+    .is_ok()
+}
+
+/// Before CONNECT is accepted, a client gets as little room as on TCP,
+/// not a whole message as large as the largest packet; once connected, it
+/// gets the rest.
+#[tokio::test]
+async fn messages_before_connect_get_the_connect_limit() {
+    use tokio_tungstenite::tungstenite::protocol::frame::{coding::Data, coding::OpCode, Frame};
+
+    let (_, websocket_addr) = start_broker().await;
+    let mut websocket = websocket_connect(websocket_addr).await;
+    // Larger than a CONNECT may be, smaller than a packet, never finished
+    let fragment = Frame::message(vec![0u8; 512 * 1024], OpCode::Data(Data::Binary), false);
+    let _ = websocket.send(Message::Frame(fragment)).await;
+    assert!(
+        closed(&mut websocket).await,
+        "still waiting for the rest of the message"
+    );
+
+    let mut websocket = websocket_connect(websocket_addr).await;
+    let mut buffer = BytesMut::new();
+    websocket
+        .send(Message::Binary(Bytes::from_static(&CONNECT)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut websocket, &mut buffer).await,
+        ControlPacket::ConnAck(_)
+    ));
+    // SUBSCRIBE to "t", then a 512 KiB PUBLISH on it comes back
+    let subscribe = [0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x00];
+    websocket
+        .send(Message::Binary(Bytes::copy_from_slice(&subscribe)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut websocket, &mut buffer).await,
+        ControlPacket::SubAck(_)
+    ));
+    let payload = 512 * 1024;
+    let length = 3 + 1 + payload;
+    let mut publish = vec![0x30];
+    let mut rest = length;
+    loop {
+        let byte = (rest % 128) as u8;
+        rest /= 128;
+        publish.push(if rest > 0 { byte | 0x80 } else { byte });
+        if rest == 0 {
+            break;
+        }
+    }
+    publish.extend_from_slice(&[0x00, 0x01, b't', 0x00]);
+    publish.resize(publish.len() + payload, 7);
+    websocket
+        .send(Message::Binary(Bytes::from(publish)))
+        .await
+        .unwrap();
+    let ControlPacket::Publish(received) = next_packet(&mut websocket, &mut buffer).await else {
+        panic!("Expected Publish");
+    };
+    assert_eq!(received.payload.unwrap().len(), payload);
 }

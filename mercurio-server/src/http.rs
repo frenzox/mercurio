@@ -8,17 +8,51 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::{
+    fs::File,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    sync::Semaphore,
+    time::Duration,
+};
 
 /// Longest request head read before giving up on the request
 const MAX_HEAD: usize = 8192;
 
-/// Reads the HTTP request at the start of `stream`. A WebSocket upgrade is
-/// returned to be completed, with the bytes read so far replayed; any other
-/// request is answered from `dir`, and `None` returned.
-pub(crate) async fn serve_or_upgrade<S>(mut stream: S, dir: &Path) -> io::Result<Option<Rewind<S>>>
+/// How long answering one request may take, the file sent included. Kept
+/// apart from the connect deadline, which only covers reading the request.
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Responses one listener sends at once; further requests are answered
+/// with Service Unavailable.
+pub(crate) const MAX_RESPONSES: usize = 32;
+
+/// The files a listener serves, and the responses it may send at once.
+pub(crate) struct Files {
+    pub dir: PathBuf,
+    pub responses: Semaphore,
+}
+
+impl Files {
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Files {
+            dir,
+            responses: Semaphore::new(MAX_RESPONSES),
+        }
+    }
+}
+
+/// The request at the start of a WebSocket listener's connection.
+pub(crate) enum Request<S> {
+    /// A WebSocket upgrade to complete, with the bytes read so far replayed
+    Upgrade(Rewind<S>),
+    /// A plain HTTP request, with its head, to answer from the files
+    Files(S, String),
+}
+
+/// Reads the HTTP request head at the start of `stream`.
+pub(crate) async fn read_request<S>(mut stream: S) -> io::Result<Request<S>>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     let mut head = Vec::new();
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -36,48 +70,114 @@ where
         head.extend_from_slice(&chunk[..read]);
     }
 
-    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    let text = String::from_utf8_lossy(&head).into_owned();
     let upgrade = text
+        .to_ascii_lowercase()
         .lines()
         .any(|line| line.starts_with("upgrade:") && line.contains("websocket"));
     if upgrade {
-        return Ok(Some(Rewind::new(stream, head)));
+        return Ok(Request::Upgrade(Rewind::new(stream, head)));
     }
-
-    let response = respond(&String::from_utf8_lossy(&head), dir).await;
-    stream.write_all(&response).await?;
-    stream.shutdown().await?;
-    Ok(None)
+    Ok(Request::Files(stream, text))
 }
 
-/// The response to a plain HTTP request.
-async fn respond(head: &str, dir: &Path) -> Vec<u8> {
+/// Answers the plain HTTP request `head` from `files`, if the listener may
+/// send another response.
+pub(crate) async fn respond<S>(mut stream: S, head: &str, files: &Files) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Ok(_response) = files.responses.try_acquire() else {
+        stream.write_all(&status("503 Service Unavailable")).await?;
+        return stream.shutdown().await;
+    };
     let mut words = head.split_whitespace();
     let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
-    if method != "GET" && method != "HEAD" {
-        return status("405 Method Not Allowed");
-    }
-    let Some(path) = file_path(dir, target) else {
-        return status("404 Not Found");
+    let found = match method {
+        "GET" | "HEAD" => find(&files.dir, target).await,
+        _ => Found::Status("405 Method Not Allowed"),
     };
-    let Ok(body) = tokio::fs::read(&path).await else {
-        return status("404 Not Found");
-    };
-
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        content_type(&path),
-        body.len()
-    )
-    .into_bytes();
-    if method == "GET" {
-        response.extend_from_slice(&body);
+    match found {
+        Found::File(file, path, length) => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {length}\r\n\
+                 Connection: close\r\n\r\n",
+                content_type(&path),
+            );
+            stream.write_all(header.as_bytes()).await?;
+            if method == "GET" {
+                tokio::io::copy(&mut file.take(length), &mut stream).await?;
+            }
+        }
+        Found::Redirect(location) => {
+            let response = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await?;
+        }
+        Found::Status(code) => stream.write_all(&status(code)).await?,
     }
-    response
+    stream.shutdown().await
 }
 
-/// The file `target` names under `dir`, `index.html` for directories.
-/// `None` for targets that would leave `dir`.
+/// What a request's target names.
+enum Found {
+    /// A file, its path and length
+    File(File, PathBuf, u64),
+    /// A directory named without its trailing slash: where it is
+    Redirect(String),
+    Status(&'static str),
+}
+
+async fn find(dir: &Path, target: &str) -> Found {
+    let not_found = Found::Status("404 Not Found");
+    let Some(path) = file_path(dir, target) else {
+        return not_found;
+    };
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return not_found;
+    };
+    if metadata.is_dir() {
+        return match redirect(target) {
+            Some(location) => Found::Redirect(location),
+            None => not_found,
+        };
+    }
+    if !metadata.is_file() {
+        return not_found;
+    }
+    match File::open(&path).await {
+        Ok(file) => Found::File(file, path, metadata.len()),
+        Err(_) => not_found,
+    }
+}
+
+/// Where a directory named by `target` is, with its trailing slash and
+/// query. Rebuilt from the path's segments, so `//host` can't send the
+/// client to another host. None when `target` had the slash already.
+fn redirect(target: &str) -> Option<String> {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    if path.ends_with('/') {
+        return None;
+    }
+    let mut location = String::from("/");
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        location.push_str(segment);
+        location.push('/');
+    }
+    if let Some(query) = query {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
+}
+
+/// The file `target` names under `dir`, `index.html` for targets ending in
+/// a slash. `None` for targets that would leave `dir`.
 fn file_path(dir: &Path, target: &str) -> Option<PathBuf> {
     let path = target.split(['?', '#']).next()?;
     let relative = Path::new(path.trim_start_matches('/'));
@@ -88,7 +188,7 @@ fn file_path(dir: &Path, target: &str) -> Option<PathBuf> {
         return None;
     }
     let mut file = dir.join(relative);
-    if path.ends_with('/') || file.is_dir() {
+    if path.ends_with('/') {
         file.push("index.html");
     }
     Some(file)
@@ -167,7 +267,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Rewind<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::file_path;
+    use super::{file_path, redirect};
     use std::path::Path;
 
     #[test]
@@ -187,5 +287,17 @@ mod tests {
             file_path(dir, "//etc/passwd"),
             Some(Path::new("/srv/www/etc/passwd").into())
         );
+    }
+
+    #[test]
+    fn test_redirects_stay_on_this_host() {
+        assert_eq!(redirect("/docs").as_deref(), Some("/docs/"));
+        assert_eq!(redirect("/a//b?x=1").as_deref(), Some("/a/b/?x=1"));
+        assert_eq!(
+            redirect("//evil.example").as_deref(),
+            Some("/evil.example/")
+        );
+        assert_eq!(redirect("").as_deref(), Some("/"));
+        assert_eq!(redirect("/docs/"), None);
     }
 }

@@ -9,6 +9,9 @@ use tokio::{
     time::timeout,
 };
 
+/// Every peer may send the header
+const ANY: &[&str] = &["0.0.0.0/0", "::/0"];
+
 const CONNECT: [u8; 16] = [
     0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x00, 0x00, 0x01, b'p',
 ];
@@ -21,6 +24,7 @@ async fn proxied_connections_start_with_a_header() {
     config.listeners = vec![{
         let mut value = ListenerConfig::new(proxied, Transport::Mqtt);
         value.proxy_protocol = true;
+        value.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         value
     }];
     tokio::spawn(mercurio_server::server::run_with_config(
@@ -87,13 +91,33 @@ async fn only_trusted_proxies_may_send_the_header() {
     assert!(!answered(untrusted, Some(header)).await);
     let trusted = start_proxied(&["127.0.0.0/8"], None).await;
     assert!(answered(trusted, Some(header)).await);
+    let any = start_proxied(ANY, None).await;
+    assert!(answered(any, Some(header)).await);
+}
+
+/// Version 2 knows only the LOCAL and PROXY commands; a connection with
+/// another can't be trusted to carry what it claims.
+#[tokio::test]
+async fn unknown_v2_commands_are_refused() {
+    let addr = start_proxied(ANY, None).await;
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    header.extend_from_slice(&[0x22, 0x11, 0x00, 0x0c]);
+    header.extend_from_slice(&[192, 0, 2, 1, 127, 0, 0, 1, 0xdc, 0x04, 0x07, 0x5b]);
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&header).await.unwrap();
+    stream.write_all(&CONNECT).await.unwrap();
+    let mut first = [0u8; 1];
+    let read = timeout(Duration::from_secs(2), stream.read(&mut first))
+        .await
+        .expect("connection still open");
+    assert!(matches!(read, Ok(0) | Err(_)), "answered: {first:02x?}");
 }
 
 /// Behind a proxy, connections are counted by the address the header
 /// gives, not the proxy's.
 #[tokio::test]
 async fn connections_are_limited_per_client_address() {
-    let addr = start_proxied(&[], Some(1)).await;
+    let addr = start_proxied(ANY, Some(1)).await;
     let from = |ip: &str| format!("PROXY TCP4 {ip} 127.0.0.1 56324 1883\r\n");
 
     let mut held = TcpStream::connect(addr).await.unwrap();

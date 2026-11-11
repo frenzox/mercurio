@@ -1318,6 +1318,7 @@ async fn address_bans_match_the_address_a_proxy_reports() {
     config.listeners = vec![{
         let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
         listener.proxy_protocol = true;
+        listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         listener
     }];
     let (_, admin) = start(config).await;
@@ -1409,6 +1410,7 @@ async fn address_bans_on_mapped_blocks_apply_to_ipv4_clients() {
     config.listeners = vec![{
         let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
         listener.proxy_protocol = true;
+        listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
         listener
     }];
     let (_, admin) = start(config).await;

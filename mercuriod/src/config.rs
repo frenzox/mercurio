@@ -198,7 +198,8 @@ pub struct ListenerConfig {
     pub proxy_protocol: bool,
 
     /// Addresses or CIDR blocks of the proxies allowed to send the header;
-    /// any when empty
+    /// required with `proxy_protocol` on TCP, `["0.0.0.0/0", "::/0"]` for
+    /// any peer
     #[serde(default)]
     pub proxy_from: Vec<String>,
 
@@ -211,6 +212,10 @@ pub struct ListenerConfig {
     /// With `protocol = "websocket"`, serve the files of this directory to
     /// plain HTTP requests
     pub http_dir: Option<String>,
+
+    /// With `protocol = "websocket"`, the origins of the web pages that
+    /// may connect, such as `https://app.example.com`; any when unset
+    pub allowed_origins: Option<Vec<String>>,
 
     /// Only accept connections arriving on this network interface (Linux)
     pub bind_interface: Option<String>,

@@ -120,11 +120,15 @@ pub struct Limits {
     /// Largest CONNECT accepted, and AUTH during enhanced authentication,
     /// fixed header included. These come before the client is
     /// authenticated, so they get less room than `max_packet_size`, which
-    /// still caps it. A larger one is refused as Packet Too Large.
+    /// still caps it. A larger one is refused as Packet Too Large. On
+    /// WebSocket listeners, which buffer whole messages, the bytes a client
+    /// sends before it is authenticated are held to twice this, framing
+    /// included, and the connection closed past that.
     pub max_connect_packet_size: usize,
     /// Messages waiting to be sent to one session.
     pub queue: QueueLimits,
     /// Connections beyond this many are closed right after being accepted.
+    /// In-process connections and those of trusted listeners don't count.
     pub max_connections: Option<usize>,
     /// Highest topic alias MQTT 5 clients may use; 0 disables aliases.
     pub topic_alias_maximum: u16,
@@ -281,7 +285,9 @@ pub struct ListenerConfig {
     pub proxy_protocol: bool,
     /// With `proxy_protocol`, the proxies allowed to send the header; other
     /// connections are closed, as their header could claim any address.
-    /// Any connection may send one when empty.
+    /// Required on TCP listeners with `proxy_protocol`: `0.0.0.0/0` and
+    /// `::/0` let any peer send one. Unix socket listeners take none, as
+    /// their clients have no address.
     pub proxy_from: Vec<AddressRange>,
     /// Prefixed to every topic the listener's clients use, so they only see
     /// their own part of the topic tree.
@@ -296,8 +302,18 @@ pub struct ListenerConfig {
     /// being accepted, on top of the broker-wide limit.
     pub max_connections: Option<usize>,
     /// On WebSocket listeners, answer plain HTTP requests with the files of
-    /// this directory.
+    /// this directory. Each response may take a minute, apart from the
+    /// connect timeout, and a listener sends 32 at once at most; requests
+    /// beyond that get Service Unavailable.
     pub http_dir: Option<PathBuf>,
+    /// On WebSocket listeners, the origins of the web pages that may
+    /// connect, such as `https://app.example.com`. Browsers say which page
+    /// opens a WebSocket in its `Origin` header; an upgrade from any other
+    /// is refused with 403 Forbidden, so a page from another site can't
+    /// reach the broker through its visitors' browsers. Clients other than
+    /// browsers send no `Origin` and are not affected. Any origin may
+    /// connect when unset.
+    pub allowed_origins: Option<Vec<String>>,
     /// Its clients skip authentication and access control, `$CONTROL` and
     /// every admin command included, as in-process connections do. They also
     /// skip the connection limits, the redirect and the client id prefixes,
@@ -329,6 +345,7 @@ impl ListenerConfig {
             plugins: None,
             max_connections: None,
             http_dir: None,
+            allowed_origins: None,
             trusted: false,
             #[cfg(unix)]
             peer_filter: None,
@@ -337,8 +354,8 @@ impl ListenerConfig {
 }
 
 /// Opens in-process connections to a broker, for parts of the same program
-/// such as bridges. These connections skip authentication and access
-/// control.
+/// such as bridges. These connections skip authentication, access control
+/// and the connection limit.
 #[derive(Clone)]
 pub struct LocalConnector(mpsc::UnboundedSender<DuplexStream>);
 
@@ -430,7 +447,8 @@ struct EndpointSettings {
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
     chain: Option<Chain>,
-    http_dir: Option<Arc<PathBuf>>,
+    http_files: Option<Arc<http::Files>>,
+    allowed_origins: Option<Arc<[String]>>,
 }
 
 impl Endpoint {
@@ -454,6 +472,37 @@ impl Endpoint {
             return Err(ServerError::Config(
                 "a trusted listener can't sit behind a proxy: the kernel reports the proxy's \
                  credentials, so every remote client would be trusted"
+                    .into(),
+            ));
+        }
+        if let Some(mount_point) = config.mount_point.as_deref() {
+            if mount_point.contains(['+', '#']) {
+                return Err(ServerError::Config(format!(
+                    "mount point `{mount_point}` has a wildcard: its clients' topic filters \
+                     would reach other mount points' topics"
+                )));
+            }
+        }
+        if config.transport != Transport::WebSocket
+            && (config.http_dir.is_some() || config.allowed_origins.is_some())
+        {
+            return Err(ServerError::Config(
+                "http_dir and allowed_origins only apply to WebSocket listeners".into(),
+            ));
+        }
+        // A Unix socket's file permissions decide who may send the header
+        if config.proxy_protocol && config.proxy_from.is_empty() && !unix {
+            return Err(ServerError::Config(
+                "a PROXY header can claim any address, so proxy_protocol needs proxy_from to \
+                 name the proxies that may send it; to let any peer send one, set proxy_from \
+                 to [\"0.0.0.0/0\", \"::/0\"]"
+                    .into(),
+            ));
+        }
+        if !config.proxy_from.is_empty() && unix {
+            return Err(ServerError::Config(
+                "a Unix socket's clients have no address for proxy_from to match; its file \
+                 permissions decide who may connect"
                     .into(),
             ));
         }
@@ -505,9 +554,7 @@ impl Endpoint {
             #[cfg(unix)]
             peer_filter: config.peer_filter,
             listener: config.listener,
-            connection_slots: config
-                .max_connections
-                .map(|max| Arc::new(Semaphore::new(max))),
+            connection_slots: config.max_connections.map(connection_slots),
             settings: EndpointSettings {
                 transport: config.transport,
                 tls_acceptor,
@@ -521,7 +568,8 @@ impl Endpoint {
                     false => config.auth.map(Arc::new),
                 },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
-                http_dir: config.http_dir.map(Arc::new),
+                http_files: config.http_dir.map(|dir| Arc::new(http::Files::new(dir))),
+                allowed_origins: config.allowed_origins.map(Into::into),
             },
         })
     }
@@ -575,7 +623,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// user name
     cert_identity: Option<String>,
     mount_point: Option<String>,
-    http_dir: Option<Arc<PathBuf>>,
+    http_files: Option<Arc<http::Files>>,
+    allowed_origins: Option<Arc<[String]>>,
     /// An in-process connection, from the local listener
     local: bool,
     /// When the PROXY header, the TLS and WebSocket handshakes and CONNECT
@@ -651,13 +700,13 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         .any(|range| range.contains(peer.ip()))
                 });
             if !trusted {
-                warn!("{:?} may not send a PROXY header, closing", peer_addr);
+                warn!(target: CONNECTIONS, "{:?} may not send a PROXY header, closing", peer_addr);
                 return None;
             }
             let header = proxy::read_header(&mut socket);
             match connect_step(&mut self.shutdown, self.connect_deadline, header).await? {
                 Ok(Ok(source)) => {
-                    debug!("{:?} is proxying {:?}", peer_addr, source);
+                    debug!(target: CONNECTIONS, "{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
                     if let Some(peer) = peer_addr.filter(|p| self.bans.refuses_address(p.ip())) {
                         warn!("{} is banned, closing", peer.ip());
@@ -665,17 +714,18 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("Bad PROXY header from {:?}: {}", peer_addr, e);
+                    warn!(target: CONNECTIONS, "Bad PROXY header from {:?}: {}", peer_addr, e);
                     return None;
                 }
                 Err(_) => {
-                    warn!("No PROXY header from {:?} in time", peer_addr);
+                    debug!(target: CONNECTIONS, "No PROXY header from {:?} in time", peer_addr);
                     return None;
                 }
             }
         }
         self.mount_point = settings.mount_point;
-        self.http_dir = settings.http_dir;
+        self.http_files = settings.http_files;
+        self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
@@ -688,28 +738,71 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let accept = acceptor.accept(socket);
         match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
-                debug!("TLS handshake completed for {:?}", peer_addr);
+                debug!(target: CONNECTIONS, "TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
                     let certs = tls_stream.get_ref().1.peer_certificates();
                     self.cert_identity = certs
                         .and_then(|c| c.first())
                         .and_then(|cert| certificate_name(cert, part));
                     if self.cert_identity.is_none() {
-                        warn!("No Common Name in the certificate of {:?}", peer_addr);
+                        warn!(
+                            target: CONNECTIONS,
+                            "No Common Name in the certificate of {:?}", peer_addr
+                        );
                         return None;
                     }
                 }
                 Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
             }
             Ok(Err(e)) => {
-                error!("TLS handshake failed for {:?}: {}", peer_addr, e);
+                debug!(target: CONNECTIONS, "TLS handshake failed for {:?}: {}", peer_addr, e);
                 None
             }
             Err(_) => {
-                warn!("TLS handshake timed out for {:?}", peer_addr);
+                debug!(target: CONNECTIONS, "TLS handshake timed out for {:?}", peer_addr);
                 None
             }
         }
+    }
+
+    /// Reads the HTTP request on a WebSocket listener with files to serve.
+    /// A WebSocket upgrade is returned to complete; any other request is
+    /// answered from `files`, under its own deadline as sending a file may
+    /// take longer than connecting does, and None returned.
+    async fn serve_http<S>(
+        &mut self,
+        stream: S,
+        files: &http::Files,
+        peer_addr: Option<SocketAddr>,
+    ) -> Option<http::Rewind<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let request = Box::pin(http::read_request(stream));
+        let (stream, head) =
+            match connect_step(&mut self.shutdown, self.connect_deadline, request).await? {
+                Ok(Ok(http::Request::Upgrade(upgrade))) => return Some(upgrade),
+                Ok(Ok(http::Request::Files(stream, head))) => (stream, head),
+                Ok(Err(e)) => {
+                    debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e);
+                    return None;
+                }
+                Err(_) => {
+                    debug!(target: CONNECTIONS, "HTTP request from {:?} timed out", peer_addr);
+                    return None;
+                }
+            };
+        let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
+        let response = Box::pin(http::respond(stream, &head, files));
+        match connect_step(&mut self.shutdown, deadline, response).await? {
+            Ok(Err(e)) => debug!(
+                target: CONNECTIONS,
+                "HTTP response to {:?} failed: {}", peer_addr, e
+            ),
+            Err(_) => debug!(target: CONNECTIONS, "HTTP response to {:?} timed out", peer_addr),
+            Ok(Ok(())) => {}
+        }
+        None
     }
 
     /// Serves one client on `stream`, after the WebSocket handshake if it
@@ -721,38 +814,40 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match transport {
             Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
-                let stream = match self.http_dir.clone() {
-                    Some(dir) => {
-                        let request = Box::pin(http::serve_or_upgrade(stream, &dir));
-                        let request =
-                            connect_step(&mut self.shutdown, self.connect_deadline, request);
-                        let Some(request) = request.await else {
-                            return;
-                        };
-                        match request {
-                            Ok(Ok(Some(upgrade))) => upgrade,
-                            Ok(Ok(None)) => return,
-                            Ok(Err(e)) => {
-                                return warn!("HTTP request from {:?} failed: {}", peer_addr, e)
-                            }
-                            Err(_) => return warn!("HTTP request from {:?} timed out", peer_addr),
-                        }
-                    }
+                let stream = match self.http_files.clone() {
+                    Some(files) => match Box::pin(self.serve_http(stream, &files, peer_addr)).await
+                    {
+                        Some(upgrade) => upgrade,
+                        None => return,
+                    },
                     None => http::Rewind::new(stream, Vec::new()),
                 };
                 // An MQTT packet may span messages, but no honest client
                 // needs one larger than the largest packet
-                let handshake = Box::pin(websocket::accept(stream, self.limits.max_packet_size));
+                let handshake = Box::pin(websocket::accept(
+                    stream,
+                    self.limits.max_packet_size,
+                    self.allowed_origins.as_deref(),
+                ));
                 let handshake = connect_step(&mut self.shutdown, self.connect_deadline, handshake);
                 let Some(handshake) = handshake.await else {
                     return;
                 };
                 match handshake {
                     Ok(Ok(websocket)) => {
-                        Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
+                        let budget = websocket.read_budget();
+                        let mut connection = Connection::new(websocket);
+                        connection.set_read_budget(budget);
+                        Box::pin(self.handle(connection, peer_addr)).await
                     }
-                    Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
-                    Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
+                    Ok(Err(e)) => debug!(
+                        target: CONNECTIONS,
+                        "WebSocket handshake failed for {:?}: {}", peer_addr, e
+                    ),
+                    Err(_) => debug!(
+                        target: CONNECTIONS,
+                        "WebSocket handshake timed out for {:?}", peer_addr
+                    ),
                 }
             }
         }
@@ -926,6 +1021,12 @@ async fn validate_credentials(
     chain.authenticate(client, credentials).await
 }
 
+/// One permit per connection allowed. A semaphore holds fewer than
+/// `usize::MAX` permits; a limit beyond that many is out of reach anyway.
+fn connection_slots(max: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS)))
+}
+
 /// Runs one step of connecting, such as a handshake or reading CONNECT,
 /// within the connect deadline. None if the server starts shutting down
 /// first: a client that isn't connected has nothing to be told, so it is
@@ -1081,9 +1182,7 @@ impl<St: MqttStore + 'static> Server<St> {
             broker,
             session_manager_holder,
             address_slots: Arc::default(),
-            connection_slots: limits
-                .max_connections
-                .map(|max| Arc::new(Semaphore::new(max))),
+            connection_slots: limits.max_connections.map(connection_slots),
             notify_shutdown,
             shutdown_complete,
             auth_config,
@@ -1246,10 +1345,12 @@ impl<St: MqttStore + 'static> Listener<St> {
                 }
             }
 
-            let trusted = endpoint.is_some_and(|i| self.endpoints[i].trusted);
+            // In-process connections, which have no endpoint, are trusted
+            let trusted = endpoint.is_none_or(|i| self.endpoints[i].trusted);
 
             // Held by the connection's task for as long as it runs. Trusted
-            // clients take none, so an operator can reach a full broker.
+            // clients take none, so an operator or an in-process bridge can
+            // reach a full broker.
             let slot = match &self.connection_slots {
                 Some(slots) if !trusted => match Arc::clone(slots).try_acquire_owned() {
                     Ok(permit) => Some(permit),
@@ -1306,7 +1407,8 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
-                http_dir: None,
+                http_files: None,
+                allowed_origins: None,
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
@@ -1315,6 +1417,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
+                    crate::connection::configure_tcp(&socket);
                     let parts = HandlerParts {
                         listener: Arc::clone(&self.endpoints[endpoint].state.name),
                         ..parts
@@ -1405,13 +1508,41 @@ impl<St: MqttStore + 'static> Listener<St> {
                     // Closed by the broker's own shutdown
                     Err(mercurio_core::error::Error::MQTTReasonCode(
                         ReasonCode::ServerShuttingDown,
-                    )) => debug!("Connection closed for shutdown"),
-                    Err(err) => error!(cause = ?err, "Connection error"),
+                    )) => debug!(target: CONNECTIONS, "Connection closed for shutdown"),
+                    // Only the broker's own storage failing is its error;
+                    // anything else a client can cause at will
+                    Err(Error::Storage(e)) => {
+                        error!("Storage failed serving {:?}: {}", handler.peer, e)
+                    }
+                    Err(Error::Io(e)) => {
+                        debug!(target: CONNECTIONS, "Connection of {:?} failed: {}", handler.peer, e)
+                    }
+                    Err(err) => warn!(
+                        target: CONNECTIONS,
+                        "Closing the connection of {:?}: {}", handler.peer, err
+                    ),
                     Ok(()) => {}
                 }
             }
-            Err(_) => warn!("No CONNECT received in time, closing connection"),
+            Err(_) => debug!(
+                target: CONNECTIONS,
+                "No CONNECT from {:?} in time, closing", handler.peer
+            ),
+            Ok(Ok(None)) => debug!(
+                target: CONNECTIONS,
+                "{:?} closed the connection before CONNECT", handler.peer
+            ),
+            Ok(Ok(Some(packet))) => warn!(
+                target: CONNECTIONS,
+                "{:?} sent {} before CONNECT, closing",
+                handler.peer,
+                describe(&packet)
+            ),
             Ok(Err(Error::MQTTReasonCode(ReasonCode::UnsupportedProtocolVersion))) => {
+                debug!(
+                    target: CONNECTIONS,
+                    "{:?} asked for an unsupported protocol version", handler.peer
+                );
                 // Answered in the MQTT 3.1.1 format, which every version can
                 // read [MQTT-3.1.2-2]
                 let connack = ConnAckPacket {
@@ -1432,7 +1563,10 @@ impl<St: MqttStore + 'static> Listener<St> {
             Ok(Err(Error::MQTTReasonCode(reason)))
                 if handler.connection.connect_version() == Some(ProtocolVersion::V5) =>
             {
-                warn!("Refusing invalid CONNECT: {:?}", reason);
+                warn!(
+                    target: CONNECTIONS,
+                    "Refusing invalid CONNECT from {:?}: {:?}", handler.peer, reason
+                );
                 let connack = ConnAckPacket {
                     protocol_version: ProtocolVersion::V5,
                     flags: ConnAckFlags {
@@ -1449,7 +1583,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     .write_packet(ControlPacket::ConnAck(connack))
                     .await;
             }
-            _ => error!("ConnectPacket expectation not met"),
+            Ok(Err(Error::Io(e))) => debug!(
+                target: CONNECTIONS,
+                "Connection of {:?} failed before CONNECT: {}", handler.peer, e
+            ),
+            Ok(Err(e)) => warn!(
+                target: CONNECTIONS,
+                "Refusing invalid CONNECT from {:?}: {}", handler.peer, e
+            ),
         }
         // Boxed: it runs once, at the end, but would take room in this
         // state for the whole connection
