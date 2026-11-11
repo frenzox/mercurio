@@ -15,7 +15,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::{Packet, PacketType};
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
@@ -175,7 +175,7 @@ impl Decoder for ConnAckProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
-        check_authentication(
+        crate::check_decoded_authentication(
             &properties.authentication_method,
             &properties.authentication_data,
         )?;

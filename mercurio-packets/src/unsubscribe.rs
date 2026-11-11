@@ -14,7 +14,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::{Packet, PacketType};
+use crate::{push_user_property, Packet, PacketType};
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {

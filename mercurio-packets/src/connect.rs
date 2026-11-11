@@ -18,7 +18,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::{Packet, PacketType};
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 /// The Connect Flags byte (section 3.1.2.3). It says which optional fields
 /// of the payload follow, so [`ConnectPacket`] derives it from the payload
@@ -200,7 +200,7 @@ impl Decoder for ConnectProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
-        check_authentication(
+        crate::check_decoded_authentication(
             &properties.authentication_method,
             &properties.authentication_data,
         )?;

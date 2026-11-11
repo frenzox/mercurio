@@ -25,12 +25,15 @@ pub mod subscribe;
 pub mod unsuback;
 pub mod unsubscribe;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use bytes::{buf::Take, Buf, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
     error::{EncodeError, Error},
-    properties::{AuthenticationData, AuthenticationMethod},
+    properties::{AuthenticationData, AuthenticationMethod, UserProperty},
     protocol::ProtocolVersion,
     reason::ReasonCode,
     Result,
@@ -388,10 +391,43 @@ pub(crate) fn check_authentication(
     method: &Option<AuthenticationMethod>,
     data: &Option<AuthenticationData>,
 ) -> core::result::Result<(), EncodeError> {
-    if data.is_some() && method.is_none() {
+    if lone_authentication_data(method, data) {
         return Err(EncodeError::InvalidProperty(AuthenticationData::ID));
     }
     Ok(())
+}
+
+/// The decoder's side of [`check_authentication`]: a protocol error.
+pub(crate) fn check_decoded_authentication(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> Result<()> {
+    if lone_authentication_data(method, data) {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    Ok(())
+}
+
+fn lone_authentication_data(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> bool {
+    data.is_some() && method.is_none()
+}
+
+/// Stores a property that may appear at most once in a packet; a repeat is
+/// a protocol error [MQTT-2.2.2-2].
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<()> {
+    if slot.is_some() {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Appends a User Property, which may appear any number of times.
+pub(crate) fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
+    slot.get_or_insert_with(Vec::new).push(value);
 }
 
 /// Size of the Variable Byte Integer that writes `len`; a length too large
@@ -1356,6 +1392,7 @@ mod encode_tests {
                     topic_filter: String::from("a/#"),
                 }],
             }),
+            ControlPacket::Publish(publish()),
         ];
         for packet in packets {
             let mut buffer = BytesMut::new();

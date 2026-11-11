@@ -413,7 +413,7 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
 
 /// Stores a property that may appear at most once in a packet; a repeat is
 /// a protocol error [MQTT-2.2.2-2].
-pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
     if slot.is_some() {
         return Err(ReasonCode::ProtocolError.into());
     }
@@ -421,20 +421,8 @@ pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
     Ok(())
 }
 
-/// Authentication Data only means something with an Authentication Method;
-/// alone it is a protocol error (section 3.1.2.11.10).
-pub fn check_authentication(
-    method: &Option<AuthenticationMethod>,
-    data: &Option<AuthenticationData>,
-) -> crate::Result<()> {
-    if data.is_some() && method.is_none() {
-        return Err(ReasonCode::ProtocolError.into());
-    }
-    Ok(())
-}
-
 /// Appends a User Property, which may appear any number of times.
-pub fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
+pub(crate) fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
     slot.get_or_insert_with(Vec::new).push(value);
 }
 

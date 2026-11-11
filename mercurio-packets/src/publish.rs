@@ -15,7 +15,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::{Packet, PacketType};
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 /// MQTT 5 only.
@@ -203,7 +203,7 @@ impl PublishPacket {
         }
 
         let properties = if with_properties {
-            Some(PublishProperties::decode(buffer)?)
+            crate::present(PublishProperties::decode(buffer)?)
         } else {
             None
         };

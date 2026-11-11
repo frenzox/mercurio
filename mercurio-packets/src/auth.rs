@@ -14,7 +14,7 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-use crate::{Packet, PacketType};
+use crate::{push_user_property, set_once, Packet, PacketType};
 
 #[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
@@ -63,7 +63,7 @@ impl Decoder for AuthProperties {
             _ => Err(ReasonCode::MalformedPacket.into()),
         })?;
 
-        check_authentication(&properties.auth_method, &properties.auth_data)?;
+        crate::check_decoded_authentication(&properties.auth_method, &properties.auth_data)?;
 
         Ok(properties)
     }
