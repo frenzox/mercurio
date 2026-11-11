@@ -2,11 +2,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     queue::Subscriber,
-    sys::{DropCause, Stats},
+    sys::{is_sys, DropCause, Stats, SysOverlay},
     topic_tree::TopicTree,
 };
 use mercurio_core::{message::Message, Result};
 use mercurio_storage::RetainedMessageStore;
+use tracing::warn;
 
 /// Message broker that handles pub/sub routing.
 ///
@@ -15,8 +16,8 @@ use mercurio_storage::RetainedMessageStore;
 /// It is thread-safe and can be cloned cheaply (uses Arc internally).
 pub(crate) struct Broker<S: RetainedMessageStore> {
     subscriptions: TopicTree<Subscriber>,
-    /// Storage backend for retained messages
-    storage: Arc<S>,
+    /// Storage backend for retained messages, `$SYS` ones in memory
+    storage: Arc<SysOverlay<S>>,
     stats: Arc<Stats>,
 }
 
@@ -34,8 +35,23 @@ impl<S: RetainedMessageStore> Broker<S> {
     pub(crate) fn new(storage: Arc<S>) -> Broker<S> {
         Broker {
             subscriptions: TopicTree::new(),
-            storage,
+            storage: Arc::new(SysOverlay::new(storage)),
             stats: Default::default(),
+        }
+    }
+
+    /// The retained messages, `$SYS` ones included, for the admin API.
+    pub(crate) fn retained_store(&self) -> Arc<dyn RetainedMessageStore>
+    where
+        S: 'static,
+    {
+        self.storage.clone()
+    }
+
+    /// Removes the `$SYS` messages an earlier version stored.
+    pub(crate) async fn forget_stored_sys(&self) {
+        if let Err(e) = self.storage.forget_stored().await {
+            warn!("Can't remove the stored $SYS messages: {}", e);
         }
     }
 
@@ -65,6 +81,9 @@ impl<S: RetainedMessageStore> Broker<S> {
     // ponytail: counts the store each time, a COUNT(*) on PostgreSQL; keep a
     // count in memory if retained publishes get frequent under a cap
     pub(crate) async fn retained_full(&self, topic: &str, max: usize) -> Result<bool> {
+        if is_sys(topic) {
+            return Ok(false);
+        }
         let storage_error =
             |e: mercurio_storage::StorageError| mercurio_core::error::Error::Storage(e.to_string());
         if self.storage.count_retained().await.map_err(storage_error)? < max {
@@ -322,6 +341,36 @@ mod tests {
             b"hello".as_ref()
         );
         assert!(retained[0].retain); // Retained flag should be true on delivery
+    }
+
+    #[tokio::test]
+    async fn test_sys_messages_are_retained_in_memory_only() {
+        let storage = Arc::new(MemoryStore::new());
+        let broker = Broker::new(Arc::clone(&storage));
+        let topic = "$SYS/broker/connection/bridge/state";
+        broker
+            .publish(topic, create_test_message(topic, "1", true))
+            .await
+            .unwrap();
+
+        assert_eq!(storage.count_retained().await.unwrap(), 0);
+        let retained = broker.retained("$SYS/#").await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].retain);
+        assert!(broker.retained("#").await.unwrap().is_empty());
+        // Not counted toward the limit, nor limited by it
+        broker
+            .publish("a", create_test_message("a", "x", true))
+            .await
+            .unwrap();
+        assert!(!broker.retained_full("$SYS/broker/new", 1).await.unwrap());
+        assert!(broker.retained_full("b", 1).await.unwrap());
+
+        broker
+            .publish(topic, create_test_message(topic, "", true))
+            .await
+            .unwrap();
+        assert!(broker.retained("$SYS/#").await.unwrap().is_empty());
     }
 
     #[tokio::test]

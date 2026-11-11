@@ -97,7 +97,7 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 </table>
 
 <h2 id="sys">$SYS statistics</h2>
-<p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged.</p>
+<p>Every <code>sys_interval</code> seconds (10 by default), the broker publishes retained statistics under <code>$SYS/broker/</code>, with mosquitto's names, so dashboards built for mosquitto work unchanged. Retained <code>$SYS</code> messages, bridge states included, are kept in memory: a new subscriber gets the latest values, but they are not written to storage and don't count toward <code>max_retained_messages</code> or <code>retained messages/count</code>.</p>
 <pre>recado sub -t '$SYS/broker/#' -T</pre>
 <table>
 <tr><th>Topic</th><th>Value</th></tr>
@@ -110,7 +110,7 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>clients/expired</code></td><td>Sessions ended by their expiry</td></tr>
 <tr><td><code>messages/received</code>, <code>messages/sent</code></td><td>PUBLISH packets since start</td></tr>
 <tr><td><code>bytes/received</code>, <code>bytes/sent</code></td><td>Bytes since start</td></tr>
-<tr><td><code>retained messages/count</code></td><td>Retained messages stored</td></tr>
+<tr><td><code>retained messages/count</code></td><td>Retained messages stored, <code>$SYS</code> ones not counted</td></tr>
 <tr><td><code>subscriptions/count</code></td><td>Subscriptions</td></tr>
 <tr><td><code>publish/messages/dropped</code></td><td>Messages accepted from a publisher and lost before reaching a subscriber, since start</td></tr>
 <tr><td><code>publish/messages/dropped/queue_full_qos0</code></td><td>QoS 0 messages that found a session's queue at <code>max_queued_qos0_messages</code></td></tr>

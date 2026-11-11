@@ -162,9 +162,9 @@ pub struct Limits {
     /// for longer, or for no expiry, are told to use this; it also bounds
     /// `persistent_client_expiration`. Unbounded when unset.
     pub max_session_expiry: Option<Duration>,
-    /// Topics that may hold a retained message at once, the broker's own
-    /// `$SYS` statistics included; retaining a message on another topic is
-    /// then refused with Quota Exceeded. Unbounded when unset.
+    /// Topics that may hold a retained message at once; retaining a message
+    /// on another topic is then refused with Quota Exceeded. The broker's
+    /// own `$SYS` topics, kept in memory, don't count. Unbounded when unset.
     pub max_retained_messages: Option<usize>,
     /// Connections one client address may hold at once, counting the
     /// address a PROXY header gives; further ones are closed before any
@@ -1154,10 +1154,11 @@ impl<St: MqttStore + 'static> Server<St> {
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
         let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
+        broker.forget_stored_sys().await;
 
         let admin = Admin::new(AdminParts {
             directory: Arc::new(session_manager.clone()),
-            retained: storage.clone(),
+            retained: broker.retained_store(),
             topics: broker.topics(),
             stats: Arc::clone(&stats),
             listeners: endpoints.iter().map(|e| Arc::clone(&e.state)).collect(),

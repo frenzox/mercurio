@@ -794,7 +794,7 @@ pub struct ServerConfig {
     pub max_session_expiry: Option<u64>,
 
     /// Topics that may hold a retained message at once, the broker's own
-    /// `$SYS` topics included; unbounded when unset
+    /// `$SYS` topics not counted; unbounded when unset
     pub max_retained_messages: Option<usize>,
 
     /// Connections one client address may hold at once, the address a PROXY

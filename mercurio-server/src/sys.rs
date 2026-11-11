@@ -2,16 +2,18 @@
 //! refreshed periodically, following mosquitto's topic names.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use mercurio_core::{message::Message, qos::QoS};
-use mercurio_storage::MqttStore;
+use mercurio_core::{message::Message, qos::QoS, topic::topic_matches_filter};
+use mercurio_storage::{MqttStore, Result as StorageResult, RetainedMessageStore};
 use tokio::time;
 use tracing::warn;
 
@@ -96,6 +98,79 @@ pub(crate) struct ClientCounters {
     /// Messages for the client the broker lost, those lost while it was
     /// away after this connection included
     pub dropped: AtomicU64,
+}
+
+/// Retained messages, those on `$SYS` topics kept in memory in front of
+/// `store`. The broker republishes its statistics every interval, so
+/// storing each update would be wasted writes, and they would count toward
+/// `max_retained_messages`. Clients may not publish to `$SYS`, so only the
+/// broker and its bridges put anything there.
+pub(crate) struct SysOverlay<S> {
+    store: Arc<S>,
+    sys: RwLock<BTreeMap<String, Message>>,
+}
+
+impl<S: RetainedMessageStore> SysOverlay<S> {
+    pub(crate) fn new(store: Arc<S>) -> Self {
+        SysOverlay {
+            store,
+            sys: Default::default(),
+        }
+    }
+
+    /// Removes the `$SYS` messages an earlier version left in the store.
+    pub(crate) async fn forget_stored(&self) -> StorageResult<()> {
+        for message in self.store.get_retained("$SYS/#").await? {
+            self.store.store_retained(&message.topic, None).await?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn is_sys(topic: &str) -> bool {
+    topic == "$SYS" || topic.starts_with("$SYS/")
+}
+
+#[async_trait]
+impl<S: RetainedMessageStore> RetainedMessageStore for SysOverlay<S> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> StorageResult<()> {
+        if !is_sys(topic) {
+            return self.store.store_retained(topic, message).await;
+        }
+        let mut sys = self.sys.write().unwrap();
+        match message {
+            Some(message) => sys.insert(topic.to_string(), message),
+            None => sys.remove(topic),
+        };
+        Ok(())
+    }
+
+    async fn get_retained(&self, topic_filter: &str) -> StorageResult<Vec<Message>> {
+        let mut found = self.store.get_retained(topic_filter).await?;
+        // Wildcards at the first level never match `$` topics
+        if topic_filter.starts_with('$') {
+            let sys = self.sys.read().unwrap();
+            found.extend(
+                sys.iter()
+                    .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
+                    .map(|(_, message)| Message {
+                        retain: true,
+                        ..message.clone()
+                    }),
+            );
+        }
+        Ok(found)
+    }
+
+    async fn clear_all_retained(&self) -> StorageResult<()> {
+        self.sys.write().unwrap().clear();
+        self.store.clear_all_retained().await
+    }
+
+    /// Only those stored, which `max_retained_messages` limits.
+    async fn count_retained(&self) -> StorageResult<usize> {
+        self.store.count_retained().await
+    }
 }
 
 /// Rates per minute averaged over 1, 5 and 15 minutes, as mosquitto's

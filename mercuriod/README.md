@@ -183,8 +183,8 @@ max_inflight = 64
 # Most seconds any session may outlive its connection, MQTT 5 clients
 # included; worth setting where clients aren't trusted (unbounded by default)
 # max_session_expiry = 2592000
-# Topics that may hold a retained message at once, about 20 of the broker's
-# own $SYS topics included; further ones get Quota Exceeded (unbounded)
+# Topics that may hold a retained message at once, the broker's own $SYS
+# topics not counted; further ones get Quota Exceeded (unbounded)
 # max_retained_messages = 100000
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
@@ -675,7 +675,10 @@ retried and given up on as `store/batches/retried` and
 `store/batches/dropped`. Under `load/` come the 1, 5 and 15
 minute averages per minute of messages, bytes and connections, such as
 `load/messages/received/1min`. Clients
-may subscribe to them, but not publish to `$SYS` topics.
+may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`
+messages, bridge states included, are kept in memory: new subscribers get
+the latest values, but they are not stored and don't count toward
+`max_retained_messages`.
 
 ## Running
 
