@@ -1180,6 +1180,11 @@ pub struct HttpAuthConfig {
     #[serde(serialize_with = "redact_some_url")]
     pub acl_url: Option<String>,
 
+    /// Names superusers, whom no `acl_url` check restricts and who may
+    /// administer the broker
+    #[serde(serialize_with = "redact_some_url")]
+    pub superuser_url: Option<String>,
+
     #[serde(default = "default_http_timeout")]
     pub timeout_seconds: u64,
 
@@ -1713,6 +1718,7 @@ mod tests {
         assert!(config.server.redirect.is_some());
         let http = config.auth.http.as_ref().unwrap();
         assert!(http.ca_path.is_some() && http.cert_path.is_some() && http.key_path.is_some());
+        assert!(http.superuser_url.is_some());
         assert!(config.listeners.iter().any(|l| l.auth.is_some()));
         assert!(config.bridges.iter().any(|b| !b.topics.is_empty()));
 
@@ -1819,6 +1825,7 @@ mod tests {
             [auth.http]
             user_url = "https://svc:SECRET-user@auth.example.com/user?token=SECRET-tok"
             acl_url = "https://auth.example.com/acl?api_key=SECRET-key"
+            superuser_url = "https://svc:SECRET-su@auth.example.com/su"
 
             [[listeners]]
             port = 1884

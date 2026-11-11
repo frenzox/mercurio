@@ -655,6 +655,13 @@ fn build_auth(
             "user_url",
             config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
         ),
+        (
+            "superuser_url",
+            config
+                .http
+                .as_ref()
+                .is_some_and(|h| h.superuser_url.is_some()),
+        ),
     ];
     if let Some((key, _)) = authenticating
         .iter()
@@ -863,6 +870,11 @@ mod tests {
                 "dynamic_security",
             ),
             ("[http]\nuser_url = \"http://h/user\"\n", "user_url"),
+            // A user name nobody checked would make anyone a superuser
+            (
+                "[http]\nacl_url = \"http://h/acl\"\nsuperuser_url = \"http://h/su\"\n",
+                "superuser_url",
+            ),
         ] {
             for main in [true, false] {
                 let Err(error) = build_auth(&auth(toml), &mut Vec::new(), main) else {
@@ -898,6 +910,18 @@ mod tests {
         std::fs::remove_file(&acl).unwrap();
         let (value, plugins, _) = result.map_err(|e| panic!("{e}")).unwrap();
         assert!(!value.require_auth);
+        assert_eq!(plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_a_superuser_endpoint_alone_is_used() {
+        let (_, plugins, _) = build_auth(
+            &auth("enabled = true\n[http]\nsuperuser_url = \"http://h/su\"\n"),
+            &mut Vec::new(),
+            true,
+        )
+        .map_err(|e| panic!("{e}"))
+        .unwrap();
         assert_eq!(plugins.len(), 1);
     }
 

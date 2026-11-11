@@ -214,6 +214,10 @@ allow_anonymous = false
 # [auth.http]
 # user_url = "https://auth.internal/mqtt/user"
 # acl_url = "https://auth.internal/mqtt/acl"
+# A 2xx answer for a user name makes it a superuser: no acl_url check
+# restricts it, and it may administer the broker over $CONTROL. Only with
+# authentication enabled
+# superuser_url = "https://auth.internal/mqtt/superuser"
 # No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
@@ -243,7 +247,7 @@ group = "mercurio"
 # host = "0.0.0.0"
 # port = 8883
 # [listeners.tls]
-# enabled = true
+# authentication enabled
 # cert_path = "/etc/mercurio/server.crt"
 # key_path = "/etc/mercurio/server.key"
 #
@@ -293,7 +297,7 @@ group = "mercurio"
 # Names of the [[plugins]] its clients go through; all of them when unset
 # plugins = ["deny"]
 # [listeners.auth]
-# enabled = true
+# authentication enabled
 # allow_anonymous = false
 # password_file = "/etc/mercurio/tenant1.passwd"
 
@@ -315,7 +319,7 @@ group = "mercurio"
 # client id must be a single topic level, without `/`, `+` or `#`
 # [bridges.tls]
 # TLS with the system's root certificates
-# enabled = true
+# authentication enabled
 # A CA, or a client certificate, turns TLS on even without `enabled`
 # ca_path = "/etc/mercurio/cloud-ca.crt"
 # Client certificate, for brokers that require mutual TLS; both or neither

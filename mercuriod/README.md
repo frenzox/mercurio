@@ -283,6 +283,10 @@ allow_anonymous = false
 # [auth.http]
 # user_url = "http://auth.internal/mqtt/user"
 # acl_url = "http://auth.internal/mqtt/acl"
+# A 2xx answer for a user name makes it a superuser: no acl_url check
+# restricts it, and it may administer the broker over $CONTROL. Only with
+# authentication enabled
+# superuser_url = "http://auth.internal/mqtt/superuser"
 # No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
@@ -312,7 +316,7 @@ group = "mercurio"
 # host = "0.0.0.0"
 # port = 8883
 # [listeners.tls]
-# enabled = true
+# authentication enabled
 # cert_path = "/etc/mercurio/server.crt"
 # key_path = "/etc/mercurio/server.key"
 #
@@ -362,7 +366,7 @@ group = "mercurio"
 # Names of the [[plugins]] its clients go through; all of them when unset
 # plugins = ["deny"]
 # [listeners.auth]
-# enabled = true
+# authentication enabled
 # allow_anonymous = false
 # password_file = "/etc/mercurio/tenant1.passwd"
 
@@ -384,7 +388,7 @@ group = "mercurio"
 # client id must be a single topic level, without `/`, `+` or `#`
 # [bridges.tls]
 # TLS with the system's root certificates
-# enabled = true
+# authentication enabled
 # A CA, or a client certificate, turns TLS on even without `enabled`
 # ca_path = "/etc/mercurio/cloud-ca.crt"
 # Client certificate, for brokers that require mutual TLS; both or neither
@@ -554,7 +558,11 @@ topic check, it POSTs
 `{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
 receive, 2 to publish and 4 to subscribe. A 2xx status allows; anything else, a timeout
 included, denies. Topic answers are reused for `cache_seconds`, since
-every message is checked. Over `https://`, `ca_path` names the CA
+every message is checked. With `superuser_url`, the broker first POSTs
+`{"username"}` there; a 2xx answer, cached like topic answers, makes the
+user a superuser, allowed every topic and `$CONTROL` without asking
+`acl_url`. Anything else, a failure included, means not a superuser. Over
+`https://`, `ca_path` names the CA
 certificates endpoints' certificates must chain to, in place of the bundled
 roots, and `cert_path` and `key_path` a client certificate for endpoints
 that ask for one. `user_url` replaces `password_file` and

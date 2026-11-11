@@ -6,13 +6,17 @@
 //! - `acl_url` receives `{"username", "clientid", "topic", "acc"}`, where
 //!   `acc` is 1 to receive, 2 to publish and 4 to subscribe, and 8 to
 //!   publish to a `$CONTROL/...` topic, which administers the broker
+//! - `superuser_url` receives `{"username"}`; a 2xx answer lets that user
+//!   do everything, `$CONTROL` included, without asking `acl_url`
 //!
-//! ACL answers are cached for `cache_seconds`, as every message is checked.
-//! Only 2xx (allow) and 4xx (deny) are answers: other statuses and failed
-//! requests deny the check at hand and are asked again next time.
+//! ACL and superuser answers are cached for `cache_seconds`, as every
+//! message is checked. Only 2xx (allow) and 4xx (deny) are answers: other
+//! statuses and failed requests deny the check at hand, or make the user no
+//! superuser for it, and are asked again next time.
 
 use std::{
     collections::{HashMap, VecDeque},
+    hash::Hash,
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -54,7 +58,10 @@ pub struct HttpAuth {
     agent: ureq::Agent,
     user_url: Option<String>,
     acl_url: Option<String>,
-    cache: Mutex<Cache>,
+    superuser_url: Option<String>,
+    cache: Mutex<Cache<CacheKey>>,
+    /// Whether each user name is a superuser's
+    superusers: Mutex<Cache<String>>,
     failures: Mutex<Throttle>,
     requests: Arc<Semaphore>,
     in_flight: Mutex<HashMap<RequestKey, Answer>>,
@@ -73,6 +80,7 @@ impl HttpAuth {
         if let Some(tls) = tls_config(config)? {
             auth.agent = agent(Duration::from_secs(config.timeout_seconds), tls);
         }
+        auth.superuser_url = config.superuser_url.clone();
         Ok(auth)
     }
 
@@ -95,7 +103,9 @@ impl HttpAuth {
             agent: agent(timeout, TlsConfig::default()),
             user_url,
             acl_url,
+            superuser_url: None,
             cache: Mutex::new(Cache::new(CACHE_LIMIT, cache_for)),
+            superusers: Mutex::new(Cache::new(CACHE_LIMIT, cache_for)),
             failures: Mutex::default(),
             requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
             in_flight: Mutex::default(),
@@ -272,14 +282,14 @@ impl Drop for Waiter<'_> {
 
 /// ACL answers, each kept for the same time, so the order they came in is
 /// the order they expire in.
-struct Cache {
+struct Cache<K> {
     limit: usize,
     ttl: Duration,
-    answers: HashMap<CacheKey, (bool, Instant)>,
-    order: VecDeque<(CacheKey, Instant)>,
+    answers: HashMap<K, (bool, Instant)>,
+    order: VecDeque<(K, Instant)>,
 }
 
-impl Cache {
+impl<K: Hash + Eq + Clone> Cache<K> {
     fn new(limit: usize, ttl: Duration) -> Self {
         Self {
             limit,
@@ -289,12 +299,12 @@ impl Cache {
         }
     }
 
-    fn get(&self, key: &CacheKey) -> Option<bool> {
+    fn get(&self, key: &K) -> Option<bool> {
         let (allowed, at) = self.answers.get(key)?;
         (at.elapsed() < self.ttl).then_some(*allowed)
     }
 
-    fn insert(&mut self, key: CacheKey, allowed: bool) {
+    fn insert(&mut self, key: K, allowed: bool) {
         let now = Instant::now();
         while let Some((_, at)) = self.order.front() {
             if now.duration_since(*at) < self.ttl && self.answers.len() < self.limit {
@@ -344,7 +354,7 @@ impl Plugin for HttpAuth {
         if self.user_url.is_some() {
             hooks.push("authenticate");
         }
-        if self.acl_url.is_some() {
+        if self.acl_url.is_some() || self.superuser_url.is_some() {
             hooks.extend(["authorize", "authorize_control"]);
         }
         PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&hooks)
@@ -387,8 +397,9 @@ impl Plugin for HttpAuth {
         self.check(client, topic, acc)
     }
 
-    /// Asks the ACL endpoint with an `acc` of its own, so a backend that
-    /// grants publishing to every topic doesn't grant this as well.
+    /// Allows superusers; asks the ACL endpoint about others with an `acc`
+    /// of its own, so a backend that grants publishing to every topic
+    /// doesn't grant this as well.
     fn authorize_control<'a>(
         &'a self,
         client: &'a ClientInfo,
@@ -405,9 +416,9 @@ impl HttpAuth {
         topic: &'a str,
         acc: u8,
     ) -> BoxFuture<'a, Decision> {
-        let Some(url) = &self.acl_url else {
+        if self.acl_url.is_none() && self.superuser_url.is_none() {
             return ready(Decision::Defer);
-        };
+        }
         let decision = |allowed| match allowed {
             true => Decision::Allow,
             false => Decision::Deny,
@@ -419,6 +430,12 @@ impl HttpAuth {
             acc,
         );
         Box::pin(async move {
+            if self.is_superuser(client).await {
+                return Decision::Allow;
+            }
+            let Some(url) = &self.acl_url else {
+                return Decision::Defer;
+            };
             if let Some(allowed) = self.cache.lock().unwrap().get(&key) {
                 return decision(allowed);
             }
@@ -434,6 +451,25 @@ impl HttpAuth {
             self.cache.lock().unwrap().insert(key, allowed);
             decision(allowed)
         })
+    }
+
+    /// Whether the superuser endpoint answers 2xx for `client`'s user name;
+    /// never for a client without one, nor when the endpoint fails.
+    async fn is_superuser(&self, client: &ClientInfo) -> bool {
+        let (Some(url), Some(username)) = (&self.superuser_url, &client.username) else {
+            return false;
+        };
+        if let Some(superuser) = self.superusers.lock().unwrap().get(username) {
+            return superuser;
+        }
+        let Some(superuser) = self.allows(url, json!({ "username": username })).await else {
+            return false;
+        };
+        self.superusers
+            .lock()
+            .unwrap()
+            .insert(username.clone(), superuser);
+        superuser
     }
 }
 
@@ -592,6 +628,7 @@ mod tests {
         HttpAuthConfig {
             user_url: None,
             acl_url: Some(url.to_string()),
+            superuser_url: None,
             timeout_seconds: 5,
             cache_seconds: 60,
             ca_path: path(files[0]),
@@ -648,6 +685,120 @@ mod tests {
                 .unwrap_or_else(|| panic!("{files:?} loaded"));
             assert!(error.contains(expected), "{files:?}: {error}");
         }
+    }
+
+    /// Checks with `superuser` as the superuser endpoint and `acl` as the
+    /// ACL one.
+    fn superuser_auth(superuser: String, acl: Option<String>) -> HttpAuth {
+        HttpAuth {
+            superuser_url: Some(superuser),
+            ..HttpAuth::new(None, acl, Duration::from_secs(5), Duration::from_secs(60))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_superusers_skip_acl_checks_and_may_administer() {
+        let superusers = backend(Duration::ZERO, |body, _| {
+            if body == r#"{"username":"alice"}"# {
+                "200 OK"
+            } else {
+                "403 Forbidden"
+            }
+        });
+        let (acl_url, acl_requests) = serve("\"topic\":\"public\"");
+        let auth = superuser_auth(superusers.url, Some(acl_url));
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let bob = ClientInfo::new("c", Some("bob".to_string()));
+        for _ in 0..2 {
+            for access in [Access::Write, Access::Read, Access::Subscribe] {
+                assert_eq!(
+                    auth.authorize(&alice, "private", access).await,
+                    Decision::Allow
+                );
+            }
+            assert_eq!(
+                auth.authorize_control(&alice, "$CONTROL/broker/v1").await,
+                Decision::Allow
+            );
+            assert_eq!(
+                auth.authorize(&bob, "private", Access::Write).await,
+                Decision::Deny
+            );
+            assert_eq!(
+                auth.authorize(&bob, "public", Access::Write).await,
+                Decision::Allow
+            );
+            assert_eq!(
+                auth.authorize_control(&bob, "$CONTROL/broker/v1").await,
+                Decision::Deny
+            );
+        }
+        // Each user's answer is cached, as topic answers are
+        assert_eq!(superusers.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(acl_requests.load(Ordering::SeqCst), 3);
+
+        // Clients without a user name are never superusers
+        let anonymous = ClientInfo::new("c", None);
+        assert_eq!(
+            auth.authorize(&anonymous, "private", Access::Write).await,
+            Decision::Deny
+        );
+        assert_eq!(superusers.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_failing_superuser_endpoint_means_not_a_superuser() {
+        let superusers = backend(Duration::ZERO, |_, index| match index {
+            0 => "500 Internal Server Error",
+            _ => "200 OK",
+        });
+        let (acl_url, _) = serve("\"topic\":\"public\"");
+        let auth = superuser_auth(superusers.url, Some(acl_url.clone()));
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        assert_eq!(
+            auth.authorize(&alice, "private", Access::Write).await,
+            Decision::Deny
+        );
+        assert_eq!(
+            auth.authorize(&alice, "public", Access::Write).await,
+            Decision::Allow
+        );
+        // Not cached, so asked again once the endpoint is back
+        assert_eq!(
+            auth.authorize(&alice, "private", Access::Write).await,
+            Decision::Allow
+        );
+
+        let auth = superuser_auth("http://127.0.0.1:1/".to_string(), Some(acl_url));
+        assert_eq!(
+            auth.authorize_control(&alice, "$CONTROL/broker/v1").await,
+            Decision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn test_without_an_acl_endpoint_others_are_left_to_the_next_check() {
+        let (superuser_url, _) = serve("alice");
+        let auth = superuser_auth(superuser_url, None);
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let bob = ClientInfo::new("c", Some("bob".to_string()));
+        assert_eq!(
+            auth.authorize(&alice, "t", Access::Write).await,
+            Decision::Allow
+        );
+        assert_eq!(
+            auth.authorize(&bob, "t", Access::Write).await,
+            Decision::Defer
+        );
+        assert_eq!(
+            auth.authorize_control(&bob, "$CONTROL/broker/v1").await,
+            Decision::Defer
+        );
+        assert_eq!(
+            auth.status(),
+            PluginStatus::new("http-auth", PluginKind::Builtin)
+                .with_hooks(&["authorize", "authorize_control"])
+        );
     }
 
     #[tokio::test]
