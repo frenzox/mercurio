@@ -772,6 +772,9 @@ fn build_auth(
     }
     // Without authentication, only its access control is used
     if let Some((auth, _, _)) = http.filter(|_| config.enabled || http_acl) {
+        if auth.has_tls_files() {
+            reloadable.push(auth.clone());
+        }
         plugins.push(auth);
     }
     if let Some(path) = &config.acl_file {
@@ -987,6 +990,28 @@ mod tests {
         .map_err(|e| panic!("{e}"))
         .unwrap();
         assert_eq!(plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_http_auth_tls_files_are_reloadable() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/http-auth");
+        for (tls, reloaded) in [
+            (String::new(), false),
+            (format!("ca_path = \"{fixtures}/ca.pem\"\n"), true),
+        ] {
+            let mut reloadable = Vec::new();
+            build_auth(
+                &auth(&format!(
+                    "enabled = true\n[http]\nuser_url = \"https://h/u\"\n{tls}"
+                )),
+                &mut reloadable,
+                true,
+            )
+            .map_err(|e| panic!("{e}"))
+            .unwrap();
+            let items: Vec<_> = reloadable.iter().map(|file| file.item()).collect();
+            assert_eq!(items.contains(&"http-auth"), reloaded, "{tls}: {items:?}");
+        }
     }
 
     /// A broker with the authentication `toml` sets up; its port.
