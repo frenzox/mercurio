@@ -8,6 +8,7 @@ use clap::Parser;
 mod cli;
 mod client;
 mod commands;
+mod dynsec;
 mod output;
 
 use cli::Cli;
@@ -36,7 +37,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), Failure> {
-    let request = commands::request(cli.command);
+    let request = commands::request(cli.command, new_password)?;
     let wait = Duration::from_secs(cli.timeout);
     let Some(data) = client::send(&cli.connect, &request, wait).await? else {
         return Ok(());
@@ -51,4 +52,18 @@ async fn run(cli: Cli) -> Result<(), Failure> {
         });
     }
     Ok(())
+}
+
+/// Asks twice for a new password for `username`; empty means none.
+fn new_password(username: &str) -> Result<String, Failure> {
+    let password = prompt(&format!("New password for {username}: "))?;
+    if !password.is_empty() && prompt("Again: ")? != password {
+        return Err(Failure::Usage("the passwords don't match".to_string()));
+    }
+    Ok(password)
+}
+
+fn prompt(text: &str) -> Result<String, Failure> {
+    rpassword::prompt_password(text)
+        .map_err(|e| Failure::Usage(format!("can't read a password: {e}")))
 }

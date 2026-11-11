@@ -229,6 +229,7 @@ async fn a_broker_that_never_answers_times_out() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("no answer"), "{}", stderr(&output));
 }
+
 #[tokio::test(flavor = "multi_thread")]
 async fn answers_print_as_tables_by_default() {
     let broker = start("tables").await;
@@ -254,5 +255,19 @@ async fn answers_print_as_tables_by_default() {
         stderr(&reload).contains("previous contents"),
         "{}",
         stderr(&reload)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynsec_commands_without_dynamic_security_time_out() {
+    let broker = start("no-dynsec").await;
+    let output = broker
+        .ctl(&["--timeout", "1", "dynsec", "list-clients"])
+        .await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("dynamic security"),
+        "{}",
+        stderr(&output)
     );
 }

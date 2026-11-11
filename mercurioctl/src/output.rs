@@ -285,7 +285,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{reload_failed, render, utc};
-    use crate::commands::{Request, BROKER_TOPIC};
+    use crate::commands::{Request, BROKER_TOPIC, DYNSEC_TOPIC};
 
     fn shown(command: Value, data: Value) -> String {
         let request = Request {
@@ -422,6 +422,42 @@ version:    0.4.1
         assert_eq!(
             shown(json!({"command": "getConfig"}), config.clone()),
             format!("{config:#}\n")
+        );
+    }
+
+    #[test]
+    fn dynamic_security_answers_print_generically() {
+        let dynsec = |command: Value, data: Value| {
+            let request = Request {
+                topic: DYNSEC_TOPIC,
+                command,
+            };
+            render(&request, &data, false)
+        };
+        assert_eq!(
+            dynsec(
+                json!({"command": "listClients"}),
+                json!({ "totalCount": 2, "clients": ["alice", "bob"] })
+            ),
+            "alice\nbob\n"
+        );
+        assert_eq!(
+            dynsec(
+                json!({"command": "getClient"}),
+                json!({ "client": {
+                    "username": "alice", "disabled": false,
+                    "roles": [{ "rolename": "sensors" }], "groups": [],
+                } })
+            ),
+            "\
+client:
+  disabled:  false
+  groups:    -
+  roles:
+    ROLENAME
+    sensors
+  username:  alice
+"
         );
     }
 }

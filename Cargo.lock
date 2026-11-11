@@ -1474,6 +1474,7 @@ dependencies = [
  "clap",
  "mercurio-client",
  "mercurio-server",
+ "rpassword",
  "serde_json",
  "tokio",
 ]

@@ -7,9 +7,13 @@ use crate::cli::{
     BanCommand, BrokerCommand, ClientCommand, Command, ListCommand, PageArgs, RetainedCommand,
     SubscriptionCommand,
 };
+use crate::client::Failure;
+use crate::dynsec;
 
 /// Where the broker's own commands go.
 pub const BROKER_TOPIC: &str = "$CONTROL/broker/v1";
+/// Where dynamic security commands go.
+pub const DYNSEC_TOPIC: &str = "$CONTROL/dynamic-security/v1";
 
 /// One command and the topic it goes to.
 #[derive(Debug, PartialEq)]
@@ -26,9 +30,19 @@ impl Request {
     }
 }
 
-/// What `command` sends.
-pub fn request(command: Command) -> Request {
+/// What `command` sends. `read_password` asks for a password a dynamic
+/// security command needs and wasn't given, for the client it names.
+pub fn request(
+    command: Command,
+    read_password: impl FnOnce(&str) -> Result<String, Failure>,
+) -> Result<Request, Failure> {
     let command = match command {
+        Command::Dynsec(c) => {
+            return Ok(Request {
+                topic: DYNSEC_TOPIC,
+                command: dynsec::command(c, read_password)?,
+            })
+        }
         Command::Client(c) => client(c),
         Command::Ban(c) => ban(c),
         Command::Retained(c) => retained(c),
@@ -38,10 +52,10 @@ pub fn request(command: Command) -> Request {
         Command::Bridge(ListCommand::List) => named("listBridges", json!({})),
         Command::Plugin(ListCommand::List) => named("listPlugins", json!({})),
     };
-    Request {
+    Ok(Request {
         topic: BROKER_TOPIC,
         command,
-    }
+    })
 }
 
 /// The command object for `name`, with the members of `args` that aren't
@@ -173,7 +187,10 @@ mod tests {
     /// The command object `args` send to the broker.
     fn sent(args: &[&str]) -> Value {
         let argv = std::iter::once("mercurioctl").chain(args.iter().copied());
-        let request = request(Cli::try_parse_from(argv).unwrap().command);
+        let request = request(Cli::try_parse_from(argv).unwrap().command, |_| {
+            panic!("asked for a password")
+        })
+        .unwrap();
         assert_eq!(request.topic, BROKER_TOPIC);
         request.command
     }
@@ -315,5 +332,13 @@ mod tests {
         );
         assert_eq!(sent(&["bridge", "list"]), json!({"command": "listBridges"}));
         assert_eq!(sent(&["plugin", "list"]), json!({"command": "listPlugins"}));
+    }
+
+    #[test]
+    fn dynsec_commands_go_to_dynamic_security() {
+        let cli = Cli::try_parse_from(["mercurioctl", "dynsec", "list-roles"]).unwrap();
+        let request = request(cli.command, |_| panic!("asked for a password")).unwrap();
+        assert_eq!(request.topic, super::DYNSEC_TOPIC);
+        assert_eq!(request.command, json!({"command": "listRoles"}));
     }
 }

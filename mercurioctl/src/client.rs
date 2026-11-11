@@ -6,7 +6,7 @@ use bytes::Bytes;
 use mercurio_client::{cli::ConnectArgs, ClientError, Event, MessageProperties, MqttClient, QoS};
 use serde_json::{json, Value};
 
-use crate::commands::Request;
+use crate::commands::{Request, DYNSEC_TOPIC};
 
 /// Why mercurioctl failed, which sets its exit status.
 #[derive(Debug, PartialEq)]
@@ -19,6 +19,8 @@ pub enum Failure {
     /// The broker couldn't be reached, refused the login or didn't answer
     /// in time
     Connection(String),
+    /// The command line asks for something that can't be done
+    Usage(String),
 }
 
 impl Failure {
@@ -26,6 +28,7 @@ impl Failure {
         match self {
             Failure::Rejected { .. } => 1,
             Failure::Connection(_) => 2,
+            Failure::Usage(_) => 3,
         }
     }
 }
@@ -41,7 +44,8 @@ impl fmt::Display for Failure {
                 code: None,
                 message,
             }
-            | Failure::Connection(message) => f.write_str(message),
+            | Failure::Connection(message)
+            | Failure::Usage(message) => f.write_str(message),
         }
     }
 }
@@ -68,10 +72,14 @@ pub async fn send(
             result
         }
         Ok(Err(failure)) => Err(failure),
-        Err(_) => Err(Failure::Connection(format!(
-            "no answer from the broker within {} s",
-            wait.as_secs()
-        ))),
+        Err(_) => {
+            let mut message = format!("no answer from the broker within {} s", wait.as_secs());
+            // Nothing answers its topic on a broker without it
+            if request.topic == DYNSEC_TOPIC {
+                message.push_str("; is dynamic security enabled?");
+            }
+            Err(Failure::Connection(message))
+        }
     }
 }
 
@@ -227,6 +235,7 @@ mod tests {
         assert_eq!(rejected.to_string(), "no client `x` (notFound)");
         assert_eq!(rejected.exit_code(), 1);
         assert_eq!(Failure::Connection("refused".to_string()).exit_code(), 2);
+        assert_eq!(Failure::Usage("no".to_string()).exit_code(), 3);
     }
 
     #[test]

@@ -3,6 +3,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mercurio_client::cli::ConnectArgs;
 
+use crate::dynsec::Dynsec;
+
 const AFTER_HELP: &str = "\
 Exit status: 0 on success, 1 when the broker refused the command, 2 when \
 the broker couldn't be reached, refused the login or didn't answer in time, \
@@ -53,6 +55,9 @@ pub enum Command {
     /// The broker's plugins
     #[command(subcommand)]
     Plugin(ListCommand),
+    /// Dynamic security: clients, groups, roles and their ACLs
+    #[command(subcommand)]
+    Dynsec(Dynsec),
 }
 
 #[derive(Subcommand, Debug)]
