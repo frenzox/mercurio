@@ -203,6 +203,58 @@ impl MessageProperties {
     }
 }
 
+/// How [`MqttClient::request`](crate::MqttClient::request) asks: what the
+/// request waits for at most, and what its message looks like.
+///
+/// ```
+/// use std::time::Duration;
+/// use mercurio_client::{QoS, RequestOptions};
+///
+/// let options = RequestOptions::new(Duration::from_secs(5))
+///     .response_prefix("replies")
+///     .qos(QoS::AtMostOnce);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RequestOptions {
+    pub(crate) timeout: Duration,
+    pub(crate) response_prefix: Option<String>,
+    pub(crate) qos: QoS,
+    pub(crate) properties: MessageProperties,
+}
+
+impl RequestOptions {
+    /// A request answered within `timeout`, published with QoS 1 so a
+    /// request the broker refuses fails at once.
+    pub fn new(timeout: Duration) -> Self {
+        RequestOptions {
+            timeout,
+            response_prefix: None,
+            qos: QoS::AtLeastOnce,
+            properties: MessageProperties::default(),
+        }
+    }
+
+    /// Where responses come, below this prefix, when the broker offers no
+    /// Response Information.
+    pub fn response_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.response_prefix = Some(prefix.into());
+        self
+    }
+
+    /// The QoS the request is published with.
+    pub fn qos(mut self, qos: QoS) -> Self {
+        self.qos = qos;
+        self
+    }
+
+    /// Properties of the request message; its response topic and
+    /// correlation data are replaced.
+    pub fn properties(mut self, properties: MessageProperties) -> Self {
+        self.properties = properties;
+        self
+    }
+}
+
 /// Will message configuration, built with [`Will::new`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -375,9 +427,12 @@ pub struct ConnectOptions {
     pub(crate) reconnect_max: Option<Duration>,
     pub(crate) write_timeout: Option<Duration>,
     pub(crate) manual_acks: bool,
+    pub(crate) resubscribe: bool,
+    pub(crate) max_redirects: u8,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
+    pub(crate) outbound_topic_aliases: u16,
     pub(crate) request_response_information: bool,
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
@@ -410,9 +465,12 @@ impl std::fmt::Debug for ConnectOptions {
             .field("reconnect_max", &self.reconnect_max)
             .field("write_timeout", &self.write_timeout)
             .field("manual_acks", &self.manual_acks)
+            .field("resubscribe", &self.resubscribe)
+            .field("max_redirects", &self.max_redirects)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
+            .field("outbound_topic_aliases", &self.outbound_topic_aliases)
             .field(
                 "request_response_information",
                 &self.request_response_information,
@@ -504,9 +562,12 @@ impl ConnectOptions {
             reconnect_max: None,
             write_timeout: None,
             manual_acks: false,
+            resubscribe: false,
+            max_redirects: 0,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
+            outbound_topic_aliases: 0,
             request_response_information: false,
             request_problem_information: true,
             authenticator: None,
@@ -654,6 +715,34 @@ impl ConnectOptions {
         self
     }
 
+    /// After reconnecting to a broker that kept no session, make the
+    /// subscriptions it granted before again, with their options and
+    /// identifiers, before `Event::Reconnected` arrives. A subscription the
+    /// broker refuses this time is reported with `Event::ResubscribeFailed`
+    /// after `Event::Reconnected`, and isn't made again later. Unsubscribing
+    /// forgets a subscription. Off unless set.
+    pub fn resubscribe(mut self, resubscribe: bool) -> Self {
+        self.resubscribe = resubscribe;
+        self
+    }
+
+    /// Follow up to `hops` redirections in a row to the servers a broker
+    /// names when it refuses CONNECT, or closes the connection, with Use
+    /// Another Server or Server Moved and a Server Reference: a list of
+    /// `host[:port]` entries tried in order, each with this client's TLS
+    /// settings and, without a port, the current one. An entry with a
+    /// scheme that would turn TLS off, or on, is skipped. After Server
+    /// Moved the server reached replaces the host and port for the rest of
+    /// the client's life; Use Another Server only applies to that attempt,
+    /// and reconnecting later goes back to the configured broker. Off (0)
+    /// unless set, in which case redirections fail with
+    /// [`ClientError::Redirected`] or end the client. Not with a
+    /// [`connector`](Self::connector) or a Unix socket.
+    pub fn follow_redirects(mut self, hops: u8) -> Self {
+        self.max_redirects = hops;
+        self
+    }
+
     /// Longest wait between reconnection attempts, 60 seconds unless set.
     pub fn reconnect_max(mut self, max: Duration) -> Self {
         self.reconnect_max = Some(max);
@@ -716,6 +805,19 @@ impl ConnectOptions {
     /// saving bandwidth on repeated topics. MQTT 5 only.
     pub fn topic_alias_maximum(mut self, maximum: u16) -> Self {
         self.topic_alias_maximum = maximum;
+        self
+    }
+
+    /// Replace the topics of published messages with aliases, up to this
+    /// many at once and no more than the broker's Topic Alias Maximum; off
+    /// (0) unless set, and only with MQTT 5 brokers that announce a
+    /// maximum. The first publish to a topic sends it with a new alias, and
+    /// later ones send the alias alone. Once every alias is taken, a new
+    /// topic takes over the alias of the topic published to least
+    /// recently. Aliases start over on each connection, and messages sent
+    /// again after reconnecting carry their whole topic.
+    pub fn outbound_topic_aliases(mut self, maximum: u16) -> Self {
+        self.outbound_topic_aliases = maximum;
         self
     }
 

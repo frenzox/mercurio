@@ -57,6 +57,8 @@ pub fn command() -> clap::Command {
         ("insecure", "MERCURIOCTL_INSECURE"),
         ("cert", "MERCURIOCTL_CERT"),
         ("key", "MERCURIOCTL_KEY"),
+        ("ws", "MERCURIOCTL_WS"),
+        ("ws_path", "MERCURIOCTL_WS_PATH"),
         ("timeout", "MERCURIOCTL_TIMEOUT"),
         #[cfg(unix)]
         ("unix", "MERCURIOCTL_UNIX"),
@@ -70,7 +72,7 @@ pub fn command() -> clap::Command {
             let arg = arg.env(variable);
             match id {
                 // 1, 0, yes, no, on and off, as well as true and false
-                "tls" | "insecure" => arg.value_parser(BoolishValueParser::new()),
+                "tls" | "insecure" | "ws" => arg.value_parser(BoolishValueParser::new()),
                 _ => arg,
             }
         });
@@ -346,6 +348,8 @@ mod tests {
             "MERCURIOCTL_INSECURE",
             "MERCURIOCTL_CERT",
             "MERCURIOCTL_KEY",
+            "MERCURIOCTL_WS",
+            "MERCURIOCTL_WS_PATH",
             "MERCURIOCTL_TIMEOUT",
         ] {
             assert!(help.contains(variable), "{variable} missing from:\n{help}");

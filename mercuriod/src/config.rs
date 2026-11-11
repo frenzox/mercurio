@@ -74,13 +74,37 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub protocol_version: BridgeProtocol,
 
-    /// Publish the bridge's state, retained, to
-    /// `$SYS/broker/connection/<client id>/state` on this broker
+    /// Publish the bridge's state, retained, to `notification_topic` on
+    /// this broker
     #[serde(default = "default_true")]
     pub notifications: bool,
 
+    /// Where the state goes; `$SYS/broker/connection/<client id>/state` by
+    /// default
+    pub notification_topic: Option<String>,
+
+    /// Publish the state on this broker only; with `false`, on the remote
+    /// broker too, which then publishes `0` through the bridge's will when
+    /// the link drops
+    #[serde(default = "default_true")]
+    pub notifications_local_only: bool,
+
     /// Client id on the remote broker; `mercurio-bridge-{name}` by default
     pub client_id: Option<String>,
+
+    /// Keep-alive with the remote broker, in seconds
+    #[serde(default = "default_bridge_keepalive")]
+    pub keepalive: u16,
+
+    /// Start a new session on the remote broker at each connection,
+    /// instead of resuming the one kept there
+    #[serde(default)]
+    pub clean_start: bool,
+
+    /// Seconds the remote broker keeps the bridge's session, and the
+    /// messages for `in` topics, after the link drops
+    #[serde(default = "default_bridge_session_expiry")]
+    pub session_expiry: u32,
 
     pub username: Option<String>,
 
@@ -100,6 +124,23 @@ impl BridgeConfig {
             .clone()
             .unwrap_or_else(|| format!("mercurio-bridge-{}", self.name))
     }
+
+    /// Where the bridge publishes its state.
+    pub fn notification_topic(&self) -> String {
+        self.notification_topic
+            .clone()
+            .unwrap_or_else(|| format!("$SYS/broker/connection/{}/state", self.client_id()))
+    }
+}
+
+fn default_bridge_keepalive() -> u16 {
+    60
+}
+
+/// A day, so messages for `in` topics wait on the remote broker through
+/// short outages
+fn default_bridge_session_expiry() -> u32 {
+    24 * 60 * 60
 }
 
 /// TLS to the remote broker. A CA or a client certificate turns it on
@@ -632,13 +673,23 @@ impl Config {
                     "Two [[bridges]] use the client id `{client_id}`; set a different `client_id` or `name`"
                 ));
             }
-            // The id is a topic level of `$SYS/broker/connection/<id>/state`
-            if bridge.notifications
-                && (client_id.is_empty() || client_id.contains(['/', '+', '#', '\0']))
-            {
-                return Err(format!(
-                    "Bridge {name}: client id `{client_id}` must be a non-empty topic level, without `/`, `+` or `#`, for its state topic; set another `client_id` or `notifications = false`"
-                ));
+            match &bridge.notification_topic {
+                Some(topic) if bridge.notifications => {
+                    if let Err(e) = mercurio_core::topic::validate_publish_topic(topic) {
+                        return Err(format!(
+                            "Bridge {name}: notification_topic `{topic}` is not a topic to publish to: {e}"
+                        ));
+                    }
+                }
+                // The id is a topic level of `$SYS/broker/connection/<id>/state`
+                None if bridge.notifications
+                    && (client_id.is_empty() || client_id.contains(['/', '+', '#', '\0'])) =>
+                {
+                    return Err(format!(
+                        "Bridge {name}: client id `{client_id}` must be a non-empty topic level, without `/`, `+` or `#`, for its state topic; set another `client_id`, a `notification_topic` or `notifications = false`"
+                    ));
+                }
+                _ => {}
             }
             if bridge.tls.cert_path.is_some() != bridge.tls.key_path.is_some() {
                 return Err(format!(
@@ -1419,6 +1470,13 @@ mod tests {
             assert!(check(&[invalid]).is_err(), "{invalid}");
         }
         assert!(check(&["name = \"a/b\"\nnotifications = false"]).is_ok());
+        // A topic of its own needs no single-level client id, but must be
+        // a topic one may publish to
+        assert!(check(&["name = \"a/b\"\nnotification_topic = \"bridges/a/state\""]).is_ok());
+        for invalid in ["bridges/+/state", ""] {
+            let bridge = format!("name = \"a\"\nnotification_topic = \"{invalid}\"");
+            assert!(check(&[&bridge]).is_err(), "{invalid}");
+        }
 
         // Half a client certificate
         assert!(check(&["name = \"a\"\n[bridges.tls]\ncert_path = \"c.pem\""]).is_err());
@@ -1806,6 +1864,10 @@ mod tests {
         assert!(config.listeners.iter().any(|l| l.auth.is_some()));
         assert!(config.listeners.iter().any(|l| l.health && l.metrics));
         assert!(config.bridges.iter().any(|b| !b.topics.is_empty()));
+        assert!(config
+            .bridges
+            .iter()
+            .any(|b| b.notification_topic.is_some()));
 
         let storage = storage.as_table().unwrap();
         for (backend, keys) in [

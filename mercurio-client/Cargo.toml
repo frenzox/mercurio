@@ -15,8 +15,9 @@ all-features = true
 
 [features]
 default = ["tls"]
-# Command-line arguments for connecting, shared by the Mercurio tools
-clap = ["dep:clap", "dep:rpassword"]
+# Command-line arguments for connecting, shared by the Mercurio tools; their
+# --ws needs WebSocket, so the flags don't depend on other crates' features
+clap = ["dep:clap", "dep:rpassword", "websocket"]
 # TLS connections, through rustls, trusting the operating system's
 # certificate store
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]

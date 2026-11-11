@@ -7,7 +7,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::{Args, ValueEnum};
 use mercurio_client::{
-    Event, MessageProperties, MqttClient, QoS, RetainHandling, SubscriptionOptions,
+    Event, MessageProperties, MqttClient, QoS, ReasonCode, RetainHandling, SubscriptionOptions,
 };
 use serde_json::{json, Value};
 use tokio::{signal, time::Instant};
@@ -92,7 +92,10 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     let mut options = args.will.apply(args.connection.to_connect_options()?);
     let reconnect = args.reconnect;
     if let Some(seconds) = reconnect {
-        options = options.reconnect(Duration::from_secs(seconds));
+        // A broker that lost the session lost the subscriptions with it
+        options = options
+            .reconnect(Duration::from_secs(seconds))
+            .resubscribe(true);
     }
 
     let client = MqttClient::connect(options).await?;
@@ -114,19 +117,16 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
         .iter()
         .map(|t| (t.as_str(), subscription_options))
         .collect();
-    let subscribe = || async {
+    let subscribe = async {
         let granted = client
             .subscribe_with(&subscriptions, subscription.subscription_id)
             .await?;
         match granted.iter().find(|result| !result.success) {
-            Some(refused) => Err(Failure::Rejected(format!(
-                "the broker refused the subscription to {}: {}",
-                refused.topic, refused.reason
-            ))),
+            Some(refused) => Err(refused_subscription(&refused.topic, refused.reason)),
             None => Ok(()),
         }
     };
-    if let Err(failure) = subscribe().await {
+    if let Err(failure) = subscribe.await {
         let _ = client.disconnect().await;
         return Err(failure);
     }
@@ -197,15 +197,9 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                         }
                         eprintln!("recado: {}; reconnecting", Failure::disconnected(&reason));
                     }
-                    Some(Event::Reconnected {
-                        session_present, ..
-                    }) => {
-                        eprintln!("recado: reconnected");
-                        // A broker that lost the session lost the
-                        // subscriptions with it
-                        if !session_present {
-                            subscribe().await?;
-                        }
+                    Some(Event::Reconnected { .. }) => eprintln!("recado: reconnected"),
+                    Some(Event::ResubscribeFailed { topic, reason, .. }) => {
+                        return Err(refused_subscription(&topic, reason));
                     }
                     Some(Event::Stopped { error, .. }) => {
                         return Err(Failure::Connection(format!(
@@ -226,6 +220,12 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     let _ = client.disconnect().await;
 
     outcome
+}
+
+fn refused_subscription(topic: &str, reason: ReasonCode) -> Failure {
+    Failure::Rejected(format!(
+        "the broker refused the subscription to {topic}: {reason}"
+    ))
 }
 
 /// Ctrl-C, or SIGTERM as from `kill` or a service manager: either ends the

@@ -26,7 +26,7 @@ pub struct ConnectArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure", "cert", "key"]
+        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure", "cert", "key", "ws"]
     )]
     pub unix: Option<PathBuf>,
 
@@ -68,6 +68,15 @@ pub struct ConnectArgs {
     /// Private key (PEM) of the --cert certificate
     #[arg(long, value_name = "PATH", requires = "cert")]
     pub key: Option<String>,
+
+    /// Speak MQTT over a WebSocket on the host and port: ws://, or wss://
+    /// with --tls
+    #[arg(long)]
+    pub ws: bool,
+
+    /// Path of the WebSocket endpoint [default: /mqtt]
+    #[arg(long, value_name = "PATH", requires = "ws")]
+    pub ws_path: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectArgs {
@@ -85,6 +94,8 @@ impl std::fmt::Debug for ConnectArgs {
             .field("insecure", &self.insecure)
             .field("cert", &self.cert)
             .field("key", &self.key)
+            .field("ws", &self.ws)
+            .field("ws_path", &self.ws_path)
             .finish()
     }
 }
@@ -138,6 +149,9 @@ impl ConnectArgs {
         }
         if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
             options = options.client_cert(cert, key);
+        }
+        if self.ws {
+            options = options.websocket(self.ws_path.as_deref().unwrap_or("/mqtt"));
         }
         options
     }
@@ -260,6 +274,23 @@ mod tests {
         assert!(options.tls.danger_skip_verify);
     }
 
+    #[test]
+    fn websocket_takes_an_optional_path() {
+        let options = parse(&[]).unwrap().to_connect_options();
+        assert_eq!(options.websocket_path, None);
+        let options = parse(&["--ws"]).unwrap().to_connect_options();
+        assert_eq!(options.websocket_path.as_deref(), Some("/mqtt"));
+        let options = parse(&["--ws", "--ws-path", "/ws", "--tls"])
+            .unwrap()
+            .to_connect_options();
+        assert_eq!(options.websocket_path.as_deref(), Some("/ws"));
+        assert!(options.tls.enabled);
+        assert!(
+            parse(&["--ws-path", "/ws"]).is_err(),
+            "--ws-path without --ws"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_unix_socket_replaces_host_port_and_tls() {
@@ -277,6 +308,7 @@ mod tests {
             &["--cafile", "ca.pem"],
             &["--insecure"],
             &["--cert", "c.pem", "--key", "c.key"],
+            &["--ws"],
         ] {
             let args: Vec<&str> = ["--unix", "/x.sock"]
                 .into_iter()

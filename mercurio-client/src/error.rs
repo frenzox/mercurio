@@ -22,7 +22,10 @@ pub enum ClientError {
     ConnectionRefused(ReasonCode),
 
     /// The broker refused the connection and named another server to use
-    /// instead, `reason` saying whether the move is for good.
+    /// instead, `reason` saying whether the move is for good. With
+    /// [`follow_redirects`](crate::ConnectOptions::follow_redirects), the
+    /// last redirection when the hop limit was reached or no server it
+    /// named could be read.
     #[error("Connection refused ({reason:?}), use {server_reference} instead")]
     #[non_exhaustive]
     Redirected {
@@ -65,6 +68,12 @@ pub enum ClientError {
     /// Not Authorized; the message wasn't accepted.
     #[error("Publish refused by the broker: {0:?}")]
     PublishRefused(ReasonCode),
+
+    /// The broker refused the subscription to the response topic of a
+    /// [`request`](crate::MqttClient::request).
+    #[error("Subscription to {topic} refused: {reason:?}")]
+    #[non_exhaustive]
+    SubscribeRefused { topic: String, reason: ReasonCode },
 
     /// The broker sent a packet the client didn't expect at that point.
     #[error("Protocol error: {0}")]

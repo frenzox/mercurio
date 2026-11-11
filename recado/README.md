@@ -74,6 +74,7 @@ Connection options, for both commands:
 | `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
 | `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
+| `--ws`, `--ws-path` | MQTT over WebSocket, `wss://` with `--tls`, at the path given | `/mqtt` |
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a
 message, 2 when it couldn't be reached, refused the login or closed the

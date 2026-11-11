@@ -266,6 +266,40 @@ async fn giving_up_reconnecting_reports_why() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn subscriptions_are_made_again_after_the_session_is_lost() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Grants the subscription, then forgets the session and refuses it
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 256];
+        for reason in [0x00, 0x87] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut buffer).await.unwrap();
+            socket.write_all(&[0x20, 0x03, 0, 0, 0]).await.unwrap();
+            let n = socket.read(&mut buffer).await.unwrap();
+            assert_eq!(buffer[0], 0x82, "SUBSCRIBE {:02x?}", &buffer[..n]);
+            let suback = [0x90, 0x04, buffer[2], buffer[3], 0x00, reason];
+            socket.write_all(&suback).await.unwrap();
+            if reason == 0 {
+                drop(socket);
+            } else {
+                let _ = socket.read(&mut buffer).await;
+            }
+        }
+    });
+
+    let output = Broker { port }
+        .run(&["sub", "-t", "a", "--reconnect", "1"])
+        .await;
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(message.contains("reconnected"), "{message}");
+    assert!(message.contains("subscription to a"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_refused_subscription_fails() {
     let mut config = ServerConfig::default();
     config.limits.max_subscriptions = Some(1);
@@ -606,4 +640,32 @@ async fn sub_fails_when_the_timeout_comes_first() {
         .await;
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(output.stdout, b"here\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_reaches_a_websocket_listener() {
+    use mercurio_server::server::{ListenerConfig, Transport};
+
+    let websocket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let websocket_port = websocket.local_addr().unwrap().port().to_string();
+    let mut config = ServerConfig::default();
+    config.listeners = vec![ListenerConfig::new(websocket, Transport::WebSocket)];
+    let broker = start_with(config).await;
+    let receiver = broker.client("receiver").await;
+    receiver
+        .subscribe(&[("ws", QoS::AtMostOnce)])
+        .await
+        .unwrap();
+
+    for path in [&[][..], &["--ws-path", "/mqtt"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_recado"))
+            .env_clear()
+            .args(["pub", "-H", "127.0.0.1", "-p", &websocket_port, "--ws"])
+            .args(path)
+            .args(["-t", "ws", "-m", "over websocket"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(next_payload(&receiver).await, b"over websocket");
+    }
 }

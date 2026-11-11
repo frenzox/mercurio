@@ -144,6 +144,7 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>--cafile</code></td><td>CA certificates (PEM) to verify the broker with, the only ones then trusted; implies <code>--tls</code></td><td>the operating system's store</td></tr>
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
 <tr><td><code>--cert PATH</code>, <code>--key PATH</code></td><td>Client certificate and its private key, both PEM, for brokers that authenticate clients by certificate; each needs the other, and they imply <code>--tls</code></td><td></td></tr>
+<tr><td><code>--ws</code>, <code>--ws-path PATH</code></td><td>Speak MQTT over a WebSocket on the host and port, <code>wss://</code> with the TLS options, at this path; not with <code>--unix</code></td><td><code>/mqtt</code></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
 </table>
 <pre><span class="comment"># Over TLS, as alice; asks for the password</span>

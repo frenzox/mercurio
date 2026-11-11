@@ -15,7 +15,7 @@ name = "recado"
 path = "src/main.rs"
 
 [dependencies]
-mercurio-client = { path = "../mercurio-client", version = "0.4.1", features = ["clap"] }
+mercurio-client = { path = "../mercurio-client", version = "0.4.1", features = ["clap", "websocket"] }
 
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

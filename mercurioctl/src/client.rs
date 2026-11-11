@@ -2,8 +2,7 @@
 
 use std::{fmt, io, path::Path, time::Duration};
 
-use mercurio_client::Bytes;
-use mercurio_client::{cli::ConnectArgs, ClientError, Event, MessageProperties, MqttClient, QoS};
+use mercurio_client::{cli::ConnectArgs, ClientError, Event, MqttClient, RequestOptions};
 use serde_json::{json, Value};
 
 use crate::commands::{Request, DYNSEC_TOPIC};
@@ -77,7 +76,8 @@ pub fn resolve(mut args: ConnectArgs, admin_socket: &Path) -> ConnectArgs {
             && !args.tls
             && args.cafile.is_none()
             && !args.insecure
-            && args.cert.is_none();
+            && args.cert.is_none()
+            && !args.ws;
         if none_given && admin_socket.exists() {
             args.unix = Some(admin_socket.to_path_buf());
         }
@@ -98,7 +98,7 @@ pub async fn send(
         let client = MqttClient::connect(args.to_connect_options())
             .await
             .map_err(|e| connection_failure(&target(args), e))?;
-        let result = ask(&client, request).await;
+        let result = ask(&client, request, wait).await;
         Ok::<_, Failure>((client, result))
     })
     .await;
@@ -109,17 +109,19 @@ pub async fn send(
             result
         }
         Ok(Err(failure)) => Err(failure),
-        Err(_) => {
-            let mut message = format!("no answer from the broker within {} s", wait.as_secs());
-            // Nothing answers its topic on a broker without it
-            if request.topic == DYNSEC_TOPIC {
-                message.push_str("; is dynamic security enabled?");
-            } else {
-                message.push_str("; is it a Mercurio broker that serves $CONTROL/broker/v1?");
-            }
-            Err(Failure::Connection(message))
-        }
+        Err(_) => Err(no_answer(request, wait)),
     }
+}
+
+fn no_answer(request: &Request, wait: Duration) -> Failure {
+    let mut message = format!("no answer from the broker within {} s", wait.as_secs());
+    // Nothing answers its topic on a broker without it
+    if request.topic == DYNSEC_TOPIC {
+        message.push_str("; is dynamic security enabled?");
+    } else {
+        message.push_str("; is it a Mercurio broker that serves $CONTROL/broker/v1?");
+    }
+    Failure::Connection(message)
 }
 
 /// Connecting to `target` failed with `error`.
@@ -148,58 +150,57 @@ fn target(args: &ConnectArgs) -> String {
     )
 }
 
-async fn ask(client: &MqttClient, request: &Request) -> Result<Option<Value>, Failure> {
-    let response_topic = response_topic(request.topic, &token());
-    let correlation = Bytes::from(token());
-    let granted = client
-        .subscribe(&[(response_topic.as_str(), QoS::AtLeastOnce)])
-        .await
-        .map_err(|e| Failure::Connection(e.to_string()))?;
-    if granted.iter().any(|result| !result.success) {
-        return Err(Failure::Rejected {
-            code: None,
-            message: format!("not allowed to subscribe to {response_topic}"),
-        });
-    }
-    let properties = MessageProperties::default()
-        .response_topic(response_topic.clone())
-        .correlation_data(correlation.clone());
+async fn ask(
+    client: &MqttClient,
+    request: &Request,
+    wait: Duration,
+) -> Result<Option<Value>, Failure> {
     let payload = json!({ "commands": [&request.command] }).to_string();
-    // QoS 1, so a request the broker refuses fails here instead of going
-    // unanswered
-    client
-        .publish_with_properties(request.topic, payload, QoS::AtLeastOnce, false, properties)
-        .await
-        .map_err(|e| match e {
-            ClientError::PublishRefused(reason) => Failure::Rejected {
-                code: None,
-                message: format!(
-                    "the broker refused the request ({})",
-                    camel_case(&format!("{reason:?}"))
-                ),
-            },
-            e => Failure::Connection(e.to_string()),
-        })?;
+    // QoS 1, the default, so a request the broker refuses fails here
+    // instead of going unanswered
+    let options = RequestOptions::new(wait).response_prefix(response_prefix(request.topic));
+    let asking = client.request(request.topic, payload, options);
+    tokio::pin!(asking);
     loop {
-        match client.recv().await {
-            Some(Event::Message {
-                topic,
-                payload,
-                properties,
-                ..
-            }) if topic == response_topic
-                && properties.correlation_data.as_ref() == Some(&correlation) =>
-            {
-                return answer(&payload);
+        tokio::select! {
+            response = &mut asking => {
+                return match response {
+                    Ok(response) => answer(&response.payload),
+                    Err(error) => Err(request_failure(request, wait, error)),
+                };
             }
-            Some(Event::Disconnected { reason }) => {
-                return Err(Failure::Connection(format!(
-                    "the broker closed the connection: {reason:?}"
-                )));
-            }
-            Some(_) => {}
-            None => return Err(Failure::Connection("the connection closed".to_string())),
+            event = client.recv() => match event {
+                Some(Event::Disconnected { reason }) => {
+                    return Err(Failure::Connection(format!(
+                        "the broker closed the connection: {reason:?}"
+                    )));
+                }
+                Some(_) => {}
+                None => return Err(Failure::Connection("the connection closed".to_string())),
+            },
         }
+    }
+}
+
+/// Why `request` failed with `error`.
+fn request_failure(request: &Request, wait: Duration, error: ClientError) -> Failure {
+    match error {
+        ClientError::SubscribeRefused { topic, .. } => Failure::Rejected {
+            code: None,
+            message: format!("not allowed to subscribe to {topic}"),
+        },
+        ClientError::PublishRefused(reason) => Failure::Rejected {
+            code: None,
+            message: format!(
+                "the broker refused the request ({})",
+                camel_case(&format!("{reason:?}"))
+            ),
+        },
+        ClientError::Timeout => no_answer(request, wait),
+        ClientError::Disconnected | ClientError::Closed => {
+            Failure::Connection("the connection closed".to_string())
+        }
+        error => Failure::Connection(error.to_string()),
     }
 }
 
@@ -224,9 +225,10 @@ pub fn answer(payload: &[u8]) -> Result<Option<Value>, Failure> {
 /// Under the request's own topic, which any administrator allowed to send
 /// the request may also subscribe to: dynamic security's older administrator
 /// roles grant `$CONTROL/dynamic-security/#` only. The broker consumes
-/// publishes there without routing them to subscribers.
-fn response_topic(request_topic: &str, token: &str) -> String {
-    format!("{request_topic}/response/{token}")
+/// publishes there without routing them to subscribers. The client adds a
+/// token of its own below it.
+fn response_prefix(request_topic: &str) -> String {
+    format!("{request_topic}/response")
 }
 
 /// `NotAuthorized` as `notAuthorized`, how command errors spell their codes.
@@ -238,15 +240,6 @@ fn camel_case(name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 16 hex digits another run is unlikely to pick: `RandomState`'s keys are
-/// seeded from the operating system for each process.
-fn token() -> String {
-    use std::hash::BuildHasher;
-
-    let random = std::collections::hash_map::RandomState::new();
-    format!("{:016x}", random.hash_one(std::process::id()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -254,7 +247,7 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
-    use super::{answer, camel_case, connection_failure, resolve, response_topic, token, Failure};
+    use super::{answer, camel_case, connection_failure, resolve, response_prefix, Failure};
     use crate::cli::Cli;
 
     #[test]
@@ -315,6 +308,7 @@ mod tests {
             &["--cafile", "ca.pem"],
             &["--insecure"],
             &["--cert", "c.pem", "--key", "c.key"],
+            &["--ws"],
         ] {
             assert_eq!(resolve(connect(options), &socket).unix, None, "{options:?}");
         }
@@ -391,13 +385,10 @@ mod tests {
     fn responses_come_back_under_the_request_topic() {
         use crate::commands::{BROKER_TOPIC, DYNSEC_TOPIC};
 
+        assert_eq!(response_prefix(BROKER_TOPIC), "$CONTROL/broker/v1/response");
         assert_eq!(
-            response_topic(BROKER_TOPIC, "ab"),
-            "$CONTROL/broker/v1/response/ab"
-        );
-        assert_eq!(
-            response_topic(DYNSEC_TOPIC, "ab"),
-            "$CONTROL/dynamic-security/v1/response/ab"
+            response_prefix(DYNSEC_TOPIC),
+            "$CONTROL/dynamic-security/v1/response"
         );
     }
 
@@ -405,13 +396,5 @@ mod tests {
     fn reason_codes_are_spelled_like_command_errors() {
         assert_eq!(camel_case("NotAuthorized"), "notAuthorized");
         assert_eq!(camel_case(""), "");
-    }
-
-    #[test]
-    fn tokens_are_sixteen_hex_digits_and_differ() {
-        let (a, b) = (token(), token());
-        assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
-        assert_ne!(a, b);
     }
 }

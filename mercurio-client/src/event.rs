@@ -36,6 +36,12 @@ pub enum Event {
     #[non_exhaustive]
     Reconnected { session_present: bool },
 
+    /// With [`resubscribe`](crate::ConnectOptions::resubscribe) on, the
+    /// broker refused to take back this subscription after reconnecting
+    /// without a session; the client forgets it.
+    #[non_exhaustive]
+    ResubscribeFailed { topic: String, reason: ReasonCode },
+
     /// Reconnecting failed for good, as when the broker refused the
     /// credentials; the last event before [`MqttClient::recv`] returns
     /// `None`.
@@ -43,6 +49,16 @@ pub enum Event {
     /// [`MqttClient::recv`]: crate::MqttClient::recv
     #[non_exhaustive]
     Stopped { error: Arc<ClientError> },
+}
+
+/// The answer to [`MqttClient::request`](crate::MqttClient::request).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Response {
+    /// The response topic it came on
+    pub topic: String,
+    pub payload: Bytes,
+    pub properties: MessageProperties,
 }
 
 /// Identifies a received message to acknowledge, with manual
