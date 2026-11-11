@@ -316,7 +316,7 @@ impl Decoder for bool {
 impl Encoder for Bytes {
     fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
         put_length(self.len(), buffer)?;
-        buffer.extend(self);
+        buffer.extend_from_slice(self);
         Ok(())
     }
 

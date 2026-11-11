@@ -176,7 +176,7 @@ impl PublishPacket {
 
         // Payload. Here it goes raw, shouldn't be encoded
         if let Some(payload) = &self.payload {
-            buffer.extend(payload);
+            buffer.extend_from_slice(payload);
         }
         Ok(())
     }
