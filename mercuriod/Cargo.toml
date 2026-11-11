@@ -30,6 +30,7 @@ mercurio-storage = { path = "../mercurio-storage", version = "0.4.0", features =
 
 argon2 = "0.6"
 clap.workspace = true
+getrandom.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 toml = "1"

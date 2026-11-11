@@ -214,6 +214,14 @@ fn escape_username(username: &str) -> String {
     username.replace('=', "=3D").replace(',', "=2C")
 }
 
+/// `name` prepared with SASLprep, or None if it is refused or left empty.
+pub fn prepare_username(name: &str) -> Option<String> {
+    stringprep::saslprep(name)
+        .ok()
+        .map(|prepared| prepared.into_owned())
+        .filter(|prepared| !prepared.is_empty())
+}
+
 /// A `saslname` back as the user name, or None if an `=` escapes anything
 /// else.
 fn unescape_username(name: &str) -> Option<String> {
@@ -272,6 +280,8 @@ pub enum Error {
     OutOfOrder,
     /// The operating system's random source failed.
     Random(String),
+    /// SASLprep refuses the user name, or leaves it empty.
+    InvalidUsername,
 }
 
 impl fmt::Display for Error {
@@ -279,6 +289,7 @@ impl fmt::Display for Error {
         match self {
             Error::Malformed(what) => write!(f, "malformed SCRAM message from the server: {what}"),
             Error::Server(error) => write!(f, "the server refused SCRAM authentication: {error}"),
+            Error::InvalidUsername => f.write_str("the user name is not valid for SCRAM"),
             Error::NonceMismatch => f.write_str("the server's SCRAM nonce does not extend ours"),
             Error::TooFewIterations(i) => write!(
                 f,
@@ -342,20 +353,21 @@ impl ScramClient {
     /// Begins an exchange with a random nonce: the `client-first-message`.
     pub fn start(&mut self) -> Result<String, Error> {
         let nonce = random_nonce().map_err(Error::Random)?;
-        Ok(self.start_with_nonce(&nonce))
+        self.start_with_nonce(&nonce)
     }
 
     /// Begins an exchange with `nonce`, which must be printable ASCII
     /// without `,` and never used before. For tests; use
     /// [`start`](Self::start).
-    pub fn start_with_nonce(&mut self, nonce: &str) -> String {
-        let first_bare = format!("n={},r={nonce}", escape_username(&self.username));
+    pub fn start_with_nonce(&mut self, nonce: &str) -> Result<String, Error> {
+        let username = prepare_username(&self.username).ok_or(Error::InvalidUsername)?;
+        let first_bare = format!("n={},r={nonce}", escape_username(&username));
         let message = format!("{GS2_HEADER}{first_bare}");
         self.state = ClientState::SentFirst {
             nonce: nonce.to_string(),
             first_bare,
         };
-        message
+        Ok(message)
     }
 
     /// Answers the `server-first-message` with the
@@ -521,13 +533,14 @@ impl ClientFirst {
             _ => return Err(ServerError::InvalidEncoding),
         };
         let username = unescape_username(name)
-            .filter(|u| !u.is_empty())
+            .and_then(|u| prepare_username(&u))
             .ok_or(ServerError::InvalidUsernameEncoding)?;
         // Logging in as someone else is not offered
         if !authzid.is_empty() {
             let authzid = authzid
                 .strip_prefix("a=")
                 .and_then(unescape_username)
+                .and_then(|a| prepare_username(&a))
                 .ok_or(ServerError::InvalidEncoding)?;
             if authzid != username {
                 return Err(ServerError::OtherError);
@@ -641,6 +654,31 @@ impl AwaitingProof {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn user_names_are_prepared_with_saslprep() {
+        // U+2168 ROMAN NUMERAL NINE maps to "IX"; U+00AD SOFT HYPHEN maps to nothing
+        let mut client = ScramClient::new("us\u{00AD}er\u{2168}", "pencil");
+        let first = client.start_with_nonce("rOprNGfwEbeRWgbNEkqO").unwrap();
+        assert_eq!(first, "n,,n=userIX,r=rOprNGfwEbeRWgbNEkqO");
+
+        let parsed = ClientFirst::parse("n,,n=us\u{00AD}er\u{2168},r=abc".as_bytes()).unwrap();
+        assert_eq!(parsed.username(), "userIX");
+    }
+
+    #[test]
+    fn user_names_saslprep_refuses_fail_the_exchange() {
+        // U+0007 is a prohibited control character
+        let mut client = ScramClient::new("us\u{0007}er", "pencil");
+        assert!(matches!(
+            client.start_with_nonce("rOprNGfwEbeRWgbNEkqO"),
+            Err(Error::InvalidUsername)
+        ));
+        assert_eq!(
+            ClientFirst::parse("n,,n=us\u{0007}er,r=abc".as_bytes()).err(),
+            Some(ServerError::InvalidUsernameEncoding)
+        );
+    }
     use super::*;
 
     // RFC 7677, section 3
@@ -661,7 +699,7 @@ mod tests {
     #[test]
     fn client_follows_the_rfc_7677_example() {
         let mut client = ScramClient::new("user", "pencil");
-        assert_eq!(client.start_with_nonce(CLIENT_NONCE), CLIENT_FIRST);
+        assert_eq!(client.start_with_nonce(CLIENT_NONCE).unwrap(), CLIENT_FIRST);
         assert_eq!(
             client.respond(SERVER_FIRST.as_bytes()).unwrap(),
             CLIENT_FINAL
@@ -727,7 +765,7 @@ mod tests {
             "",
         ] {
             let mut client = ScramClient::new("user", "pencil");
-            client.start_with_nonce(CLIENT_NONCE);
+            client.start_with_nonce(CLIENT_NONCE).unwrap();
             client.respond(SERVER_FIRST.as_bytes()).unwrap();
             assert_eq!(
                 client.finish(server_final.as_bytes()).unwrap_err(),
@@ -736,7 +774,7 @@ mod tests {
             );
         }
         let mut client = ScramClient::new("user", "pencil");
-        client.start_with_nonce(CLIENT_NONCE);
+        client.start_with_nonce(CLIENT_NONCE).unwrap();
         client.respond(SERVER_FIRST.as_bytes()).unwrap();
         assert_eq!(
             client.finish(b"e=invalid-proof").unwrap_err(),
@@ -744,7 +782,7 @@ mod tests {
         );
         // Accepted without the exchange having run
         let mut client = ScramClient::new("user", "pencil");
-        client.start_with_nonce(CLIENT_NONCE);
+        client.start_with_nonce(CLIENT_NONCE).unwrap();
         assert_eq!(
             client.finish(SERVER_FINAL.as_bytes()).unwrap_err(),
             Error::OutOfOrder
@@ -755,7 +793,7 @@ mod tests {
     fn the_client_checks_the_server_first_message() {
         let respond = |server_first: &str| {
             let mut client = ScramClient::new("user", "pencil");
-            client.start_with_nonce(CLIENT_NONCE);
+            client.start_with_nonce(CLIENT_NONCE).unwrap();
             client.respond(server_first.as_bytes())
         };
         assert_eq!(
@@ -787,12 +825,12 @@ mod tests {
     #[test]
     fn the_salted_password_is_reused_for_the_same_salt_and_count() {
         let mut client = ScramClient::new("user", "pencil");
-        client.start_with_nonce(CLIENT_NONCE);
+        client.start_with_nonce(CLIENT_NONCE).unwrap();
         client.respond(SERVER_FIRST.as_bytes()).unwrap();
         let cached = client.salted.clone().unwrap();
         // Another password would give another proof, unless the cache is used
         client.password = "other".into();
-        client.start_with_nonce(CLIENT_NONCE);
+        client.start_with_nonce(CLIENT_NONCE).unwrap();
         assert_eq!(
             client.respond(SERVER_FIRST.as_bytes()).unwrap(),
             CLIENT_FINAL
@@ -835,7 +873,7 @@ mod tests {
     #[test]
     fn user_names_are_escaped_both_ways() {
         let mut client = ScramClient::new("a,b=c", "pencil");
-        let first = client.start_with_nonce(CLIENT_NONCE);
+        let first = client.start_with_nonce(CLIENT_NONCE).unwrap();
         assert_eq!(first, "n,,n=a=2Cb=3Dc,r=rOprNGfwEbeRWgbNEkqO");
         assert_eq!(
             ClientFirst::parse(first.as_bytes()).unwrap().username(),
