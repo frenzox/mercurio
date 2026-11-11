@@ -251,9 +251,14 @@ pub enum Event {
     /// A subscription was removed.
     #[non_exhaustive]
     Unsubscribed { client: ClientInfo, filter: String },
-    /// A session ended because its expiry interval passed.
+    /// A session ended because its expiry interval passed. `mount_point`
+    /// is that of the listener its client connected to, which with the
+    /// client id names the session.
     #[non_exhaustive]
-    SessionExpired { client_id: String },
+    SessionExpired {
+        client_id: String,
+        mount_point: Option<String>,
+    },
 }
 
 impl Event {
@@ -936,6 +941,7 @@ mod tests {
     fn expired(client_id: &str) -> Event {
         Event::SessionExpired {
             client_id: client_id.into(),
+            mount_point: None,
         }
     }
 

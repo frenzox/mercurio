@@ -36,7 +36,7 @@ use tracing::{info, warn};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore,
+    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore, SessionKey,
     SessionOwner, SessionState, StorageError, StoredBan, StoredClient, StoredSubscription,
     StoredWillMessage, TopicRange, Write,
 };
@@ -233,6 +233,58 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS retained_messages_expires_at
         ON retained_messages (expires_at) WHERE expires_at IS NOT NULL;
 ",
+    // The mount point becomes part of the key of every table of a client's
+    // state, so the same client id on two mount points keeps two sessions.
+    // Rows take the mount point of their session's owner, and those without
+    // a session none, an empty string. Done once, while the primary key of
+    // sessions lacks the mount point: run again, the rows of a client id
+    // with sessions on two mount points would match both.
+    "
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+            WHERE i.indrelid = 'sessions'::regclass AND i.indisprimary
+                AND a.attname = 'mount_point'
+        ) THEN
+            RETURN;
+        END IF;
+
+        ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE sessions SET mount_point = COALESCE(owner_mount_point, '');
+
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE subscriptions t SET mount_point = s.mount_point
+            FROM sessions s WHERE s.client_id = t.client_id;
+        ALTER TABLE will_messages ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE will_messages t SET mount_point = s.mount_point
+            FROM sessions s WHERE s.client_id = t.client_id;
+        ALTER TABLE queued_messages ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE queued_messages t SET mount_point = s.mount_point
+            FROM sessions s WHERE s.client_id = t.client_id;
+        ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE inflight_messages t SET mount_point = s.mount_point
+            FROM sessions s WHERE s.client_id = t.client_id;
+        ALTER TABLE incoming_qos2 ADD COLUMN IF NOT EXISTS mount_point TEXT NOT NULL DEFAULT '';
+        UPDATE incoming_qos2 t SET mount_point = s.mount_point
+            FROM sessions s WHERE s.client_id = t.client_id;
+
+        ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_pkey,
+            ADD PRIMARY KEY (mount_point, client_id);
+        ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_pkey,
+            ADD PRIMARY KEY (mount_point, client_id, topic_filter);
+        ALTER TABLE will_messages DROP CONSTRAINT IF EXISTS will_messages_pkey,
+            ADD PRIMARY KEY (mount_point, client_id);
+        ALTER TABLE queued_messages DROP CONSTRAINT IF EXISTS queued_messages_pkey,
+            ADD PRIMARY KEY (mount_point, client_id, sequence);
+        ALTER TABLE inflight_messages DROP CONSTRAINT IF EXISTS inflight_messages_pkey,
+            ADD PRIMARY KEY (mount_point, client_id, packet_id);
+        ALTER TABLE incoming_qos2 DROP CONSTRAINT IF EXISTS incoming_qos2_pkey,
+            ADD PRIMARY KEY (mount_point, client_id, packet_id);
+    END
+    $$;
+",
 ];
 
 /// The migration that creates the subscriptions table, after which
@@ -315,12 +367,38 @@ async fn move_subscriptions(client: &tokio_postgres::Client) -> Result<()> {
         else {
             continue;
         };
-        let (sql, params) = insert_subscriptions(&client_id, &subscriptions, "NOTHING");
-        let params: Vec<&(dyn ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-            .collect();
-        client.execute(sql, &params).await.db()?;
+        // The table as it was before the mount point was part of its key
+        client
+            .execute(
+                "INSERT INTO subscriptions
+                 (client_id, topic_filter, qos, no_local, retain_as_published,
+                  subscription_identifier)
+                 SELECT $1, * FROM unnest($2::TEXT[], $3::INTEGER[], $4::BOOLEAN[],
+                                          $5::BOOLEAN[], $6::BIGINT[])
+                 ON CONFLICT DO NOTHING",
+                &[
+                    &client_id,
+                    &subscriptions
+                        .iter()
+                        .map(|s| s.topic_filter.clone())
+                        .collect::<Vec<_>>(),
+                    &subscriptions
+                        .iter()
+                        .map(|s| qos_to_int(s.qos))
+                        .collect::<Vec<_>>(),
+                    &subscriptions.iter().map(|s| s.no_local).collect::<Vec<_>>(),
+                    &subscriptions
+                        .iter()
+                        .map(|s| s.retain_as_published)
+                        .collect::<Vec<_>>(),
+                    &subscriptions
+                        .iter()
+                        .map(|s| s.subscription_identifier.map(i64::from))
+                        .collect::<Vec<_>>(),
+                ],
+            )
+            .await
+            .db()?;
         client
             .execute(
                 "UPDATE sessions SET subscriptions = ''::BYTEA WHERE client_id = $1",
@@ -761,116 +839,130 @@ fn tls(ca_path: Option<&Path>) -> Result<MakeRustlsConnect> {
 
 type Params = Vec<Box<dyn ToSql + Sync + Send>>;
 
-/// Inserts `subscriptions` of `client_id`, doing `on_conflict`, `NOTHING`
-/// or `UPDATE`, for those already stored.
+/// The client's mount point and id, `$1` and `$2` of its statements.
+fn key_params(key: &SessionKey) -> Params {
+    vec![
+        Box::new(key.stored_mount_point().to_string()),
+        Box::new(key.client_id.clone()),
+    ]
+}
+
+/// `key_params` followed by `more`.
+fn with_key(key: &SessionKey, more: Params) -> Params {
+    let mut params = key_params(key);
+    params.extend(more);
+    params
+}
+
+/// Inserts or updates `subscriptions` of the client of `key`, if it has a
+/// stored session.
 fn insert_subscriptions(
-    client_id: &str,
+    key: &SessionKey,
     subscriptions: &[StoredSubscription],
-    on_conflict: &str,
 ) -> (&'static str, Params) {
-    let sql = match on_conflict {
-        "NOTHING" => {
-            "INSERT INTO subscriptions
-             (client_id, topic_filter, qos, no_local, retain_as_published,
-              subscription_identifier)
-             SELECT $1, * FROM unnest($2::TEXT[], $3::INTEGER[], $4::BOOLEAN[], $5::BOOLEAN[],
-                                      $6::BIGINT[])
-             ON CONFLICT DO NOTHING"
-        }
-        _ => {
-            "INSERT INTO subscriptions
-             (client_id, topic_filter, qos, no_local, retain_as_published,
-              subscription_identifier)
-             SELECT $1, * FROM unnest($2::TEXT[], $3::INTEGER[], $4::BOOLEAN[], $5::BOOLEAN[],
-                                      $6::BIGINT[])
-             WHERE EXISTS (SELECT 1 FROM sessions WHERE client_id = $1)
-             ON CONFLICT (client_id, topic_filter) DO UPDATE SET
-             qos = EXCLUDED.qos, no_local = EXCLUDED.no_local,
-             retain_as_published = EXCLUDED.retain_as_published,
-             subscription_identifier = EXCLUDED.subscription_identifier"
-        }
-    };
     (
-        sql,
-        vec![
-            Box::new(client_id.to_string()),
-            column(subscriptions, |s| s.topic_filter.clone()),
-            column(subscriptions, |s| qos_to_int(s.qos)),
-            column(subscriptions, |s| s.no_local),
-            column(subscriptions, |s| s.retain_as_published),
-            column(subscriptions, |s| s.subscription_identifier.map(i64::from)),
-        ],
+        "INSERT INTO subscriptions
+         (mount_point, client_id, topic_filter, qos, no_local, retain_as_published,
+          subscription_identifier)
+         SELECT $1, $2, * FROM unnest($3::TEXT[], $4::INTEGER[], $5::BOOLEAN[], $6::BOOLEAN[],
+                                      $7::BIGINT[])
+         WHERE EXISTS (SELECT 1 FROM sessions WHERE mount_point = $1 AND client_id = $2)
+         ON CONFLICT (mount_point, client_id, topic_filter) DO UPDATE SET
+         qos = EXCLUDED.qos, no_local = EXCLUDED.no_local,
+         retain_as_published = EXCLUDED.retain_as_published,
+         subscription_identifier = EXCLUDED.subscription_identifier",
+        with_key(
+            key,
+            vec![
+                column(subscriptions, |s| s.topic_filter.clone()),
+                column(subscriptions, |s| qos_to_int(s.qos)),
+                column(subscriptions, |s| s.no_local),
+                column(subscriptions, |s| s.retain_as_published),
+                column(subscriptions, |s| s.subscription_identifier.map(i64::from)),
+            ],
+        ),
     )
 }
 
-/// The statements that apply `write` for `client_id`, other than those
-/// applied in bulk.
-fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
-    let id = || -> Box<dyn ToSql + Sync + Send> { Box::new(client_id.to_string()) };
+/// The statements that apply `write` for the client of `key`, other than
+/// those applied in bulk.
+fn statements(key: &SessionKey, write: &Write) -> Vec<(&'static str, Params)> {
     match write {
         Write::SaveSession(session) => vec![
             (
                 "INSERT INTO sessions
-                 (client_id, subscriptions, clean_start, expiry_interval, expires_at,
-                  owner_username, owner_mount_point)
-                 VALUES ($1, ''::BYTEA, $2, $3, $4, $5, $6)
-                 ON CONFLICT (client_id) DO UPDATE SET
+                 (mount_point, client_id, subscriptions, clean_start, expiry_interval,
+                  expires_at, owner_username, owner_mount_point)
+                 VALUES ($1, $2, ''::BYTEA, $3, $4, $5, $6, $7)
+                 ON CONFLICT (mount_point, client_id) DO UPDATE SET
                  subscriptions = EXCLUDED.subscriptions, clean_start = EXCLUDED.clean_start,
                  expiry_interval = EXCLUDED.expiry_interval, expires_at = EXCLUDED.expires_at,
                  owner_username = EXCLUDED.owner_username,
                  owner_mount_point = EXCLUDED.owner_mount_point",
-                vec![
-                    id(),
-                    // No longer used; kept for databases that require it
-                    Box::new(false),
-                    Box::new(session.expiry_interval.map(i64::from)),
-                    Box::new(session.expires_at.map(|t| t as i64)),
-                    Box::new(session.owner.username.clone()),
-                    Box::new(session.owner.mount_point.clone()),
-                ],
+                with_key(
+                    key,
+                    vec![
+                        // No longer used; kept for databases that require it
+                        Box::new(false),
+                        Box::new(session.expiry_interval.map(i64::from)),
+                        Box::new(session.expires_at.map(|t| t as i64)),
+                        Box::new(session.owner.username.clone()),
+                        Box::new(session.owner.mount_point.clone()),
+                    ],
+                ),
             ),
-            ("DELETE FROM subscriptions WHERE client_id = $1", vec![id()]),
-            insert_subscriptions(client_id, &session.subscriptions, "UPDATE"),
+            (
+                "DELETE FROM subscriptions WHERE mount_point = $1 AND client_id = $2",
+                key_params(key),
+            ),
+            insert_subscriptions(key, &session.subscriptions),
         ],
-        Write::AddSubscription(subscription) => vec![insert_subscriptions(
-            client_id,
-            std::slice::from_ref(subscription),
-            "UPDATE",
-        )],
+        Write::AddSubscription(subscription) => {
+            vec![insert_subscriptions(
+                key,
+                std::slice::from_ref(subscription),
+            )]
+        }
         Write::RemoveSubscription(topic_filter) => vec![(
-            "DELETE FROM subscriptions WHERE client_id = $1 AND topic_filter = $2",
-            vec![id(), Box::new(topic_filter.clone())],
+            "DELETE FROM subscriptions
+             WHERE mount_point = $1 AND client_id = $2 AND topic_filter = $3",
+            with_key(key, vec![Box::new(topic_filter.clone())]),
         )],
         Write::SetExpiry {
             interval,
             expires_at,
         } => vec![(
-            "UPDATE sessions SET expiry_interval = $2, expires_at = $3 WHERE client_id = $1",
-            vec![
-                id(),
-                Box::new(i64::from(*interval)),
-                Box::new(*expires_at as i64),
-            ],
+            "UPDATE sessions SET expiry_interval = $3, expires_at = $4
+             WHERE mount_point = $1 AND client_id = $2",
+            with_key(
+                key,
+                vec![Box::new(i64::from(*interval)), Box::new(*expires_at as i64)],
+            ),
         )],
         Write::StoreWill(will) => vec![(
             "INSERT INTO will_messages
-             (client_id, topic, payload, qos, retain, delay_secs, properties)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (client_id) DO UPDATE SET
+             (mount_point, client_id, topic, payload, qos, retain, delay_secs, properties)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (mount_point, client_id) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              retain = EXCLUDED.retain, delay_secs = EXCLUDED.delay_secs,
              properties = EXCLUDED.properties",
-            vec![
-                id(),
-                Box::new(will.topic.clone()),
-                Box::new(will.payload.to_vec()),
-                Box::new(qos_to_int(will.qos)),
-                Box::new(will.retain),
-                Box::new(i64::from(will.delay_secs)),
-                Box::new(encode_properties(&will.properties)),
-            ],
+            with_key(
+                key,
+                vec![
+                    Box::new(will.topic.clone()),
+                    Box::new(will.payload.to_vec()),
+                    Box::new(qos_to_int(will.qos)),
+                    Box::new(will.retain),
+                    Box::new(i64::from(will.delay_secs)),
+                    Box::new(encode_properties(&will.properties)),
+                ],
+            ),
         )],
-        Write::DeleteWill => vec![("DELETE FROM will_messages WHERE client_id = $1", vec![id()])],
+        Write::DeleteWill => vec![(
+            "DELETE FROM will_messages WHERE mount_point = $1 AND client_id = $2",
+            key_params(key),
+        )],
         Write::StoreInflight(_)
         | Write::ReleaseInflight(_)
         | Write::RemoveInflight(_)
@@ -881,23 +973,20 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
             unreachable!("applied in bulk by bulk_statements")
         }
         Write::ClearQueue => vec![(
-            "DELETE FROM queued_messages WHERE client_id = $1",
-            vec![id()],
+            "DELETE FROM queued_messages WHERE mount_point = $1 AND client_id = $2",
+            key_params(key),
         )],
-        Write::DeleteSession => vec![
-            ("DELETE FROM sessions WHERE client_id = $1", vec![id()]),
-            ("DELETE FROM subscriptions WHERE client_id = $1", vec![id()]),
-            ("DELETE FROM will_messages WHERE client_id = $1", vec![id()]),
-            (
-                "DELETE FROM queued_messages WHERE client_id = $1",
-                vec![id()],
-            ),
-            (
-                "DELETE FROM inflight_messages WHERE client_id = $1",
-                vec![id()],
-            ),
-            ("DELETE FROM incoming_qos2 WHERE client_id = $1", vec![id()]),
-        ],
+        Write::DeleteSession => [
+            "DELETE FROM sessions WHERE mount_point = $1 AND client_id = $2",
+            "DELETE FROM subscriptions WHERE mount_point = $1 AND client_id = $2",
+            "DELETE FROM will_messages WHERE mount_point = $1 AND client_id = $2",
+            "DELETE FROM queued_messages WHERE mount_point = $1 AND client_id = $2",
+            "DELETE FROM inflight_messages WHERE mount_point = $1 AND client_id = $2",
+            "DELETE FROM incoming_qos2 WHERE mount_point = $1 AND client_id = $2",
+        ]
+        .into_iter()
+        .map(|sql| (sql, key_params(key)))
+        .collect(),
     }
 }
 
@@ -914,7 +1003,7 @@ enum Fate<'a> {
 /// costs about as much as the rows it writes. The changes of a run touch
 /// rows by key only, so applying each key's final state in any order is
 /// the same as applying them in order.
-fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params)> {
+fn bulk_statements(key: &SessionKey, run: &[&Write]) -> Vec<(&'static str, Params)> {
     let mut fates: HashMap<u16, Fate> = HashMap::new();
     // None once removed
     let mut queued: BTreeMap<u64, Option<&Message>> = BTreeMap::new();
@@ -951,7 +1040,6 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
         }
     }
 
-    let id = || -> Box<dyn ToSql + Sync + Send> { Box::new(client_id.to_string()) };
     let mut statements: Vec<(&'static str, Params)> = Vec::new();
     let ids_of = |wanted: fn(&Fate) -> bool| -> Vec<i32> {
         fates
@@ -963,16 +1051,17 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
     let removed = ids_of(|fate| matches!(fate, Fate::Removed));
     if !removed.is_empty() {
         statements.push((
-            "DELETE FROM inflight_messages WHERE client_id = $1 AND packet_id = ANY($2)",
-            vec![id(), Box::new(removed)],
+            "DELETE FROM inflight_messages
+             WHERE mount_point = $1 AND client_id = $2 AND packet_id = ANY($3)",
+            with_key(key, vec![Box::new(removed)]),
         ));
     }
     let released = ids_of(|fate| matches!(fate, Fate::Released));
     if !released.is_empty() {
         statements.push((
             "UPDATE inflight_messages SET released = TRUE, payload = NULL
-             WHERE client_id = $1 AND packet_id = ANY($2)",
-            vec![id(), Box::new(released)],
+             WHERE mount_point = $1 AND client_id = $2 AND packet_id = ANY($3)",
+            with_key(key, vec![Box::new(released)]),
         ));
     }
     let stored: Vec<(&InflightMessage, bool)> = fates
@@ -985,33 +1074,36 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
     if !stored.is_empty() {
         statements.push((
             "INSERT INTO inflight_messages
-             (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-              subscription_identifiers, retain, expires_at)
-             SELECT $1, * FROM unnest($2::INTEGER[], $3::TEXT[], $4::BYTEA[], $5::INTEGER[],
-                                      $6::BOOLEAN[], $7::BIGINT[], $8::BOOLEAN[], $9::BYTEA[],
-                                      $10::TEXT[], $11::BOOLEAN[], $12::BIGINT[])
-             ON CONFLICT (client_id, packet_id) DO UPDATE SET
+             (mount_point, client_id, packet_id, topic, payload, qos, dup, sequence, released,
+              properties, subscription_identifiers, retain, expires_at)
+             SELECT $1, $2, * FROM unnest($3::INTEGER[], $4::TEXT[], $5::BYTEA[],
+                                          $6::INTEGER[], $7::BOOLEAN[], $8::BIGINT[],
+                                          $9::BOOLEAN[], $10::BYTEA[], $11::TEXT[],
+                                          $12::BOOLEAN[], $13::BIGINT[])
+             ON CONFLICT (mount_point, client_id, packet_id) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              dup = EXCLUDED.dup, sequence = EXCLUDED.sequence, released = EXCLUDED.released,
              properties = EXCLUDED.properties,
              subscription_identifiers = EXCLUDED.subscription_identifiers,
              retain = EXCLUDED.retain, expires_at = EXCLUDED.expires_at",
-            vec![
-                id(),
-                column(&stored, |(m, _)| i32::from(m.packet_id)),
-                column(&stored, |(m, _)| m.topic.clone()),
-                column(&stored, |(m, released)| {
-                    m.payload.as_ref().filter(|_| !released).map(|p| p.to_vec())
-                }),
-                column(&stored, |(m, _)| qos_to_int(m.qos)),
-                column(&stored, |(m, _)| m.dup),
-                column(&stored, |(m, _)| m.sequence as i64),
-                column(&stored, |(m, released)| m.released || *released),
-                column(&stored, |(m, _)| encode_properties(&m.properties)),
-                column(&stored, |(m, _)| identifiers(&m.subscription_identifiers)),
-                column(&stored, |(m, _)| m.retain),
-                column(&stored, |(m, _)| m.expires_at.map(|t| t as i64)),
-            ],
+            with_key(
+                key,
+                vec![
+                    column(&stored, |(m, _)| i32::from(m.packet_id)),
+                    column(&stored, |(m, _)| m.topic.clone()),
+                    column(&stored, |(m, released)| {
+                        m.payload.as_ref().filter(|_| !released).map(|p| p.to_vec())
+                    }),
+                    column(&stored, |(m, _)| qos_to_int(m.qos)),
+                    column(&stored, |(m, _)| m.dup),
+                    column(&stored, |(m, _)| m.sequence as i64),
+                    column(&stored, |(m, released)| m.released || *released),
+                    column(&stored, |(m, _)| encode_properties(&m.properties)),
+                    column(&stored, |(m, _)| identifiers(&m.subscription_identifiers)),
+                    column(&stored, |(m, _)| m.retain),
+                    column(&stored, |(m, _)| m.expires_at.map(|t| t as i64)),
+                ],
+            ),
         ));
     }
     let incoming_ids = |stored: bool| -> Vec<i32> {
@@ -1024,17 +1116,18 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
     let released_ids = incoming_ids(false);
     if !released_ids.is_empty() {
         statements.push((
-            "DELETE FROM incoming_qos2 WHERE client_id = $1 AND packet_id = ANY($2)",
-            vec![id(), Box::new(released_ids)],
+            "DELETE FROM incoming_qos2
+             WHERE mount_point = $1 AND client_id = $2 AND packet_id = ANY($3)",
+            with_key(key, vec![Box::new(released_ids)]),
         ));
     }
     let received_ids = incoming_ids(true);
     if !received_ids.is_empty() {
         statements.push((
-            "INSERT INTO incoming_qos2 (client_id, packet_id)
-             SELECT $1, * FROM unnest($2::INTEGER[])
+            "INSERT INTO incoming_qos2 (mount_point, client_id, packet_id)
+             SELECT $1, $2, * FROM unnest($3::INTEGER[])
              ON CONFLICT DO NOTHING",
-            vec![id(), Box::new(received_ids)],
+            with_key(key, vec![Box::new(received_ids)]),
         ));
     }
     let dequeued: Vec<i64> = queued
@@ -1044,8 +1137,9 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
         .collect();
     if !dequeued.is_empty() {
         statements.push((
-            "DELETE FROM queued_messages WHERE client_id = $1 AND sequence = ANY($2)",
-            vec![id(), Box::new(dequeued)],
+            "DELETE FROM queued_messages
+             WHERE mount_point = $1 AND client_id = $2 AND sequence = ANY($3)",
+            with_key(key, vec![Box::new(dequeued)]),
         ));
     }
     let queued: Vec<(&u64, &&Message)> = queued
@@ -1055,26 +1149,29 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
     if !queued.is_empty() {
         statements.push((
             "INSERT INTO queued_messages
-             (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
-              subscription_identifiers)
-             SELECT $1, * FROM unnest($2::BIGINT[], $3::TEXT[], $4::BYTEA[], $5::INTEGER[],
-                                      $6::BOOLEAN[], $7::BYTEA[], $8::BIGINT[], $9::TEXT[])
-             ON CONFLICT (client_id, sequence) DO UPDATE SET
+             (mount_point, client_id, sequence, topic, payload, qos, retain, properties,
+              expires_at, subscription_identifiers)
+             SELECT $1, $2, * FROM unnest($3::BIGINT[], $4::TEXT[], $5::BYTEA[],
+                                          $6::INTEGER[], $7::BOOLEAN[], $8::BYTEA[],
+                                          $9::BIGINT[], $10::TEXT[])
+             ON CONFLICT (mount_point, client_id, sequence) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              retain = EXCLUDED.retain, properties = EXCLUDED.properties,
              expires_at = EXCLUDED.expires_at,
              subscription_identifiers = EXCLUDED.subscription_identifiers",
-            vec![
-                id(),
-                column(&queued, |(s, _)| **s as i64),
-                column(&queued, |(_, m)| m.topic.to_string()),
-                column(&queued, |(_, m)| m.payload.as_ref().map(|p| p.to_vec())),
-                column(&queued, |(_, m)| qos_to_int(m.qos)),
-                column(&queued, |(_, m)| m.retain),
-                column(&queued, |(_, m)| encode_properties(&m.properties)),
-                column(&queued, |(_, m)| m.expires_at.map(|t| t as i64)),
-                column(&queued, |(_, m)| identifiers(&m.subscription_identifiers)),
-            ],
+            with_key(
+                key,
+                vec![
+                    column(&queued, |(s, _)| **s as i64),
+                    column(&queued, |(_, m)| m.topic.to_string()),
+                    column(&queued, |(_, m)| m.payload.as_ref().map(|p| p.to_vec())),
+                    column(&queued, |(_, m)| qos_to_int(m.qos)),
+                    column(&queued, |(_, m)| m.retain),
+                    column(&queued, |(_, m)| encode_properties(&m.properties)),
+                    column(&queued, |(_, m)| m.expires_at.map(|t| t as i64)),
+                    column(&queued, |(_, m)| identifiers(&m.subscription_identifiers)),
+                ],
+            ),
         ));
     }
     statements
@@ -1111,11 +1208,11 @@ impl BatchStore for PostgresStore {
         Some(self)
     }
 
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
-        self.fence(self.apply_batch(client_id, writes).await)
+    async fn apply(&self, key: &SessionKey, writes: &[Write]) -> Result<()> {
+        self.fence(self.apply_batch(key, writes).await)
     }
 
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
+    async fn load_session(&self, key: &SessionKey) -> Result<Option<SessionState>> {
         // One row per subscription, or one without any
         let rows = self
             .query(
@@ -1123,16 +1220,17 @@ impl BatchStore for PostgresStore {
                     "SELECT {SESSION_COLUMNS}, f.topic_filter, f.qos, f.no_local,
                             f.retain_as_published, f.subscription_identifier
                      FROM sessions s
-                     LEFT JOIN subscriptions f ON f.client_id = s.client_id
-                     WHERE s.client_id = $1"
+                     LEFT JOIN subscriptions f
+                         ON f.mount_point = s.mount_point AND f.client_id = s.client_id
+                     WHERE s.mount_point = $1 AND s.client_id = $2"
                 ),
-                &[&client_id],
+                &[&key.stored_mount_point(), &key.client_id],
             )
             .await?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
-        let mut session = session_from_row(row, client_id)?;
+        let mut session = session_from_row(row, key)?;
         for row in &rows {
             if row
                 .try_get::<_, Option<&str>>("topic_filter")
@@ -1145,18 +1243,18 @@ impl BatchStore for PostgresStore {
         Ok(Some(session))
     }
 
-    async fn list_sessions(&self) -> Result<Vec<String>> {
-        self.query("SELECT client_id FROM sessions", &[])
+    async fn list_sessions(&self) -> Result<Vec<SessionKey>> {
+        self.query("SELECT mount_point, client_id FROM sessions", &[])
             .await?
             .iter()
-            .map(|row| row.try_get(0).col())
+            .map(key_from_row)
             .collect()
     }
 
-    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
+    async fn load_will(&self, key: &SessionKey) -> Result<Option<StoredWillMessage>> {
         self.query(
-            "SELECT * FROM will_messages WHERE client_id = $1",
-            &[&client_id],
+            "SELECT * FROM will_messages WHERE mount_point = $1 AND client_id = $2",
+            &[&key.stored_mount_point(), &key.client_id],
         )
         .await?
         .first()
@@ -1164,10 +1262,10 @@ impl BatchStore for PostgresStore {
         .transpose()
     }
 
-    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
+    async fn load_inflight(&self, key: &SessionKey) -> Result<Vec<InflightMessage>> {
         self.query(
-            "SELECT * FROM inflight_messages WHERE client_id = $1",
-            &[&client_id],
+            "SELECT * FROM inflight_messages WHERE mount_point = $1 AND client_id = $2",
+            &[&key.stored_mount_point(), &key.client_id],
         )
         .await?
         .iter()
@@ -1175,10 +1273,10 @@ impl BatchStore for PostgresStore {
         .collect()
     }
 
-    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+    async fn load_incoming_qos2(&self, key: &SessionKey) -> Result<Vec<u16>> {
         self.query(
-            "SELECT packet_id FROM incoming_qos2 WHERE client_id = $1",
-            &[&client_id],
+            "SELECT packet_id FROM incoming_qos2 WHERE mount_point = $1 AND client_id = $2",
+            &[&key.stored_mount_point(), &key.client_id],
         )
         .await?
         .iter()
@@ -1186,10 +1284,11 @@ impl BatchStore for PostgresStore {
         .collect()
     }
 
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
+    async fn load_queue(&self, key: &SessionKey) -> Result<Vec<(u64, Message)>> {
         self.query(
-            "SELECT * FROM queued_messages WHERE client_id = $1 ORDER BY sequence",
-            &[&client_id],
+            "SELECT * FROM queued_messages WHERE mount_point = $1 AND client_id = $2
+             ORDER BY sequence",
+            &[&key.stored_mount_point(), &key.client_id],
         )
         .await?
         .iter()
@@ -1199,53 +1298,69 @@ impl BatchStore for PostgresStore {
 
     /// One query per table for the whole page, those after the sessions
     /// pipelined: its sessions, then the rows of every other table in the
-    /// range of client ids the page covers.
-    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+    /// range of keys the page covers. Keys are compared as rows, in the
+    /// order of the primary keys, so each lookup reads its index in order.
+    async fn load_clients(
+        &self,
+        after: Option<&SessionKey>,
+        limit: usize,
+    ) -> Result<Vec<LoadedClient>> {
         let after_clause = match after {
-            Some(_) => "client_id > $1",
-            None => "$1::TEXT IS NULL",
+            Some(_) => "(mount_point, client_id) > ($1, $2)",
+            None => "$1::TEXT IS NULL AND $2::TEXT IS NULL",
         };
+        let after_mount_point = after.map(SessionKey::stored_mount_point);
+        let after_client_id = after.map(|key| key.client_id.as_str());
         let sessions = self
             .query(
                 &format!(
-                    "SELECT s.client_id, {SESSION_COLUMNS} FROM sessions s
-                     WHERE {after_clause} ORDER BY s.client_id LIMIT $2"
+                    "SELECT s.mount_point, s.client_id, {SESSION_COLUMNS} FROM sessions s
+                     WHERE {after_clause} ORDER BY s.mount_point, s.client_id LIMIT $3"
                 ),
-                &[&after, &(limit as i64)],
+                &[&after_mount_point, &after_client_id, &(limit as i64)],
             )
             .await?;
-        let mut clients: BTreeMap<String, Result<StoredClient>> = BTreeMap::new();
+        let mut clients: HashMap<SessionKey, Result<StoredClient>> = HashMap::new();
         let mut order = Vec::with_capacity(sessions.len());
         for row in &sessions {
-            let client_id: String = row.try_get("client_id").col()?;
-            let stored = session_from_row(row, &client_id).map(|session| StoredClient {
+            let key = key_from_row(row)?;
+            let stored = session_from_row(row, &key).map(|session| StoredClient {
                 session,
                 will: None,
                 queue: Vec::new(),
                 inflight: Vec::new(),
                 incoming_qos2: Vec::new(),
             });
-            order.push(client_id.clone());
-            clients.insert(client_id, stored);
+            order.push(key.clone());
+            clients.insert(key, stored);
         }
         let Some(last) = order.last().cloned() else {
             return Ok(Vec::new());
         };
 
-        let within = format!("WHERE {after_clause} AND client_id <= $2 ORDER BY client_id");
+        let within = format!(
+            "WHERE {after_clause} AND (mount_point, client_id) <= ($3, $4)
+             ORDER BY mount_point, client_id"
+        );
         let sql = [
             format!("SELECT * FROM subscriptions {within}"),
             format!("SELECT * FROM will_messages {within}"),
             format!("SELECT * FROM queued_messages {within}, sequence"),
             format!("SELECT * FROM inflight_messages {within}"),
-            format!("SELECT client_id, packet_id FROM incoming_qos2 {within}"),
+            format!("SELECT mount_point, client_id, packet_id FROM incoming_qos2 {within}"),
         ];
         let client = self.client().await?;
         let mut statements = Vec::with_capacity(sql.len());
         for sql in &sql {
             statements.push(client.prepare_cached(sql).await.db()?);
         }
-        let params: [&(dyn ToSql + Sync); 2] = [&after, &last];
+        let last_mount_point = last.stored_mount_point();
+        let params: [&(dyn ToSql + Sync); 4] = [
+            &after_mount_point,
+            &after_client_id,
+            &last_mount_point,
+            &last.client_id,
+        ];
         let results = join_all(statements.iter().map(|s| client.query(s, &params))).await;
         let mut results = results.into_iter();
         let mut next = || results.next().expect("one result per statement").db();
@@ -1278,24 +1393,32 @@ impl BatchStore for PostgresStore {
         ];
         for put in puts {
             for row in next()? {
-                let client_id: String = row.try_get("client_id").col()?;
+                let key = key_from_row(&row)?;
                 // Rows of a client without a session are left out
-                let Some(Ok(stored)) = clients.get_mut(&client_id) else {
+                let Some(Ok(stored)) = clients.get_mut(&key) else {
                     continue;
                 };
                 if let Err(e) = put(stored, &row) {
-                    clients.insert(client_id, Err(e));
+                    clients.insert(key, Err(e));
                 }
             }
         }
         Ok(order
             .into_iter()
-            .map(|client_id| LoadedClient {
-                stored: clients.remove(&client_id).expect("each client is gathered"),
-                client_id,
+            .map(|key| LoadedClient {
+                stored: clients.remove(&key).expect("each client is gathered"),
+                key,
             })
             .collect())
     }
+}
+
+/// The key of a row with `mount_point` and `client_id` columns.
+fn key_from_row(row: &Row) -> Result<SessionKey> {
+    Ok(SessionKey::new(
+        Some(row.try_get("mount_point").col()?),
+        row.try_get::<_, String>("client_id").col()?,
+    ))
 }
 
 /// The columns of a session `session_from_row` reads.
@@ -1303,7 +1426,7 @@ const SESSION_COLUMNS: &str = "s.expiry_interval, s.expires_at, s.owner_username
     s.owner_mount_point, length(s.subscriptions) > 0 AS unmoved";
 
 /// A session, without its subscriptions, which have a table of their own.
-fn session_from_row(row: &Row, client_id: &str) -> Result<SessionState> {
+fn session_from_row(row: &Row, key: &SessionKey) -> Result<SessionState> {
     // Subscriptions an older version kept in the session's row that the
     // move to their table couldn't read
     if row.try_get("unmoved").col()? {
@@ -1312,7 +1435,7 @@ fn session_from_row(row: &Row, client_id: &str) -> Result<SessionState> {
         ));
     }
     Ok(SessionState {
-        client_id: client_id.to_string(),
+        client_id: key.client_id.clone(),
         subscriptions: Vec::new(),
         expiry_interval: row
             .try_get::<_, Option<i64>>("expiry_interval")
@@ -1387,7 +1510,7 @@ fn incoming_from_row(row: &Row) -> Result<u16> {
 impl PostgresStore {
     /// Applies the batch in one transaction, its statements pipelined, so
     /// it costs about one round trip.
-    async fn apply_batch(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+    async fn apply_batch(&self, key: &SessionKey, writes: &[Write]) -> Result<()> {
         let mut statements = Vec::new();
         let mut run = Vec::new();
         for write in writes {
@@ -1395,11 +1518,11 @@ impl PostgresStore {
                 run.push(write);
                 continue;
             }
-            statements.extend(bulk_statements(client_id, &run));
+            statements.extend(bulk_statements(key, &run));
             run.clear();
-            statements.extend(self::statements(client_id, write));
+            statements.extend(self::statements(key, write));
         }
-        statements.extend(bulk_statements(client_id, &run));
+        statements.extend(bulk_statements(key, &run));
         if statements.is_empty() {
             return Ok(());
         }
@@ -1751,7 +1874,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::StoredSubscription;
+    use crate::{testing::key, StoredSubscription};
 
     /// The tests share one database, and some take it over or empty it.
     static DATABASE: Mutex<()> = Mutex::const_new(());
@@ -1819,7 +1942,7 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(version as usize, MIGRATIONS.len());
-        let old = store.load_session("old").await.unwrap().unwrap();
+        let old = store.load_session(&key("old")).await.unwrap().unwrap();
         assert_eq!(old.owner, SessionOwner::default());
     }
 
@@ -1863,7 +1986,7 @@ mod tests {
         let store = PostgresStore::connect(&url, &ConnectOptions::default())
             .await
             .unwrap();
-        let loaded = store.load_inflight("c").await.unwrap();
+        let loaded = store.load_inflight(&key("c")).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
         assert!(!loaded[0].retain);
@@ -1906,17 +2029,17 @@ mod tests {
         let store = PostgresStore::connect(&url, &ConnectOptions::default())
             .await
             .unwrap();
-        let mut loaded = store.load_session("old").await.unwrap().unwrap();
+        let mut loaded = store.load_session(&key("old")).await.unwrap().unwrap();
         loaded
             .subscriptions
             .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
         assert_eq!(loaded.subscriptions, subscriptions);
         assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
-        let none = store.load_session("none").await.unwrap().unwrap();
+        let none = store.load_session(&key("none")).await.unwrap().unwrap();
         assert!(none.subscriptions.is_empty());
         // Those that can't be read stay, and their session fails to load
         assert!(matches!(
-            store.load_session("bad").await,
+            store.load_session(&key("bad")).await,
             Err(StorageError::SerializationError(_))
         ));
         let blobs: i64 = store
@@ -1931,6 +2054,93 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(blobs, 1);
+    }
+
+    /// A database written before the mount point was part of the key moves
+    /// each session's rows under the mount point of its owner, and keeps
+    /// rows without a session under none. Migrating again changes nothing.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_migrates_rows_under_their_sessions_mount_point() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let keyed = MIGRATIONS.len() - 1;
+        database_at(
+            &url,
+            keyed,
+            "INSERT INTO sessions
+                 (client_id, subscriptions, clean_start, expiry_interval, owner_username,
+                  owner_mount_point)
+                 VALUES ('a', '', FALSE, 60, 'alice', 'tenant-a/'),
+                        ('b', '', FALSE, NULL, 'bob', NULL);
+             INSERT INTO subscriptions VALUES ('a', 's/a', 1, FALSE, FALSE, NULL),
+                                              ('b', 's/b', 0, FALSE, FALSE, NULL);
+             INSERT INTO will_messages VALUES ('a', 'w/a', '', 0, FALSE, 0, '');
+             INSERT INTO inflight_messages
+                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties)
+                 VALUES ('a', 1, 'i/a', NULL, 1, FALSE, 1, FALSE, ''),
+                        ('orphan', 1, 'i/o', NULL, 1, FALSE, 1, FALSE, '');
+             INSERT INTO queued_messages
+                 (client_id, sequence, topic, payload, qos, retain, properties)
+                 VALUES ('a', 4, 'q/a', NULL, 1, FALSE, '');
+             INSERT INTO incoming_qos2 VALUES ('a', 7), ('orphan', 8);",
+        )
+        .await;
+
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let mounted = SessionKey::new(Some("tenant-a/".into()), "a");
+        let check = |store: PostgresStore| {
+            let mounted = mounted.clone();
+            async move {
+                assert!(store.load_session(&key("a")).await.unwrap().is_none());
+                let a = store.load_client(&mounted).await.unwrap().unwrap();
+                assert_eq!(a.session.owner.username.as_deref(), Some("alice"));
+                assert_eq!(a.session.subscriptions[0].topic_filter, "s/a");
+                assert_eq!(a.will.unwrap().topic, "w/a");
+                assert_eq!(a.inflight[0].topic, "i/a");
+                assert_eq!(a.queue[0].0, 4);
+                assert_eq!(a.incoming_qos2, [7]);
+                let b = store.load_client(&key("b")).await.unwrap().unwrap();
+                assert_eq!(b.session.subscriptions[0].topic_filter, "s/b");
+                assert_eq!(store.load_inflight(&key("orphan")).await.unwrap().len(), 1);
+                assert_eq!(store.load_incoming_qos2(&key("orphan")).await.unwrap(), [8]);
+                let mut listed = store.list_sessions().await.unwrap();
+                listed.sort();
+                assert_eq!(listed, [key("b"), mounted.clone()]);
+            }
+        };
+        check(store.clone()).await;
+
+        // The same client id gets a session of its own on another mount
+        // point, which running the migration again leaves alone
+        store
+            .apply(
+                &key("a"),
+                &[
+                    Write::SaveSession(crate::testing::session("a")),
+                    Write::StoreIncomingQos2(9),
+                ],
+            )
+            .await
+            .unwrap();
+        let client = store.client().await.unwrap();
+        client.batch_execute(MIGRATIONS[keyed]).await.unwrap();
+        client
+            .execute(
+                "UPDATE mercurio_schema SET version = $1",
+                &[&(keyed as i32)],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(store.load_incoming_qos2(&key("a")).await.unwrap(), [9]);
+        store.delete_session(&key("a")).await.unwrap();
+        check(store).await;
     }
 
     #[tokio::test]
@@ -1959,7 +2169,10 @@ mod tests {
         let _database = DATABASE.lock().await;
         let store = empty_store(&url).await;
         store
-            .apply("c", &[Write::SaveSession(crate::testing::session("c"))])
+            .apply(
+                &key("c"),
+                &[Write::SaveSession(crate::testing::session("c"))],
+            )
             .await
             .unwrap();
 
@@ -1967,10 +2180,13 @@ mod tests {
         let mut bad = crate::testing::inflight_message(3);
         bad.topic = "\0".into();
         assert!(store
-            .apply("c", &[Write::DeleteSession, Write::StoreInflight(bad)])
+            .apply(
+                &key("c"),
+                &[Write::DeleteSession, Write::StoreInflight(bad)]
+            )
             .await
             .is_err());
-        assert!(store.load_session("c").await.unwrap().is_some());
+        assert!(store.load_session(&key("c")).await.unwrap().is_some());
     }
 
     /// Rows that can't be read fail to load as undecodable, each in the
@@ -1984,7 +2200,7 @@ mod tests {
         for client_id in ["bad", "good"] {
             store
                 .apply(
-                    client_id,
+                    &key(client_id),
                     &[
                         Write::SaveSession(crate::testing::session(client_id)),
                         Write::StoreInflight(crate::testing::inflight_message(1)),
@@ -2008,17 +2224,21 @@ mod tests {
         let undecodable =
             |result: Result<_>| matches!(result, Err(StorageError::SerializationError(_)));
 
-        assert!(undecodable(store.load_session("bad").await.map(|_| ())));
-        assert!(undecodable(store.load_inflight("bad").await.map(|_| ())));
-        assert!(undecodable(store.load_queue("bad").await.map(|_| ())));
-        assert!(store.load_session("good").await.unwrap().is_some());
-        assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
-        assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
+        assert!(undecodable(
+            store.load_session(&key("bad")).await.map(|_| ())
+        ));
+        assert!(undecodable(
+            store.load_inflight(&key("bad")).await.map(|_| ())
+        ));
+        assert!(undecodable(store.load_queue(&key("bad")).await.map(|_| ())));
+        assert!(store.load_session(&key("good")).await.unwrap().is_some());
+        assert_eq!(store.load_inflight(&key("good")).await.unwrap().len(), 1);
+        assert_eq!(store.load_queue(&key("good")).await.unwrap().len(), 1);
         let loaded = store.load_clients(None, 10).await.unwrap();
         let stored = |client_id: &str| {
             &loaded
                 .iter()
-                .find(|c| c.client_id == client_id)
+                .find(|c| c.key == key(client_id))
                 .unwrap()
                 .stored
         };
@@ -2030,8 +2250,8 @@ mod tests {
         )));
         assert!(stored("good").is_ok());
 
-        store.delete_session("bad").await.unwrap();
-        assert!(store.load_session("bad").await.unwrap().is_none());
+        store.delete_session(&key("bad")).await.unwrap();
+        assert!(store.load_session(&key("bad")).await.unwrap().is_none());
     }
 
     /// A retained lookup only reads, so it doesn't wait for the lock a
@@ -2257,11 +2477,14 @@ mod tests {
 
         // The old holder's writes are refused, the new holder's accepted
         assert!(matches!(
-            active.apply("c", &[Write::ClearQueue]).await,
+            active.apply(&key("c"), &[Write::ClearQueue]).await,
             Err(StorageError::Fenced)
         ));
         assert!(active.store_retained("t", None).await.is_err());
-        standby.apply("c", &[Write::ClearQueue]).await.unwrap();
+        standby
+            .apply(&key("c"), &[Write::ClearQueue])
+            .await
+            .unwrap();
 
         // The standby finds the bans as it starts serving; the old holder
         // can't change them any more
@@ -2296,7 +2519,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        active.apply("c", &[Write::ClearQueue]).await.unwrap();
+        active.apply(&key("c"), &[Write::ClearQueue]).await.unwrap();
         assert!(!lock.is_lost());
 
         database
@@ -2307,7 +2530,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            active.apply("c", &[Write::ClearQueue]).await,
+            active.apply(&key("c"), &[Write::ClearQueue]).await,
             Err(StorageError::Fenced)
         ));
         assert!(lock.is_lost());

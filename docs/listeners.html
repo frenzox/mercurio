@@ -132,6 +132,7 @@ port = 1885
 mount_point = "tenant1/"</pre>
 <p>A client on that listener publishing <code>sensors/t1</code> publishes <code>tenant1/sensors/t1</code>, and subscribing to <code>#</code> subscribes to <code>tenant1/#</code>. The messages it receives carry their topics without the prefix. Shared subscriptions are mounted too: <code>$share/g/jobs</code> becomes <code>$share/g/tenant1/jobs</code>. Clients of other listeners see the full topics.</p>
 <p>ACL rules see the full topic, mount point included. A mount point must end with <code>/</code>: <code>tenant1</code> alone would also let clients reach <code>tenant10/...</code>.</p>
+<p>Each mount point also has its own client ids: a client <code>sensor-7</code> on this listener and one on another mount point, or on a listener without one, are two clients with two sessions, which never take each other over. Listeners with the same mount point share their clients' ids and sessions. The admin API and <code>mercurioctl client</code> commands name a client's mount point when its id is on more than one; see <a href="security.html#client-ids">Client id ownership</a>.</p>
 
 <h2 id="auth">Per-listener authentication</h2>
 <p><code>[listeners.auth]</code> replaces <code>[auth]</code> for a listener's clients, with the same options except dynamic security. Here local services connect freely, while the public listener requires passwords and has its own ACL:</p>

@@ -48,6 +48,10 @@ pub struct ListenerInfo {
 pub struct ClientSummary {
     #[serde(rename = "clientid")]
     pub client_id: String,
+    /// The mount point of the listener the client connected to, which
+    /// with the client id names the session; null for none
+    #[serde(rename = "mountpoint")]
+    pub mount_point: Option<String>,
     pub username: Option<String>,
     pub connected: bool,
     /// The client's address and port, its last one when disconnected
@@ -77,6 +81,10 @@ pub struct ClientSummary {
 pub struct ClientDetails {
     #[serde(rename = "clientid")]
     pub client_id: String,
+    /// The mount point of the listener the client connected to, which
+    /// with the client id names the session; null for none
+    #[serde(rename = "mountpoint")]
+    pub mount_point: Option<String>,
     pub username: Option<String>,
     pub connected: bool,
     pub address: Option<String>,
@@ -184,6 +192,10 @@ pub struct SubscriptionSummary {
 pub struct SubscriberInfo {
     #[serde(rename = "clientid")]
     pub client_id: String,
+    /// The mount point of the listener the client connected to, which
+    /// with the client id names the session; null for none
+    #[serde(rename = "mountpoint")]
+    pub mount_point: Option<String>,
     pub qos: u8,
     pub no_local: bool,
     pub retain_as_published: bool,

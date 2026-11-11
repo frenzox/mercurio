@@ -99,22 +99,33 @@ fn client(c: ClientCommand) -> Value {
             }),
             page,
         ),
-        ClientCommand::Show { clientid } => named("getClient", json!({ "clientid": clientid })),
+        ClientCommand::Show {
+            clientid,
+            mount_point,
+        } => named(
+            "getClient",
+            json!({ "clientid": clientid, "mountpoint": mount_point }),
+        ),
         ClientCommand::Disconnect {
             clientid,
+            mount_point,
             no_will,
             reason_code,
         } => named(
             "disconnectClient",
-            json!({ "clientid": clientid, "sendWill": !no_will, "reasonCode": reason_code }),
+            json!({
+                "clientid": clientid, "mountpoint": mount_point, "sendWill": !no_will,
+                "reasonCode": reason_code,
+            }),
         ),
         ClientCommand::DeleteSession {
             clientid,
+            mount_point,
             disconnect,
             ..
         } => named(
             "deleteSession",
-            json!({ "clientid": clientid, "disconnect": disconnect }),
+            json!({ "clientid": clientid, "mountpoint": mount_point, "disconnect": disconnect }),
         ),
     }
 }
@@ -256,6 +267,32 @@ mod tests {
         assert_eq!(
             sent(&["client", "delete-session", "s1", "--disconnect"]),
             json!({"command": "deleteSession", "clientid": "s1", "disconnect": true})
+        );
+        // A client id on more than one mount point needs its mount point
+        assert_eq!(
+            sent(&["client", "show", "s1", "--mount-point", "tenant-a/"]),
+            json!({"command": "getClient", "clientid": "s1", "mountpoint": "tenant-a/"})
+        );
+        assert_eq!(
+            sent(&["client", "disconnect", "s1", "--mount-point", ""]),
+            json!({
+                "command": "disconnectClient", "clientid": "s1", "mountpoint": "",
+                "sendWill": true,
+            })
+        );
+        assert_eq!(
+            sent(&[
+                "client",
+                "delete-session",
+                "s1",
+                "--mount-point",
+                "b/",
+                "-y"
+            ]),
+            json!({
+                "command": "deleteSession", "clientid": "s1", "mountpoint": "b/",
+                "disconnect": false,
+            })
         );
     }
 

@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use mercurio_storage::{BatchStore, StorageError, Write};
+use mercurio_storage::{BatchStore, SessionKey, StorageError, Write};
 use tokio::{
     sync::{mpsc, oneshot, watch, Semaphore},
     time::Instant,
@@ -43,10 +43,11 @@ const MAX_RECONCILE_DELAY: Duration = Duration::from_secs(60);
 
 /// What the broker holds for each client, for storing it whole.
 pub(crate) trait Snapshots: Send + Sync {
-    /// The writes that replace everything stored for `client_id` with what
-    /// the broker holds for it, the first of them `Write::DeleteSession`;
-    /// None once the broker holds nothing to take them from.
-    fn snapshot<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<Vec<Write>>>;
+    /// The writes that replace everything stored for the client of `key`
+    /// with what the broker holds for it, the first of them
+    /// `Write::DeleteSession`; None once the broker holds nothing to take
+    /// them from.
+    fn snapshot<'a>(&'a self, key: &'a SessionKey) -> BoxFuture<'a, Option<Vec<Write>>>;
 }
 
 /// How the writers of one broker fared with storage.
@@ -67,7 +68,7 @@ struct Health {
     /// Clients whose stored state is dirty: a batch of their changes was
     /// given up, so storage holds something else than the broker until
     /// their state is stored whole again
-    dirty: Mutex<HashSet<String>>,
+    dirty: Mutex<HashSet<SessionKey>>,
     /// Batches attempted again after a failure since the broker started
     retried: AtomicU64,
     /// Batches given up since the broker started
@@ -144,7 +145,7 @@ struct Entry {
 /// one has stopped.
 pub(crate) struct Writers<S> {
     storage: Arc<S>,
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    entries: Arc<Mutex<HashMap<SessionKey, Entry>>>,
     next_id: Arc<AtomicU64>,
     health: Arc<Health>,
 }
@@ -187,18 +188,18 @@ impl<S: BatchStore + 'static> Writers<S> {
     }
 
     /// The client's writer, started if it has none.
-    pub(crate) fn get(&self, client_id: &str) -> Writer {
+    pub(crate) fn get(&self, key: &SessionKey) -> Writer {
         let mut entries = self.entries.lock().unwrap();
-        if let Some(writer) = entries.get(client_id).and_then(|e| e.writer.clone()) {
+        if let Some(writer) = entries.get(key).and_then(|e| e.writer.clone()) {
             return writer;
         }
-        let previous = entries.get(client_id).map(|e| e.stopped.clone());
+        let previous = entries.get(key).map(|e| e.stopped.clone());
         let (sender, receiver) = mpsc::unbounded_channel();
         let (stopped_tx, stopped) = watch::channel(false);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let writer = Writer::new(sender);
         entries.insert(
-            client_id.to_string(),
+            key.clone(),
             Entry {
                 writer: Some(writer.clone()),
                 stopped,
@@ -208,7 +209,7 @@ impl<S: BatchStore + 'static> Writers<S> {
         tokio::spawn(run(
             Arc::clone(&writer.pending),
             Arc::clone(&self.storage),
-            client_id.to_string(),
+            key.clone(),
             receiver,
             previous,
             stopped_tx,
@@ -219,24 +220,24 @@ impl<S: BatchStore + 'static> Writers<S> {
         writer
     }
 
-    pub(crate) fn write(&self, client_id: &str, write: Write) {
-        self.get(client_id).write(write);
+    pub(crate) fn write(&self, key: &SessionKey, write: Write) {
+        self.get(key).write(write);
     }
 
-    pub(crate) async fn write_paced(&self, client_id: &str, writes: Box<[Write]>) {
-        self.get(client_id).write_paced(writes).await;
+    pub(crate) async fn write_paced(&self, key: &SessionKey, writes: Box<[Write]>) {
+        self.get(key).write_paced(writes).await;
     }
 
     /// Lets the client's writer stop once it has applied what it was sent.
-    pub(crate) fn close(&self, client_id: &str) {
-        if let Some(entry) = self.entries.lock().unwrap().get_mut(client_id) {
+    pub(crate) fn close(&self, key: &SessionKey) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(key) {
             entry.writer = None;
         }
     }
 
     /// Waits until the client's earlier changes are in storage.
-    pub(crate) async fn settle(&self, client_id: &str) {
-        let (writer, stopped) = match self.entries.lock().unwrap().get(client_id) {
+    pub(crate) async fn settle(&self, key: &SessionKey) {
+        let (writer, stopped) = match self.entries.lock().unwrap().get(key) {
             Some(entry) => (entry.writer.clone(), entry.stopped.clone()),
             None => return,
         };
@@ -251,13 +252,13 @@ impl<S: BatchStore + 'static> Writers<S> {
     /// Waits until every change made so far is in storage, and makes one
     /// more attempt to store the state of dirty clients whole.
     pub(crate) async fn flush_all(&self) {
-        let client_ids: Vec<String> = self.entries.lock().unwrap().keys().cloned().collect();
-        for client_id in client_ids {
-            self.settle(&client_id).await;
+        let keys: Vec<SessionKey> = self.entries.lock().unwrap().keys().cloned().collect();
+        for key in keys {
+            self.settle(&key).await;
         }
-        let dirty: Vec<String> = self.health.dirty.lock().unwrap().iter().cloned().collect();
-        for client_id in dirty {
-            self.get(&client_id).flush().await;
+        let dirty: Vec<SessionKey> = self.health.dirty.lock().unwrap().iter().cloned().collect();
+        for key in dirty {
+            self.get(&key).flush().await;
         }
     }
 }
@@ -270,11 +271,11 @@ impl<S: BatchStore + 'static> Writers<S> {
 async fn run<S: BatchStore>(
     pending: Arc<Semaphore>,
     storage: Arc<S>,
-    client_id: String,
+    key: SessionKey,
     mut ops: mpsc::UnboundedReceiver<Op>,
     previous: Option<watch::Receiver<bool>>,
     stopped: watch::Sender<bool>,
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    entries: Arc<Mutex<HashMap<SessionKey, Entry>>>,
     id: u64,
     health: Arc<Health>,
 ) {
@@ -283,7 +284,7 @@ async fn run<S: BatchStore>(
     }
     let mut batch = Vec::new();
     let mut flushed = Vec::new();
-    let mut dirty = health.dirty.lock().unwrap().contains(&client_id);
+    let mut dirty = health.dirty.lock().unwrap().contains(&key);
     let mut reconcile_delay = RECONCILE_DELAY;
     let mut next_reconcile = Instant::now();
     // Held by something besides the map, such as a queue's journal, when
@@ -305,7 +306,7 @@ async fn run<S: BatchStore>(
             Ok(Some(op)) => Some(op),
             Ok(None) => {
                 if dirty {
-                    reconcile(storage.as_ref(), &client_id, &health).await;
+                    reconcile(storage.as_ref(), &key, &health).await;
                 }
                 break;
             }
@@ -316,12 +317,12 @@ async fn run<S: BatchStore>(
                 // starts a new one.
                 let mut entries = entries.lock().unwrap();
                 let only_the_map = entries
-                    .get(&client_id)
+                    .get(&key)
                     .filter(|entry| entry.id == id)
                     .and_then(|entry| entry.writer.as_ref())
                     .is_some_and(|writer| writer.ops.strong_count() == 1);
                 if only_the_map && ops.is_empty() {
-                    entries.remove(&client_id);
+                    entries.remove(&key);
                     break;
                 }
                 held = true;
@@ -348,7 +349,7 @@ async fn run<S: BatchStore>(
         }
         if dirty {
             if !flushed.is_empty() || Instant::now() >= next_reconcile {
-                if reconcile(storage.as_ref(), &client_id, &health).await {
+                if reconcile(storage.as_ref(), &key, &health).await {
                     dirty = false;
                     reconcile_delay = RECONCILE_DELAY;
                 } else {
@@ -359,9 +360,9 @@ async fn run<S: BatchStore>(
         } else {
             compact(&mut batch);
             if !batch.is_empty() {
-                if apply(storage.as_ref(), &client_id, &batch, &health).await == Applied::GaveUp {
+                if apply(storage.as_ref(), &key, &batch, &health).await == Applied::GaveUp {
                     health.failed.fetch_add(1, Ordering::Relaxed);
-                    health.dirty.lock().unwrap().insert(client_id.clone());
+                    health.dirty.lock().unwrap().insert(key.clone());
                     dirty = true;
                     next_reconcile = Instant::now() + RECONCILE_DELAY;
                 }
@@ -375,8 +376,8 @@ async fn run<S: BatchStore>(
     }
     let _ = stopped.send(true);
     let mut entries = entries.lock().unwrap();
-    if entries.get(&client_id).is_some_and(|entry| entry.id == id) {
-        entries.remove(&client_id);
+    if entries.get(&key).is_some_and(|entry| entry.id == id) {
+        entries.remove(&key);
     }
 }
 
@@ -436,31 +437,28 @@ enum Applied {
 /// allow.
 async fn apply<S: BatchStore>(
     storage: &S,
-    client_id: &str,
+    key: &SessionKey,
     batch: &[Write],
     health: &Health,
 ) -> Applied {
     let mut retry = Retry::default();
     loop {
-        let Err(e) = storage.apply(client_id, batch).await else {
+        let Err(e) = storage.apply(key, batch).await else {
             return Applied::Stored;
         };
         match retry.after(&e) {
             Some(delay) => {
                 health.retried.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "Failed to store changes for `{}`, retrying: {}",
-                    client_id, e
-                );
+                warn!("Failed to store changes for {}, retrying: {}", key, e);
                 tokio::time::sleep(delay).await;
             }
             None if matches!(e, StorageError::Fenced) => return Applied::Fenced,
             None => {
                 error!(
-                    "Gave up storing {} changes for `{}`, storing its whole state instead \
+                    "Gave up storing {} changes for {}, storing its whole state instead \
                      once storage takes it: {}",
                     batch.len(),
-                    client_id,
+                    key,
                     e
                 );
                 return Applied::GaveUp;
@@ -471,23 +469,23 @@ async fn apply<S: BatchStore>(
 
 /// Stores the client's state whole, replacing what storage holds for it.
 /// Returns whether it did, and the client is clean again.
-async fn reconcile<S: BatchStore>(storage: &S, client_id: &str, health: &Health) -> bool {
+async fn reconcile<S: BatchStore>(storage: &S, key: &SessionKey, health: &Health) -> bool {
     let Some(snapshots) = health.snapshots.get() else {
         return false;
     };
-    let Some(writes) = snapshots.snapshot(client_id).await else {
+    let Some(writes) = snapshots.snapshot(key).await else {
         return false;
     };
-    match storage.apply(client_id, &writes).await {
+    match storage.apply(key, &writes).await {
         Ok(()) => {
-            health.dirty.lock().unwrap().remove(client_id);
-            info!("Stored the whole state of `{}` again", client_id);
+            health.dirty.lock().unwrap().remove(key);
+            info!("Stored the whole state of {} again", key);
             true
         }
         Err(e) => {
             warn!(
-                "Failed to store the whole state of `{}`, will try again: {}",
-                client_id, e
+                "Failed to store the whole state of {}, will try again: {}",
+                key, e
             );
             false
         }
@@ -531,6 +529,10 @@ mod tests {
     use mercurio_storage::memory::MemoryStore;
 
     use super::*;
+
+    fn key(client_id: &str) -> SessionKey {
+        SessionKey::unmounted(client_id)
+    }
 
     fn inflight(packet_id: u16) -> Write {
         Write::StoreInflight(mercurio_storage::InflightMessage {
@@ -648,26 +650,26 @@ mod tests {
     async fn test_a_new_writer_waits_for_the_previous_one() {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
-        writers.write("c", Write::RemoveSubscription("t".into()));
-        writers.close("c");
-        writers.write("c", Write::DeleteSession);
-        writers.settle("c").await;
-        assert!(storage.load_session("c").await.unwrap().is_none());
+        writers.write(&key("c"), Write::RemoveSubscription("t".into()));
+        writers.close(&key("c"));
+        writers.write(&key("c"), Write::DeleteSession);
+        writers.settle(&key("c")).await;
+        assert!(storage.load_session(&key("c")).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn test_idle_writers_stop_and_start_again() {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
-        writers.write("c", Write::RemoveSubscription("t".into()));
-        writers.settle("c").await;
+        writers.write(&key("c"), Write::RemoveSubscription("t".into()));
+        writers.settle(&key("c")).await;
         tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
         assert!(writers.entries.lock().unwrap().is_empty());
 
         // A later change starts a new writer
-        writers.write("c", Write::DeleteSession);
-        writers.settle("c").await;
-        assert!(storage.load_session("c").await.unwrap().is_none());
+        writers.write(&key("c"), Write::DeleteSession);
+        writers.settle(&key("c")).await;
+        assert!(storage.load_session(&key("c")).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -675,7 +677,7 @@ mod tests {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
         // As a disconnected session's queue journal holds it
-        let held = writers.get("c");
+        let held = writers.get(&key("c"));
         tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
         assert_eq!(writers.entries.lock().unwrap().len(), 1);
         held.write(Write::DeleteWill);
@@ -686,11 +688,11 @@ mod tests {
     async fn test_writers_stop_once_closed() {
         let storage = Arc::new(MemoryStore::new());
         let writers = Writers::new(Arc::clone(&storage));
-        writers.write("c", Write::DeleteWill);
-        writers.close("c");
-        writers.settle("c").await;
+        writers.write(&key("c"), Write::DeleteWill);
+        writers.close(&key("c"));
+        writers.settle(&key("c")).await;
         tokio::task::yield_now().await;
         assert!(writers.entries.lock().unwrap().is_empty());
-        assert!(storage.load_will("c").await.unwrap().is_none());
+        assert!(storage.load_will(&key("c")).await.unwrap().is_none());
     }
 }

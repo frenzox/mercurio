@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use mercurio_server::{
-    admin::{check_arguments, Admin, AdminError, AdminExtension, ErrorCode, Paging},
+    admin::{check_arguments, Admin, AdminError, AdminExtension, ErrorCode, Paging, SessionKey},
     plugin::BoxFuture,
 };
 use serde::{de::DeserializeOwned, Deserialize};
@@ -88,9 +88,10 @@ impl DaemonCommands {
         let paging = arguments::<PageArgs>(args)?.paging()?;
         let mut bridges = Vec::new();
         for status in self.bridges.iter().skip(paging.offset).take(paging.count) {
+            // A bridge's local client is in-process, without a mount point
             let queued = match self.admin.get() {
                 Some(admin) => admin
-                    .client(status.client_id())
+                    .client(&SessionKey::unmounted(status.client_id()))
                     .await
                     .map_or(0, |client| client.queued),
                 None => 0,
