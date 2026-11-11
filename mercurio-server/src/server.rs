@@ -1922,6 +1922,16 @@ where
                         )
                         .await;
                 }
+                // Logged where the admissions are counted
+                Err(StartError::Crowded) => {
+                    return self
+                        .refuse(
+                            protocol_version,
+                            client_maximum_packet_size,
+                            ReasonCode::ServerBusy,
+                        )
+                        .await;
+                }
                 Err(StartError::Storage(e)) => return Err(e),
             };
         start_result.assigned_client_id |= assigned_client_id;

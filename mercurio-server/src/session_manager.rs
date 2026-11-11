@@ -242,6 +242,8 @@ enum Acquired<S: BatchStore + 'static> {
     OwnedBy(SessionOwner),
     /// The connection using the id didn't let go of it in time
     Busy,
+    /// Too many connections were checking their client id already
+    Crowded,
 }
 
 /// Why `start_session` started no session.
@@ -252,6 +254,8 @@ pub(crate) enum StartError {
     OwnedByAnother(Box<ConnectPacket>),
     /// The connection using the client id didn't let go of it in time
     Busy,
+    /// Too many connections were checking their client id at once
+    Crowded,
     Storage(Error),
 }
 
@@ -530,6 +534,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         {
             Acquired::Lease(claim) => claim,
             Acquired::Busy => return Err(StartError::Busy),
+            Acquired::Crowded => return Err(StartError::Crowded),
             Acquired::OwnedBy(holder) => {
                 warn!(
                     "Client `{}` belongs to {}, refusing a connection from {}",
@@ -736,7 +741,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 "Too many connections checking their client id at once, refusing `{}`",
                 client_id
             );
-            return Ok(Acquired::Busy);
+            return Ok(Acquired::Crowded);
         };
         let admitted = admission.lock().lock().await;
         let checked = async {
@@ -3115,7 +3120,7 @@ mod tests {
         let result = manager
             .start_session(connect_packet("fresh"), SessionOwner::default())
             .await;
-        assert!(matches!(result, Err(StartError::Busy)));
+        assert!(matches!(result, Err(StartError::Crowded)));
         // A client id already being admitted still waits its turn
         let started = manager
             .start_session(connect_packet("c0"), SessionOwner::default())
