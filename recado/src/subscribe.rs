@@ -156,6 +156,7 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                         retain,
                         properties,
                         subscription_ids,
+                        ..
                     }) => {
                         let mut out = io::stdout().lock();
                         let written = match args.format {

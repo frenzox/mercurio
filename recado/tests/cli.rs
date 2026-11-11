@@ -212,12 +212,23 @@ async fn mqtt_3_without_a_client_id_still_connects() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_subscription_fails() {
+    let mut config = ServerConfig::default();
+    config.limits.max_subscriptions = Some(1);
+    let broker = start_with(config).await;
+    let output = broker.run(&["sub", "-t", "a", "-t", "b"]).await;
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(message.contains("subscription to b"), "{message}");
+    assert_eq!(message.lines().count(), 1, "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_filter_is_a_usage_error() {
     let broker = start().await;
     let output = broker.run(&["sub", "-t", "a/#/b"]).await;
     let message = stderr(&output);
-    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert_eq!(output.status.code(), Some(3), "{message}");
     assert!(message.contains("a/#/b"), "{message}");
-    assert!(message.contains("Topic filter invalid"), "{message}");
     assert_eq!(message.lines().count(), 1, "{message}");
 }
 

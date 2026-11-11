@@ -59,9 +59,9 @@ impl From<ClientError> for Failure {
                 Failure::Rejected(format!("the broker refused the message: {reason}"))
             }
             ClientError::NotSupported(_) => Failure::Rejected(error.to_string()),
-            ClientError::TooLong(_) | ClientError::PacketTooLarge => {
-                Failure::Usage(error.to_string())
-            }
+            ClientError::TooLong(_)
+            | ClientError::PacketTooLarge
+            | ClientError::InvalidArgument(_) => Failure::Usage(error.to_string()),
             error => Failure::Connection(error.to_string()),
         }
     }
