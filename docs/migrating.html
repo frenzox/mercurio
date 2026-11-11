@@ -155,8 +155,14 @@ path = "/var/lib/mercurio/mercurio.db"</pre></td></tr>
 <tr><td><code>bridge_protocol_version mqttv311</code></td><td><code>protocol_version = "mqttv311"</code></td></tr>
 <tr><td><code>remote_clientid</code>, <code>remote_username</code>, <code>remote_password</code></td><td><code>client_id</code>, <code>username</code>, <code>password</code></td></tr>
 <tr><td><code>bridge_cafile</code>, <code>bridge_certfile</code>, <code>bridge_keyfile</code></td><td><code>[bridges.tls]</code> <code>ca_path</code>, <code>cert_path</code>, <code>key_path</code></td></tr>
-<tr><td><code>notifications</code></td><td><code>notifications</code>; the state goes to this broker only</td></tr>
+<tr><td><code>notifications</code></td><td><code>notifications</code></td></tr>
+<tr><td><code>notification_topic</code></td><td><code>notification_topic</code></td></tr>
+<tr><td><code>notifications_local_only</code></td><td><code>notifications_local_only</code>; <code>true</code> by default, where mosquitto's default is <code>false</code>, as Mercurio and other brokers refuse client publishes to the default <code>$SYS</code> topic</td></tr>
+<tr><td><code>keepalive_interval</code></td><td><code>keepalive</code></td></tr>
+<tr><td><code>cleansession</code></td><td><code>clean_start</code></td></tr>
+<tr><td><code>restart_timeout</code></td><td>none: the wait between attempts doubles from a second up to a minute, with jitter</td></tr>
 </table>
+<p>MQTT 5 bridges also take <code>session_expiry</code>, the seconds the remote broker keeps the session, a day by default. Not supported yet: <code>bridge_attempt_unsubscribe</code>, <code>bridge_bind_address</code>, <code>bridge_capath</code>, <code>bridge_insecure</code>, <code>bridge_alpn</code>, <code>bridge_identity</code> and <code>bridge_psk</code>, <code>bridge_max_packet_size</code>, <code>bridge_outgoing_retain</code>, <code>bridge_reload_type</code>, <code>bridge_require_ocsp</code>, <code>bridge_tls_version</code>, <code>idle_timeout</code>, <code>local_cleansession</code>, <code>local_clientid</code>, <code>local_username</code> and <code>local_password</code> (the local side connects in process), <code>round_robin</code> (addresses are always tried in turn), <code>start_type</code> (bridges always start with the broker), <code>threshold</code> and <code>try_private</code>.</p>
 
 <h2 id="differences">Differences to know</h2>
 <ul>

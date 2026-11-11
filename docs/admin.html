@@ -158,7 +158,7 @@ topic read $CONTROL/broker/v1/response/#</pre>
 <p>mercuriod serves the following ones; a broker <a href="embedding.html">embedded</a> without them answers <code>unavailable</code>.</p>
 <table>
 <tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
-<tr><td><code>listBridges</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>bridges</code>: <code>name</code>, <code>connected</code>, <code>remoteAddress</code>, <code>connectedSince</code> or <code>disconnectedSince</code>, and <code>queued</code>, the messages waiting for the bridge on this broker</td></tr>
+<tr><td><code>listBridges</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>bridges</code>: <code>name</code>, <code>connected</code>, <code>remoteAddress</code>, <code>connectedSince</code> or <code>disconnectedSince</code>, <code>queued</code>, the messages waiting for the bridge on this broker, <code>forwardedOut</code> and <code>forwardedIn</code>, the messages the other broker accepted in each direction since the broker started, and <code>dropped</code>, those refused by the other broker or covered by no route</td></tr>
 <tr><td><code>getConfig</code></td><td></td><td>The configuration in use, with the keys of the TOML file. Passwords, credentials in URLs and every plugin <code>config</code> table read <code>"&lt;redacted&gt;"</code>.</td></tr>
 <tr><td><code>getLogLevel</code></td><td></td><td><code>level</code></td></tr>
 <tr><td><code>setLogLevel</code></td><td><code>level</code>: directives as <a href="configuration.html#logging"><code>[logging] level</code></a> takes them</td><td>Nothing. The level lasts until the broker restarts. <code>invalidArgument</code> for an empty or malformed level.</td></tr>

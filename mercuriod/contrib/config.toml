@@ -303,10 +303,25 @@ group = "mercurio"
 # addresses = ["broker1.example.com:8883", "broker2.example.com:8883"]
 # "mqttv5" (default) or "mqttv311" for brokers without MQTT 5
 # protocol_version = "mqttv5"
+# Keep-alive with the remote broker, in seconds
+# keepalive = 60
+# Start a new session on the remote broker at each connection instead of
+# resuming the one kept there
+# clean_start = false
+# Seconds the remote broker keeps the session, and messages for "in"
+# topics, after the link drops
+# session_expiry = 86400
 # Publish "1"/"0", retained, to $SYS/broker/connection/<client id>/state
 # notifications = true
-# Each bridge needs its own name and client id; with notifications, the
-# client id must be a single topic level, without `/`, `+` or `#`
+# Another topic for the state
+# notification_topic = "bridges/cloud/state"
+# With false, publish the state on the remote broker too; it publishes "0"
+# through the bridge's will when the link drops. Brokers that refuse
+# client publishes to $SYS, Mercurio among them, need a notification_topic
+# notifications_local_only = true
+# Each bridge needs its own name and client id; with notifications and no
+# notification_topic, the client id must be a single topic level, without
+# `/`, `+` or `#`
 # [bridges.tls]
 # TLS with the system's root certificates
 # enabled = true

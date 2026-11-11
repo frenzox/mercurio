@@ -215,7 +215,12 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>protocol_version</code></td><td><code>"mqttv5"</code></td><td><code>"mqttv5"</code> or <code>"mqttv311"</code>.</td></tr>
 <tr><td><code>client_id</code></td><td><code>"mercurio-bridge-&lt;name&gt;"</code></td><td>Client id on both brokers.</td></tr>
 <tr><td><code>username</code>, <code>password</code></td><td></td><td>Credentials for the remote broker.</td></tr>
-<tr><td><code>notifications</code></td><td><code>true</code></td><td>Publish the bridge's state, retained, to <code>$SYS/broker/connection/&lt;client id&gt;/state</code>.</td></tr>
+<tr><td><code>keepalive</code></td><td><code>60</code></td><td>Keep-alive with the remote broker, in seconds.</td></tr>
+<tr><td><code>clean_start</code></td><td><code>false</code></td><td>Start a new session on the remote broker at each connection instead of resuming the one kept there.</td></tr>
+<tr><td><code>session_expiry</code></td><td><code>86400</code></td><td>Seconds the remote broker keeps the session, and the messages for <code>in</code> topics, after the link drops.</td></tr>
+<tr><td><code>notifications</code></td><td><code>true</code></td><td>Publish the bridge's state, retained, to <code>notification_topic</code>.</td></tr>
+<tr><td><code>notification_topic</code></td><td><code>"$SYS/broker/connection/&lt;client id&gt;/state"</code></td><td>Where the state goes.</td></tr>
+<tr><td><code>notifications_local_only</code></td><td><code>true</code></td><td>With <code>false</code>, publish the state on the remote broker too, which publishes <code>0</code> through the bridge's will when the link drops.</td></tr>
 <tr><td><code>[bridges.tls]</code></td><td></td><td><code>enabled</code>, <code>ca_path</code>, and <code>cert_path</code> with <code>key_path</code> for mutual TLS.</td></tr>
 </table>
 <h3>[[bridges.topics]]</h3>

@@ -54,6 +54,9 @@ const BRIDGES: &[Column] = &[
     ("REMOTE", &["remoteAddress"]),
     ("SINCE", &["connectedSince", "disconnectedSince"]),
     ("QUEUED", &["queued"]),
+    ("OUT", &["forwardedOut"]),
+    ("IN", &["forwardedIn"]),
+    ("DROPPED", &["dropped"]),
 ];
 const PLUGINS: &[Column] = &[
     ("NAME", &["name"]),
@@ -326,6 +329,25 @@ mod tests {
 CLIENT ID  USERNAME  CONNECTED  ADDRESS         SINCE                 SUBS  QUEUED  INFLIGHT
 sensor-1   alice     true       10.0.0.7:51234  2026-11-10 20:00:00Z  2     0       0
 s2         -         false      -               2026-11-10 21:00:00Z  0     12      0
+"
+        );
+    }
+
+    #[test]
+    fn bridges_show_their_counters() {
+        let data = json!({
+            "bridges": [{
+                "name": "cloud", "connected": true, "remoteAddress": "10.0.0.1:1883",
+                "connectedSince": 1794340800, "queued": 4, "forwardedOut": 120,
+                "forwardedIn": 7, "dropped": 1,
+            }],
+            "totalCount": 1,
+        });
+        assert_eq!(
+            shown(json!({"command": "listBridges"}), data),
+            "\
+NAME   CONNECTED  REMOTE         SINCE                 QUEUED  OUT  IN  DROPPED
+cloud  true       10.0.0.1:1883  2026-11-10 20:00:00Z  4       120  7   1
 "
         );
     }

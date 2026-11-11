@@ -109,15 +109,22 @@ key_path = "/etc/mercurio/site1.key"</pre>
 <p><code>enabled = true</code> alone verifies the remote broker with the system's root certificates. A <code>ca_path</code> or a client certificate turns TLS on even without <code>enabled</code>, as <code>--cafile</code> does for recado and mercurioctl, so the password never crosses the network in the clear by mistake. <code>cert_path</code> and <code>key_path</code> go together; the broker refuses to start with only one.</p>
 
 <h2>Monitoring</h2>
-<p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost.</p>
+<p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost. It goes to <code>$SYS/broker/connection/&lt;client id&gt;/state</code>, or to <code>notification_topic</code> when set.</p>
 <pre>recado sub -t '$SYS/broker/connection/+/state' -T
 <span class="comment"># $SYS/broker/connection/mercurio-bridge-cloud/state: 1</span></pre>
+<p>With <code>notifications_local_only = false</code>, the remote broker gets the state on the same topic: the bridge publishes <code>1</code>, retained, once connected, and connects with a retained will of <code>0</code>, which the remote broker publishes when the link drops. Brokers that refuse client publishes to <code>$SYS</code>, Mercurio among them, need a <code>notification_topic</code> outside it:</p>
+<pre>[[bridges]]
+name = "cloud"
+host = "iot.example.com"
+notification_topic = "bridges/site1/state"
+notifications_local_only = false</pre>
+<p><code>mercurioctl bridge list</code>, or the <code>listBridges</code> admin command, shows each bridge's link, the messages queued for it, the messages forwarded each way since the broker started, and those dropped because the other broker refused them or no route covered them.</p>
 
 <h2>When the remote broker is down</h2>
 <ul>
 <li>Messages to forward wait in the bridge's queue on this broker, up to <code>max_queued_messages</code>, and are sent once the bridge reconnects.</li>
 <li>A QoS 1 or 2 message is acknowledged to the broker it came from only once the other broker accepted it. Messages under way when a connection drops are sent again over the next one, so none is lost; one may arrive twice. A message the receiving broker refuses, for instance for want of permission, is logged and dropped.</li>
-<li>The bridge's session on the remote broker lasts a day, so messages for <code>in</code> topics wait there across short outages.</li>
+<li>The bridge's session on the remote broker lasts a day, so messages for <code>in</code> topics wait there across short outages; <code>session_expiry</code> sets another number of seconds, and <code>clean_start = true</code> starts a new session at each connection instead. <code>keepalive</code> sets the keep-alive with the remote broker, 60 seconds by default.</li>
 <li>The bridge retries forever; the broker starts even if every remote broker is down.</li>
 <li>If this broker closes the bridge's own connection, for instance when another client takes its client id, the bridge connects again.</li>
 </ul>
