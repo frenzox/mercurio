@@ -9,7 +9,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, LoginFailures, Overflow, QueueLimits, ShareStrategy, Transport},
+    server::{Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareStrategy, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -249,6 +249,13 @@ pub struct ListenerConfig {
 
     /// Concurrent connections allowed on this listener
     pub max_connections: Option<usize>,
+
+    /// New connections per second this listener accepts on average
+    pub max_connection_rate: Option<u32>,
+
+    /// New connections this listener accepts at once after a quiet spell;
+    /// `max_connection_rate` by default
+    pub connection_rate_burst: Option<u32>,
 
     /// Replaces `[server] max_packet_size` for this listener's clients
     pub max_packet_size: Option<usize>,
@@ -890,6 +897,21 @@ pub struct ServerConfig {
     /// or not; unbounded when unset
     pub max_sessions: Option<usize>,
 
+    /// PUBLISH packets per second one client may send on average; the
+    /// broker stops reading from a client going faster. Unlimited when unset
+    pub max_publish_rate: Option<u32>,
+
+    /// PUBLISH packets a client may send at once after a quiet spell;
+    /// `max_publish_rate` by default
+    pub publish_rate_burst: Option<u32>,
+
+    /// Payload bytes per second one client may publish on average
+    pub max_publish_bytes_rate: Option<u32>,
+
+    /// Payload bytes a client may publish at once after a quiet spell;
+    /// `max_publish_bytes_rate` by default
+    pub publish_bytes_burst: Option<u32>,
+
     /// Failed logins from one address within `login_failure_window` that
     /// get it banned for `login_failure_ban`; 0 turns this off
     #[serde(default = "default_login_failure_attempts")]
@@ -964,6 +986,10 @@ impl Default for ServerConfig {
             persistent_client_expiration: None,
             max_session_expiry: default_max_session_expiry(),
             max_sessions: None,
+            max_publish_rate: None,
+            publish_rate_burst: None,
+            max_publish_bytes_rate: None,
+            publish_bytes_burst: None,
             login_failure_attempts: default_login_failure_attempts(),
             login_failure_window: default_login_failure_window(),
             login_failure_ban: default_login_failure_ban(),
@@ -998,6 +1024,22 @@ impl ExpiryBound {
             ExpiryBound::Unlimited(_) => None,
         }
     }
+}
+
+/// The rate `per_second`, `name` in the configuration, with `burst`,
+/// one second's worth by default.
+pub fn rate(name: &str, per_second: Option<u32>, burst: Option<u32>) -> Result<Option<Rate>, String> {
+    let Some(per_second) = per_second else {
+        return match burst {
+            Some(_) => Err(format!("a burst for {name} needs {name}")),
+            None => Ok(None),
+        };
+    };
+    let burst = burst.unwrap_or(per_second);
+    if per_second == 0 || burst == 0 {
+        return Err(format!("{name} and its burst must be at least 1"));
+    }
+    Ok(Some(Rate::new(per_second, burst)))
 }
 
 fn default_login_failure_attempts() -> u32 {
@@ -1313,6 +1355,16 @@ impl ServerConfig {
         limits.max_topic_filter_length = self.max_topic_filter_length;
         limits.max_session_expiry = self.max_session_expiry.duration();
         limits.max_sessions = self.max_sessions;
+        limits.max_publish_rate = rate(
+            "max_publish_rate",
+            self.max_publish_rate,
+            self.publish_rate_burst,
+        )?;
+        limits.max_publish_bytes_rate = rate(
+            "max_publish_bytes_rate",
+            self.max_publish_bytes_rate,
+            self.publish_bytes_burst,
+        )?;
         if self.login_failure_attempts > 0 {
             if self.login_failure_window == 0 || self.login_failure_ban == 0 {
                 return Err(
@@ -1863,6 +1915,21 @@ mod tests {
             None
         );
         assert!(limits("[server]\nlogin_failure_ban = 0\n").is_err());
+    }
+
+    #[test]
+    fn test_publish_rates_take_a_second_of_burst_by_default() {
+        use mercurio_server::server::Rate;
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        let set = limits("[server]\nmax_publish_rate = 50\nmax_publish_bytes_rate = 1000\npublish_bytes_burst = 5000\n").unwrap();
+        assert_eq!(set.max_publish_rate, Some(Rate::new(50, 50)));
+        assert_eq!(set.max_publish_bytes_rate, Some(Rate::new(1000, 5000)));
+        assert_eq!(limits("").unwrap().max_publish_rate, None);
+        assert!(limits("[server]\npublish_rate_burst = 5\n").is_err());
+        assert!(limits("[server]\nmax_publish_rate = 0\n").is_err());
     }
 
     #[test]

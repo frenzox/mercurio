@@ -2,7 +2,7 @@ mod common;
 
 use std::{net::SocketAddr, time::Duration};
 
-use mercurio_server::server::{Limits, ServerConfig};
+use mercurio_server::server::{Limits, ListenerConfig, Rate, ServerConfig, Transport};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -447,6 +447,66 @@ async fn connect_lasting(addr: SocketAddr, client_id: u8) -> (TcpStream, u8) {
         .unwrap();
     let connack = common::read_connack(&mut stream).await;
     (stream, connack[3])
+}
+
+#[tokio::test]
+async fn clients_over_their_publish_rate_are_read_more_slowly() {
+    let addr = start_broker({
+        let mut value = Limits::default();
+        value.max_publish_rate = Some(Rate::new(20, 5));
+        value
+    })
+    .await;
+    let (mut stream, _) = connect(addr, b'p').await;
+
+    // 25 QoS 1 PUBLISH packets to "t" at once: 5 go through at once, the
+    // other 20 at 20 a second
+    let started = std::time::Instant::now();
+    let mut packets = Vec::new();
+    for id in 1..=25u8 {
+        packets.extend_from_slice(&[0x32, 0x06, 0x00, 0x01, b't', 0x00, id, 0x00]);
+    }
+    stream.write_all(&packets).await.unwrap();
+    // PUBACK packets with No Matching Subscribers, 6 bytes each
+    let mut acks = [0u8; 25 * 6];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut acks))
+        .await
+        .expect("not every PUBACK arrived")
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+    // The connection is still served
+    stream.write_all(&[0xc0, 0x00]).await.unwrap();
+    let mut pong = [0u8; 2];
+    stream.read_exact(&mut pong).await.unwrap();
+    assert_eq!(pong, [0xd0, 0x00]);
+}
+
+#[tokio::test]
+async fn listeners_close_connections_beyond_their_rate() {
+    let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let limited = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = limited.local_addr().unwrap();
+    let mut config = ServerConfig::default();
+    config.listeners = vec![{
+        let mut value = ListenerConfig::new(limited, Transport::Mqtt);
+        value.max_connection_rate = Some(Rate::new(1, 2));
+        value
+    }];
+    tokio::spawn(mercurio_server::server::run_with_config(
+        main,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let _first = connect(addr, b'1').await;
+    let _second = connect(addr, b'2').await;
+    // The third is closed unanswered
+    let mut third = TcpStream::connect(addr).await.unwrap();
+    assert!(read_until_closed(&mut third).await.is_empty());
+    // A second later there is room for one more
+    sleep(Duration::from_millis(1100)).await;
+    assert_eq!(connect(addr, b'4').await.1[3], 0x00);
 }
 
 #[tokio::test]

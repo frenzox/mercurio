@@ -182,6 +182,16 @@ pub struct Limits {
     /// IPv4 clients of an IPv6 socket as their IPv4 address. Unbounded
     /// when unset, as many devices can share an address behind NAT.
     pub max_connections_per_ip: Option<usize>,
+    /// PUBLISH packets per second one client may send, with a burst
+    /// allowance. Beyond it the broker stops reading from the client until
+    /// the rate allows another, so the client slows down to it as TCP's
+    /// flow control pushes back; nothing is dropped or refused.
+    /// In-process clients and those of trusted listeners are not limited.
+    /// Unlimited when unset.
+    pub max_publish_rate: Option<Rate>,
+    /// Like `max_publish_rate`, for the payload bytes of the PUBLISH
+    /// packets one client sends per second.
+    pub max_publish_bytes_rate: Option<Rate>,
     /// Failed logins that get a client address banned for a while,
     /// through the same bans as the admin API's, listed with their expiry
     /// and the reason `automatic: …`. Addresses count as for
@@ -221,9 +231,101 @@ impl Default for Limits {
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
+            max_publish_rate: None,
+            max_publish_bytes_rate: None,
             login_failures: None,
             max_sessions: None,
         }
+    }
+}
+
+/// A rate of so many a second, with a burst allowance: up to `burst` may
+/// come at once after a quiet spell, and `per_second` on average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Rate {
+    pub per_second: u32,
+    /// At least 1
+    pub burst: u32,
+}
+
+impl Rate {
+    pub fn new(per_second: u32, burst: u32) -> Self {
+        Rate { per_second, burst }
+    }
+}
+
+/// A token bucket holding up to `burst` tokens, refilled at `per_second`.
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    fn new(rate: Rate) -> Self {
+        let burst = f64::from(rate.burst.max(1));
+        Bucket {
+            rate: f64::from(rate.per_second),
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
+        self.last = now;
+    }
+
+    /// Takes `amount` tokens, going into debt if there are fewer; how long
+    /// until the debt is paid back, if there is one.
+    fn take(&mut self, amount: f64) -> Option<Duration> {
+        self.refill();
+        self.tokens -= amount;
+        if self.tokens >= 0.0 {
+            return None;
+        }
+        if self.rate == 0.0 {
+            return Some(Duration::MAX);
+        }
+        Some(Duration::from_secs_f64(-self.tokens / self.rate))
+    }
+
+    /// Takes one token if there is one.
+    fn try_take(&mut self) -> bool {
+        self.refill();
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+/// How fast one client may publish.
+struct Pacing {
+    messages: Option<Bucket>,
+    bytes: Option<Bucket>,
+}
+
+impl Pacing {
+    fn new(limits: &Limits) -> Self {
+        Pacing {
+            messages: limits.max_publish_rate.map(Bucket::new),
+            bytes: limits.max_publish_bytes_rate.map(Bucket::new),
+        }
+    }
+
+    /// Counts a PUBLISH of `bytes`; how long to wait before reading the
+    /// next packet, if the client went over its rate.
+    fn publish(&mut self, bytes: usize) -> Option<Duration> {
+        let messages = self.messages.as_mut().and_then(|b| b.take(1.0));
+        let bytes = self.bytes.as_mut().and_then(|b| b.take(bytes as f64));
+        messages.max(bytes)
     }
 }
 
@@ -366,6 +468,10 @@ pub struct ListenerConfig {
     /// refuses, or whose credentials can't be read, are closed at once.
     #[cfg(unix)]
     pub peer_filter: Option<PeerFilter>,
+    /// New connections per second the listener accepts, with a burst
+    /// allowance; further ones are closed right after being accepted, as
+    /// those beyond `max_connections` are. Unlimited when unset.
+    pub max_connection_rate: Option<Rate>,
     /// Replaces [`Limits::max_packet_size`] for the listener's clients.
     pub max_packet_size: Option<usize>,
     /// Replaces [`Limits::max_connect_packet_size`] for the listener's
@@ -405,6 +511,7 @@ impl ListenerConfig {
             trusted: false,
             #[cfg(unix)]
             peer_filter: None,
+            max_connection_rate: None,
             max_packet_size: None,
             max_connect_packet_size: None,
             max_keepalive: None,
@@ -474,6 +581,8 @@ struct Endpoint {
     limits: Limits,
     /// The settings of the listener that replace the broker's
     overrides: LimitOverrides,
+    /// New connections allowed, when limited
+    connection_rate: Option<Bucket>,
     #[cfg(unix)]
     peer_filter: Option<PeerFilter>,
 }
@@ -650,6 +759,7 @@ impl Endpoint {
             state,
             trusted: config.trusted,
             limits: Limits::default(),
+            connection_rate: config.max_connection_rate.map(Bucket::new),
             overrides: LimitOverrides {
                 max_packet_size: config.max_packet_size,
                 max_connect_packet_size: config.max_connect_packet_size,
@@ -1511,6 +1621,17 @@ impl<St: MqttStore + 'static> Listener<St> {
 
             // In-process connections, which have no endpoint, are trusted
             let trusted = endpoint.is_none_or(|i| self.endpoints[i].trusted);
+
+            if let Some(i) = endpoint.filter(|_| !trusted) {
+                let endpoint = &mut self.endpoints[i];
+                if endpoint.connection_rate.as_mut().is_some_and(|b| !b.try_take()) {
+                    warn!(
+                        "Connection rate of {} exceeded, refusing {:?}",
+                        endpoint.state.name, peer_addr
+                    );
+                    continue;
+                }
+            }
 
             // Held by the connection's task for as long as it runs. Trusted
             // clients take none, so an operator or an in-process bridge can
@@ -2478,6 +2599,16 @@ where
         let deadline = time::sleep(timeout_duration.unwrap_or_default());
         tokio::pin!(deadline);
 
+        // Clients over their publish rate aren't read from until it allows
+        // another message
+        let mut pacing = match self.local || self.chain.is_trusted() {
+            true => Pacing::new(&Limits::default()),
+            false => Pacing::new(&self.limits),
+        };
+        let paused = time::sleep(Duration::ZERO);
+        tokio::pin!(paused);
+        let mut reading = true;
+
         let client_id = session.get_client_id().await;
         while !self.shutdown.is_shutdown() {
             // Every turn of the loop follows a message sent or a packet
@@ -2501,16 +2632,33 @@ where
             let step = tokio::select! {
                 // So are the packets most clients send, PUBLISH and its
                 // acknowledgements; the rest are boxed
-                packet = self.connection.read_packet() => match HotPacket::try_from(packet?) {
-                    Ok(packet) => Step::Done(self.handle_hot(&session, &client_id, packet).await?),
+                packet = self.connection.read_packet(), if reading => match HotPacket::try_from(packet?) {
+                    Ok(packet) => {
+                        let published = match &packet {
+                            HotPacket::Publish(p) => Some(p.payload.as_ref().map_or(0, |p| p.len())),
+                            _ => None,
+                        };
+                        let flow = self.handle_hot(&session, &client_id, packet).await?;
+                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
+                            reading = false;
+                            paused.as_mut().reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
+                        }
+                        Step::Done(flow)
+                    }
                     Err(packet) => Step::Wake(Wake::Packet(packet)),
                 },
+                // The client is sending, so it is alive: its keep-alive
+                // starts over once it may send again
+                _ = &mut paused, if !reading => {
+                    reading = true;
+                    Step::Done(Flow::PacketHandled)
+                }
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
                 (message, journaled) = session.next_outgoing(window_open) => {
                     Step::Done(self.send_outgoing(&session, &client_id, message, journaled).await?)
                 }
-                _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
+                _ = &mut deadline, if timeout_duration.is_some() && reading => Step::Wake(Wake::KeepAliveExpired),
                 Ok(()) = lease.close.changed() => {
                     let close = (*lease.close.borrow_and_update()).unwrap_or(Close::TakenOver);
                     Step::Wake(Wake::Closed(close))
@@ -3088,6 +3236,11 @@ enum Flow {
     Close,
 }
 
+/// An instant no timer reaches, for waits too long to add to now.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86400 * 365 * 30)
+}
+
 /// Explains `reason` to the client, unless the text would make the packet
 /// larger than the client accepts [MQTT-3.1.2-25].
 fn reason_string(
@@ -3141,6 +3294,36 @@ mod tests {
         let _v6 = slots.acquire(ip("2001:db8:0:1::1"), 1).unwrap();
         assert!(slots.acquire(ip("2001:db8:0:1:ffff::2"), 1).is_none());
         assert!(slots.acquire(ip("2001:db8:0:2::1"), 1).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_buckets_allow_a_burst_then_the_rate() {
+        let mut bucket = Bucket::new(Rate::new(10, 3));
+        for _ in 0..3 {
+            assert_eq!(bucket.take(1.0), None);
+        }
+        // In debt by one, paid back in a tenth of a second
+        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
+        time::advance(Duration::from_millis(100)).await;
+        assert_eq!(bucket.take(1.0), Some(Duration::from_millis(100)));
+        // A long quiet spell refills no more than the burst
+        time::advance(Duration::from_secs(60)).await;
+        assert!(bucket.try_take() && bucket.try_take() && bucket.try_take());
+        assert!(!bucket.try_take());
+        time::advance(Duration::from_millis(100)).await;
+        assert!(bucket.try_take());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pacing_waits_for_the_slower_of_messages_and_bytes() {
+        let mut limits = Limits::default();
+        limits.max_publish_rate = Some(Rate::new(100, 1));
+        limits.max_publish_bytes_rate = Some(Rate::new(1000, 1000));
+        let mut pacing = Pacing::new(&limits);
+        assert_eq!(pacing.publish(500), None);
+        // One message too many, and 1000 bytes too many
+        assert_eq!(pacing.publish(1500), Some(Duration::from_secs(1)));
+        assert_eq!(Pacing::new(&Limits::default()).publish(usize::MAX), None);
     }
 
     #[test]

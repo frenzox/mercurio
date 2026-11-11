@@ -159,6 +159,12 @@ host = "0.0.0.0"
 port = 8883
 max_connections = 500</pre>
 <p>Connections beyond the limit are closed right after being accepted. The broker-wide <code>[server] max_connections</code> still applies, and a flood on one listener can't use up the slots of another.</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8883
+max_connection_rate = 50     <span class="comment"># new connections a second, on average</span>
+connection_rate_burst = 200  <span class="comment"># at once after a quiet spell; max_connection_rate by default</span></pre>
+<p>Connections beyond the rate are closed right after being accepted, before any handshake, as those beyond <code>max_connections</code> are. A reconnect storm after an outage then reaches the broker at a pace it can authenticate.</p>
 <p>A listener may also replace some <code>[server]</code> limits for its own clients; those it leaves out come from <code>[server]</code>:</p>
 <pre>[[listeners]]
 host = "0.0.0.0"

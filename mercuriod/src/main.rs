@@ -314,6 +314,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.proxy_from = prepared.proxy_from;
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
+        value.max_connection_rate = config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
         value.max_packet_size = extra.max_packet_size;
         value.max_connect_packet_size = extra.max_connect_packet_size;
         value.max_keepalive = extra.max_keepalive;
@@ -499,6 +504,11 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
         if extra.port.is_some() == extra.path.is_some() {
             return Err("Each [[listeners]] entry needs either `port` or `path`".into());
         }
+        config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
         if extra.max_connect_packet_size == Some(0) {
             return Err("A listener's max_connect_packet_size must be at least 1".into());
         }
