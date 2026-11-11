@@ -10,6 +10,7 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use clap::{Parser, Subcommand};
 use mercurio_server::acl::AclFile;
+use mercurio_server::admin::AdminExtension;
 use mercurio_server::plugin::Plugin;
 use mercurio_server::server::{
     AuthConfig as ServerAuthConfig, ConnectPolicy, ListenerConfig, LocalConnector, Redirect,
@@ -21,15 +22,16 @@ use mercurio_storage::{
 };
 use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
 
 #[cfg(target_os = "linux")]
 mod admin_socket;
 mod bridge;
+mod commands;
 mod config;
 mod credentials;
 mod dynsec;
 mod http_auth;
+mod logging;
 mod reload;
 #[cfg(unix)]
 mod syslog;
@@ -146,55 +148,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Config::default()
     };
 
-    // Initialize logging
-    let log_level = if cli.verbose {
-        "debug"
-    } else {
-        &config.logging.level
-    };
-
-    let mut filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
-    if !config.logging.connection_messages {
-        filter = filter.add_directive(
-            format!("{}=off", mercurio_server::CONNECTIONS)
-                .parse()
-                .expect("valid directive"),
-        );
-    }
-    #[cfg(unix)]
-    let syslog = match config.logging.syslog {
-        true => Some(
-            syslog::Syslog::connect("/dev/log")
-                .map_err(|e| format!("Failed to connect to syslog at /dev/log: {}", e))?,
-        ),
-        false => None,
-    };
-    #[cfg(not(unix))]
-    let syslog: Option<std::io::Sink> = match config.logging.syslog {
-        true => return Err("syslog is only supported on Unix".into()),
-        false => None,
-    };
-    match (syslog, &config.logging.file) {
-        (Some(syslog), _) => fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(syslog)
-            .init(),
-        (None, Some(path)) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("Failed to open log file {}: {}", path, e))?;
-            fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-        }
-        (None, None) => fmt().with_env_filter(filter).init(),
-    }
+    let log_level = logging::init(&config.logging, cli.verbose)?;
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -349,6 +303,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bridge::spawn(bridge, connector.clone())?;
     }
 
+    let commands = Arc::new(commands::DaemonCommands::new(log_level));
+
     let mut server_config = ServerConfig::default();
     server_config.tls = tls_config;
     server_config.auth = auth_config;
@@ -357,6 +313,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     server_config.policy = policy;
     server_config.listeners = listeners;
     server_config.local_listener = Some(local_listener);
+    let extension: Arc<dyn AdminExtension> = commands.clone();
+    server_config.admin_extension = Some(extension);
     server_config.sys_interval =
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     #[cfg(unix)]
