@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mercurio_server::{
-    error::ServerError,
+    error::{ConfigErrorKind, ServerError},
     server::{run_with_config, ListenerConfig, ServerConfig, Transport},
 };
 #[cfg(unix)]
@@ -24,6 +24,16 @@ async fn start_with(extra: ListenerConfig) -> Result<(), ServerError> {
     .expect("server started serving anyway")
 }
 
+/// Asserts that startup failed on the extra listener, for `kind`.
+#[track_caller]
+fn assert_kind(result: Result<(), ServerError>, kind: ConfigErrorKind) {
+    let Err(ServerError::Config(error)) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(error.kind, kind, "{error}");
+    assert_eq!(error.listener, 1, "{error}");
+}
+
 #[tokio::test]
 async fn trusted_tcp_listeners_fail_startup() {
     let mut value = ListenerConfig::new(
@@ -32,7 +42,7 @@ async fn trusted_tcp_listeners_fail_startup() {
     );
     value.trusted = true;
     let result = start_with(value).await;
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::TrustedTcp);
 }
 
 /// A PROXY header can claim any address, so trusting every peer to send
@@ -45,9 +55,12 @@ async fn proxy_protocol_without_proxy_from_fails_startup() {
     );
     value.proxy_protocol = true;
     let result = start_with(value).await;
-    let Err(ServerError::Config(message)) = result else {
+    let Err(ServerError::Config(error)) = result else {
         panic!("{result:?}");
     };
+    assert_eq!(error.kind, ConfigErrorKind::ProxyFromRequired);
+    assert_eq!(error.listener, 1);
+    let message = error.to_string();
     assert!(message.contains(r#"["0.0.0.0/0", "::/0"]"#), "{message}");
 }
 
@@ -60,7 +73,7 @@ async fn peer_filters_on_tcp_listeners_fail_startup() {
     );
     value.peer_filter = Some(Arc::new(|_: &UCred| true));
     let result = start_with(value).await;
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::PeerFilterOnTcp);
 }
 
 #[cfg(unix)]
@@ -76,7 +89,7 @@ async fn trusted_listeners_take_no_plugins() {
     value.plugins = Some(Vec::new());
     let result = start_with(value).await;
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::TrustedWithAuth);
 }
 
 #[cfg(unix)]
@@ -95,7 +108,7 @@ async fn trusted_listeners_refuse_the_proxy_protocol() {
     value.proxy_protocol = true;
     let result = start_with(value).await;
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::TrustedBehindProxy);
 }
 
 #[cfg(unix)]
@@ -104,7 +117,7 @@ async fn trusted_listeners_refuse_the_websocket_transport() {
     let (value, path) = trusted_socket("trusted-ws", Transport::WebSocket).await;
     let result = start_with(value).await;
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::TrustedBehindProxy);
 }
 
 #[cfg(unix)]
@@ -114,7 +127,7 @@ async fn trusted_listeners_take_no_auth() {
     value.auth = Some(Default::default());
     let result = start_with(value).await;
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::TrustedWithAuth);
 }
 
 async fn tcp_listener(transport: Transport) -> ListenerConfig {
@@ -129,9 +142,9 @@ async fn mount_points_with_wildcards_fail_startup() {
         let mut value = tcp_listener(Transport::Mqtt).await;
         value.mount_point = Some(mount_point.into());
         let result = start_with(value).await;
-        assert!(
-            matches!(result, Err(ServerError::Config(_))),
-            "{mount_point}: {result:?}"
+        assert_kind(
+            result,
+            ConfigErrorKind::MountPointWildcard(mount_point.into()),
         );
     }
 }
@@ -142,12 +155,12 @@ async fn websocket_settings_on_mqtt_listeners_fail_startup() {
     let mut value = tcp_listener(Transport::Mqtt).await;
     value.http_dir = Some(std::env::temp_dir());
     let result = start_with(value).await;
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::WebSocketOnly("http_dir"));
 
     let mut value = tcp_listener(Transport::Mqtt).await;
     value.allowed_origins = Some(vec!["https://app.example".into()]);
     let result = start_with(value).await;
-    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+    assert_kind(result, ConfigErrorKind::WebSocketOnly("allowed_origins"));
 }
 
 /// A limit too large to count is no limit, not a panic.

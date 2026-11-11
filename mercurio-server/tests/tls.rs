@@ -4,6 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use mercurio_server::{
     auth::SimpleCredentialValidator,
+    error::TlsError,
     plugin::{ready, BoxFuture, ClientInfo, Event, Plugin},
     server::{run_with_config, ServerConfig},
     tls::{CertificateName, Tls, TlsConfig},
@@ -177,9 +178,14 @@ async fn reload_serves_new_connections_the_new_certificate() {
 #[test]
 fn unusable_files_are_refused_up_front() {
     let missing = TlsConfig::new("/nonexistent/cert.pem", "/nonexistent/key.pem");
-    assert!(Tls::new(missing).is_err());
+    let error = Tls::new(missing).unwrap_err();
+    assert!(
+        matches!(&error, TlsError::ReadCertificates { path, .. } if path == "/nonexistent/cert.pem"),
+        "{error}"
+    );
     let mismatched = TlsConfig::new(fixture("server.pem"), fixture("server2.key"));
-    assert!(Tls::new(mismatched).is_err());
+    let error = Tls::new(mismatched).unwrap_err();
+    assert!(matches!(error, TlsError::Configure(_)), "{error}");
 }
 
 /// A listener asking for client certificates signed by the test root CA,

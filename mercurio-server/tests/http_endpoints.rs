@@ -3,7 +3,7 @@ mod common;
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_server::{
-    error::ServerError,
+    error::{ConfigErrorKind, ServerError},
     server::{ListenerConfig, Server, ServerConfig, Transport},
 };
 use mercurio_storage::memory::MemoryStore;
@@ -138,5 +138,8 @@ async fn endpoints_need_a_websocket_listener() {
     config.listeners = vec![listener];
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let result = Server::new(main, config, std::sync::Arc::new(MemoryStore::new())).await;
-    assert!(matches!(result, Err(ServerError::Config(_))));
+    let Err(ServerError::Config(error)) = result else {
+        panic!("served metrics on an MQTT listener");
+    };
+    assert_eq!(error.kind, ConfigErrorKind::WebSocketOnly("metrics"));
 }

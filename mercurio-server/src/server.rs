@@ -14,7 +14,7 @@ use std::{
     task::Poll,
 };
 
-use crate::error::ServerError;
+use crate::error::{ConfigError, ConfigErrorKind, ServerError};
 use crate::CONNECTIONS;
 use futures_util::FutureExt;
 #[cfg(unix)]
@@ -562,6 +562,51 @@ impl ListenerConfig {
             use_username_as_clientid: false,
         }
     }
+
+    /// What makes these settings unservable, if anything.
+    fn problem(&self) -> Option<ConfigErrorKind> {
+        let unix = !matches!(self.listener, Socket::Tcp(_));
+        if self.trusted && !unix {
+            return Some(ConfigErrorKind::TrustedTcp);
+        }
+        if self.trusted && (self.auth.is_some() || self.plugins.is_some()) {
+            return Some(ConfigErrorKind::TrustedWithAuth);
+        }
+        if self.trusted && (self.proxy_protocol || self.transport == Transport::WebSocket) {
+            return Some(ConfigErrorKind::TrustedBehindProxy);
+        }
+        if let Some(mount_point) = self.mount_point.as_deref() {
+            if mount_point.contains(['+', '#']) {
+                return Some(ConfigErrorKind::MountPointWildcard(mount_point.into()));
+            }
+        }
+        if self.transport != Transport::WebSocket {
+            let websocket_only = [
+                ("http_dir", self.http_dir.is_some()),
+                ("allowed_origins", self.allowed_origins.is_some()),
+                ("health", self.health),
+                ("metrics", self.metrics),
+            ];
+            if let Some((setting, _)) = websocket_only.into_iter().find(|(_, set)| *set) {
+                return Some(ConfigErrorKind::WebSocketOnly(setting));
+            }
+        }
+        // A Unix socket's file permissions decide who may send the header
+        if self.proxy_protocol && self.proxy_from.is_empty() && !unix {
+            return Some(ConfigErrorKind::ProxyFromRequired);
+        }
+        if self.use_username_as_clientid && self.trusted {
+            return Some(ConfigErrorKind::TrustedUsernameAsClientId);
+        }
+        if !self.proxy_from.is_empty() && unix {
+            return Some(ConfigErrorKind::ProxyFromOnUnix);
+        }
+        #[cfg(unix)]
+        if self.peer_filter.is_some() && !unix {
+            return Some(ConfigErrorKind::PeerFilterOnTcp);
+        }
+        None
+    }
 }
 
 /// Opens in-process connections to a broker, for parts of the same program
@@ -697,76 +742,13 @@ impl LimitOverrides {
 }
 
 impl Endpoint {
-    fn new(config: ListenerConfig, timeout: Duration) -> std::result::Result<Self, ServerError> {
-        let unix = !matches!(config.listener, Socket::Tcp(_));
-        if config.trusted && !unix {
-            return Err(ServerError::Config(
-                "only a Unix socket listener can be trusted: anyone who reaches a TCP one \
-                 would administer the broker"
-                    .into(),
-            ));
-        }
-        if config.trusted && (config.auth.is_some() || config.plugins.is_some()) {
-            return Err(ServerError::Config(
-                "a trusted listener skips authentication and access control, so it takes no \
-                 auth or plugins"
-                    .into(),
-            ));
-        }
-        if config.trusted && (config.proxy_protocol || config.transport == Transport::WebSocket) {
-            return Err(ServerError::Config(
-                "a trusted listener can't sit behind a proxy: the kernel reports the proxy's \
-                 credentials, so every remote client would be trusted"
-                    .into(),
-            ));
-        }
-        if let Some(mount_point) = config.mount_point.as_deref() {
-            if mount_point.contains(['+', '#']) {
-                return Err(ServerError::Config(format!(
-                    "mount point `{mount_point}` has a wildcard: its clients' topic filters \
-                     would reach other mount points' topics"
-                )));
-            }
-        }
-        if config.transport != Transport::WebSocket
-            && (config.http_dir.is_some()
-                || config.allowed_origins.is_some()
-                || config.health
-                || config.metrics)
-        {
-            return Err(ServerError::Config(
-                "http_dir, allowed_origins, health and metrics only apply to WebSocket listeners"
-                    .into(),
-            ));
-        }
-        // A Unix socket's file permissions decide who may send the header
-        if config.proxy_protocol && config.proxy_from.is_empty() && !unix {
-            return Err(ServerError::Config(
-                "a PROXY header can claim any address, so proxy_protocol needs proxy_from to \
-                 name the proxies that may send it; to let any peer send one, set proxy_from \
-                 to [\"0.0.0.0/0\", \"::/0\"]"
-                    .into(),
-            ));
-        }
-        if config.use_username_as_clientid && config.trusted {
-            return Err(ServerError::Config(
-                "a trusted listener verifies no user names, so it can't use them as client ids"
-                    .into(),
-            ));
-        }
-        if !config.proxy_from.is_empty() && unix {
-            return Err(ServerError::Config(
-                "a Unix socket's clients have no address for proxy_from to match; its file \
-                 permissions decide who may connect"
-                    .into(),
-            ));
-        }
-        #[cfg(unix)]
-        if config.peer_filter.is_some() && !unix {
-            return Err(ServerError::Config(
-                "a peer filter needs a Unix socket listener".into(),
-            ));
-        }
+    /// The listener `config`, the `index`th of the broker, once its
+    /// settings are checked.
+    fn new(
+        index: usize,
+        config: ListenerConfig,
+        timeout: Duration,
+    ) -> std::result::Result<Self, ConfigError> {
         let (address, path) = match &config.listener {
             Socket::Tcp(listener) => (listener.local_addr().ok().map(|a| a.to_string()), None),
             #[cfg(unix)]
@@ -778,12 +760,16 @@ impl Endpoint {
                     .and_then(|a| a.as_pathname().map(|p| p.display().to_string())),
             ),
         };
+        let name = address.clone().or_else(|| path.clone()).unwrap_or_default();
+        if let Some(kind) = config.problem() {
+            return Err(ConfigError {
+                listener: index,
+                name,
+                kind,
+            });
+        }
         let state = Arc::new(ListenerState {
-            name: address
-                .clone()
-                .or_else(|| path.clone())
-                .unwrap_or_default()
-                .into(),
+            name: name.into(),
             info: ListenerInfo {
                 address,
                 path,
@@ -1465,7 +1451,8 @@ impl<St: MqttStore + 'static> Server<St> {
         };
         let mut endpoints = std::iter::once(main)
             .chain(listeners)
-            .map(|l| Endpoint::new(l, plugin_timeout))
+            .enumerate()
+            .map(|(i, l)| Endpoint::new(i, l, plugin_timeout))
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let auth_config = Arc::new(auth_config);
