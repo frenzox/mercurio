@@ -121,6 +121,12 @@ max_queued_qos0_messages = 1000
 # "drop_oldest", the oldest waiting of its kind (QoS 0, or QoS 1 and 2) so
 # a client that falls behind gets the latest ones
 # queue_overflow = "drop_newest"
+# How a shared subscription's group picks the member a message goes to:
+# "round_robin", "random", "sticky" (the same member for as long as it is
+# connected and takes messages) or "hash" (by the publisher's client id, so
+# each publisher's messages stay in order). Connected members whose queue
+# has room always come first
+# shared_subscription_strategy = "round_robin"
 
 # Send messages at the QoS of the subscription even when they were published
 # with a lower one; goes beyond the MQTT specification

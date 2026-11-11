@@ -52,7 +52,7 @@ use mercurio_packets::{
 
 use crate::{
     acl::Access,
-    broker::Broker,
+    broker::{Broker, Publisher},
     connection::Connection,
     plugin::{
         is_control, AuthResult, Chain, ClientInfo, Event, Exchange, MessageAction, PluginMessage,
@@ -297,6 +297,8 @@ struct Shared {
     queue: Arc<MessageQueue>,
     /// Identifies this session's subscriptions in the topic tree
     subscriber_id: u64,
+    /// A hash of the client id, which never changes for a session
+    client_key: u64,
     /// Generation of the latest connection to use this session. Changed
     /// with `state` locked, so checks made under that lock see it settled;
     /// readable without the lock by the session manager.
@@ -441,6 +443,12 @@ impl Session {
         stats: Arc<Stats>,
     ) -> Self {
         let client_id = connect_packet.payload.client_id.clone();
+        let client_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            client_id.hash(&mut hasher);
+            hasher.finish()
+        };
         let will_message = WillMessage::from_connect_packet(&connect_packet);
         let presence = Presence::default();
         let queue = MessageQueue::new(queue_limits).counted_in(stats);
@@ -482,6 +490,7 @@ impl Session {
                 }),
                 queue: Arc::new(queue),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
+                client_key,
                 generation: AtomicU64::new(0),
                 owes_retained: AtomicBool::new(false),
             }),
@@ -1023,7 +1032,7 @@ impl Session {
         };
 
         let subscribers = broker
-            .publish_from(&topic, message, Some(self.shared.subscriber_id))
+            .publish_from(&topic, message, Some(self.publisher()))
             .await
             .map_err(storage_failure)?;
 
@@ -1109,6 +1118,14 @@ impl Session {
     /// Identifies this session's subscriptions in the topic tree.
     pub(crate) fn subscriber_id(&self) -> u64 {
         self.shared.subscriber_id
+    }
+
+    /// This session as the publisher of a message.
+    fn publisher(&self) -> Publisher {
+        Publisher {
+            session: self.shared.subscriber_id,
+            key: self.shared.client_key,
+        }
     }
 
     /// Records a new connection to the session and returns the counters

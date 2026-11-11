@@ -371,6 +371,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     server_config.plugin_timeout = config.server.plugin_timeout();
     server_config.plugin_tick_interval = config.server.plugin_tick_interval();
+    server_config.share_strategy = config.server.share_strategy();
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(hangup, reloadable));
 

@@ -9,7 +9,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, Overflow, QueueLimits, Transport},
+    server::{Limits, Overflow, QueueLimits, ShareStrategy, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -776,6 +776,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub queue_overflow: QueueOverflow,
 
+    /// How a shared subscription's group picks the member a message goes to
+    #[serde(default)]
+    pub shared_subscription_strategy: SharedStrategy,
+
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
     #[serde(default)]
@@ -906,6 +910,7 @@ impl Default for ServerConfig {
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: default_max_queued_bytes(),
             queue_overflow: QueueOverflow::default(),
+            shared_subscription_strategy: SharedStrategy::default(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
@@ -964,6 +969,17 @@ impl ExpiryBound {
 /// while devices offline over a weekend find theirs.
 fn default_max_session_expiry() -> ExpiryBound {
     ExpiryBound::Seconds(7 * 24 * 3600)
+}
+
+/// How a shared subscription's group picks a member.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedStrategy {
+    #[default]
+    RoundRobin,
+    Random,
+    Sticky,
+    Hash,
 }
 
 /// Which message a full queue drops.
@@ -1197,6 +1213,15 @@ impl ServerConfig {
 
     pub fn plugin_tick_interval(&self) -> Duration {
         Duration::from_secs(self.plugin_tick_interval)
+    }
+
+    pub fn share_strategy(&self) -> ShareStrategy {
+        match self.shared_subscription_strategy {
+            SharedStrategy::RoundRobin => ShareStrategy::RoundRobin,
+            SharedStrategy::Random => ShareStrategy::Random,
+            SharedStrategy::Sticky => ShareStrategy::Sticky,
+            SharedStrategy::Hash => ShareStrategy::Hash,
+        }
     }
 
     pub fn limits(&self) -> Result<Limits, String> {
@@ -1737,6 +1762,24 @@ mod tests {
         assert!(toml::from_str::<Config>("[server]\nmax_session_expiry = \"forever\"\n").is_err());
         assert_eq!(limits("").max_sessions, None);
         assert_eq!(limits("[server]\nmax_sessions = 5\n").max_sessions, Some(5));
+    }
+
+    #[test]
+    fn test_shared_subscription_strategy_is_read() {
+        let strategy = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.share_strategy()
+        };
+        use mercurio_server::server::ShareStrategy;
+        assert_eq!(strategy(""), ShareStrategy::RoundRobin);
+        assert_eq!(
+            strategy("[server]\nshared_subscription_strategy = \"hash\"\n"),
+            ShareStrategy::Hash
+        );
+        assert!(
+            toml::from_str::<Config>("[server]\nshared_subscription_strategy = \"first\"\n")
+                .is_err()
+        );
     }
 
     #[test]

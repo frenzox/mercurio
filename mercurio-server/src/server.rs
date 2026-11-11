@@ -89,6 +89,7 @@ pub struct AuthConfig {
 }
 
 pub use crate::{
+    broker::ShareStrategy,
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
     queue::{Overflow, QueueLimits},
 };
@@ -244,6 +245,8 @@ pub struct ServerConfig {
     pub plugin_tick_interval: Duration,
     /// Serves the `$CONTROL/broker/v1` commands the broker doesn't know.
     pub admin_extension: Option<Arc<dyn AdminExtension>>,
+    /// How shared subscriptions pick the member a message goes to.
+    pub share_strategy: ShareStrategy,
 }
 
 impl Default for ServerConfig {
@@ -260,6 +263,7 @@ impl Default for ServerConfig {
             plugin_timeout: Duration::from_secs(5),
             plugin_tick_interval: Duration::from_secs(1),
             admin_extension: None,
+            share_strategy: ShareStrategy::default(),
         }
     }
 }
@@ -1188,6 +1192,7 @@ impl<St: MqttStore + 'static> Server<St> {
             plugin_timeout,
             plugin_tick_interval,
             admin_extension,
+            share_strategy,
         } = config;
         let stats = Arc::new(Stats::default());
         let policy = Arc::new(policy);
@@ -1207,7 +1212,9 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
-        let broker = Broker::new(Arc::clone(&storage)).counted_in(Arc::clone(&stats));
+        let broker = Broker::new(Arc::clone(&storage))
+            .counted_in(Arc::clone(&stats))
+            .with_share_strategy(share_strategy);
         let session_manager_holder = SessionManagerDropGuard::new(
             Arc::clone(&storage),
             limits.queue,
