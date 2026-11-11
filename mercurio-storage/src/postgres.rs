@@ -285,6 +285,12 @@ const MIGRATIONS: &[&str] = &[
     END
     $$;
 ",
+    // Which shared subscription a queued or in-flight message came through,
+    // so it can go to another member of the group
+    "
+    ALTER TABLE queued_messages ADD COLUMN IF NOT EXISTS share_group TEXT;
+    ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS share_group TEXT;
+",
 ];
 
 /// The migration that creates the subscriptions table, after which
@@ -1075,17 +1081,18 @@ fn bulk_statements(key: &SessionKey, run: &[&Write]) -> Vec<(&'static str, Param
         statements.push((
             "INSERT INTO inflight_messages
              (mount_point, client_id, packet_id, topic, payload, qos, dup, sequence, released,
-              properties, subscription_identifiers, retain, expires_at)
+              properties, subscription_identifiers, retain, expires_at, share_group)
              SELECT $1, $2, * FROM unnest($3::INTEGER[], $4::TEXT[], $5::BYTEA[],
                                           $6::INTEGER[], $7::BOOLEAN[], $8::BIGINT[],
                                           $9::BOOLEAN[], $10::BYTEA[], $11::TEXT[],
-                                          $12::BOOLEAN[], $13::BIGINT[])
+                                          $12::BOOLEAN[], $13::BIGINT[], $14::TEXT[])
              ON CONFLICT (mount_point, client_id, packet_id) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              dup = EXCLUDED.dup, sequence = EXCLUDED.sequence, released = EXCLUDED.released,
              properties = EXCLUDED.properties,
              subscription_identifiers = EXCLUDED.subscription_identifiers,
-             retain = EXCLUDED.retain, expires_at = EXCLUDED.expires_at",
+             retain = EXCLUDED.retain, expires_at = EXCLUDED.expires_at,
+             share_group = EXCLUDED.share_group",
             with_key(
                 key,
                 vec![
@@ -1102,6 +1109,7 @@ fn bulk_statements(key: &SessionKey, run: &[&Write]) -> Vec<(&'static str, Param
                     column(&stored, |(m, _)| identifiers(&m.subscription_identifiers)),
                     column(&stored, |(m, _)| m.retain),
                     column(&stored, |(m, _)| m.expires_at.map(|t| t as i64)),
+                    column(&stored, |(m, _)| m.share_group.clone()),
                 ],
             ),
         ));
@@ -1150,15 +1158,16 @@ fn bulk_statements(key: &SessionKey, run: &[&Write]) -> Vec<(&'static str, Param
         statements.push((
             "INSERT INTO queued_messages
              (mount_point, client_id, sequence, topic, payload, qos, retain, properties,
-              expires_at, subscription_identifiers)
+              expires_at, subscription_identifiers, share_group)
              SELECT $1, $2, * FROM unnest($3::BIGINT[], $4::TEXT[], $5::BYTEA[],
                                           $6::INTEGER[], $7::BOOLEAN[], $8::BYTEA[],
-                                          $9::BIGINT[], $10::TEXT[])
+                                          $9::BIGINT[], $10::TEXT[], $11::TEXT[])
              ON CONFLICT (mount_point, client_id, sequence) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              retain = EXCLUDED.retain, properties = EXCLUDED.properties,
              expires_at = EXCLUDED.expires_at,
-             subscription_identifiers = EXCLUDED.subscription_identifiers",
+             subscription_identifiers = EXCLUDED.subscription_identifiers,
+             share_group = EXCLUDED.share_group",
             with_key(
                 key,
                 vec![
@@ -1170,6 +1179,9 @@ fn bulk_statements(key: &SessionKey, run: &[&Write]) -> Vec<(&'static str, Param
                     column(&queued, |(_, m)| encode_properties(&m.properties)),
                     column(&queued, |(_, m)| m.expires_at.map(|t| t as i64)),
                     column(&queued, |(_, m)| identifiers(&m.subscription_identifiers)),
+                    column(&queued, |(_, m)| {
+                        m.share_group.as_deref().map(str::to_string)
+                    }),
                 ],
             ),
         ));
@@ -1499,6 +1511,10 @@ fn queued_from_row(row: &Row) -> Result<(u64, Message)> {
             row.try_get("subscription_identifiers").col()?,
         )?,
         origin: None,
+        share_group: row
+            .try_get::<_, Option<String>>("share_group")
+            .col()?
+            .map(Arc::from),
     };
     Ok((row.try_get::<_, i64>("sequence").col()? as u64, message))
 }
@@ -1601,6 +1617,7 @@ fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
             .try_get::<_, Option<i64>>("expires_at")
             .col()?
             .map(|t| t as u64),
+        share_group: row.try_get("share_group").col()?,
     })
 }
 
@@ -1633,6 +1650,7 @@ fn retained_from_row(row: &Row) -> Result<Message> {
             .map(|t| t as u64),
         subscription_identifiers: Vec::new(),
         origin,
+        share_group: None,
     })
 }
 
@@ -1969,6 +1987,46 @@ mod tests {
             .unwrap();
     }
 
+    /// Messages stored before share groups were recorded load without one,
+    /// and running the migration again changes nothing.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_migrates_messages_without_a_share_group() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let marking = MIGRATIONS.len() - 1;
+        database_at(
+            &url,
+            marking,
+            "INSERT INTO queued_messages
+                 (mount_point, client_id, sequence, topic, payload, qos, retain, properties)
+                 VALUES ('', 'a', 4, 'q', NULL, 1, FALSE, '');
+             INSERT INTO inflight_messages
+                 (mount_point, client_id, packet_id, topic, payload, qos, dup, sequence,
+                  released, properties)
+                 VALUES ('', 'a', 1, 'i', NULL, 1, FALSE, 1, FALSE, '');",
+        )
+        .await;
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        store
+            .client()
+            .await
+            .unwrap()
+            .batch_execute(MIGRATIONS[marking])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_queue(&key("a")).await.unwrap()[0].1.share_group,
+            None
+        );
+        assert_eq!(
+            store.load_inflight(&key("a")).await.unwrap()[0].share_group,
+            None
+        );
+    }
+
     /// In-flight messages stored before they kept their RETAIN flag and
     /// expiry load without either.
     #[tokio::test]
@@ -2064,7 +2122,7 @@ mod tests {
     async fn test_migrates_rows_under_their_sessions_mount_point() {
         let url = database_url();
         let _database = DATABASE.lock().await;
-        let keyed = MIGRATIONS.len() - 1;
+        let keyed = MIGRATIONS.len() - 2;
         database_at(
             &url,
             keyed,

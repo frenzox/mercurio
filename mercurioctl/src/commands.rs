@@ -88,6 +88,7 @@ fn client(c: ClientCommand) -> Value {
             prefix,
             user,
             address,
+            mount_point,
             page,
         } => paged(
             "listClients",
@@ -96,6 +97,7 @@ fn client(c: ClientCommand) -> Value {
                 "clientidPrefix": prefix,
                 "username": user,
                 "address": address,
+                "mountpoint": mount_point,
             }),
             page,
         ),
@@ -241,6 +243,10 @@ mod tests {
         assert_eq!(
             sent(&["client", "list", "--offline"]),
             json!({"command": "listClients", "connected": false})
+        );
+        assert_eq!(
+            sent(&["client", "list", "--mount-point", "tenant/"]),
+            json!({"command": "listClients", "mountpoint": "tenant/"})
         );
         assert_eq!(
             sent(&["client", "show", "s1"]),

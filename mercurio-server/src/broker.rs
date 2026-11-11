@@ -28,6 +28,7 @@ pub(crate) struct Broker<S: RetainedMessageStore> {
     storage: Arc<SysOverlay<S>>,
     stats: Arc<Stats>,
     share_strategy: ShareStrategy,
+    share_redelivery: ShareRedelivery,
 }
 
 impl<S: RetainedMessageStore> Clone for Broker<S> {
@@ -37,7 +38,50 @@ impl<S: RetainedMessageStore> Clone for Broker<S> {
             storage: Arc::clone(&self.storage),
             stats: Arc::clone(&self.stats),
             share_strategy: self.share_strategy,
+            share_redelivery: self.share_redelivery,
         }
+    }
+}
+
+/// When the messages a member of a share group was given and hasn't
+/// processed go to another member: those still queued for it, and those
+/// at QoS 1 it was sent and hasn't acknowledged. QoS 2 messages it was
+/// sent stay with it [MQTT-4.8.2-5]. A QoS 1 message the member processed
+/// without acknowledging reaches the application twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShareRedelivery {
+    /// When the member's session ends, as its expiry passes, a clean start
+    /// replaces it or it is deleted; until then its messages wait for it
+    #[default]
+    OnSessionEnd,
+    /// Also as soon as the member's connection is lost, to the members
+    /// connected then; the rest still waits for the member
+    OnDisconnect,
+}
+
+/// Gives the messages a departing member of a share group held to
+/// another member of the group.
+pub(crate) trait Reoffer: Send + Sync {
+    /// Offers `message`, which reached the session `except` through the
+    /// shared subscription `group`, to another member: one connected, or
+    /// with `anyone` a disconnected one when no connected member takes it.
+    /// Whether a member took it; one no member takes with `anyone` is lost.
+    fn reoffer(&self, group: &str, message: Message, except: u64, anyone: bool) -> bool;
+}
+
+impl<S: RetainedMessageStore + 'static> Reoffer for Broker<S> {
+    fn reoffer(&self, group: &str, message: Message, except: u64, anyone: bool) -> bool {
+        let mut taken = false;
+        self.subscriptions.choose_in(group, |members, turn| {
+            let chosen = self.share_member(members, turn, None, &message, Some(except), anyone);
+            taken = chosen.is_some();
+            chosen
+        });
+        if !taken && anyone {
+            self.stats.dropped(DropCause::NoShareMember, 1, None);
+        }
+        taken
     }
 }
 
@@ -78,6 +122,7 @@ impl<S: RetainedMessageStore> Broker<S> {
             storage: Arc::new(SysOverlay::new(storage)),
             stats: Default::default(),
             share_strategy: ShareStrategy::default(),
+            share_redelivery: ShareRedelivery::default(),
         }
     }
 
@@ -85,6 +130,53 @@ impl<S: RetainedMessageStore> Broker<S> {
     pub(crate) fn with_share_strategy(mut self, strategy: ShareStrategy) -> Self {
         self.share_strategy = strategy;
         self
+    }
+
+    /// Hands a departing member's messages to the rest of its group as
+    /// `redelivery` says.
+    pub(crate) fn with_share_redelivery(mut self, redelivery: ShareRedelivery) -> Self {
+        self.share_redelivery = redelivery;
+        self
+    }
+
+    pub(crate) fn share_redelivery(&self) -> ShareRedelivery {
+        self.share_redelivery
+    }
+
+    /// The member of a share group, of `members` and with `turn` the index
+    /// whose turn it is, that takes `message`: the first connected member
+    /// whose queue takes it, from where the strategy starts, and only with
+    /// `anyone` a disconnected one, whose queue waits for its client to
+    /// return, when no connected member can. The session `except` is
+    /// never chosen.
+    fn share_member(
+        &self,
+        members: &[(u64, Subscriber)],
+        turn: usize,
+        publisher: Option<Publisher>,
+        message: &Message,
+        except: Option<u64>,
+        anyone: bool,
+    ) -> Option<usize> {
+        let len = members.len();
+        // `turn` follows the member chosen last
+        let start = match (self.share_strategy, publisher) {
+            (ShareStrategy::Random, _) => (random_u64() % len as u64) as usize,
+            (ShareStrategy::Sticky, _) => (turn + len - 1) % len,
+            (ShareStrategy::Hash, Some(publisher)) => (publisher.key % len as u64) as usize,
+            _ => turn,
+        };
+        let origin = publisher.map(|p| p.session);
+        let order = (0..len).map(|i| (start + i) % len);
+        let offer = |want_connected: bool| {
+            order.clone().find(|&i| {
+                let member = &members[i].1;
+                Some(member.session_id) != except
+                    && member.queue.is_connected() == want_connected
+                    && Subscriber::offer(std::slice::from_ref(member), message.clone(), origin)
+            })
+        };
+        offer(true).or_else(|| if anyone { offer(false) } else { None })
     }
 
     /// The retained messages, `$SYS` ones included, for the admin API.
@@ -216,29 +308,8 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        // Each share group's message goes to the first connected member
-        // whose queue takes it, from where the strategy starts, and only to
-        // a disconnected one, whose queue waits for its client to return,
-        // when no connected member can
-        let strategy = self.share_strategy;
         let matches = self.subscriptions.matching_with(topic, |members, turn| {
-            let len = members.len();
-            // `turn` follows the member chosen last
-            let start = match (strategy, publisher) {
-                (ShareStrategy::Random, _) => (random_u64() % len as u64) as usize,
-                (ShareStrategy::Sticky, _) => (turn + len - 1) % len,
-                (ShareStrategy::Hash, Some(publisher)) => (publisher.key % len as u64) as usize,
-                _ => turn,
-            };
-            let order = (0..len).map(|i| (start + i) % len);
-            let offer = |want_connected: bool| {
-                order.clone().find(|&i| {
-                    let member = &members[i].1;
-                    member.queue.is_connected() == want_connected
-                        && Subscriber::offer(std::slice::from_ref(member), message.clone(), origin)
-                })
-            };
-            let chosen = offer(true).or_else(|| offer(false));
+            let chosen = self.share_member(members, turn, publisher, &message, None, true);
             if chosen.is_none() {
                 self.stats.dropped(DropCause::NoShareMember, 1, None);
             }
@@ -289,6 +360,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 
@@ -302,7 +374,31 @@ mod tests {
             no_local: false,
             retain_as_published: false,
             subscription_identifier: None,
+            share: Some(Arc::from("$share/g/jobs")),
         }
+    }
+
+    #[tokio::test]
+    async fn test_reoffered_messages_go_to_another_member() {
+        let broker = Broker::new(Arc::new(MemoryStore::new()));
+        let leaving = share_member(1, QueueLimits::default(), false);
+        let online = share_member(2, QueueLimits::default(), true);
+        let offline = share_member(3, QueueLimits::default(), false);
+        for member in [&leaving, &online, &offline] {
+            broker.subscribe("$share/g/jobs", member.session_id, member.clone());
+        }
+        let message = create_test_message("jobs", "m", false);
+
+        // A connected member takes it, never the one leaving
+        assert!(broker.reoffer("$share/g/jobs", message.clone(), 1, false));
+        assert_eq!(online.queue.len(), 1);
+        // Without one connected, only when anyone may take it
+        online.queue.set_connected(false);
+        assert!(!broker.reoffer("$share/g/jobs", message.clone(), 2, false));
+        assert!(broker.reoffer("$share/g/jobs", message.clone(), 1, true));
+        assert_eq!(leaving.queue.len(), 0);
+        assert_eq!(online.queue.len() + offline.queue.len(), 2);
+        assert!(!broker.reoffer("$share/other/jobs", message, 1, true));
     }
 
     #[tokio::test]
@@ -671,6 +767,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         };
         broker.publish("test/topic", clear_msg).await.unwrap();
 

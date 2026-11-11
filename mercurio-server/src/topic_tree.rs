@@ -27,6 +27,18 @@ struct ShareGroup<T> {
     next: AtomicUsize,
 }
 
+impl<T> ShareGroup<T> {
+    /// Lets `choose` pick a member, given the members and the index whose
+    /// turn it is. The turn then passes to the member after the one
+    /// chosen, so members `choose` skips don't shift the rotation.
+    fn pick(&self, choose: &mut impl FnMut(&[(u64, T)], usize) -> Option<usize>) {
+        let len = self.members.len();
+        let turn = self.next.load(Ordering::Relaxed) % len;
+        let next = choose(&self.members, turn).unwrap_or(turn) + 1;
+        self.next.store(next % len, Ordering::Relaxed);
+    }
+}
+
 impl<T> TopicNode<T> {
     fn new() -> TopicNode<T> {
         TopicNode {
@@ -69,9 +81,7 @@ impl<T> TopicNode<T> {
     }
 
     /// Adds every regular subscriber of this node to `matches` and lets
-    /// `choose` pick the member of each share group, given the members and
-    /// the index whose turn it is. The turn then passes to the member after
-    /// the one chosen, so members `choose` skips don't shift the rotation.
+    /// `choose` pick the member of each share group; see `ShareGroup::pick`.
     fn collect(
         &self,
         matches: &mut Matches<T>,
@@ -81,10 +91,7 @@ impl<T> TopicNode<T> {
     {
         matches.regular.extend(self.subscribers.values().cloned());
         for group in self.shared.values() {
-            let len = group.members.len();
-            let turn = group.next.load(Ordering::Relaxed) % len;
-            let next = choose(&group.members, turn).unwrap_or(turn) + 1;
-            group.next.store(next % len, Ordering::Relaxed);
+            group.pick(choose);
             matches.shared_groups += 1;
         }
     }
@@ -256,6 +263,32 @@ impl<T: Clone> TopicTree<T> {
             }
         }
         found
+    }
+
+    /// Lets `choose` pick a member of the share group of `filter`, a shared
+    /// subscription, as `matching_with` does for the groups of a topic.
+    /// False if the group has no members.
+    pub fn choose_in(
+        &self,
+        filter: &str,
+        mut choose: impl FnMut(&[(u64, T)], usize) -> Option<usize>,
+    ) -> bool {
+        let (Some(share_name), filter) = split_shared(filter) else {
+            return false;
+        };
+        let root = self.root.read().unwrap();
+        let mut node = &*root;
+        for level in filter.split('/') {
+            match node.children.get(level) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        let Some(group) = node.shared.get(share_name) else {
+            return false;
+        };
+        group.pick(&mut choose);
+        true
     }
 
     /// The subscribers of exactly `filter`, which may be a shared

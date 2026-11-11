@@ -538,7 +538,7 @@ impl AuthExchange for WasmAuth {
                 })
                 .await;
             let Some(result) = result else {
-                return AuthResult::Failed(ReasonCode::NotAuthorized);
+                return AuthResult::failed(ReasonCode::NotAuthorized);
             };
             let (result, state) = convert::auth_result(result);
             self.state = state;

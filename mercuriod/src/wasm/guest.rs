@@ -289,7 +289,9 @@ fn old_event(event: &wit::Event) -> old::Event {
             client: client_info(&u.client),
             filter: u.filter.clone(),
         }),
-        wit::Event::SessionExpired(client_id) => old::Event::SessionExpired(client_id.clone()),
+        wit::Event::SessionExpired(expired) => {
+            old::Event::SessionExpired(expired.client_id.clone())
+        }
     }
 }
 
@@ -323,7 +325,10 @@ fn auth_result(result: old::AuthResult) -> wit::AuthResult {
             username,
             data: None,
         }),
-        old::AuthResult::Failed(code) => wit::AuthResult::Failed(code),
+        old::AuthResult::Failed(code) => wit::AuthResult::Failed(wit::Failure {
+            reason: code,
+            reason_string: None,
+        }),
     }
 }
 
@@ -367,5 +372,26 @@ mod tests {
         };
         let back = new_message(old_message(message.clone()));
         assert_eq!(format!("{back:?}"), format!("{message:?}"));
+    }
+
+    #[test]
+    fn test_0_1_authentication_failures_have_no_reason_string() {
+        let wit::AuthResult::Failed(failure) = auth_result(old::AuthResult::Failed(0x8c)) else {
+            panic!("expected a failure");
+        };
+        assert_eq!(failure.reason, 0x8c);
+        assert_eq!(failure.reason_string, None);
+    }
+
+    #[test]
+    fn test_0_1_expired_sessions_carry_the_client_id_alone() {
+        let expired = wit::Event::SessionExpired(wit::SessionExpired {
+            client_id: "c".into(),
+            mount_point: Some("tenant/".into()),
+        });
+        let old::Event::SessionExpired(client_id) = old_event(&expired) else {
+            panic!("expected a session-expired event");
+        };
+        assert_eq!(client_id, "c");
     }
 }

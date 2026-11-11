@@ -129,6 +129,7 @@ async fn statistics_stay_out_of_the_retained_store() {
         expires_at: None,
         subscription_identifiers: Vec::new(),
         origin: None,
+        share_group: None,
     };
     storage
         .store_retained("$SYS/broker/old", Some(stale))

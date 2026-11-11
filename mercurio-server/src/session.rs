@@ -59,6 +59,7 @@ use crate::{
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
+    shutdown::Tasks,
     sys::{ClientCounters, DropCause, Stats},
     topic_tree::TopicTree,
 };
@@ -236,30 +237,80 @@ fn max_expiry_interval(max: Duration) -> u32 {
 
 /// The session expiry to announce in CONNACK: the server's maximum, when
 /// the client's request was lowered to it.
-fn announced_session_expiry(connect_packet: &ConnectPacket, limits: &Limits) -> Option<u32> {
+fn announced_session_expiry(client: &ClientSettings, limits: &Limits) -> Option<u32> {
     let max = max_expiry_interval(limits.max_session_expiry?);
-    let requested = connect_packet
-        .properties
-        .as_ref()?
-        .session_expiry_interval
-        .as_ref()?
-        .value;
-    (requested == max).then_some(max)
+    (client.session_expiry_interval? == max).then_some(max)
 }
 
 /// The keep-alive the connection runs with: the client's own, unless it
 /// exceeds the server's maximum or disables keep-alive, in which case MQTT 5
 /// clients are told to use the maximum. MQTT 3.x has no way to tell them.
-pub(crate) fn effective_keepalive(connect_packet: &ConnectPacket, limits: &Limits) -> u16 {
-    let requested = connect_packet.keepalive;
+pub(crate) fn effective_keepalive(
+    requested: u16,
+    protocol_version: ProtocolVersion,
+    limits: &Limits,
+) -> u16 {
     match limits.max_keepalive {
         Some(max)
-            if connect_packet.protocol_version.supports_properties()
-                && (requested == 0 || requested > max) =>
+            if protocol_version.supports_properties() && (requested == 0 || requested > max) =>
         {
             max
         }
         _ => requested,
+    }
+}
+
+/// What a session keeps of its client's latest CONNECT: only what is read
+/// once the connection is up. The rest, credentials and user properties
+/// included, goes with the packet instead of living as long as the session,
+/// which may be forever.
+#[derive(Debug, Clone)]
+struct ClientSettings {
+    protocol_version: ProtocolVersion,
+    clean_start: bool,
+    keepalive: u16,
+    /// As requested, once capped to the server's maximum
+    session_expiry_interval: Option<u32>,
+    receive_maximum: Option<u16>,
+    maximum_packet_size: Option<u32>,
+    topic_alias_maximum: Option<u16>,
+    request_response_information: bool,
+    /// Whether the client takes reason strings beyond the reason code's
+    /// own: true unless it sent Request Problem Information 0
+    request_problem_information: bool,
+    /// The enhanced authentication method, which every AUTH must name
+    authentication_method: Option<String>,
+}
+
+impl From<&ConnectPacket> for ClientSettings {
+    fn from(connect: &ConnectPacket) -> Self {
+        let properties = connect.properties.as_ref();
+        ClientSettings {
+            protocol_version: connect.protocol_version,
+            clean_start: connect.clean_start,
+            keepalive: connect.keepalive,
+            session_expiry_interval: properties
+                .and_then(|p| p.session_expiry_interval.as_ref())
+                .map(|e| e.value),
+            receive_maximum: properties
+                .and_then(|p| p.receive_maximum.as_ref())
+                .map(|r| r.value),
+            maximum_packet_size: properties
+                .and_then(|p| p.maximum_packet_size.as_ref())
+                .map(|m| m.value),
+            topic_alias_maximum: properties
+                .and_then(|p| p.topic_alias_maximum.as_ref())
+                .map(|m| m.value),
+            request_response_information: properties
+                .and_then(|p| p.request_response_information.as_ref())
+                .is_some_and(|r| r.value == 1),
+            request_problem_information: properties
+                .and_then(|p| p.request_problem_information.as_ref())
+                .is_none_or(|r| r.value != 0),
+            authentication_method: properties
+                .and_then(|p| p.authentication_method.as_ref())
+                .map(|m| m.value.clone()),
+        }
     }
 }
 
@@ -285,6 +336,8 @@ struct RetainedDelivery {
 
 pub struct SessionDropGuard {
     session: Session,
+    /// Where unsubscribing runs when it has to wait
+    tasks: Tasks,
 }
 
 #[derive(Clone)]
@@ -310,7 +363,7 @@ struct Shared {
 }
 
 struct State {
-    pub connect_packet: ConnectPacket,
+    client: ClientSettings,
     /// Cached client ID to avoid lock acquisition for logging
     client_id: String,
     /// Topic filters subscribed to, with their granted QoS
@@ -357,6 +410,9 @@ struct State {
     pending_will: Option<(AbortHandle, WillMessage, u64)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
+    /// Why the last re-authentication failed, in the method's words, for
+    /// the DISCONNECT that follows
+    auth_failure: Option<String>,
     /// User name verified by authentication, the one access control trusts
     verified_user: Option<String>,
     /// The client's address, None for in-process clients
@@ -411,12 +467,6 @@ pub(crate) struct SessionSnapshot {
     pub counters: Arc<ClientCounters>,
 }
 
-impl From<Session> for SessionDropGuard {
-    fn from(session: Session) -> Self {
-        SessionDropGuard { session }
-    }
-}
-
 /// Takes the session's subscriptions out of the topic tree once the
 /// session leaves the session manager, even when what removed it is
 /// cancelled before it unsubscribed: nothing is queued for a session no one
@@ -429,7 +479,8 @@ impl Drop for SessionDropGuard {
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let session = self.session.clone();
-            runtime.spawn(async move { session.unsubscribe_all().await });
+            self.tasks
+                .spawn_on(async move { session.unsubscribe_all().await }, &runtime);
         }
     }
 }
@@ -439,10 +490,17 @@ impl SessionDropGuard {
         connect_packet: ConnectPacket,
         queue_limits: QueueLimits,
         stats: Arc<Stats>,
+        tasks: Tasks,
     ) -> Self {
         SessionDropGuard {
             session: Session::with_queue_limits(connect_packet, queue_limits, stats),
+            tasks,
         }
+    }
+
+    /// Guards `session`, unsubscribing in `tasks` when that has to wait.
+    pub(crate) fn guarding(session: Session, tasks: Tasks) -> Self {
+        SessionDropGuard { session, tasks }
     }
 
     pub(crate) fn session(&self) -> Session {
@@ -471,13 +529,14 @@ impl Session {
             hasher.finish()
         };
         let will_message = WillMessage::from_connect_packet(&connect_packet);
+        let client = ClientSettings::from(&connect_packet);
         let presence = Presence::default();
         let queue = MessageQueue::new(queue_limits).counted_in(stats);
         queue.set_counters(Arc::clone(&presence.counters));
         Session {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
-                    connect_packet,
+                    client,
                     client_id,
                     subscriptions: HashMap::new(),
                     topics: None,
@@ -500,6 +559,7 @@ impl Session {
                     will_message,
                     pending_will: None,
                     auth_exchange: None,
+                    auth_failure: None,
                     verified_user: None,
                     peer: None,
                     connection_info: None,
@@ -523,7 +583,7 @@ impl Session {
         let mut session = self.shared.state.lock().await;
         session.client_id = connect_packet.payload.client_id.clone();
         session.will_message = WillMessage::from_connect_packet(&connect_packet);
-        session.connect_packet = connect_packet;
+        session.client = ClientSettings::from(&connect_packet);
     }
 
     /// Clear the will message. Called on normal DISCONNECT.
@@ -691,11 +751,7 @@ impl Session {
             session.max_retained_messages = limits.max_retained_messages;
 
             // CONNACK properties only exist in MQTT 5.0
-            if session
-                .connect_packet
-                .protocol_version
-                .supports_properties()
-            {
+            if session.client.protocol_version.supports_properties() {
                 ack.properties = Some(ConnAckProperties {
                     assigned_client_id: assigned_client_id
                         .then(|| AssignedClientIdentifier::new(session.client_id.clone())),
@@ -705,35 +761,26 @@ impl Session {
                     topic_alias_max: Some(TopicAliasMaximum::new(limits.topic_alias_maximum)),
                     // Echoes the method a successful enhanced authentication used
                     authentication_method: session
-                        .connect_packet
-                        .properties
-                        .as_ref()
-                        .and_then(|p| p.authentication_method.clone()),
+                        .client
+                        .authentication_method
+                        .clone()
+                        .map(AuthenticationMethod::new),
                     authentication_data: auth_data.map(AuthenticationData::new),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
                     response_information: policy
                         .response_information
                         .as_ref()
-                        .filter(|_| {
-                            session
-                                .connect_packet
-                                .properties
-                                .as_ref()
-                                .and_then(|p| p.request_response_information.as_ref())
-                                .is_some_and(|r| r.value == 1)
-                        })
+                        .filter(|_| session.client.request_response_information)
                         .map(|template| {
                             ResponseInformation::new(template.replace("%c", &session.client_id))
                         }),
-                    session_expiry_interval: announced_session_expiry(
-                        &session.connect_packet,
-                        limits,
-                    )
-                    .map(SessionExpiryInterval::new),
+                    session_expiry_interval: announced_session_expiry(&session.client, limits)
+                        .map(SessionExpiryInterval::new),
                     server_keepalive: {
-                        let keepalive = effective_keepalive(&session.connect_packet, limits);
-                        (keepalive != session.connect_packet.keepalive)
-                            .then(|| ServerKeepAlive::new(keepalive))
+                        let client = &session.client;
+                        let keepalive =
+                            effective_keepalive(client.keepalive, client.protocol_version, limits);
+                        (keepalive != client.keepalive).then(|| ServerKeepAlive::new(keepalive))
                     },
                     // Spelled out even where absence means the same, for
                     // clients and tools that inspect them
@@ -1029,6 +1076,7 @@ impl Session {
                         expires_at: None,
                         subscription_identifiers: Vec::new(),
                         origin: None,
+                        share_group: None,
                     };
                     broker.publish_to(&topic, reply, self.shared.subscriber_id);
                 }
@@ -1063,6 +1111,7 @@ impl Session {
             properties,
             subscription_identifiers: Vec::new(),
             origin,
+            share_group: None,
         };
 
         let subscribers = broker
@@ -1076,7 +1125,7 @@ impl Session {
             .state
             .lock()
             .await
-            .connect_packet
+            .client
             .protocol_version
             .supports_reason_codes();
         if subscribers == 0 && reports_reasons {
@@ -1107,10 +1156,7 @@ impl Session {
         reason: ReasonCode,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        let reports_reasons = session
-            .connect_packet
-            .protocol_version
-            .supports_reason_codes();
+        let reports_reasons = session.client.protocol_version.supports_reason_codes();
         let reason = if reports_reasons {
             reason
         } else {
@@ -1219,9 +1265,9 @@ impl Session {
             username: state.owner.username.clone(),
             peer: state.peer,
             listener: presence.listener.clone(),
-            protocol_version: seen.then_some(state.connect_packet.protocol_version),
+            protocol_version: seen.then_some(state.client.protocol_version),
             keepalive: seen.then_some(presence.keepalive),
-            clean_start: seen.then_some(state.connect_packet.clean_start),
+            clean_start: seen.then_some(state.client.clean_start),
             connected_at: presence
                 .connected_at
                 .filter(|_| presence.disconnected_at.is_none()),
@@ -1286,6 +1332,7 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default(),
+                share_group: sent.share_group.as_deref().map(str::to_string),
             }));
         }
         for (packet_id, sequence) in &state.pubrecs {
@@ -1301,6 +1348,7 @@ impl Session {
                 released: true,
                 properties: MessageProperties::default(),
                 subscription_identifiers: Vec::new(),
+                share_group: None,
             }));
         }
         writes.extend(
@@ -1332,6 +1380,12 @@ impl Session {
     /// Puts back messages queued for the client before a restart.
     pub(crate) fn restore_queue(&self, messages: Vec<(u64, Message)>) {
         self.shared.queue.restore(messages);
+    }
+
+    /// Why the last re-authentication failed, in the method's words, if
+    /// it gave some and the client takes them.
+    pub(crate) async fn take_auth_failure(&self) -> Option<String> {
+        self.shared.state.lock().await.auth_failure.take()
     }
 
     /// The largest packet the client accepts, if it set a limit.
@@ -1648,12 +1702,7 @@ impl Session {
 
         // Every AUTH must name the method the connection was authenticated
         // with [MQTT-4.12.1-1]
-        let connect_method = session
-            .connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.authentication_method.as_ref())
-            .map(|m| m.value.clone());
+        let connect_method = session.client.authentication_method.clone();
         let method_name = packet.properties.auth_method.as_ref().map(|m| &m.value);
         let Some(method) = connect_method.filter(|m| Some(m) == method_name) else {
             return Err(ReasonCode::ProtocolError.into());
@@ -1702,8 +1751,13 @@ impl Session {
                     ..Default::default()
                 },
             }))),
-            AuthResult::Failed(reason) => {
+            AuthResult::Failed {
+                reason,
+                reason_string,
+            } => {
                 session.auth_exchange = None;
+                session.auth_failure =
+                    reason_string.filter(|_| session.client.request_problem_information);
                 Err(reason.into())
             }
         }
@@ -1759,6 +1813,82 @@ impl Session {
             no_local: subscription.no_local,
             retain_as_published: subscription.retain_as_published,
             subscription_identifier: subscription.subscription_identifier,
+            share: parse_shared_subscription(&subscription.topic_filter)
+                .is_some()
+                .then(|| Arc::from(subscription.topic_filter.as_str())),
+        }
+    }
+
+    /// The messages that reached this session through a shared
+    /// subscription and may go to another member of the group: the QoS 1
+    /// messages sent and not acknowledged, in the order they were sent,
+    /// then those queued. QoS 2 messages sent stay with the session
+    /// [MQTT-4.8.2-5].
+    pub(crate) async fn handbacks(&self) -> Vec<Handback> {
+        let mut unacknowledged: Vec<(u64, Handback)> = {
+            let state = self.shared.state.lock().await;
+            state
+                .unacknowledged_messages
+                .iter()
+                .filter(|(_, sent)| sent.publish.qos_level == QoS::AtLeastOnce)
+                .filter_map(|(packet_id, sent)| {
+                    let group = sent.share_group.clone()?;
+                    let publish = &sent.publish;
+                    let message = Message {
+                        packet_id: None,
+                        topic: Arc::from(publish.topic_name.as_str()),
+                        dup: false,
+                        qos: publish.qos_level,
+                        retain: publish.retain,
+                        payload: publish.payload.clone(),
+                        properties: message_properties(publish.properties.as_ref()),
+                        expires_at: sent.expires_at,
+                        subscription_identifiers: Vec::new(),
+                        origin: None,
+                        share_group: None,
+                    };
+                    let held = Held::Unacknowledged(*packet_id);
+                    Some((
+                        sent.sequence,
+                        Handback {
+                            message,
+                            group,
+                            held,
+                        },
+                    ))
+                })
+                .collect()
+        };
+        unacknowledged.sort_by_key(|(sequence, _)| *sequence);
+        let queued = self
+            .shared
+            .queue
+            .shared()
+            .into_iter()
+            .filter_map(|(sequence, message)| {
+                Some(Handback {
+                    group: message.share_group.clone()?,
+                    message,
+                    held: Held::Queued(sequence),
+                })
+            });
+        unacknowledged
+            .into_iter()
+            .map(|(_, handback)| handback)
+            .chain(queued)
+            .collect()
+    }
+
+    /// Lets go of a message another member of its group took. False if the
+    /// session no longer held it.
+    pub(crate) async fn give_up(&self, held: Held) -> bool {
+        match held {
+            Held::Queued(sequence) => self.shared.queue.remove(sequence),
+            Held::Unacknowledged(packet_id) => {
+                let mut state = self.shared.state.lock().await;
+                state.unsent.retain(|id| *id != packet_id);
+                state.unacknowledged_messages.remove(&packet_id).is_some()
+            }
         }
     }
 
@@ -1962,6 +2092,7 @@ impl Session {
                         sequence,
                         publish: publish.clone(),
                         expires_at: message.expires_at,
+                        share_group: message.share_group.clone(),
                     },
                 );
                 InflightMessage {
@@ -1976,6 +2107,7 @@ impl Session {
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
                     subscription_identifiers: message.subscription_identifiers.clone(),
+                    share_group: message.share_group.as_deref().map(str::to_string),
                 }
             });
 
@@ -2024,6 +2156,7 @@ impl Session {
                         sequence: message.sequence,
                         publish,
                         expires_at: message.expires_at,
+                        share_group: message.share_group.map(Arc::from),
                     },
                 );
             }
@@ -2116,6 +2249,26 @@ struct Unacknowledged {
     publish: PublishPacket,
     /// Unix time in milliseconds when the message expires, if it does
     expires_at: Option<u64>,
+    /// The shared subscription it came through, if it did
+    share_group: Option<Arc<str>>,
+}
+
+/// A message that reached a session through a shared subscription and may
+/// go to another member of the group.
+pub(crate) struct Handback {
+    pub message: Message,
+    /// The shared subscription, `$share/{name}/{filter}`
+    pub group: Arc<str>,
+    pub held: Held,
+}
+
+/// Where a session holds a message it may hand back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// Queued, at this sequence of the queue
+    Queued(u64),
+    /// Sent at QoS 1 with this packet id, not acknowledged
+    Unacknowledged(u16),
 }
 
 /// What a resumed session resends at once.
@@ -2165,12 +2318,10 @@ impl State {
     /// without one.
     fn apply_topic_alias(&mut self, publish: PublishPacket) -> Option<PublishPacket> {
         let maximum = self
-            .connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.topic_alias_maximum.as_ref())
+            .client
+            .topic_alias_maximum
             .filter(|_| self.send_topic_aliases)
-            .map_or(0, |m| m.value);
+            .unwrap_or(0);
 
         let with_alias = |mut publish: PublishPacket, alias: u16| {
             publish
@@ -2206,12 +2357,7 @@ impl State {
     /// Most QoS 1 and 2 messages that may be in flight: the client's
     /// Receive Maximum, capped by the broker's limit.
     fn window(&self) -> usize {
-        let receive_maximum = self
-            .connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.receive_maximum.as_ref())
-            .map_or(u16::MAX, |r| r.value);
+        let receive_maximum = self.client.receive_maximum.unwrap_or(u16::MAX);
         usize::from(receive_maximum.min(self.max_inflight))
     }
 
@@ -2226,24 +2372,19 @@ impl State {
 
     /// Whether `publish` is larger than the client accepts.
     fn too_big(&self, publish: &PublishPacket) -> bool {
-        self.client_maximum_packet_size().is_some_and(|maximum| {
-            publish.encoded_size(self.connect_packet.protocol_version) > maximum
-        })
+        self.client_maximum_packet_size()
+            .is_some_and(|maximum| publish.encoded_size(self.client.protocol_version) > maximum)
     }
 
     /// The largest packet the client accepts, if it set a limit.
     fn client_maximum_packet_size(&self) -> Option<usize> {
-        self.connect_packet
-            .properties
-            .as_ref()
-            .and_then(|p| p.maximum_packet_size.as_ref())
-            .map(|m| m.value as usize)
+        self.client.maximum_packet_size.map(|m| m as usize)
     }
 
     /// Reason for acknowledging a packet id with no exchange in progress.
     /// MQTT 3.x acknowledgements carry no reason, so it's always success.
     fn unknown_packet_id_reason(&self) -> ReasonCode {
-        if self.connect_packet.protocol_version.supports_reason_codes() {
+        if self.client.protocol_version.supports_reason_codes() {
             ReasonCode::PacketIdentifierNotFound
         } else {
             ReasonCode::Success
@@ -2269,7 +2410,7 @@ mod tests {
     use super::*;
     use mercurio_core::protocol::ProtocolVersion;
     use mercurio_packets::{
-        connect::{self, ConnectPayload},
+        connect::{self, ConnectPayload, ConnectProperties},
         subscribe::{RetainHandling, SubscribePayload, SubscriptionOptions},
         unsubscribe::UnsubscribePayload,
     };
@@ -2546,6 +2687,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 
@@ -2672,6 +2814,7 @@ mod tests {
                     sequence,
                     publish: PublishPacket::default(),
                     expires_at: None,
+                    share_group: None,
                 },
             );
         }
@@ -3908,5 +4051,45 @@ mod tests {
         let will = session.take_will().await;
         assert!(will.is_some());
         assert_eq!(will.unwrap().topic, "will/topic");
+    }
+
+    /// Owns bytes and records when they are freed.
+    struct Watched(Arc<AtomicBool>);
+
+    impl AsRef<[u8]> for Watched {
+        fn as_ref(&self) -> &[u8] {
+            b"secret"
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sessions_let_go_of_credentials_and_connect_properties() {
+        let password_freed = Arc::new(AtomicBool::new(false));
+        let property_freed = Arc::new(AtomicBool::new(false));
+        let mut connect = create_connect_packet_without_will();
+        connect.payload.user_name = Some("alice".to_string());
+        connect.payload.password = Some(Bytes::from_owner(Watched(Arc::clone(&password_freed))));
+        connect.properties = Some(ConnectProperties {
+            authentication_data: Some(AuthenticationData::new(Bytes::from_owner(Watched(
+                Arc::clone(&property_freed),
+            )))),
+            ..Default::default()
+        });
+
+        let mut session = Session::new(connect.clone());
+        let resumed = connect.clone();
+        drop(connect);
+        assert!(!password_freed.load(Ordering::SeqCst));
+        session.set_connect_packet(resumed).await;
+
+        assert!(password_freed.load(Ordering::SeqCst));
+        assert!(property_freed.load(Ordering::SeqCst));
+        drop(session);
     }
 }

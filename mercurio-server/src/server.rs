@@ -16,6 +16,7 @@ use std::{
 
 use crate::error::ServerError;
 use crate::CONNECTIONS;
+use futures_util::FutureExt;
 #[cfg(unix)]
 use tokio::net::{unix::UCred, UnixListener, UnixStream};
 use tokio::{
@@ -71,7 +72,7 @@ use crate::{
     session_manager::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
-    shutdown::Shutdown,
+    shutdown::{Shutdown, Tasks},
     sys::{self, ConnectedGuard, DropCause, Stats},
     tls::{certificate_name, Tls},
     websocket,
@@ -93,7 +94,7 @@ pub struct AuthConfig {
 
 pub use crate::{
     bans::LoginFailures,
-    broker::ShareStrategy,
+    broker::{ShareRedelivery, ShareStrategy},
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
     queue::{Overflow, QueueLimits},
 };
@@ -195,6 +196,14 @@ pub struct Limits {
     /// Like `max_publish_rate`, for the payload bytes of the PUBLISH
     /// packets one client sends per second.
     pub max_publish_bytes_rate: Option<Rate>,
+    /// How long a client may stay over `max_publish_rate` or
+    /// `max_publish_bytes_rate` without a break: one that still has more
+    /// waiting than its rate allows after this long is disconnected with
+    /// Message Rate Too High, or just disconnected if it speaks MQTT 3.x.
+    /// It is over its rate from the first PUBLISH the rate holds back
+    /// until it has nothing waiting when the broker reads from it again.
+    /// Clients are only slowed down when unset.
+    pub publish_rate_grace: Option<Duration>,
     /// Failed logins that get a client address banned for a while,
     /// through the same bans as the admin API's, listed with their expiry
     /// and the reason `automatic: …`. Addresses count as for
@@ -236,6 +245,7 @@ impl Default for Limits {
             max_connections_per_ip: None,
             max_publish_rate: None,
             max_publish_bytes_rate: None,
+            publish_rate_grace: None,
             login_failures: None,
             max_sessions: None,
         }
@@ -313,6 +323,10 @@ impl Bucket {
 struct Pacing {
     messages: Option<Bucket>,
     bytes: Option<Bucket>,
+    /// How long the client may stay over its rate
+    grace: Option<Duration>,
+    /// Since when the client is over its rate, if it is
+    over_since: Option<Instant>,
 }
 
 impl Pacing {
@@ -320,6 +334,8 @@ impl Pacing {
         Pacing {
             messages: limits.max_publish_rate.map(Bucket::new),
             bytes: limits.max_publish_bytes_rate.map(Bucket::new),
+            grace: limits.publish_rate_grace,
+            over_since: None,
         }
     }
 
@@ -328,7 +344,28 @@ impl Pacing {
     fn publish(&mut self, bytes: usize) -> Option<Duration> {
         let messages = self.messages.as_mut().and_then(|b| b.take(1.0));
         let bytes = self.bytes.as_mut().and_then(|b| b.take(bytes as f64));
-        messages.max(bytes)
+        let wait = messages.max(bytes);
+        match wait {
+            Some(_) => {
+                self.over_since.get_or_insert_with(Instant::now);
+            }
+            None => self.over_since = None,
+        }
+        wait
+    }
+
+    /// Records that the client had nothing waiting once its rate allowed
+    /// reading from it again, so it is no longer over its rate.
+    fn caught_up(&mut self) {
+        self.over_since = None;
+    }
+
+    /// Whether the client has been over its rate for longer than allowed.
+    fn past_grace(&self) -> bool {
+        match (self.grace, self.over_since) {
+            (Some(grace), Some(since)) => since.elapsed() > grace,
+            _ => false,
+        }
     }
 }
 
@@ -360,6 +397,8 @@ pub struct ServerConfig {
     pub admin_extension: Option<Arc<dyn AdminExtension>>,
     /// How shared subscriptions pick the member a message goes to.
     pub share_strategy: ShareStrategy,
+    /// When a member's messages go to the rest of its share group.
+    pub share_redelivery: ShareRedelivery,
 }
 
 impl Default for ServerConfig {
@@ -377,6 +416,7 @@ impl Default for ServerConfig {
             plugin_tick_interval: Duration::from_secs(1),
             admin_extension: None,
             share_strategy: ShareStrategy::default(),
+            share_redelivery: ShareRedelivery::default(),
         }
     }
 }
@@ -866,6 +906,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     use_username_as_clientid: bool,
     /// Where its failed logins are counted; None when they aren't
     failed_logins: Option<Arc<FailedLogins>>,
+    /// Where tasks outliving the connection run, such as a delayed will
+    tasks: Tasks,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -1145,6 +1187,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             bans: self.bans,
             use_username_as_clientid: self.use_username_as_clientid,
             failed_logins: self.failed_logins,
+            tasks: self.tasks,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -1215,6 +1258,8 @@ struct Listener<St: MqttStore + 'static> {
     connection_slots: Option<Arc<Semaphore>>,
     bans: Arc<Bans>,
     failed_logins: Option<Arc<FailedLogins>>,
+    /// Where connections and everything else the server starts run
+    tasks: Tasks,
 }
 
 struct Handler<St, S>
@@ -1246,6 +1291,7 @@ where
     bans: Arc<Bans>,
     use_username_as_clientid: bool,
     failed_logins: Option<Arc<FailedLogins>>,
+    tasks: Tasks,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1404,6 +1450,7 @@ impl<St: MqttStore + 'static> Server<St> {
             plugin_tick_interval,
             admin_extension,
             share_strategy,
+            share_redelivery,
         } = config;
         let stats = Arc::new(Stats::default());
         let policy = Arc::new(policy);
@@ -1423,17 +1470,21 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
+        let tasks = Tasks::default();
         let broker = Broker::new(Arc::clone(&storage))
             .counted_in(Arc::clone(&stats))
-            .with_share_strategy(share_strategy);
+            .with_share_strategy(share_strategy)
+            .with_share_redelivery(share_redelivery);
         let session_manager_holder = SessionManagerDropGuard::new(
             Arc::clone(&storage),
             limits.queue,
             limits.write_timeout,
             limits.max_sessions,
             Arc::clone(&stats),
+            tasks.clone(),
         );
         let session_manager = session_manager_holder.session_manager();
+        session_manager.set_share_groups(Arc::new(broker.clone()));
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
         let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
@@ -1449,8 +1500,11 @@ impl<St: MqttStore + 'static> Server<St> {
             extension: admin_extension,
             plugins: all_plugins.clone(),
             bans: Arc::clone(&bans),
+            tasks: tasks.clone(),
         });
-        let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
+        let chain = Chain::new(plugins, plugin_timeout)
+            .with_admin(admin.clone())
+            .with_tasks(tasks.clone());
         for endpoint in &mut endpoints {
             endpoint.limits = endpoint.overrides.apply(limits);
             endpoint.settings.chain = match endpoint.trusted {
@@ -1459,7 +1513,7 @@ impl<St: MqttStore + 'static> Server<St> {
                     .settings
                     .chain
                     .take()
-                    .map(|chain| chain.with_admin(admin.clone())),
+                    .map(|chain| chain.with_admin(admin.clone()).with_tasks(tasks.clone())),
             };
         }
 
@@ -1483,9 +1537,12 @@ impl<St: MqttStore + 'static> Server<St> {
             failed_logins: limits
                 .login_failures
                 .map(|l| Arc::new(FailedLogins::new(l))),
+            tasks: tasks.clone(),
         };
 
-        session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
+        session_manager.set_expiry_chain(
+            Chain::new(all_plugins.clone(), plugin_timeout).with_tasks(tasks.clone()),
+        );
         let restored_wills = session_manager.restore_from_storage(&server.broker).await?;
 
         Ok(Server {
@@ -1506,7 +1563,11 @@ impl<St: MqttStore + 'static> Server<St> {
     }
 
     /// Serves clients until `shutdown` completes, then lets connections
-    /// close and storage catch up, for a few seconds at most.
+    /// close and storage catch up, for a few seconds at most. Every task
+    /// the server started has ended by the time this returns, those still
+    /// running aborted, and the server holds `storage` no more: it may be
+    /// opened again at once. [`Admin`] handles kept from
+    /// [`Server::admin`] still hold it until dropped.
     pub async fn run(self, shutdown: impl Future) -> std::result::Result<(), ServerError> {
         let Server {
             listener: mut server,
@@ -1520,11 +1581,12 @@ impl<St: MqttStore + 'static> Server<St> {
         } = self;
 
         let session_manager = server.session_manager_holder.session_manager();
+        let tasks = server.tasks.clone();
         if !plugins.is_empty() {
             let mut ticks = time::interval(plugin_tick_interval);
             ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             let mut stop = server.notify_shutdown.subscribe();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 loop {
                     tokio::select! {
                         _ = ticks.tick() => {}
@@ -1541,6 +1603,7 @@ impl<St: MqttStore + 'static> Server<St> {
         }
         if let Some(interval) = sys_interval {
             sys::spawn_publisher(
+                &tasks,
                 server.broker.clone(),
                 session_manager.clone(),
                 Arc::clone(&server.stats),
@@ -1551,7 +1614,7 @@ impl<St: MqttStore + 'static> Server<St> {
         // Lookups leave expired retained messages out; this removes them
         let broker = server.broker.clone();
         let mut stop = server.notify_shutdown.subscribe();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut ticks = time::interval(RETAINED_SWEEP);
             ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
@@ -1565,7 +1628,7 @@ impl<St: MqttStore + 'static> Server<St> {
         // Its own timer: the $SYS publisher may be off, or slower
         let bans = Arc::clone(&server.bans);
         let mut stop = server.notify_shutdown.subscribe();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut ticks = time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -1578,7 +1641,7 @@ impl<St: MqttStore + 'static> Server<St> {
         for (key, will, due) in restored_wills {
             let broker = server.broker.clone();
             let session_manager = session_manager.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 time::sleep(due).await;
                 if session_manager.take_restored_will(&key).await {
                     publish_will(&broker, will, &key).await;
@@ -1615,6 +1678,9 @@ impl<St: MqttStore + 'static> Server<St> {
         {
             warn!("Storage still writing after waiting to shut down");
         }
+        // What is left, such as expiry timers, delayed wills and idle
+        // writers, ends here: a restarted broker takes it up from storage
+        tasks.stop().await;
         Ok(())
     }
 }
@@ -1740,6 +1806,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 use_username_as_clientid: false,
                 // Trusted clients skip authentication altogether
                 failed_logins: self.failed_logins.clone().filter(|_| !trusted),
+                tasks: self.tasks.clone(),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1750,7 +1817,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(Box::new(parts).serve_accepted(
+                    self.tasks.spawn(Box::new(parts).serve_accepted(
                         socket,
                         settings,
                         peer_addr,
@@ -1776,7 +1843,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(Box::new(parts).serve_accepted(
+                    self.tasks.spawn(Box::new(parts).serve_accepted(
                         socket,
                         settings,
                         peer_addr,
@@ -1792,7 +1859,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         local: true,
                         ..parts
                     };
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         let _slots = slots;
                         parts.serve(stream, Transport::Mqtt, None).await;
                     });
@@ -2168,8 +2235,9 @@ where
                 .await;
         }
 
-        let keepalive = effective_keepalive(&connect_packet, &self.limits);
         let protocol_version = connect_packet.protocol_version;
+        let keepalive =
+            effective_keepalive(connect_packet.keepalive, protocol_version, &self.limits);
         let client_maximum_packet_size = connect_packet
             .properties
             .as_ref()
@@ -2189,57 +2257,62 @@ where
             mount_point: key.mount_point.clone(),
         };
         let client_id = connect_packet.payload.client_id.clone();
-        let mut start_result =
-            match Box::pin(self.session_manager.start_session(*connect_packet, owner)).await {
-                Ok(start_result) => start_result,
-                Err(StartError::OwnedByAnother(connect_packet)) => {
-                    return self
-                        .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
-                        .await;
-                }
-                Err(StartError::Busy) => {
-                    warn!(
-                        "The connection using client id `{}` didn't let go of it in time",
-                        client_id
-                    );
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerBusy,
-                        )
-                        .await;
-                }
-                Err(StartError::TooManySessions) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::QuotaExceeded,
-                        )
-                        .await;
-                }
-                // Logged where the admissions are counted
-                Err(StartError::Crowded) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerBusy,
-                        )
-                        .await;
-                }
-                Err(StartError::SetAside) => {
-                    return self
-                        .refuse(
-                            protocol_version,
-                            client_maximum_packet_size,
-                            ReasonCode::ServerUnavailable,
-                        )
-                        .await;
-                }
-                Err(StartError::Storage(e)) => return Err(e),
-            };
+        let mut start_result = match Box::pin(self.session_manager.start_session(
+            *connect_packet,
+            owner,
+            expiry,
+        ))
+        .await
+        {
+            Ok(start_result) => start_result,
+            Err(StartError::OwnedByAnother(connect_packet)) => {
+                return self
+                    .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
+                    .await;
+            }
+            Err(StartError::Busy) => {
+                warn!(
+                    "The connection using client id `{}` didn't let go of it in time",
+                    client_id
+                );
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerBusy,
+                    )
+                    .await;
+            }
+            Err(StartError::TooManySessions) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::QuotaExceeded,
+                    )
+                    .await;
+            }
+            // Logged where the admissions are counted
+            Err(StartError::Crowded) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerBusy,
+                    )
+                    .await;
+            }
+            Err(StartError::SetAside) => {
+                return self
+                    .refuse(
+                        protocol_version,
+                        client_maximum_packet_size,
+                        ReasonCode::ServerUnavailable,
+                    )
+                    .await;
+            }
+            Err(StartError::Storage(e)) => return Err(e),
+        };
         // A client whose id was replaced learns the one it has
         start_result.assigned_client_id |= assigned_client_id || renamed;
         let mut session = start_result.session;
@@ -2343,10 +2416,11 @@ where
         // Tell MQTT 5 clients why the server is closing the connection
         if let Err(Error::Reason(reason)) = &result {
             if protocol_version.supports_reason_codes() && reason.code() >= 0x80 {
+                let text = session.take_auth_failure().await;
                 let disconnect = ControlPacket::Disconnect(DisconnectPacket {
                     reason: *reason,
                     properties: Some(DisconnectProperties {
-                        reason_string: reason_string(*reason, client_maximum_packet_size),
+                        reason_string: explained(*reason, text, client_maximum_packet_size),
                         ..Default::default()
                     }),
                 });
@@ -2355,6 +2429,19 @@ where
         }
 
         session.detach(lease.generation, expiry).await;
+
+        // A member of a share group that only lost its connection gives
+        // its messages to the members connected, when asked to; a session
+        // ending with its connection gives them as it ends, and one taken
+        // over keeps them for its client
+        if self.broker.share_redelivery() == ShareRedelivery::OnDisconnect
+            && expiry != Some(Duration::ZERO)
+            && session.generation() == lease.generation
+        {
+            self.session_manager
+                .hand_back_on_disconnect(&key, &session)
+                .await;
+        }
 
         // A close that drops the will can lose the race against a read error,
         // an EOF or a DISCONNECT with a will
@@ -2395,10 +2482,10 @@ where
 
             if delay.is_zero() {
                 Box::pin(publish).await;
-            } else {
+            } else if let Some(task) = self.tasks.spawn(publish) {
                 // Aborted, freeing the will, as soon as a new connection
-                // takes the session over or the session is deleted
-                let task = tokio::spawn(publish).abort_handle();
+                // takes the session over or the session is deleted. Once the
+                // server has stopped, the stored will waits for a restart.
                 session.set_pending_will(generation, task, pending).await;
             }
         }
@@ -2449,10 +2536,35 @@ where
         loop {
             let challenge = match result {
                 AuthResult::Success { username, data } => return Ok(Some((username, data))),
-                AuthResult::Failed(reason) => {
+                AuthResult::Failed {
+                    reason,
+                    reason_string: text,
+                } => {
                     warn!("Enhanced authentication with `{}` failed", method);
                     self.login_failed().await;
-                    self.reject_connect(connect_packet, reason).await?;
+                    let properties = connect_packet.properties.as_ref();
+                    let text = text.filter(|_| {
+                        properties
+                            .and_then(|p| p.request_problem_information.as_ref())
+                            .is_none_or(|r| r.value != 0)
+                    });
+                    let client_maximum = properties
+                        .and_then(|p| p.maximum_packet_size.as_ref())
+                        .map(|m| m.value);
+                    let connack = ConnAckPacket {
+                        flags: ConnAckFlags {
+                            session_present: false,
+                        },
+                        reason_code: reason,
+                        properties: Some(ConnAckProperties {
+                            reason_string: explained(reason, text, client_maximum),
+                            ..Default::default()
+                        }),
+                    };
+                    let _ = self
+                        .connection
+                        .write_packet(ControlPacket::ConnAck(connack))
+                        .await;
                     return Ok(None);
                 }
                 AuthResult::Continue(challenge) => challenge,
@@ -2673,35 +2785,39 @@ where
             // a boxed future while it lasts: an idle connection holds just
             // what waiting takes, not the state of its heaviest handling
             let step = tokio::select! {
-                // So are the packets most clients send, PUBLISH and its
-                // acknowledgements; the rest are boxed
-                packet = self.connection.read_packet(), if reading => match HotPacket::try_from(packet?) {
-                    Ok(packet) => {
-                        let published = match &packet {
-                            HotPacket::Publish(p) => Some(p.payload.as_ref().map_or(0, |p| p.len())),
-                            _ => None,
-                        };
-                        let flow = self.handle_hot(&session, &key, packet).await?;
-                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
-                            reading = false;
-                            paused.as_mut().reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
-                        }
-                        Step::Done(flow)
-                    }
-                    Err(packet) => Step::Wake(Wake::Packet(packet)),
-                },
+                packet = self.connection.read_packet(), if reading => Step::Read(packet?),
                 // The client is sending, so it is alive: its keep-alive
                 // starts over once it may send again
                 _ = &mut paused, if !reading => {
                     reading = true;
-                    Step::Done(Flow::PacketHandled)
+                    // A client with nothing waiting by now has slowed down
+                    // to its rate; one with more is still over it
+                    match self.connection.read_packet().now_or_never() {
+                        Some(packet) => Step::Read(packet?),
+                        None => {
+                            pacing.caught_up();
+                            Step::Done(Flow::PacketHandled)
+                        }
+                    }
                 }
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
                 (message, journaled) = session.next_outgoing(window_open) => {
                     Step::Done(self.send_outgoing(&session, &key, message, journaled).await?)
                 }
-                _ = &mut deadline, if timeout_duration.is_some() && reading => Step::Wake(Wake::KeepAliveExpired),
+                // A task that runs late, starved by others, can find the
+                // deadline passed and a packet waiting that came in time;
+                // the select picks either at random, so the packet is
+                // looked for before giving up on the client. Biasing the
+                // select towards reading would do it too, but a client
+                // sending without pause would then hold off its outgoing
+                // messages, takeovers and shutdown for as long as it sends.
+                _ = &mut deadline, if timeout_duration.is_some() && reading => {
+                    match self.connection.read_packet().now_or_never() {
+                        Some(packet) => Step::Read(packet?),
+                        None => Step::Wake(Wake::KeepAliveExpired),
+                    }
+                }
                 Ok(()) = lease.close.changed() => {
                     let close = (*lease.close.borrow_and_update()).unwrap_or(Close::TakenOver);
                     Step::Wake(Wake::Closed(close))
@@ -2710,9 +2826,38 @@ where
                     return Err(ReasonCode::ServerShuttingDown.into());
                 }
             };
-            let flow = match step {
-                Step::Done(flow) => flow,
-                Step::Wake(wake) => {
+            let handled = match step {
+                Step::Done(flow) => Ok(flow),
+                Step::Wake(wake) => Err(wake),
+                // So are the packets most clients send, PUBLISH and its
+                // acknowledgements; the rest are boxed
+                Step::Read(packet) => match HotPacket::try_from(packet) {
+                    Ok(packet) => {
+                        let published = match &packet {
+                            HotPacket::Publish(p) => {
+                                Some(p.payload.as_ref().map_or(0, |p| p.len()))
+                            }
+                            _ => None,
+                        };
+                        let flow = self.handle_hot(&session, &key, packet).await?;
+                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
+                            if pacing.past_grace() {
+                                warn!("Client {} stayed over its publish rate, disconnecting", key);
+                                return Err(ReasonCode::MessageRateTooHigh.into());
+                            }
+                            reading = false;
+                            paused
+                                .as_mut()
+                                .reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
+                        }
+                        Ok(flow)
+                    }
+                    Err(packet) => Err(Wake::Packet(packet)),
+                },
+            };
+            let flow = match handled {
+                Ok(flow) => flow,
+                Err(wake) => {
                     Box::pin(self.handle_wake(
                         wake,
                         &session,
@@ -3244,11 +3389,12 @@ impl HotPacket {
     }
 }
 
-/// A wake-up either handled already or to be handled.
+/// A wake-up either handled already or to be handled, or a packet read.
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Done(Flow),
     Wake(Wake),
+    Read(Option<ControlPacket>),
 }
 
 /// What a connection does once it handled what woke it.
@@ -3270,7 +3416,23 @@ fn reason_string(
     reason: ReasonCode,
     client_maximum_packet_size: Option<u32>,
 ) -> Option<ReasonString> {
-    let text = reason.to_string();
+    fitting(reason.to_string(), client_maximum_packet_size)
+}
+
+/// Explains `reason` to the client in `text`, as `reason_string` does
+/// without it or when it would make the packet too large.
+fn explained(
+    reason: ReasonCode,
+    text: Option<String>,
+    client_maximum_packet_size: Option<u32>,
+) -> Option<ReasonString> {
+    text.and_then(|text| fitting(text, client_maximum_packet_size))
+        .or_else(|| reason_string(reason, client_maximum_packet_size))
+}
+
+/// `text` as a reason string, unless it would make the packet larger than
+/// the client accepts.
+fn fitting(text: String, client_maximum_packet_size: Option<u32>) -> Option<ReasonString> {
     // Room for the rest of a CONNACK or DISCONNECT around the string
     let fits = client_maximum_packet_size.is_none_or(|max| text.len() + 16 <= max as usize);
     fits.then(|| ReasonString::new(text))
@@ -3294,6 +3456,7 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, key
         properties: will.properties,
         subscription_identifiers: Vec::new(),
         origin: None,
+        share_group: None,
     };
 
     if let Err(e) = broker.publish(&topic, message).await {
@@ -3349,6 +3512,19 @@ mod tests {
         // One message too many, and 1000 bytes too many
         assert_eq!(pacing.publish(1500), Some(Duration::from_secs(1)));
         assert_eq!(Pacing::new(&Limits::default()).publish(usize::MAX), None);
+    }
+
+    #[test]
+    fn test_reason_strings_fit_the_client_maximum_packet_size() {
+        let text = || Some("the token expired an hour ago".to_string());
+        let explain = |max| explained(ReasonCode::NotAuthorized, text(), max).map(|r| r.value);
+        assert_eq!(
+            explain(None).as_deref(),
+            Some("the token expired an hour ago")
+        );
+        // The method's text is longer than the reason code's own
+        assert_eq!(explain(Some(40)).as_deref(), Some("Not authorized"));
+        assert_eq!(explain(Some(20)), None);
     }
 
     #[test]

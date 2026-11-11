@@ -9,7 +9,10 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareStrategy, Transport},
+    server::{
+        Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareRedelivery, ShareStrategy,
+        Transport,
+    },
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -806,6 +809,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub shared_subscription_strategy: SharedStrategy,
 
+    /// When the messages a member of a shared subscription holds go to
+    /// another member: as its session ends, or already as it disconnects
+    #[serde(default)]
+    pub shared_subscription_redelivery: SharedRedelivery,
+
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
     #[serde(default)]
@@ -912,6 +920,11 @@ pub struct ServerConfig {
     /// `max_publish_bytes_rate` by default
     pub publish_bytes_burst: Option<u32>,
 
+    /// Seconds a client may stay over `max_publish_rate` or
+    /// `max_publish_bytes_rate` before it is disconnected with Message Rate
+    /// Too High; clients are only slowed down when unset
+    pub publish_rate_grace: Option<u64>,
+
     /// Failed logins from one address within `login_failure_window` that
     /// get it banned for `login_failure_ban`; 0 turns this off
     #[serde(default = "default_login_failure_attempts")]
@@ -965,6 +978,7 @@ impl Default for ServerConfig {
             max_queued_bytes: default_max_queued_bytes(),
             queue_overflow: QueueOverflow::default(),
             shared_subscription_strategy: SharedStrategy::default(),
+            shared_subscription_redelivery: SharedRedelivery::default(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
@@ -990,6 +1004,7 @@ impl Default for ServerConfig {
             publish_rate_burst: None,
             max_publish_bytes_rate: None,
             publish_bytes_burst: None,
+            publish_rate_grace: None,
             login_failure_attempts: default_login_failure_attempts(),
             login_failure_window: default_login_failure_window(),
             login_failure_ban: default_login_failure_ban(),
@@ -1073,6 +1088,15 @@ pub enum SharedStrategy {
     Random,
     Sticky,
     Hash,
+}
+
+/// When a member's messages go to the rest of its shared subscription.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRedelivery {
+    #[default]
+    SessionEnd,
+    Disconnect,
 }
 
 /// Which message a full queue drops.
@@ -1317,6 +1341,13 @@ impl ServerConfig {
         }
     }
 
+    pub fn share_redelivery(&self) -> ShareRedelivery {
+        match self.shared_subscription_redelivery {
+            SharedRedelivery::SessionEnd => ShareRedelivery::OnSessionEnd,
+            SharedRedelivery::Disconnect => ShareRedelivery::OnDisconnect,
+        }
+    }
+
     pub fn limits(&self) -> Result<Limits, String> {
         let maximum_qos = QoS::try_from(self.max_qos)
             .map_err(|n| format!("max_qos must be 0, 1 or 2, not {n}"))?;
@@ -1367,6 +1398,15 @@ impl ServerConfig {
             self.max_publish_bytes_rate,
             self.publish_bytes_burst,
         )?;
+        if self.publish_rate_grace.is_some()
+            && limits.max_publish_rate.is_none()
+            && limits.max_publish_bytes_rate.is_none()
+        {
+            return Err(
+                "publish_rate_grace needs max_publish_rate or max_publish_bytes_rate".into(),
+            );
+        }
+        limits.publish_rate_grace = self.publish_rate_grace.map(Duration::from_secs);
         if self.login_failure_attempts > 0 {
             if self.login_failure_window == 0 || self.login_failure_ban == 0 {
                 return Err(
@@ -1878,6 +1918,24 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_subscription_redelivery_is_read() {
+        let redelivery = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.share_redelivery()
+        };
+        use mercurio_server::server::ShareRedelivery;
+        assert_eq!(redelivery(""), ShareRedelivery::OnSessionEnd);
+        assert_eq!(
+            redelivery("[server]\nshared_subscription_redelivery = \"disconnect\"\n"),
+            ShareRedelivery::OnDisconnect
+        );
+        assert!(
+            toml::from_str::<Config>("[server]\nshared_subscription_redelivery = \"never\"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_shared_subscription_strategy_is_read() {
         let strategy = |toml: &str| {
             let config: Config = toml::from_str(toml).unwrap();
@@ -1932,6 +1990,21 @@ mod tests {
         assert_eq!(limits("").unwrap().max_publish_rate, None);
         assert!(limits("[server]\npublish_rate_burst = 5\n").is_err());
         assert!(limits("[server]\nmax_publish_rate = 0\n").is_err());
+    }
+
+    #[test]
+    fn test_publish_rate_grace_needs_a_rate() {
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        let set = limits("[server]\nmax_publish_bytes_rate = 1000\npublish_rate_grace = 30\n");
+        assert_eq!(
+            set.unwrap().publish_rate_grace,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(limits("").unwrap().publish_rate_grace, None);
+        assert!(limits("[server]\npublish_rate_grace = 30\n").is_err());
     }
 
     #[test]

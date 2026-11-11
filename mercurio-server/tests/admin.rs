@@ -1995,6 +1995,40 @@ async fn commands_name_the_mount_point_of_a_shared_client_id() {
     assert_eq!(admin.session_key("dev", None).await.unwrap(), key("a/"));
 }
 
+/// `listClients` lists the clients of one mount point, `""` for none.
+#[tokio::test]
+async fn clients_are_listed_by_mount_point() {
+    let (addr, a, b, _) = start_mounted().await;
+    let mut tool = admin_client(addr).await;
+    let _on_a = Client::connect_with(a, persistent("dev")).await;
+    let _also_on_a = Client::connect_with(a, persistent("other")).await;
+    let _on_b = Client::connect_with(b, persistent("dev")).await;
+
+    let listed = |response: Value| -> Vec<(Value, Value)> {
+        response["data"]["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["clientid"].clone(), c["mountpoint"].clone()))
+            .collect()
+    };
+    let on_a = tool
+        .run(json!({"command": "listClients", "mountpoint": "a/"}))
+        .await;
+    assert_eq!(
+        listed(on_a),
+        [(json!("dev"), json!("a/")), (json!("other"), json!("a/"))]
+    );
+    let unmounted = tool
+        .run(json!({"command": "listClients", "mountpoint": ""}))
+        .await;
+    assert_eq!(listed(unmounted), [(json!("admin"), Value::Null)]);
+    let none = tool
+        .run(json!({"command": "listClients", "mountpoint": "c/"}))
+        .await;
+    assert_eq!(none["data"]["totalCount"], 0, "{none}");
+}
+
 /// A ban on a client id holds on every mount point.
 #[tokio::test]
 async fn client_id_bans_hold_on_every_mount_point() {

@@ -89,7 +89,7 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <p>Commands are <code>mercurioctl &lt;group&gt; &lt;verb&gt;</code>. What each one does and returns is in the <a href="admin.html#commands">command reference</a>; <code>--help</code> after any of them lists its options.</p>
 <table>
 <tr><th>Command</th><th>Runs</th></tr>
-<tr><td><code>client list</code> <code>[--connected | --offline]</code> <code>[--prefix P]</code> <code>[--user U]</code> <code>[--address A]</code></td><td><code>listClients</code></td></tr>
+<tr><td><code>client list</code> <code>[--connected | --offline]</code> <code>[--prefix P]</code> <code>[--user U]</code> <code>[--address A]</code> <code>[--mount-point M]</code></td><td><code>listClients</code></td></tr>
 <tr><td><code>client show &lt;clientid&gt; [--mount-point M]</code></td><td><code>getClient</code></td></tr>
 <tr><td><code>client disconnect &lt;clientid&gt; [--mount-point M] [--no-will] [--reason-code C]</code></td><td><code>disconnectClient</code>; <code>C</code> in decimal or <code>0x..</code></td></tr>
 <tr><td><code>client delete-session &lt;clientid&gt; [--mount-point M] [--disconnect] [--yes]</code></td><td><code>deleteSession</code>; asks for confirmation first, or needs <code>--yes</code> off a terminal</td></tr>

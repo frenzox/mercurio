@@ -50,7 +50,7 @@ impl AuthExchange for ChallengeExchange {
                     username: Some("u".into()),
                     data: None,
                 },
-                _ => AuthResult::Failed(ReasonCode::NotAuthorized),
+                _ => AuthResult::failed(ReasonCode::NotAuthorized),
             },
         )
     }

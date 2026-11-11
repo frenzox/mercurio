@@ -48,6 +48,7 @@ fn arguments_of(command: &str) -> Option<&'static [&'static str]> {
             "clientidPrefix",
             "username",
             "address",
+            "mountpoint",
             "offset",
             "count",
         ],
@@ -166,6 +167,7 @@ struct ListClientsArgs {
     clientid_prefix: Option<String>,
     username: Option<String>,
     address: Option<String>,
+    mountpoint: Option<String>,
     #[serde(flatten)]
     page: PageArgs,
 }
@@ -182,6 +184,7 @@ impl ListClientsArgs {
             client_id_prefix: self.clientid_prefix,
             username: self.username,
             address,
+            mount_point: self.mountpoint,
             paging: self.page.paging()?,
         })
     }

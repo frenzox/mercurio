@@ -277,6 +277,29 @@ impl MessageQueue {
             .collect()
     }
 
+    /// The messages queued that came through a shared subscription, with
+    /// their sequence, oldest first.
+    pub(crate) fn shared(&self) -> Vec<(u64, Message)> {
+        let state = self.state.lock().unwrap();
+        state
+            .messages
+            .iter()
+            .filter(|(_, message)| message.share_group.is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// Takes the message at `sequence` out of the queue, and out of the
+    /// journal. False if it isn't queued anymore.
+    pub(crate) fn remove(&self, sequence: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(position) = state.messages.iter().position(|(s, _)| *s == sequence) else {
+            return false;
+        };
+        state.evict(&[position]);
+        true
+    }
+
     /// Puts back messages recorded by a previous run, keeping their order.
     pub(crate) fn restore(&self, messages: Vec<(u64, Message)>) {
         let mut state = self.state.lock().unwrap();
@@ -422,6 +445,9 @@ pub(crate) struct Subscriber {
     pub no_local: bool,
     pub retain_as_published: bool,
     pub subscription_identifier: Option<u32>,
+    /// The shared subscription, `$share/{name}/{filter}`, for a member of
+    /// a share group
+    pub share: Option<Arc<str>>,
 }
 
 impl Subscriber {
@@ -495,6 +521,8 @@ impl Subscriber {
     /// [MQTT-3.8.4-8].
     fn prepare(&self, mut message: Message, granted_qos: QoS, identifiers: Vec<u32>) -> Message {
         message.subscription_identifiers = identifiers;
+        message.share_group = self.share.clone();
+
         if self.queue.limits.upgrade_qos {
             message.qos = granted_qos;
         } else if (message.qos as u8) > (granted_qos as u8) {
@@ -530,6 +558,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 
@@ -720,6 +749,7 @@ mod tests {
                 no_local: false,
                 retain_as_published: false,
                 subscription_identifier: None,
+                share: None,
             };
             Subscriber::deliver(&[subscriber], message(QoS::AtMostOnce), None);
             assert_eq!(queue.pop(false).await.0.qos, expected);

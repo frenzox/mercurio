@@ -262,6 +262,8 @@ pub struct InflightMessage {
     pub properties: MessageProperties,
     /// Identifiers of the subscriptions the message matched, sent with it
     pub subscription_identifiers: Vec<u32>,
+    /// The shared subscription the message came through, if it did
+    pub share_group: Option<String>,
 }
 
 /// Trait for retained message storage.

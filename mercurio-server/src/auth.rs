@@ -101,16 +101,16 @@ impl PlainExchange {
     fn check(&mut self, data: Option<&Bytes>) -> AuthResult {
         // PLAIN is a single step
         if std::mem::replace(&mut self.done, true) {
-            return AuthResult::Failed(ReasonCode::ProtocolError);
+            return AuthResult::failed(ReasonCode::ProtocolError);
         }
 
         let Some(data) = data else {
             // PLAIN requires data in the initial request
-            return AuthResult::Failed(ReasonCode::BadAuthenticationMethod);
+            return AuthResult::failed(ReasonCode::BadAuthenticationMethod);
         };
 
         let Some((username, password)) = parse_plain_data(data) else {
-            return AuthResult::Failed(ReasonCode::MalformedPacket);
+            return AuthResult::failed(ReasonCode::MalformedPacket);
         };
 
         match check_password(&self.credentials, &username, password.as_bytes()) {
@@ -118,7 +118,7 @@ impl PlainExchange {
                 username: Some(username),
                 data: None,
             },
-            _ => AuthResult::Failed(ReasonCode::BadUserNameOrPassword),
+            _ => AuthResult::failed(ReasonCode::BadUserNameOrPassword),
         }
     }
 }
@@ -316,20 +316,25 @@ impl<S: ScramCredentialStore + ?Sized> AuthExchange for ScramExchange<S> {
                     known,
                 } => {
                     let Some(data) = data else {
-                        return AuthResult::Failed(ReasonCode::MalformedPacket);
+                        return AuthResult::Failed {
+                            reason: ReasonCode::MalformedPacket,
+                            reason_string: Some("the client's final message is missing".into()),
+                        };
                     };
                     match awaiting.verify(data) {
                         Ok(server_final) if known => AuthResult::Success {
                             username: Some(username),
                             data: Some(Bytes::from(server_final)),
                         },
+                        // An unknown user fails as a wrong password does,
+                        // reason string included
                         Ok(_) | Err(ServerError::InvalidProof) => {
-                            AuthResult::Failed(ReasonCode::BadUserNameOrPassword)
+                            scram_failure(&ServerError::InvalidProof)
                         }
                         Err(error) => scram_refusal(error),
                     }
                 }
-                ScramState::Done => AuthResult::Failed(ReasonCode::ProtocolError),
+                ScramState::Done => AuthResult::failed(ReasonCode::ProtocolError),
             }
         })
     }
@@ -341,7 +346,10 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
     async fn first(&mut self, data: Option<&Bytes>) -> AuthResult {
         let Some(data) = data else {
             // The client's first message goes in the CONNECT
-            return AuthResult::Failed(ReasonCode::BadAuthenticationMethod);
+            return AuthResult::Failed {
+                reason: ReasonCode::BadAuthenticationMethod,
+                reason_string: Some("the client's first message is missing".into()),
+            };
         };
         let first = match ClientFirst::parse(data) {
             Ok(first) => first,
@@ -367,21 +375,43 @@ impl<S: ScramCredentialStore + ?Sized> ScramExchange<S> {
     }
 }
 
-/// The reason code refusing a client for `error`, logged with the RFC's
-/// name for it, as a refusing CONNACK carries no SCRAM message.
+/// Refuses a client for `error`, logged with the RFC's name for it.
 fn scram_refusal(error: ServerError) -> AuthResult {
     warn!("SCRAM-SHA-256 authentication refused: {}", error);
-    AuthResult::Failed(match error {
-        ServerError::ChannelBindingNotSupported | ServerError::ExtensionsNotSupported => {
-            ReasonCode::BadAuthenticationMethod
+    scram_failure(&error)
+}
+
+/// The reason code refusing a client for `error`, and a short text saying
+/// why: a refusing CONNACK or DISCONNECT carries no SCRAM message, so the
+/// reason string stands in for the RFC's server error.
+fn scram_failure(error: &ServerError) -> AuthResult {
+    let (reason, text) = match error {
+        ServerError::ChannelBindingNotSupported => (
+            ReasonCode::BadAuthenticationMethod,
+            "channel binding is not supported",
+        ),
+        ServerError::ExtensionsNotSupported => (
+            ReasonCode::BadAuthenticationMethod,
+            "SCRAM extensions are not supported",
+        ),
+        ServerError::InvalidEncoding => (ReasonCode::MalformedPacket, "malformed SCRAM message"),
+        ServerError::InvalidUsernameEncoding => {
+            (ReasonCode::MalformedPacket, "invalid user name encoding")
         }
-        ServerError::InvalidEncoding
-        | ServerError::InvalidUsernameEncoding
-        | ServerError::ChannelBindingsDontMatch => ReasonCode::MalformedPacket,
-        ServerError::InvalidProof => ReasonCode::BadUserNameOrPassword,
-        ServerError::NoResources => ReasonCode::ServerUnavailable,
-        _ => ReasonCode::NotAuthorized,
-    })
+        ServerError::ChannelBindingsDontMatch => {
+            (ReasonCode::MalformedPacket, "channel bindings don't match")
+        }
+        ServerError::InvalidProof => (
+            ReasonCode::BadUserNameOrPassword,
+            "wrong user name or password",
+        ),
+        ServerError::NoResources => (ReasonCode::ServerUnavailable, "server out of resources"),
+        _ => (ReasonCode::NotAuthorized, "authentication failed"),
+    };
+    AuthResult::Failed {
+        reason,
+        reason_string: Some(text.into()),
+    }
 }
 
 #[cfg(test)]
@@ -433,7 +463,10 @@ mod tests {
             .step(Some(&data))
             .await
         {
-            AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
+            AuthResult::Failed {
+                reason: ReasonCode::BadUserNameOrPassword,
+                ..
+            } => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
     }
@@ -451,7 +484,10 @@ mod tests {
             .step(Some(&data))
             .await
         {
-            AuthResult::Failed(ReasonCode::BadUserNameOrPassword) => {}
+            AuthResult::Failed {
+                reason: ReasonCode::BadUserNameOrPassword,
+                ..
+            } => {}
             other => panic!("Expected BadUserNameOrPassword, got {:?}", other),
         }
     }
@@ -467,7 +503,10 @@ mod tests {
             .step(None)
             .await
         {
-            AuthResult::Failed(ReasonCode::BadAuthenticationMethod) => {}
+            AuthResult::Failed {
+                reason: ReasonCode::BadAuthenticationMethod,
+                ..
+            } => {}
             other => panic!("Expected BadAuthenticationMethod, got {:?}", other),
         }
     }
@@ -485,7 +524,10 @@ mod tests {
             .step(Some(&data))
             .await
         {
-            AuthResult::Failed(ReasonCode::MalformedPacket) => {}
+            AuthResult::Failed {
+                reason: ReasonCode::MalformedPacket,
+                ..
+            } => {}
             other => panic!("Expected MalformedPacket, got {:?}", other),
         }
     }
@@ -512,7 +554,7 @@ mod tests {
         // A finished exchange accepts no more steps
         assert_eq!(
             exchange.step(Some(&data)).await,
-            AuthResult::Failed(ReasonCode::ProtocolError)
+            AuthResult::failed(ReasonCode::ProtocolError)
         );
     }
 
@@ -590,6 +632,13 @@ mod tests {
         Bytes::from(text)
     }
 
+    fn failed(reason: ReasonCode, reason_string: &str) -> AuthResult {
+        AuthResult::Failed {
+            reason,
+            reason_string: Some(reason_string.into()),
+        }
+    }
+
     /// Runs a SCRAM exchange as `username` with `password`; the server's
     /// first message, then the result of the last step.
     async fn scram_login(
@@ -627,13 +676,17 @@ mod tests {
     async fn test_scram_wrong_password_and_unknown_user_fail_alike() {
         let auth = scram_auth();
         let (known, wrong, _) = scram_login(&auth, "user", "wrong").await;
-        assert_eq!(wrong, AuthResult::Failed(ReasonCode::BadUserNameOrPassword));
-
-        let (unknown, result, _) = scram_login(&auth, "nobody", "pencil").await;
         assert_eq!(
-            result,
-            AuthResult::Failed(ReasonCode::BadUserNameOrPassword)
+            wrong,
+            failed(
+                ReasonCode::BadUserNameOrPassword,
+                "wrong user name or password"
+            )
         );
+
+        // Told apart neither by the reason code nor by the reason string
+        let (unknown, result, _) = scram_login(&auth, "nobody", "pencil").await;
+        assert_eq!(result, wrong);
         // Both answers have the same shape, and an unknown user always
         // gets the same salt
         let shape = |m: &str| {
@@ -658,19 +711,25 @@ mod tests {
         };
         assert_eq!(
             step(None).await,
-            AuthResult::Failed(ReasonCode::BadAuthenticationMethod)
+            failed(
+                ReasonCode::BadAuthenticationMethod,
+                "the client's first message is missing"
+            )
         );
         assert_eq!(
             step(Some("p=tls-unique,,n=user,r=abc")).await,
-            AuthResult::Failed(ReasonCode::BadAuthenticationMethod)
+            failed(
+                ReasonCode::BadAuthenticationMethod,
+                "channel binding is not supported"
+            )
         );
         assert_eq!(
             step(Some("garbage")).await,
-            AuthResult::Failed(ReasonCode::MalformedPacket)
+            failed(ReasonCode::MalformedPacket, "malformed SCRAM message")
         );
         assert_eq!(
             step(Some("n,a=admin,n=user,r=abc")).await,
-            AuthResult::Failed(ReasonCode::NotAuthorized)
+            failed(ReasonCode::NotAuthorized, "authentication failed")
         );
         assert!(auth.begin_auth(&client(), "PLAIN").is_none());
     }
@@ -686,12 +745,15 @@ mod tests {
         };
         assert_eq!(
             exchange.step(None).await,
-            AuthResult::Failed(ReasonCode::MalformedPacket)
+            failed(
+                ReasonCode::MalformedPacket,
+                "the client's final message is missing"
+            )
         );
         let last = data(client.respond(&server_first).unwrap());
         assert_eq!(
             exchange.step(Some(&last)).await,
-            AuthResult::Failed(ReasonCode::ProtocolError)
+            AuthResult::failed(ReasonCode::ProtocolError)
         );
     }
 
