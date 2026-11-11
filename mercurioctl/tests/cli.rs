@@ -92,7 +92,7 @@ impl Broker {
     /// Runs mercurioctl through the broker's socket, expecting success, and
     /// returns what it printed, as JSON.
     async fn json(&self, args: &[&str]) -> Value {
-        let output = self.ctl(args).await;
+        let output = self.ctl(&[args, &["--json"][..]].concat()).await;
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
         serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", stdout(&output)))
@@ -228,4 +228,31 @@ async fn a_broker_that_never_answers_times_out() {
     .await;
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("no answer"), "{}", stderr(&output));
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_print_as_tables_by_default() {
+    let broker = start("tables").await;
+    let _sensor = broker.client("sensor-1").await;
+
+    let output = broker.ctl(&["client", "list"]).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.starts_with("CLIENT ID"), "{text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("sensor-1 ")),
+        "{text}"
+    );
+
+    let reload = broker.ctl(&["broker", "reload"]).await;
+    assert_eq!(reload.status.code(), Some(1));
+    assert!(
+        stdout(&reload).contains("syntax error at line 3"),
+        "{}",
+        stdout(&reload)
+    );
+    assert!(
+        stderr(&reload).contains("previous contents"),
+        "{}",
+        stderr(&reload)
+    );
 }

@@ -8,6 +8,7 @@ use clap::Parser;
 mod cli;
 mod client;
 mod commands;
+mod output;
 
 use cli::Cli;
 use client::Failure;
@@ -37,9 +38,17 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), Failure> {
     let request = commands::request(cli.command);
     let wait = Duration::from_secs(cli.timeout);
-    if let Some(data) = client::send(&cli.connect, &request, wait).await? {
-        // A reader that went away, such as `head`, isn't an error
-        let _ = std::io::stdout().write_all(format!("{data:#}\n").as_bytes());
+    let Some(data) = client::send(&cli.connect, &request, wait).await? else {
+        return Ok(());
+    };
+    // A reader that went away, such as `head`, isn't an error
+    let _ = std::io::stdout().write_all(output::render(&request, &data, cli.json).as_bytes());
+    if request.name() == "reload" && output::reload_failed(&data) {
+        return Err(Failure::Rejected {
+            code: None,
+            message: "some files weren't reloaded; the broker keeps their previous contents"
+                .to_string(),
+        });
     }
     Ok(())
 }

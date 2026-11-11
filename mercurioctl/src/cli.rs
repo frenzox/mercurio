@@ -15,6 +15,10 @@ pub struct Cli {
     #[command(flatten)]
     pub connect: ConnectArgs,
 
+    /// Print the response data as JSON instead of a table
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Seconds to wait for the broker's answer
     #[arg(long, global = true, value_name = "SECONDS", default_value_t = 10)]
     pub timeout: u64,

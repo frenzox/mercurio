@@ -19,6 +19,13 @@ pub struct Request {
     pub command: Value,
 }
 
+impl Request {
+    /// The command's name in the protocol, such as `listClients`.
+    pub fn name(&self) -> &str {
+        self.command["command"].as_str().unwrap_or_default()
+    }
+}
+
 /// What `command` sends.
 pub fn request(command: Command) -> Request {
     let command = match command {
