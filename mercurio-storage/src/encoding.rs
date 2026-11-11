@@ -29,10 +29,12 @@ pub(crate) fn encode_properties(properties: &MessageProperties) -> Vec<u8> {
     buffer.to_vec()
 }
 
-/// Stores each subscription as three digits (QoS, No Local, Retain As
+/// How sessions kept their subscriptions before they had a table of their
+/// own: each subscription as three digits (QoS, No Local, Retain As
 /// Published), the subscription identifier if any, `:` and the topic
 /// filter. Subscriptions are separated by NUL: the only character a topic
-/// filter cannot contain.
+/// filter cannot contain. Databases are moved off it as they are opened.
+#[cfg(test)]
 pub(crate) fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> String {
     subscriptions
         .iter()

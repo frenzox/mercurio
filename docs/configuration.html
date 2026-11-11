@@ -107,6 +107,7 @@ mount_point = "tenant1/"</pre>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>upgrade_outgoing_qos</code></td><td><code>false</code></td><td>Send messages at the QoS of the subscription even when published with a lower one. Goes beyond the MQTT specification.</td></tr>
 <tr><td><code>max_subscriptions</code></td><td><code>10000</code></td><td>Subscriptions one session may hold. Further ones are refused with Quota Exceeded; replacing one it holds is allowed.</td></tr>
+<tr><td><code>max_topic_filter_length</code></td><td><code>1024</code></td><td>Longest topic filter, in bytes, a SUBSCRIBE may name. Longer ones are refused with Topic Filter Invalid (a failure for MQTT 3.x clients). Each filter is kept in memory and storage for as long as its session.</td></tr>
 <tr><td><code>check_retain_source</code></td><td><code>false</code></td><td>Send a retained message to new subscribers only while the client that published it may still publish to its topic.</td></tr>
 <tr><td><code>send_topic_aliases</code></td><td><code>false</code></td><td>Replace repeated topics with aliases for MQTT 5 clients that accept them. Off by default because some client libraries announce alias support they don't implement.</td></tr>
 <tr><td><code>response_information</code></td><td></td><td>Topic prefix given to MQTT 5 clients that request Response Information; <code>%c</code> is replaced by the client id, as in <code>"responses/%c"</code>.</td></tr>

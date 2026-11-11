@@ -300,7 +300,7 @@ mod tests {
                 .unwrap();
         }
 
-        let counters = crate::sys::counters(&stats, 0, 0, 0, 0);
+        let counters = crate::sys::counters(&stats, 0, 0, 0, 0, (0, 0));
         let stat = |name: &str| counters.iter().find(|(n, _)| *n == name).unwrap().1;
         assert_eq!(stat("publish/messages/dropped/no_share_member"), 1);
         assert_eq!(stat("publish/messages/dropped"), 1);

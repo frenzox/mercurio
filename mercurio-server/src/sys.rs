@@ -258,6 +258,7 @@ pub(crate) fn counters(
     expired: u64,
     retained: usize,
     subscriptions: usize,
+    storage_failures: (u64, usize),
 ) -> Vec<(&'static str, u64)> {
     let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     let connected = get(&stats.connected);
@@ -276,6 +277,8 @@ pub(crate) fn counters(
         ("retained messages/count", retained as u64),
         ("subscriptions/count", subscriptions as u64),
         ("publish/messages/dropped", dropped.iter().sum()),
+        ("storage/failed batches", storage_failures.0),
+        ("storage/dirty clients", storage_failures.1 as u64),
     ];
     counters.extend(DROPPED_BY_CAUSE.into_iter().zip(dropped));
     counters.push(("store/batches/retried", get(&BATCHES_RETRIED)));
@@ -295,6 +298,7 @@ pub(crate) async fn current<St: MqttStore + 'static>(
         session_manager.expired_count(),
         broker.retained_count().await,
         broker.topics().subscription_count(),
+        session_manager.storage_failures(),
     )
 }
 

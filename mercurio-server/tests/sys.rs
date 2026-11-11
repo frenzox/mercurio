@@ -52,7 +52,7 @@ async fn statistics(addr: SocketAddr) -> HashMap<String, String> {
     let mut values = HashMap::new();
     // Every statistic is retained, so a new subscriber gets them all
     timeout(Duration::from_secs(2), async {
-        while values.len() < 37 {
+        while values.len() < 39 {
             if ControlPacket::check(&buffer).is_ok() {
                 if let ControlPacket::Publish(publish) =
                     ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5).unwrap()
@@ -99,6 +99,8 @@ async fn statistics_are_published_under_sys() {
     );
     assert!(values.contains_key("$SYS/broker/store/batches/retried"));
     assert!(values.contains_key("$SYS/broker/store/batches/dropped"));
+    assert_eq!(values["$SYS/broker/storage/failed batches"], "0");
+    assert_eq!(values["$SYS/broker/storage/dirty clients"], "0");
     // CONNECT and three 8 byte PUBLISH packets
     assert_eq!(values["$SYS/broker/bytes/received"], "40");
     // The statistics are kept apart from the retained messages stored

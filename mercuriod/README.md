@@ -127,6 +127,9 @@ max_queued_qos0_messages = 1000
 # check_retain_source = false
 # Subscriptions one session may hold; further ones get Quota Exceeded
 # max_subscriptions = 10000
+# Longest topic filter, in bytes, a SUBSCRIBE may name; longer ones get
+# Topic Filter Invalid
+# max_topic_filter_length = 1024
 
 # Seconds a new connection has, in all, to send its PROXY header, complete
 # the TLS and WebSocket handshakes and send CONNECT
@@ -671,10 +674,16 @@ With `backend = "memory"`, everything is lost when the broker stops. With
 retained messages, wills, queued messages and messages in flight are kept in
 the database, so
 clients with persistent sessions resume where they left off after a
-restart.
+restart. Queued QoS 1 and 2 messages of persistent sessions are kept whether
+their client is connected or not, each removed as it is sent, in the same
+write that records it in flight, or dropped; QoS 0 messages are not kept.
 
 Changes are written in the background within milliseconds, so a crash loses
 only the changes of its last moments; a shutdown writes everything first.
+Changes the database fails to take are retried; when it keeps refusing
+them, as opposed to being out of reach, they are given up after a few
+attempts, and the client's whole state is written again, replacing what the
+database holds for it, as soon as the database takes it.
 
 The SQLite database runs in WAL mode: while the broker runs, it keeps
 `-wal` and `-shm` files next to the database, and recent changes may be
@@ -703,7 +712,10 @@ Mercurio adds the dropped messages by cause under
 `publish/messages/dropped/` (`queue_full_qos0`, `queue_full`, `expired`,
 `too_large`, `not_authorized`, `no_share_member`) and the storage batches
 retried and given up on as `store/batches/retried` and
-`store/batches/dropped`. Under `load/` come the 1, 5 and 15
+`store/batches/dropped`. `storage/failed batches` counts the batches of
+changes given up since the broker started, and `storage/dirty clients`
+the clients whose stored state is to be written whole again because of
+them. Under `load/` come the 1, 5 and 15
 minute averages per minute of messages, bytes and connections, such as
 `load/messages/received/1min`. Clients
 may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`

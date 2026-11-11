@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use crate::CONNECTIONS;
@@ -28,11 +28,11 @@ use tracing::{error, warn};
 
 use crate::{
     broker::Broker,
-    plugin::{Chain, Event},
+    plugin::{BoxFuture, Chain, Event},
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
     sys::Stats,
-    writer::Writers,
+    writer::{Snapshots, Writers},
 };
 
 pub(crate) struct SessionManagerDropGuard<S: BatchStore> {
@@ -84,8 +84,9 @@ struct State {
     connections: HashMap<String, ConnectionSlot>,
     /// Source of ConnectionSlot::generation, unique across slots
     next_generation: u64,
-    /// Clients whose will, left over from a previous run, is still due
-    restored_wills: HashSet<String>,
+    /// Clients whose will, left over from a previous run, is still due,
+    /// with that will
+    restored_wills: HashMap<String, StoredWillMessage>,
     /// The expiry timer that may end each session. Deleting or resuming a
     /// session, or scheduling a new timer for it, stops the timer.
     expiry_timers: HashMap<String, ExpiryTimer>,
@@ -115,7 +116,7 @@ impl State {
                 .connections
                 .get(client_id)
                 .map(|slot| slot.holder.generation),
-            restored_will: self.restored_wills.contains(client_id),
+            restored_will: self.restored_wills.contains_key(client_id),
         }
     }
 
@@ -425,12 +426,13 @@ impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
     }
 }
 
-/// A session read from storage: its subscriptions, queue and in-flight
-/// messages.
+/// A session read from storage: its subscriptions, queue, in-flight
+/// messages and the packet ids of incoming QoS 2 messages awaiting PUBREL.
 type StoredSession = (
     Vec<StoredSubscription>,
     Vec<(u64, Message)>,
     Vec<InflightMessage>,
+    Vec<u16>,
 );
 
 /// Result of starting a session, includes subscriptions, will, and inflight to restore if resuming.
@@ -463,7 +465,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 sessions: HashMap::new(),
                 connections: HashMap::new(),
                 next_generation: 0,
-                restored_wills: HashSet::new(),
+                restored_wills: HashMap::new(),
                 expiry_timers: HashMap::new(),
                 admissions: HashMap::new(),
             }),
@@ -473,14 +475,25 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             expiry_chain: Default::default(),
         });
 
+        let writers = Writers::new(Arc::clone(&storage));
+        writers.set_snapshots(Box::new(StoredState {
+            shared: Arc::downgrade(&shared),
+            durable: storage.is_durable(),
+        }));
         SessionManager {
             shared,
-            writers: Writers::new(Arc::clone(&storage)),
+            writers,
             storage,
             queue_limits,
             stats: Default::default(),
             takeover_wait: None,
         }
+    }
+
+    /// Batches of changes given up since the broker started, and clients
+    /// whose stored state is dirty until it is stored whole again.
+    pub(crate) fn storage_failures(&self) -> (u64, usize) {
+        self.writers.failures()
     }
 
     /// Starts or resumes the session of the client in `connect_packet`,
@@ -567,15 +580,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
         }
         let resume = resumed.is_some() || stored.is_some();
-        let (subscriptions_to_restore, queue_to_restore, inflight_to_retry) =
+        let (subscriptions_to_restore, queue_to_restore, inflight_to_retry, incoming_qos2) =
             stored.unwrap_or_default();
 
         let from_memory = resumed.is_some();
         let session = match resumed {
             Some(mut session) => {
                 session.set_connect_packet(connect_packet).await;
-                // The client is back to take its queue from memory
-                session.stop_queue_journal();
                 session
             }
             None => {
@@ -585,6 +596,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         session.set_generation(generation).await;
         session.set_owner(owner.clone()).await;
+        session.restore_incoming_qos2(incoming_qos2).await;
 
         claim.on_drop = OnDrop::End(expiry);
         let discarded = {
@@ -609,6 +621,21 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             self.writers.write(&client_id, Write::DeleteSession);
         }
 
+        // The queue of a session outliving its connection is kept in
+        // storage, connected or not, so a crash loses none of it; a stored
+        // one restored here is there already
+        let journaled = persistent && self.storage.is_durable();
+        let restored = !queue_to_restore.is_empty();
+        session.restore_queue(queue_to_restore);
+        if journaled {
+            session.start_queue_journal(self.writers.get(&client_id), restored);
+        } else {
+            session.stop_queue_journal();
+            if restored {
+                self.writers.write(&client_id, Write::ClearQueue);
+            }
+        }
+
         {
             let mut persistent_clients = self.shared.persistent.lock().unwrap();
             if persistent {
@@ -617,11 +644,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 persistent_clients.remove(&client_id);
             }
         }
-        if !queue_to_restore.is_empty() {
-            session.restore_queue(queue_to_restore);
-            self.writers.write(&client_id, Write::ClearQueue);
-        }
-
         // A session resumed from memory already holds its subscriptions; one
         // loaded from storage gets them restored after this returns
         let mut subscriptions = session.get_subscriptions().await;
@@ -680,7 +702,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 client_id
             );
         }
-        Ok(Some((stored_session.subscriptions, queue, inflight)))
+        let incoming_qos2 = self.storage.get_incoming_qos2(client_id).await?;
+        Ok(Some((
+            stored_session.subscriptions,
+            queue,
+            inflight,
+            incoming_qos2,
+        )))
     }
 
     /// Takes over `client_id` for a connection of `owner`: asks any
@@ -921,12 +949,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             self.end_session(client_id, generation, None).await;
         } else if self.storage.is_durable() {
             // Messages for the client now wait in its queue until it returns;
-            // keep them on disk meanwhile, unless another connection already
-            // took the session over
+            // keep them on disk meanwhile, as they are already unless the
+            // session was to end with the connection, and unless another
+            // connection took the session over
             let manager = self.shared.state.lock().await;
             if let Some(session) = manager.sessions.get(client_id).map(|s| s.session()) {
                 if session.generation() == generation {
-                    session.start_queue_journal(self.writers.get(client_id));
+                    session.start_queue_journal(self.writers.get(client_id), false);
                 }
             }
         }
@@ -1027,7 +1056,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let (removed, was_restored) = {
             let mut manager = self.shared.state.lock().await;
             manager.stop_expiry_timer(client_id);
-            let was_restored = manager.restored_wills.remove(client_id);
+            let was_restored = manager.restored_wills.remove(client_id).is_some();
             (manager.sessions.remove(client_id), was_restored)
         };
         if let Some(removed) = &removed {
@@ -1131,15 +1160,15 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
             // The clients were disconnected by the shutdown, so their wills
             // are due after their delay, or when the session ends if sooner
-            if let Some(will) = self.storage.get_will(&client_id).await? {
-                let will = WillMessage::from(will);
+            if let Some(stored) = self.storage.get_will(&client_id).await? {
+                let will = WillMessage::from(stored.clone());
                 let due = until_expiry.map_or(will.delay, |e| e.min(will.delay));
                 self.shared
                     .state
                     .lock()
                     .await
                     .restored_wills
-                    .insert(client_id.clone());
+                    .insert(client_id.clone(), stored);
                 wills.push((client_id.clone(), will, due));
             }
 
@@ -1193,7 +1222,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         session
             .restore_inflight(self.storage.get_all_inflight(client_id).await?)
             .await;
-        session.start_queue_journal(self.writers.get(client_id));
+        session
+            .restore_incoming_qos2(self.storage.get_incoming_qos2(client_id).await?)
+            .await;
+        session.start_queue_journal(self.writers.get(client_id), true);
         self.shared
             .persistent
             .lock()
@@ -1251,6 +1283,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             .await
             .restored_wills
             .remove(client_id)
+            .is_some()
     }
 
     /// Discards the session of `client_id` unless a connection newer than
@@ -1315,16 +1348,14 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.storage.is_durable() && self.shared.persistent.lock().unwrap().contains(client_id)
     }
 
-    /// Update persisted session with current subscriptions.
-    pub(crate) async fn save_subscriptions(
-        &self,
-        client_id: &str,
-        subscriptions: Vec<StoredSubscription>,
-    ) {
+    /// Stores the subscriptions added and removed, one write each.
+    pub(crate) async fn save_subscription_changes(&self, client_id: &str, changes: Vec<Write>) {
         if self.is_persistent(client_id) {
-            self.writers
-                .write_paced(client_id, Box::new(Write::SaveSubscriptions(subscriptions)))
-                .await;
+            for change in changes {
+                self.writers
+                    .write_paced(client_id, Box::new([change]))
+                    .await;
+            }
         }
     }
 
@@ -1334,20 +1365,41 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers.write(client_id, Write::DeleteWill);
     }
 
-    /// Store an inflight message (QoS 1/2 awaiting acknowledgment).
-    pub(crate) async fn store_inflight(&self, client_id: &str, message: &InflightMessage) {
-        if self.is_persistent(client_id) {
-            self.writers
-                .write_paced(client_id, Box::new(Write::StoreInflight(message.clone())))
-                .await;
-        }
+    /// Stores a QoS 1 or 2 message sent and awaiting acknowledgment,
+    /// removing it from the stored queue, if it was at `dequeued` there, in
+    /// the same batch: it is in one place or the other, whenever the broker
+    /// stops.
+    pub(crate) async fn store_inflight(
+        &self,
+        client_id: &str,
+        message: &InflightMessage,
+        dequeued: Option<u64>,
+    ) {
+        let writes: Box<[Write]> = match (self.is_persistent(client_id), dequeued) {
+            (true, Some(sequence)) => Box::new([
+                Write::StoreInflight(message.clone()),
+                Write::Dequeue(sequence),
+            ]),
+            (true, None) => Box::new([Write::StoreInflight(message.clone())]),
+            (false, Some(sequence)) => Box::new([Write::Dequeue(sequence)]),
+            (false, None) => return,
+        };
+        self.writers.write_paced(client_id, writes).await;
+    }
+
+    /// Removes a message dropped from the queue, rather than sent, from
+    /// the stored queue.
+    pub(crate) async fn dequeue(&self, client_id: &str, sequence: u64) {
+        self.writers
+            .write_paced(client_id, Box::new([Write::Dequeue(sequence)]))
+            .await;
     }
 
     /// Mark a QoS 2 message as released once the client sent PUBREC.
     pub(crate) async fn release_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::ReleaseInflight(packet_id)))
+                .write_paced(client_id, Box::new([Write::ReleaseInflight(packet_id)]))
                 .await;
         }
     }
@@ -1356,9 +1408,62 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     pub(crate) async fn remove_inflight(&self, client_id: &str, packet_id: u16) {
         if self.is_persistent(client_id) {
             self.writers
-                .write_paced(client_id, Box::new(Write::RemoveInflight(packet_id)))
+                .write_paced(client_id, Box::new([Write::RemoveInflight(packet_id)]))
                 .await;
         }
+    }
+
+    /// Records an incoming QoS 2 message acknowledged with PUBREC, so a
+    /// copy the client sends again after a restart isn't forwarded twice.
+    pub(crate) async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) {
+        if self.is_persistent(client_id) {
+            self.writers
+                .write_paced(client_id, Box::new([Write::StoreIncomingQos2(packet_id)]))
+                .await;
+        }
+    }
+
+    /// Forgets an incoming QoS 2 message once the client sent PUBREL.
+    pub(crate) async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) {
+        if self.is_persistent(client_id) {
+            self.writers
+                .write_paced(client_id, Box::new([Write::RemoveIncomingQos2(packet_id)]))
+                .await;
+        }
+    }
+}
+
+/// Takes what the broker holds for a client, for its writer to store it
+/// whole.
+struct StoredState {
+    shared: Weak<Shared>,
+    durable: bool,
+}
+
+impl Snapshots for StoredState {
+    fn snapshot<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Option<Vec<Write>>> {
+        Box::pin(async move {
+            let shared = self.shared.upgrade()?;
+            let (session, restored_will) = {
+                let state = shared.state.lock().await;
+                (
+                    state.sessions.get(client_id).map(SessionDropGuard::session),
+                    state.restored_wills.get(client_id).cloned(),
+                )
+            };
+            let persistent = self.durable && shared.persistent.lock().unwrap().contains(client_id);
+            let mut writes = vec![Write::DeleteSession];
+            if let Some(session) = session {
+                writes.extend(session.stored_state(persistent).await);
+            }
+            // A will from before a restart, still due
+            if let Some(will) = restored_will {
+                if !writes.iter().any(|w| matches!(w, Write::StoreWill(_))) {
+                    writes.push(Write::StoreWill(will));
+                }
+            }
+            Some(writes)
+        })
     }
 }
 
@@ -1538,6 +1643,26 @@ mod tests {
         ) -> mercurio_storage::Result<Vec<InflightMessage>> {
             self.inner.get_all_inflight(client_id).await
         }
+
+        async fn store_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner.store_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn remove_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner.remove_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn get_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner.get_incoming_qos2(client_id).await
+        }
     }
 
     #[async_trait::async_trait]
@@ -1553,6 +1678,10 @@ mod tests {
             message: &mercurio_core::message::Message,
         ) -> mercurio_storage::Result<()> {
             self.inner.enqueue(client_id, sequence, message).await
+        }
+
+        async fn dequeue(&self, client_id: &str, sequence: u64) -> mercurio_storage::Result<()> {
+            self.inner.dequeue(client_id, sequence).await
         }
 
         async fn load_queue(
@@ -1580,6 +1709,308 @@ mod tests {
     /// messages and subscriptions in it
     fn durable_storage() -> Arc<SqliteStore> {
         Arc::new(SqliteStore::in_memory().unwrap())
+    }
+
+    /// A SQLite store whose batches fail for good while `failing` is set.
+    #[derive(Default)]
+    struct FailingWrites {
+        inner: Option<SqliteStore>,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingWrites {
+        fn new() -> Arc<Self> {
+            Arc::new(FailingWrites {
+                inner: Some(SqliteStore::in_memory().unwrap()),
+                failing: Default::default(),
+            })
+        }
+
+        fn inner(&self) -> &SqliteStore {
+            self.inner.as_ref().unwrap()
+        }
+
+        fn fail(&self, failing: bool) {
+            self.failing
+                .store(failing, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BatchStore for FailingWrites {
+        async fn apply(&self, client_id: &str, writes: &[Write]) -> mercurio_storage::Result<()> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(mercurio_storage::StorageError::OperationFailed(
+                    "disk full".into(),
+                ));
+            }
+            self.inner().apply(client_id, writes).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for FailingWrites {
+        async fn save_session(
+            &self,
+            client_id: &str,
+            session: &SessionState,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().save_session(client_id, session).await
+        }
+
+        async fn load_session(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Option<SessionState>> {
+            self.inner().load_session(client_id).await
+        }
+
+        async fn delete_session(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().delete_session(client_id).await
+        }
+
+        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<String>> {
+            self.inner().list_sessions().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WillStore for FailingWrites {
+        async fn store_will(
+            &self,
+            client_id: &str,
+            will: &StoredWillMessage,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().store_will(client_id, will).await
+        }
+
+        async fn get_will(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Option<StoredWillMessage>> {
+            self.inner().get_will(client_id).await
+        }
+
+        async fn delete_will(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().delete_will(client_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InflightStore for FailingWrites {
+        async fn store_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+            message: &InflightMessage,
+        ) -> mercurio_storage::Result<()> {
+            self.inner()
+                .store_inflight(client_id, packet_id, message)
+                .await
+        }
+
+        async fn get_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<Option<InflightMessage>> {
+            self.inner().get_inflight(client_id, packet_id).await
+        }
+
+        async fn remove_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().remove_inflight(client_id, packet_id).await
+        }
+
+        async fn release_inflight(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().release_inflight(client_id, packet_id).await
+        }
+
+        async fn get_all_inflight(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Vec<InflightMessage>> {
+            self.inner().get_all_inflight(client_id).await
+        }
+
+        async fn store_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().store_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn remove_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner()
+                .remove_incoming_qos2(client_id, packet_id)
+                .await
+        }
+
+        async fn get_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner().get_incoming_qos2(client_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueueStore for FailingWrites {
+        async fn enqueue(
+            &self,
+            client_id: &str,
+            sequence: u64,
+            message: &Message,
+        ) -> mercurio_storage::Result<()> {
+            self.inner().enqueue(client_id, sequence, message).await
+        }
+
+        async fn dequeue(&self, client_id: &str, sequence: u64) -> mercurio_storage::Result<()> {
+            self.inner().dequeue(client_id, sequence).await
+        }
+
+        async fn load_queue(
+            &self,
+            client_id: &str,
+        ) -> mercurio_storage::Result<Vec<(u64, Message)>> {
+            self.inner().load_queue(client_id).await
+        }
+
+        async fn clear_queue(&self, client_id: &str) -> mercurio_storage::Result<()> {
+            self.inner().clear_queue(client_id).await
+        }
+    }
+
+    fn queued(payload: &'static str) -> Message {
+        Message {
+            packet_id: None,
+            topic: Arc::from("t"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Some(Bytes::from_static(payload.as_bytes())),
+            properties: Default::default(),
+            expires_at: None,
+            subscription_identifiers: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// Once a batch of a client's changes is given up, storage holds
+    /// something else than the broker; the client's whole state is stored
+    /// again, replacing it, as soon as storage takes it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_client_whose_changes_were_given_up_is_stored_whole_again() {
+        let storage = FailingWrites::new();
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        let mut connect = resuming("c");
+        connect.properties = Some(mercurio_packets::connect::ConnectProperties {
+            session_expiry_interval: Some(mercurio_core::properties::SessionExpiryInterval::new(
+                3600,
+            )),
+            ..Default::default()
+        });
+        let started = manager
+            .start_session(connect, owned_by("alice"))
+            .await
+            .unwrap();
+        let mut session = started.session;
+        session
+            .attach(Arc::from("test"), 60, Some(Duration::from_secs(3600)))
+            .await;
+        manager.flush().await;
+        // In storage, though no longer in the broker
+        storage.enqueue("c", 3, &queued("stale")).await.unwrap();
+        session.restore_queue(vec![(4, queued("kept"))]);
+
+        storage.fail(true);
+        let subscription = StoredSubscription::new("a", QoS::AtLeastOnce);
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        session
+            .restore_subscriptions(vec![subscription.clone()], &broker)
+            .await
+            .unwrap();
+        manager
+            .save_subscription_changes(
+                "c",
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "a",
+                    QoS::AtLeastOnce,
+                ))],
+            )
+            .await;
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 1));
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert!(stored.subscriptions.is_empty());
+
+        // Changes made meanwhile don't pile up waiting for storage
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..20_000 {
+                manager.remove_inflight("c", 1).await;
+            }
+        })
+        .await
+        .expect("a dirty client's changes wait for storage");
+
+        // Without a change or a flush, a later attempt stores it whole
+        storage.fail(false);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(manager.storage_failures(), (1, 0));
+        let stored = storage.load_session("c").await.unwrap().unwrap();
+        assert_eq!(stored.subscriptions, [subscription]);
+        assert_eq!(stored.owner, owned_by("alice"));
+        assert_eq!(stored.expiry_interval, Some(3600));
+        let queue = storage.load_queue("c").await.unwrap();
+        assert_eq!(queue.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [4]);
+    }
+
+    /// A dirty client is stored whole at its next change too, and its
+    /// changes are applied again once it is clean.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_dirty_client_is_stored_whole_at_its_next_change() {
+        let storage = FailingWrites::new();
+        let mut manager = SessionManager::new(Arc::clone(&storage));
+        let started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        mark_persistent(&manager, "c");
+        storage.fail(true);
+        manager.delete_will("c");
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 1));
+
+        storage.fail(false);
+        started.session.restore_incoming_qos2(vec![7]).await;
+        manager.store_incoming_qos2("c", 7).await;
+        manager.flush().await;
+        assert_eq!(manager.storage_failures(), (1, 0));
+        assert_eq!(storage.get_incoming_qos2("c").await.unwrap(), [7]);
+        manager.remove_incoming_qos2("c", 7).await;
+        manager.flush().await;
+        assert!(storage.get_incoming_qos2("c").await.unwrap().is_empty());
+
+        // A session gone from the broker is gone from storage too
+        storage.fail(true);
+        manager
+            .end_connection(started.lease, Some(Duration::ZERO))
+            .await;
+        manager.flush().await;
+        assert!(storage.load_session("c").await.unwrap().is_some());
+        storage.fail(false);
+        manager.flush().await;
+        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert_eq!(manager.storage_failures(), (2, 0));
     }
 
     fn mark_persistent<S: BatchStore>(manager: &SessionManager<S>, client_id: &str) {
@@ -1623,6 +2054,8 @@ mod tests {
                     payload: None,
                     qos: QoS::AtLeastOnce,
                     dup: false,
+                    retain: false,
+                    expires_at: None,
                     sequence: 0,
                     released: false,
                     properties: Default::default(),
@@ -1760,7 +2193,7 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscriptions("c", session.get_subscriptions().await)
+            .save_subscription_changes("c", session.take_subscription_changes().await)
             .await;
         manager.end_connection(started.lease, None).await;
 
@@ -1845,6 +2278,8 @@ mod tests {
                             QoS::AtLeastOnce
                         },
                         dup: false,
+                        retain: false,
+                        expires_at: None,
                         sequence,
                         released,
                         properties: Default::default(),
@@ -2095,6 +2530,8 @@ mod tests {
             payload: Some(Bytes::from("hello")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            retain: false,
+            expires_at: None,
             sequence: 0,
             released: false,
             properties: Default::default(),
@@ -2102,7 +2539,7 @@ mod tests {
         };
 
         // Store inflight message
-        manager.store_inflight("client1", &inflight).await;
+        manager.store_inflight("client1", &inflight, None).await;
         manager.flush().await;
 
         // Verify it's stored by checking storage directly
@@ -2144,6 +2581,8 @@ mod tests {
             payload: Some(Bytes::from("msg1")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            retain: false,
+            expires_at: None,
             sequence: 0,
             released: false,
             properties: Default::default(),
@@ -2155,6 +2594,8 @@ mod tests {
             payload: Some(Bytes::from("msg2")),
             qos: QoS::ExactlyOnce,
             dup: false,
+            retain: false,
+            expires_at: None,
             sequence: 0,
             released: false,
             properties: Default::default(),
@@ -2206,6 +2647,8 @@ mod tests {
             payload: Some(Bytes::from("hello")),
             qos: QoS::AtLeastOnce,
             dup: false,
+            retain: false,
+            expires_at: None,
             sequence: 0,
             released: false,
             properties: Default::default(),
@@ -2247,11 +2690,14 @@ mod tests {
                     payload: None,
                     qos: QoS::AtLeastOnce,
                     dup: false,
+                    retain: false,
+                    expires_at: None,
                     sequence: 0,
                     released: false,
                     properties: Default::default(),
                     subscription_identifiers: Vec::new(),
                 },
+                None,
             )
             .await;
         manager.flush().await;
@@ -2348,9 +2794,12 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "gw-01");
         manager
-            .save_subscriptions(
+            .save_subscription_changes(
                 "gw-01",
-                vec![StoredSubscription::new("alice/#", QoS::AtMostOnce)],
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "alice/#",
+                    QoS::AtMostOnce,
+                ))],
             )
             .await;
         manager.end_connection(started.lease, None).await;
@@ -2807,7 +3256,13 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscriptions("c", vec![StoredSubscription::new("a", QoS::AtMostOnce)])
+            .save_subscription_changes(
+                "c",
+                vec![Write::AddSubscription(StoredSubscription::new(
+                    "a",
+                    QoS::AtMostOnce,
+                ))],
+            )
             .await;
         manager.end_connection(started.lease, None).await;
 
@@ -2841,12 +3296,14 @@ mod tests {
                     QoS::AtLeastOnce
                 },
                 dup: false,
+                retain: false,
+                expires_at: None,
                 sequence: i.into(),
                 released: false,
                 properties: Default::default(),
                 subscription_identifiers: Vec::new(),
             };
-            manager.store_inflight("client1", &inflight).await;
+            manager.store_inflight("client1", &inflight, None).await;
         }
         manager.flush().await;
 

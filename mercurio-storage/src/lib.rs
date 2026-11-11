@@ -187,6 +187,10 @@ pub struct InflightMessage {
     pub payload: Option<Bytes>,
     pub qos: QoS,
     pub dup: bool,
+    /// The RETAIN flag the message was sent with, which a resend keeps
+    pub retain: bool,
+    /// Unix time in milliseconds when the message expires, if it does
+    pub expires_at: Option<u64>,
     /// Position in the order messages were sent, for resending in order
     pub sequence: u64,
     /// The client acknowledged a QoS 2 message with PUBREC, so PUBREL is
@@ -281,10 +285,22 @@ pub trait InflightStore: Send + Sync {
 
     /// Get all inflight messages for a client (for retry on reconnect).
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
+
+    /// Record that the client's QoS 2 message with this packet id was
+    /// taken and acknowledged with PUBREC, so a copy the client sends again
+    /// before its PUBREL isn't forwarded twice.
+    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
+
+    /// The client sent PUBREL for this packet id.
+    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
+
+    /// The packet ids of the client's QoS 2 messages awaiting PUBREL.
+    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
 }
 
-/// Messages waiting for disconnected clients, kept so they survive a
-/// restart. Each message is identified by its sequence in the client's queue.
+/// Messages waiting to be sent to the clients of sessions that outlive
+/// their connection, kept so they survive a restart. Each message is
+/// identified by its sequence in the client's queue.
 #[async_trait]
 pub trait QueueStore: Send + Sync {
     /// Whether stored queues outlive the process. Stores that don't are
@@ -296,6 +312,10 @@ pub trait QueueStore: Send + Sync {
     /// Stores `message` at position `sequence` of the client's queue,
     /// replacing what is stored there.
     async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()>;
+
+    /// Removes the message at position `sequence` of the client's queue, if
+    /// it is stored.
+    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()>;
 
     /// The client's queued messages, in sequence order.
     async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
@@ -310,8 +330,11 @@ pub trait QueueStore: Send + Sync {
 pub enum Write {
     /// Store the session, replacing what was stored for the client
     SaveSession(SessionState),
-    /// Replace the session's subscriptions, creating the session if needed
-    SaveSubscriptions(Vec<StoredSubscription>),
+    /// Add a subscription to the stored session, replacing the one with the
+    /// same topic filter; nothing if no session is stored
+    AddSubscription(StoredSubscription),
+    /// Remove the stored session's subscription to this topic filter
+    RemoveSubscription(String),
     /// Record when the session expires, if it is stored
     SetExpiry {
         /// Seconds the session outlives its connection
@@ -328,10 +351,18 @@ pub enum Write {
     ReleaseInflight(u16),
     /// The client acknowledged this packet id for good
     RemoveInflight(u16),
-    /// Store a message queued for a disconnected client, at this position
-    /// in its queue
+    /// The client's QoS 2 message with this packet id was taken, and PUBREL
+    /// is awaited
+    StoreIncomingQos2(u16),
+    /// The client sent PUBREL for this packet id
+    RemoveIncomingQos2(u16),
+    /// Store a message queued for the client, at this position in its
+    /// queue
     Enqueue(u64, Message),
-    /// Drop the stored queue, once the client took it
+    /// Remove the message at this position of the client's queue, which
+    /// left the queue: sent, in the batch storing it in flight, or dropped
+    Dequeue(u64),
+    /// Drop the stored queue
     ClearQueue,
     /// Remove the session and everything stored with it
     DeleteSession,
@@ -371,19 +402,22 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
     for write in writes {
         match write {
             Write::SaveSession(state) => store.save_session(client_id, state).await?,
-            Write::SaveSubscriptions(subscriptions) => {
-                let mut state = store
-                    .load_session(client_id)
-                    .await?
-                    .unwrap_or(SessionState {
-                        client_id: client_id.to_string(),
-                        subscriptions: Vec::new(),
-                        expiry_interval: None,
-                        expires_at: None,
-                        owner: SessionOwner::default(),
-                    });
-                state.subscriptions = subscriptions.clone();
-                store.save_session(client_id, &state).await?;
+            Write::AddSubscription(subscription) => {
+                if let Some(mut state) = store.load_session(client_id).await? {
+                    state
+                        .subscriptions
+                        .retain(|s| s.topic_filter != subscription.topic_filter);
+                    state.subscriptions.push(subscription.clone());
+                    store.save_session(client_id, &state).await?;
+                }
+            }
+            Write::RemoveSubscription(topic_filter) => {
+                if let Some(mut state) = store.load_session(client_id).await? {
+                    state
+                        .subscriptions
+                        .retain(|s| s.topic_filter != *topic_filter);
+                    store.save_session(client_id, &state).await?;
+                }
             }
             Write::SetExpiry {
                 interval,
@@ -408,9 +442,16 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
             Write::RemoveInflight(packet_id) => {
                 store.remove_inflight(client_id, *packet_id).await?
             }
+            Write::StoreIncomingQos2(packet_id) => {
+                store.store_incoming_qos2(client_id, *packet_id).await?
+            }
+            Write::RemoveIncomingQos2(packet_id) => {
+                store.remove_incoming_qos2(client_id, *packet_id).await?
+            }
             Write::Enqueue(sequence, message) => {
                 store.enqueue(client_id, *sequence, message).await?
             }
+            Write::Dequeue(sequence) => store.dequeue(client_id, *sequence).await?,
             Write::ClearQueue => store.clear_queue(client_id).await?,
             Write::DeleteSession => {
                 store.delete_session(client_id).await?;
@@ -418,6 +459,9 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
                 store.clear_queue(client_id).await?;
                 for message in store.get_all_inflight(client_id).await? {
                     store.remove_inflight(client_id, message.packet_id).await?;
+                }
+                for packet_id in store.get_incoming_qos2(client_id).await? {
+                    store.remove_incoming_qos2(client_id, packet_id).await?;
                 }
             }
         }
@@ -435,7 +479,217 @@ impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{BanStore, StoredBan};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use mercurio_core::{message::Message, qos::QoS};
+
+    use super::{
+        BanStore, BatchStore, InflightMessage, SessionState, StoredBan, StoredSubscription, Write,
+    };
+
+    fn queued(payload: &str) -> Message {
+        Message {
+            packet_id: None,
+            topic: Arc::from("q"),
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            payload: Some(Bytes::from(payload.to_string())),
+            properties: Default::default(),
+            expires_at: None,
+            subscription_identifiers: Vec::new(),
+            origin: None,
+        }
+    }
+
+    /// What every durable store does with queued messages: each leaves the
+    /// queue on its own, in the batch that stores it in flight when it is
+    /// sent, batches apply in order, and applying one twice is harmless.
+    pub(crate) async fn queue_round_trip(store: &dyn BatchStore) {
+        let payloads = |queue: Vec<(u64, Message)>| -> Vec<(u64, String)> {
+            queue
+                .into_iter()
+                .map(|(sequence, message)| {
+                    let payload = message.payload.unwrap_or_default();
+                    (sequence, String::from_utf8(payload.to_vec()).unwrap())
+                })
+                .collect()
+        };
+        let sent = InflightMessage {
+            packet_id: 9,
+            topic: "q".into(),
+            payload: Some(Bytes::from_static(b"1")),
+            qos: QoS::AtLeastOnce,
+            dup: false,
+            retain: false,
+            expires_at: None,
+            sequence: 0,
+            released: false,
+            properties: Default::default(),
+            subscription_identifiers: Vec::new(),
+        };
+        let batch = [
+            Write::Enqueue(1, queued("1")),
+            Write::Enqueue(2, queued("2")),
+            Write::Enqueue(3, queued("3")),
+            Write::StoreInflight(sent),
+            Write::Dequeue(1),
+            Write::Dequeue(3),
+            Write::Enqueue(3, queued("3 again")),
+            Write::Enqueue(4, queued("4")),
+            Write::Dequeue(4),
+            // Removing what isn't stored is no error
+            Write::Dequeue(10),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                payloads(store.load_queue("c").await.unwrap()),
+                [(2, "2".to_string()), (3, "3 again".to_string())]
+            );
+            let inflight = store.get_all_inflight("c").await.unwrap();
+            assert_eq!(inflight.len(), 1);
+            assert_eq!(inflight[0].packet_id, 9);
+        }
+        store
+            .apply("other", &[Write::Enqueue(2, queued("other"))])
+            .await
+            .unwrap();
+        store.apply("c", &[Write::Dequeue(2)]).await.unwrap();
+        assert_eq!(
+            payloads(store.load_queue("c").await.unwrap()),
+            [(3, "3 again".to_string())]
+        );
+        assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
+    }
+
+    /// What every store does with subscriptions: a session saved whole
+    /// replaces them, single ones are added and removed in order, applying
+    /// a batch twice is harmless, and they leave with the session.
+    pub(crate) async fn subscriptions_round_trip(store: &dyn BatchStore) {
+        let sorted = |state: Option<SessionState>| {
+            let mut subscriptions = state.unwrap().subscriptions;
+            subscriptions.sort_by(|a, b| a.topic_filter.cmp(&b.topic_filter));
+            subscriptions
+        };
+        let detailed = StoredSubscription {
+            no_local: true,
+            retain_as_published: true,
+            subscription_identifier: Some(268_435_455),
+            // Commas, colons and wildcards are all valid in topic filters
+            ..StoredSubscription::new("a/+:x,y/#", QoS::ExactlyOnce)
+        };
+        let session = SessionState {
+            client_id: "c".into(),
+            subscriptions: vec![
+                StoredSubscription::new("old", QoS::AtMostOnce),
+                StoredSubscription::new("b", QoS::AtMostOnce),
+            ],
+            expiry_interval: Some(60),
+            expires_at: None,
+            owner: Default::default(),
+        };
+        // Without a stored session there is nothing to add to
+        store
+            .apply("c", &[Write::AddSubscription(detailed.clone())])
+            .await
+            .unwrap();
+        assert!(store.load_session("c").await.unwrap().is_none());
+
+        let batch = [
+            Write::SaveSession(session.clone()),
+            Write::AddSubscription(StoredSubscription::new("b", QoS::AtLeastOnce)),
+            Write::AddSubscription(detailed.clone()),
+            Write::RemoveSubscription("old".into()),
+            Write::AddSubscription(StoredSubscription::new("gone", QoS::AtMostOnce)),
+            Write::RemoveSubscription("gone".into()),
+            // Removing what isn't subscribed is no error
+            Write::RemoveSubscription("never".into()),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                sorted(store.load_session("c").await.unwrap()),
+                [
+                    detailed.clone(),
+                    StoredSubscription::new("b", QoS::AtLeastOnce)
+                ]
+            );
+        }
+
+        // Saving the session whole replaces the subscriptions
+        store
+            .apply("c", &[Write::SaveSession(session.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted(store.load_session("c").await.unwrap()),
+            [
+                StoredSubscription::new("b", QoS::AtMostOnce),
+                StoredSubscription::new("old", QoS::AtMostOnce)
+            ]
+        );
+
+        let mut other = session.clone();
+        other.client_id = "other".into();
+        store
+            .apply("other", &[Write::SaveSession(other)])
+            .await
+            .unwrap();
+        store.apply("c", &[Write::DeleteSession]).await.unwrap();
+        assert!(store.load_session("c").await.unwrap().is_none());
+        store
+            .apply(
+                "c",
+                &[Write::SaveSession(SessionState {
+                    subscriptions: Vec::new(),
+                    ..session
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(sorted(store.load_session("c").await.unwrap()).is_empty());
+        assert_eq!(sorted(store.load_session("other").await.unwrap()).len(), 2);
+    }
+
+    /// What every store does with the packet ids of incoming QoS 2
+    /// messages: batches apply in order, applying one twice is harmless, and
+    /// deleting the session removes them.
+    pub(crate) async fn incoming_qos2_round_trip(store: &dyn BatchStore) {
+        let sorted = |mut ids: Vec<u16>| {
+            ids.sort_unstable();
+            ids
+        };
+        let batch = [
+            Write::StoreIncomingQos2(1),
+            Write::StoreIncomingQos2(u16::MAX),
+            Write::StoreIncomingQos2(7),
+            Write::RemoveIncomingQos2(7),
+            Write::RemoveIncomingQos2(1),
+            Write::StoreIncomingQos2(1),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                sorted(store.get_incoming_qos2("c").await.unwrap()),
+                [1, u16::MAX]
+            );
+        }
+        store
+            .apply("other", &[Write::StoreIncomingQos2(1)])
+            .await
+            .unwrap();
+        // Removing what isn't stored is no error
+        store
+            .apply("c", &[Write::RemoveIncomingQos2(2)])
+            .await
+            .unwrap();
+
+        store.apply("c", &[Write::DeleteSession]).await.unwrap();
+        assert!(store.get_incoming_qos2("c").await.unwrap().is_empty());
+        assert_eq!(store.get_incoming_qos2("other").await.unwrap(), [1]);
+    }
 
     pub(crate) fn ban(kind: &str, value: &str, prefix: bool) -> StoredBan {
         StoredBan {

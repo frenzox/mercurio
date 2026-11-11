@@ -97,6 +97,11 @@ pub use crate::{
 /// than clients need, far fewer than it takes to exhaust the broker.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
+/// Longest topic filter a SUBSCRIBE may name unless configured otherwise,
+/// in bytes: far longer than real filters, far shorter than the 64 KiB the
+/// protocol allows.
+pub const DEFAULT_MAX_TOPIC_FILTER_LENGTH: usize = 1024;
+
 /// Unacknowledged QoS 1 and 2 messages one client may have unless
 /// configured otherwise.
 pub const DEFAULT_MAX_INFLIGHT: u16 = 64;
@@ -157,6 +162,10 @@ pub struct Limits {
     /// Subscriptions one session may hold; further ones are refused with
     /// Quota Exceeded. Each costs memory and work on every message.
     pub max_subscriptions: Option<usize>,
+    /// Longest topic filter, in bytes, a SUBSCRIBE may name; longer ones
+    /// are refused with Topic Filter Invalid. Each filter is kept in memory
+    /// and storage for as long as its session.
+    pub max_topic_filter_length: usize,
     /// Longest a session may outlive its connection. MQTT 5 clients asking
     /// for longer, or for no expiry, are told to use this; it also bounds
     /// `persistent_client_expiration`. Unbounded when unset.
@@ -192,6 +201,7 @@ impl Default for Limits {
             persistent_client_expiration: None,
             check_retain_source: false,
             max_subscriptions: Some(DEFAULT_MAX_SUBSCRIPTIONS),
+            max_topic_filter_length: DEFAULT_MAX_TOPIC_FILTER_LENGTH,
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
@@ -2059,6 +2069,7 @@ where
             let broker = self.broker.clone();
             let session_manager = self.session_manager.clone();
             let will_session = session.clone();
+            let pending = will.clone();
 
             let publish = async move {
                 if !delay.is_zero() {
@@ -2078,7 +2089,7 @@ where
                 // Aborted, freeing the will, as soon as a new connection
                 // takes the session over or the session is deleted
                 let task = tokio::spawn(publish).abort_handle();
-                session.set_pending_will(generation, task).await;
+                session.set_pending_will(generation, task, pending).await;
             }
         }
 
@@ -2343,8 +2354,8 @@ where
                 },
                 // The common case, a message to send, isn't boxed: it would
                 // cost an allocation per message
-                message = session.next_outgoing(window_open) => {
-                    Step::Done(self.send_outgoing(&session, &client_id, message).await?)
+                (message, journaled) = session.next_outgoing(window_open) => {
+                    Step::Done(self.send_outgoing(&session, &client_id, message, journaled).await?)
                 }
                 _ = &mut deadline, if timeout_duration.is_some() => Step::Wake(Wake::KeepAliveExpired),
                 Ok(()) = lease.close.changed() => {
@@ -2399,9 +2410,18 @@ where
         let response = match packet {
             HotPacket::Publish(publish) => {
                 Stats::add(&self.stats.messages_received);
-                session
+                let response = session
                     .handle_publish(publish, &self.broker, &self.chain)
-                    .await?
+                    .await?;
+                // The client now awaits PUBREL's answer for this id
+                if let Some(ControlPacket::PubRec(pubrec)) = &response {
+                    if pubrec.reason.get_code() < 0x80 {
+                        self.session_manager
+                            .store_incoming_qos2(client_id, pubrec.packet_id)
+                            .await;
+                    }
+                }
+                response
             }
             HotPacket::PubAck(ack) => {
                 let packet_id = ack.packet_id;
@@ -2429,7 +2449,14 @@ where
                 }
                 response
             }
-            HotPacket::PubRel(rel) => session.handle_pubrel(rel).await?,
+            HotPacket::PubRel(rel) => {
+                let packet_id = rel.packet_id;
+                let response = session.handle_pubrel(rel).await?;
+                self.session_manager
+                    .remove_incoming_qos2(client_id, packet_id)
+                    .await;
+                response
+            }
             HotPacket::PubComp(comp) => {
                 let packet_id = comp.packet_id;
                 let response = session.handle_pubcomp(comp).await?;
@@ -2447,12 +2474,14 @@ where
         Ok(Flow::PacketHandled)
     }
 
-    /// Sends a message the session queued for the client.
+    /// Sends a message the session queued for the client, at `journaled`
+    /// in the queue's journal if it is stored there.
     async fn send_outgoing(
         &mut self,
         session: &Session,
         client_id: &str,
         message: Message,
+        journaled: Option<u64>,
     ) -> Result<Flow> {
         let mut session = session.clone();
         // Checked per message: a permitted subscription can still
@@ -2466,6 +2495,9 @@ where
                 .await
             {
                 session.count_drop(DropCause::NotAuthorized);
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
                 return Ok(Flow::Continue);
             }
         }
@@ -2473,15 +2505,25 @@ where
         // in-flight record is stored, not the packet
         let (write, inflight) = {
             let Some(Outgoing { packet, inflight }) = session.prepare_publish(message).await else {
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
                 return Ok(Flow::Continue);
             };
             debug!("Sending {} to client {:?}", describe(&packet), client_id);
             (self.connection.write_packet(packet), inflight)
         };
-        if let Some(inflight) = inflight {
-            self.session_manager
-                .store_inflight(client_id, &inflight)
-                .await;
+        match inflight {
+            Some(inflight) => {
+                self.session_manager
+                    .store_inflight(client_id, &inflight, journaled)
+                    .await
+            }
+            None => {
+                if let Some(sequence) = journaled {
+                    self.session_manager.dequeue(client_id, sequence).await;
+                }
+            }
         }
         write.await?;
         Stats::add(&self.stats.messages_sent);
@@ -2560,12 +2602,12 @@ where
                     .process_incoming(packet, &self.broker, &self.chain)
                     .await?;
 
-                // Persist subscriptions after subscribe/unsubscribe operations
+                // Persist what subscribe/unsubscribe operations changed
                 if is_subscription_change {
                     let client_id = session.get_client_id().await;
-                    let subscriptions = session.get_subscriptions().await;
+                    let changes = session.take_subscription_changes().await;
                     self.session_manager
-                        .save_subscriptions(&client_id, subscriptions)
+                        .save_subscription_changes(&client_id, changes)
                         .await;
                 }
 

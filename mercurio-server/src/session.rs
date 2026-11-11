@@ -63,7 +63,8 @@ use crate::{
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
-    InflightMessage, RetainedMessageStore, SessionOwner, StoredSubscription, StoredWillMessage,
+    InflightMessage, RetainedMessageStore, SessionOwner, SessionState, StoredSubscription,
+    StoredWillMessage, Write,
 };
 
 /// Will message to be published on abnormal client disconnect.
@@ -192,6 +193,14 @@ fn publish_properties(
 /// Lowers the session expiry an MQTT 5 client asks for to the server's
 /// maximum, no expiry included, so every later use of the CONNECT sees the
 /// expiry the session will have.
+/// Ends the connection of a client whose PUBLISH couldn't be stored, such
+/// as a retained message, without acknowledging it, so the client sends it
+/// again rather than lose it.
+fn storage_failure(error: mercurio_core::error::Error) -> mercurio_core::error::Error {
+    warn!("Failed to store a published message: {}", error);
+    ReasonCode::ImplementationSpecificError.into()
+}
+
 pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Limits) {
     let Some(max) = limits.max_session_expiry else {
         return;
@@ -307,9 +316,8 @@ struct State {
     topics: Option<TopicTree<Subscriber>>,
     /// Retained messages owed to new subscriptions, in subscription order
     retained: VecDeque<RetainedDelivery>,
-    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id, with
-    /// the sequence they were sent in
-    unacknowledged_messages: HashMap<u16, (u64, PublishPacket)>,
+    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
+    unacknowledged_messages: HashMap<u16, Unacknowledged>,
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
     /// sequence they were sent in
     pubrecs: HashMap<u16, u64>,
@@ -341,8 +349,8 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// The task holding the will of the last connection until its delay
-    /// passes; a newer generation aborts it
-    pending_will: Option<AbortHandle>,
+    /// passes, with a copy of that will; a newer generation aborts it
+    pending_will: Option<(AbortHandle, WillMessage)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
@@ -352,6 +360,9 @@ struct State {
     /// Who may resume the session
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
+    max_topic_filter_length: usize,
+    /// What SUBSCRIBE and UNSUBSCRIBE changed since they were last stored
+    subscription_changes: Vec<Write>,
     max_retained_messages: Option<usize>,
     /// What the admin API reports about the connection
     presence: Presence,
@@ -464,6 +475,8 @@ impl Session {
                     peer: None,
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
+                    max_topic_filter_length: usize::MAX,
+                    subscription_changes: Vec::new(),
                     max_retained_messages: None,
                     presence,
                 }),
@@ -504,20 +517,25 @@ impl Session {
     pub(crate) async fn set_generation(&self, generation: u64) {
         let mut state = self.shared.state.lock().await;
         self.shared.generation.store(generation, Ordering::Release);
-        if let Some(will) = state.pending_will.take() {
+        if let Some((will, _)) = state.pending_will.take() {
             will.abort();
         }
     }
 
-    /// Records the task holding the will of the connection of `generation`
+    /// Records the task holding `will`, of the connection of `generation`,
     /// until its delay passes, aborting it if a newer connection has
     /// already taken over.
-    pub(crate) async fn set_pending_will(&self, generation: u64, will: AbortHandle) {
+    pub(crate) async fn set_pending_will(
+        &self,
+        generation: u64,
+        task: AbortHandle,
+        will: WillMessage,
+    ) {
         let mut state = self.shared.state.lock().await;
         if self.generation() == generation {
-            state.pending_will = Some(will);
+            state.pending_will = Some((task, will));
         } else {
-            will.abort();
+            task.abort();
         }
     }
 
@@ -550,6 +568,12 @@ impl Session {
     pub(crate) async fn get_subscriptions(&self) -> Vec<StoredSubscription> {
         let session = self.shared.state.lock().await;
         session.subscriptions.values().cloned().collect()
+    }
+
+    /// What SUBSCRIBE and UNSUBSCRIBE packets changed since this was last
+    /// called, as writes to store them.
+    pub(crate) async fn take_subscription_changes(&self) -> Vec<Write> {
+        std::mem::take(&mut self.shared.state.lock().await.subscription_changes)
     }
 
     /// Restore subscriptions by re-subscribing to the broker.
@@ -616,6 +640,7 @@ impl Session {
             session.receive_maximum = limits.receive_maximum;
             session.max_inflight = limits.max_inflight.max(1);
             session.max_subscriptions = limits.max_subscriptions;
+            session.max_topic_filter_length = limits.max_topic_filter_length;
             session.max_retained_messages = limits.max_retained_messages;
 
             // Set protocol version from the CONNECT packet
@@ -789,7 +814,11 @@ impl Session {
         // clearing a retained topic is always allowed
         let retains = packet.retain && packet.payload.as_ref().is_some_and(|p| !p.is_empty());
         if let Some(max) = max_retained.filter(|_| retains) {
-            if broker.retained_full(&packet.topic_name, max).await? {
+            let full = broker
+                .retained_full(&packet.topic_name, max)
+                .await
+                .map_err(storage_failure)?;
+            if full {
                 warn!(
                     "Retained messages full, refusing one on `{}`",
                     packet.topic_name
@@ -836,30 +865,22 @@ impl Session {
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = packet.packet_id {
-                    let first_delivery = {
-                        let mut session = self.shared.state.lock().await;
-                        // The client may only have as many QoS 2 messages
-                        // awaiting PUBREL as advertised [MQTT-3.3.4-8]
-                        if !session.incoming_qos2.contains(&packet_id)
-                            && session.incoming_qos2.len() >= usize::from(session.receive_maximum)
-                        {
-                            return Err(ReasonCode::ReceiveMaximumExceeded.into());
-                        }
-                        session.incoming_qos2.insert(packet_id)
-                    };
-
+                    let session = self.shared.state.lock().await;
                     let pubrec = ControlPacket::PubRec(PubRecPacket {
                         packet_id,
                         reason: ReasonCode::Success,
                         properties: None,
                     });
-
                     // A retransmission before PUBREL was already delivered
                     // once; forwarding it again would break exactly-once.
-                    if !first_delivery {
+                    if session.incoming_qos2.contains(&packet_id) {
                         return Ok(Some(pubrec));
                     }
-
+                    // The client may only have as many QoS 2 messages
+                    // awaiting PUBREL as advertised [MQTT-3.3.4-8]
+                    if session.incoming_qos2.len() >= usize::from(session.receive_maximum) {
+                        return Err(ReasonCode::ReceiveMaximumExceeded.into());
+                    }
                     Ok(Some(pubrec))
                 } else {
                     Err(ReasonCode::ProtocolError.into())
@@ -868,6 +889,32 @@ impl Session {
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
+        // Recorded as delivered only once the broker took the message, so
+        // the client sends it again if it didn't
+        let new_qos2 = packet
+            .packet_id
+            .filter(|_| packet.qos_level == QoS::ExactlyOnce && response.is_ok());
+        let result = self.forward(packet, broker, chain, response).await;
+        if let (Ok(_), Some(packet_id)) = (&result, new_qos2) {
+            self.shared
+                .state
+                .lock()
+                .await
+                .incoming_qos2
+                .insert(packet_id);
+        }
+        result
+    }
+
+    /// Hands a PUBLISH the client may make to the plugins and the broker,
+    /// passing `response` on as its acknowledgement.
+    async fn forward<S: RetainedMessageStore>(
+        &mut self,
+        mut packet: PublishPacket,
+        broker: &Broker<S>,
+        chain: &Chain,
+        response: Result<Option<ControlPacket>>,
+    ) -> Result<Option<ControlPacket>> {
         let mut hooked_properties = None;
         if !chain.is_empty() {
             // Acknowledged whatever the plugins decide, so a dropped message
@@ -977,7 +1024,8 @@ impl Session {
 
         let subscribers = broker
             .publish_from(&topic, message, Some(self.shared.subscriber_id))
-            .await?;
+            .await
+            .map_err(storage_failure)?;
 
         // MQTT 5 publishers learn when nobody received the message
         let reports_reasons = self
@@ -1138,9 +1186,88 @@ impl Session {
         self.shared.queue.count_drop(cause, 1);
     }
 
-    /// Starts keeping the queue on disk while the client is away.
-    pub(crate) fn start_queue_journal(&self, journal: crate::writer::Writer) {
-        self.shared.queue.start_journal(journal);
+    /// What storage holds for this session when it is up to date, as the
+    /// writes that store it once what was stored is removed: the session
+    /// with its subscriptions, its will if it has one, and for a session
+    /// that outlives its connection, its messages in flight, the packet ids
+    /// of incoming QoS 2 messages awaiting PUBREL and its journaled queue.
+    pub(crate) async fn stored_state(&self, persistent: bool) -> Vec<Write> {
+        let state = self.shared.state.lock().await;
+        let mut writes = vec![Write::SaveSession(SessionState {
+            client_id: state.client_id.clone(),
+            subscriptions: state.subscriptions.values().cloned().collect(),
+            expiry_interval: state
+                .presence
+                .session_expiry
+                .map(|expiry| expiry.as_secs().try_into().unwrap_or(u32::MAX)),
+            expires_at: state.presence.expires_at,
+            owner: state.owner.clone(),
+        })];
+        let pending = state.pending_will.as_ref().map(|(_, will)| will);
+        if let Some(will) = state.will_message.as_ref().or(pending) {
+            writes.push(Write::StoreWill(will.clone().into()));
+        }
+        if !persistent {
+            return writes;
+        }
+        for (packet_id, sent) in &state.unacknowledged_messages {
+            let properties = sent.publish.properties.as_ref();
+            writes.push(Write::StoreInflight(InflightMessage {
+                packet_id: *packet_id,
+                topic: sent.publish.topic_name.clone(),
+                payload: sent.publish.payload.clone(),
+                qos: sent.publish.qos_level,
+                dup: false,
+                retain: sent.publish.retain,
+                expires_at: sent.expires_at,
+                sequence: sent.sequence,
+                released: false,
+                properties: message_properties(properties),
+                subscription_identifiers: properties
+                    .map(|p| {
+                        p.subscription_identifiers
+                            .iter()
+                            .map(|id| id.value.0)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }));
+        }
+        for (packet_id, sequence) in &state.pubrecs {
+            writes.push(Write::StoreInflight(InflightMessage {
+                packet_id: *packet_id,
+                topic: String::new(),
+                payload: None,
+                qos: QoS::ExactlyOnce,
+                dup: false,
+                retain: false,
+                expires_at: None,
+                sequence: *sequence,
+                released: true,
+                properties: MessageProperties::default(),
+                subscription_identifiers: Vec::new(),
+            }));
+        }
+        writes.extend(
+            state
+                .incoming_qos2
+                .iter()
+                .map(|packet_id| Write::StoreIncomingQos2(*packet_id)),
+        );
+        writes.extend(
+            self.shared
+                .queue
+                .journaled()
+                .into_iter()
+                .map(|(sequence, message)| Write::Enqueue(sequence, message)),
+        );
+        writes
+    }
+
+    /// Starts keeping the queue's QoS 1 and 2 messages in storage, unless
+    /// it does already. With `recorded`, those queued are there already.
+    pub(crate) fn start_queue_journal(&self, journal: crate::writer::Writer, recorded: bool) {
+        self.shared.queue.start_journal(journal, recorded);
     }
 
     pub(crate) fn stop_queue_journal(&self) {
@@ -1193,7 +1320,7 @@ impl Session {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
         let sequence = match session.unacknowledged_messages.remove(&packet_id) {
-            Some((sequence, _)) => Some(sequence),
+            Some(sent) => Some(sent.sequence),
             None => session.pubrecs.get(&packet_id).copied(),
         };
         session.unsent.retain(|id| *id != packet_id);
@@ -1274,27 +1401,32 @@ impl Session {
         // session state is locked
         let mut refused = Vec::with_capacity(packet.payload.len());
         let identity = self.identity().await;
+        let max_length = self.shared.state.lock().await.max_topic_filter_length;
         for sub in &packet.payload {
-            refused.push(if validate_subscribe_filter(&sub.topic_filter).is_err() {
-                Some(ReasonCode::TopicFilterInvalid)
-            } else if !chain.is_empty() && !chain.is_trusted() {
-                // The share group decides who gets each message, not which
-                // messages flow, so only the topic filter is checked, as
-                // mosquitto does
-                let filter = parse_shared_subscription(&sub.topic_filter)
-                    .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
-                if chain.may(&identity, filter, Access::Subscribe).await {
-                    None
+            refused.push(
+                if sub.topic_filter.len() > max_length
+                    || validate_subscribe_filter(&sub.topic_filter).is_err()
+                {
+                    Some(ReasonCode::TopicFilterInvalid)
+                } else if !chain.is_empty() && !chain.is_trusted() {
+                    // The share group decides who gets each message, not which
+                    // messages flow, so only the topic filter is checked, as
+                    // mosquitto does
+                    let filter = parse_shared_subscription(&sub.topic_filter)
+                        .map_or(sub.topic_filter.as_str(), |(_, filter)| filter);
+                    if chain.may(&identity, filter, Access::Subscribe).await {
+                        None
+                    } else {
+                        warn!(
+                            "Client `{}` may not subscribe to `{}`",
+                            identity.client_id, sub.topic_filter
+                        );
+                        Some(ReasonCode::NotAuthorized)
+                    }
                 } else {
-                    warn!(
-                        "Client `{}` may not subscribe to `{}`",
-                        identity.client_id, sub.topic_filter
-                    );
-                    Some(ReasonCode::NotAuthorized)
-                }
-            } else {
-                None
-            });
+                    None
+                },
+            );
         }
 
         let mut session = self.shared.state.lock().await;
@@ -1392,6 +1524,9 @@ impl Session {
 
             session.topics = Some(broker.topics());
             session
+                .subscription_changes
+                .push(Write::AddSubscription(subscription.clone()));
+            session
                 .subscriptions
                 .insert(sub.topic_filter.clone(), subscription);
         }
@@ -1424,6 +1559,9 @@ impl Session {
             broker.unsubscribe(&unsub.topic_filter, self.shared.subscriber_id);
             session.retained.retain(|d| d.filter != unsub.topic_filter);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
+                session
+                    .subscription_changes
+                    .push(Write::RemoveSubscription(unsub.topic_filter.clone()));
                 ReasonCode::Success
             } else {
                 ReasonCode::NoSubscriptionExisted
@@ -1678,8 +1816,8 @@ impl Session {
             return None;
         }
         while let Some(packet_id) = session.unsent.pop_front() {
-            if let Some((_, publish)) = session.unacknowledged_messages.get(&packet_id) {
-                let mut publish = publish.clone();
+            if let Some(sent) = session.unacknowledged_messages.get(&packet_id) {
+                let mut publish = sent.publish.clone();
                 publish.dup = true;
                 return Some(ControlPacket::Publish(publish));
             }
@@ -1688,8 +1826,10 @@ impl Session {
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
-    /// doesn't hold the session state while waiting.
-    pub(crate) async fn next_outgoing(&self, window_open: bool) -> Message {
+    /// doesn't hold the session state while waiting. Also returns the
+    /// message's sequence if it is stored in the queue's journal, from
+    /// which it is to be removed once sent or dropped.
+    pub(crate) async fn next_outgoing(&self, window_open: bool) -> (Message, Option<u64>) {
         self.shared.queue.pop(!window_open).await
     }
 
@@ -1756,15 +1896,22 @@ impl Session {
             let inflight = packet_id.map(|packet_id| {
                 let sequence = session.next_sequence;
                 session.next_sequence += 1;
-                session
-                    .unacknowledged_messages
-                    .insert(packet_id, (sequence, publish.clone()));
+                session.unacknowledged_messages.insert(
+                    packet_id,
+                    Unacknowledged {
+                        sequence,
+                        publish: publish.clone(),
+                        expires_at: message.expires_at,
+                    },
+                );
                 InflightMessage {
                     packet_id,
                     topic: publish.topic_name.clone(),
                     payload: publish.payload.clone(),
                     qos: publish.qos_level,
                     dup: false,
+                    retain: publish.retain,
+                    expires_at: message.expires_at,
                     sequence,
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
@@ -1779,6 +1926,17 @@ impl Session {
         }
     }
 
+    /// Adds the packet ids of incoming QoS 2 messages awaiting PUBREL,
+    /// loaded from storage, to a restored session.
+    pub(crate) async fn restore_incoming_qos2(&self, packet_ids: Vec<u16>) {
+        self.shared
+            .state
+            .lock()
+            .await
+            .incoming_qos2
+            .extend(packet_ids);
+    }
+
     /// Adds in-flight messages loaded from storage to a restored session.
     pub(crate) async fn restore_inflight(&self, inflight: Vec<InflightMessage>) {
         let mut session = self.shared.state.lock().await;
@@ -1791,7 +1949,7 @@ impl Session {
                 let publish = PublishPacket {
                     dup: false,
                     qos_level: message.qos,
-                    retain: false,
+                    retain: message.retain,
                     topic_name: message.topic,
                     packet_id: Some(message.packet_id),
                     properties: publish_properties(
@@ -1800,9 +1958,14 @@ impl Session {
                     ),
                     payload: message.payload,
                 };
-                session
-                    .unacknowledged_messages
-                    .insert(message.packet_id, (message.sequence, publish));
+                session.unacknowledged_messages.insert(
+                    message.packet_id,
+                    Unacknowledged {
+                        sequence: message.sequence,
+                        publish,
+                        expires_at: message.expires_at,
+                    },
+                );
             }
         }
     }
@@ -1812,18 +1975,42 @@ impl Session {
     /// were first sent [MQTT-4.4.0-1]. Only as many PUBLISH packets as the
     /// client's Receive Maximum allows are returned [MQTT-3.3.4-9]; the
     /// rest wait for `next_retransmission`. Those larger than the client's
-    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25].
+    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25],
+    /// and those past their expiry are discarded too [MQTT-3.3.2-5]; the
+    /// others carry the time they have left.
     pub(crate) async fn pending_retransmissions(&self) -> Retransmissions {
         let mut session = self.shared.state.lock().await;
         let session = &mut *session;
+        let now = unix_millis();
 
+        let mut resend = Retransmissions::default();
+        session.unacknowledged_messages.retain(|packet_id, sent| {
+            let expired = sent.expires_at.is_some_and(|deadline| now >= deadline);
+            if expired {
+                resend.dropped.push(*packet_id);
+            }
+            !expired
+        });
         let mut pending: Vec<(u64, Option<u16>, ControlPacket)> = session
             .unacknowledged_messages
-            .iter()
-            .map(|(packet_id, (sequence, publish))| {
-                let mut publish = publish.clone();
+            .iter_mut()
+            .map(|(packet_id, sent)| {
+                if let Some(deadline) = sent.expires_at {
+                    let remaining_secs = (deadline - now).div_ceil(1000);
+                    sent.publish
+                        .properties
+                        .get_or_insert_with(Default::default)
+                        .message_expiry_interval = Some(MessageExpiryInterval::new(
+                        remaining_secs.try_into().unwrap_or(u32::MAX),
+                    ));
+                }
+                let mut publish = sent.publish.clone();
                 publish.dup = true;
-                (*sequence, Some(*packet_id), ControlPacket::Publish(publish))
+                (
+                    sent.sequence,
+                    Some(*packet_id),
+                    ControlPacket::Publish(publish),
+                )
             })
             .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
                 let pubrel = PubRelPacket {
@@ -1836,7 +2023,6 @@ impl Session {
             .collect();
         pending.sort_by_key(|(sequence, _, _)| *sequence);
 
-        let mut resend = Retransmissions::default();
         session.unsent.clear();
         let mut room = session.window().saturating_sub(session.pubrecs.len());
         for (_, packet_id, packet) in pending {
@@ -1863,12 +2049,21 @@ impl Session {
     }
 }
 
+/// An outgoing QoS 1 or 2 message the client has yet to acknowledge.
+struct Unacknowledged {
+    /// Position in the order messages were sent
+    sequence: u64,
+    publish: PublishPacket,
+    /// Unix time in milliseconds when the message expires, if it does
+    expires_at: Option<u64>,
+}
+
 /// What a resumed session resends at once.
 #[derive(Default)]
 pub(crate) struct Retransmissions {
     pub packets: Vec<ControlPacket>,
     /// Packet ids of unacknowledged messages discarded as too large for
-    /// the client
+    /// the client or expired
     pub dropped: Vec<u16>,
 }
 
@@ -2141,6 +2336,54 @@ mod tests {
         }
     }
 
+    /// Each SUBSCRIBE and UNSUBSCRIBE is stored as what it changed, not
+    /// as every subscription the session holds.
+    #[tokio::test]
+    async fn test_subscription_changes_are_recorded_one_by_one() {
+        let mut session = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        for filter in ["a", "b"] {
+            session
+                .handle_subscribe(
+                    subscribe_packet(filter, QoS::AtLeastOnce),
+                    &broker,
+                    &no_plugins(),
+                )
+                .await
+                .unwrap();
+        }
+        let described = |changes: Vec<Write>| -> Vec<String> {
+            changes
+                .into_iter()
+                .map(|change| match change {
+                    Write::AddSubscription(s) => format!("+{}", s.topic_filter),
+                    Write::RemoveSubscription(filter) => format!("-{filter}"),
+                    _ => "other".into(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            described(session.take_subscription_changes().await),
+            ["+a", "+b"]
+        );
+
+        let unsubscribe = |filter: &str| UnsubscribePacket {
+            packet_id: 2,
+            properties: None,
+            payload: vec![UnsubscribePayload {
+                topic_filter: filter.to_string(),
+            }],
+        };
+        for filter in ["a", "never"] {
+            session
+                .handle_unsubscribe(unsubscribe(filter), &broker, &no_plugins())
+                .await
+                .unwrap();
+        }
+        assert_eq!(described(session.take_subscription_changes().await), ["-a"]);
+        assert!(session.take_subscription_changes().await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_unsubscribe_multiple_topics() {
         let mut session = create_test_session();
@@ -2236,7 +2479,7 @@ mod tests {
     }
 
     async fn next_publish(session: &mut Session) -> PublishPacket {
-        let message = session.next_outgoing(true).await;
+        let (message, _) = session.next_outgoing(true).await;
         match session.prepare_publish(message).await.map(|o| o.packet) {
             Some(ControlPacket::Publish(p)) => p,
             other => panic!("Expected Publish packet, got {:?}", other),
@@ -2351,12 +2594,16 @@ mod tests {
         let state = Arc::get_mut(&mut session.shared).unwrap().state.get_mut();
 
         state.last_packet_id = u16::MAX - 1;
-        state
-            .unacknowledged_messages
-            .insert(u16::MAX, (0, PublishPacket::default()));
-        state
-            .unacknowledged_messages
-            .insert(1, (1, PublishPacket::default()));
+        for (packet_id, sequence) in [(u16::MAX, 0), (1, 1)] {
+            state.unacknowledged_messages.insert(
+                packet_id,
+                Unacknowledged {
+                    sequence,
+                    publish: PublishPacket::default(),
+                    expires_at: None,
+                },
+            );
+        }
 
         assert_eq!(state.next_packet_id(), Some(2));
     }
@@ -2421,6 +2668,113 @@ mod tests {
             .await
             .unwrap();
         next_publish(&mut subscriber).await;
+    }
+
+    /// Retained messages, which fail to store until `working` is set.
+    #[derive(Default)]
+    struct FlakyRetained {
+        inner: MemoryStore,
+        working: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RetainedMessageStore for FlakyRetained {
+        async fn store_retained(
+            &self,
+            topic: &str,
+            message: Option<Message>,
+        ) -> mercurio_storage::Result<()> {
+            if !self.working.load(Ordering::Relaxed) {
+                return Err(mercurio_storage::StorageError::OperationFailed(
+                    "disk full".into(),
+                ));
+            }
+            self.inner.store_retained(topic, message).await
+        }
+
+        async fn get_retained(&self, topic_filter: &str) -> mercurio_storage::Result<Vec<Message>> {
+            self.inner.get_retained(topic_filter).await
+        }
+
+        async fn clear_all_retained(&self) -> mercurio_storage::Result<()> {
+            self.inner.clear_all_retained().await
+        }
+
+        async fn count_retained(&self) -> mercurio_storage::Result<usize> {
+            self.inner.count_retained().await
+        }
+    }
+
+    /// A QoS 2 message the broker failed to take isn't acknowledged, and
+    /// the copy the client sends again is forwarded.
+    #[tokio::test]
+    async fn test_incoming_qos2_that_failed_to_store_is_taken_when_resent() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let storage = Arc::new(FlakyRetained::default());
+        let broker = crate::broker::Broker::new(Arc::clone(&storage));
+        subscriber
+            .handle_subscribe(
+                subscribe_packet("t", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
+            .await
+            .unwrap();
+        let retained = |dup| {
+            let ControlPacket::Publish(mut publish) = qos2_publish("t", 5, dup) else {
+                unreachable!()
+            };
+            publish.retain = true;
+            ControlPacket::Publish(publish)
+        };
+
+        let failed = publisher
+            .process_incoming(retained(false), &broker, &no_plugins())
+            .await;
+        assert!(matches!(
+            failed,
+            Err(mercurio_core::error::Error::MQTTReasonCode(
+                ReasonCode::ImplementationSpecificError
+            ))
+        ));
+        assert!(nothing_queued(&subscriber).await);
+
+        storage.working.store(true, Ordering::Relaxed);
+        let response = publisher
+            .process_incoming(retained(true), &broker, &no_plugins())
+            .await
+            .unwrap();
+        assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
+        timeout(Duration::from_secs(1), next_publish(&mut subscriber))
+            .await
+            .expect("the copy sent again is forwarded");
+        assert_eq!(broker.retained("t").await.unwrap().len(), 1);
+    }
+
+    /// Packet ids of QoS 2 messages a restored session had taken still
+    /// mark copies sent again as already delivered.
+    #[tokio::test]
+    async fn test_restored_incoming_qos2_ids_are_not_forwarded_again() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        subscriber
+            .handle_subscribe(
+                subscribe_packet("t", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
+            .await
+            .unwrap();
+
+        publisher.restore_incoming_qos2(vec![5]).await;
+        let response = publisher
+            .process_incoming(qos2_publish("t", 5, true), &broker, &no_plugins())
+            .await
+            .unwrap();
+        assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
+        assert!(nothing_queued(&subscriber).await);
     }
 
     #[tokio::test]
@@ -3065,7 +3419,7 @@ mod tests {
         assert!(state
             .unacknowledged_messages
             .values()
-            .all(|(_, p)| !p.topic_name.is_empty()));
+            .all(|sent| !sent.publish.topic_name.is_empty()));
     }
 
     fn encoded_len(packet: &ControlPacket) -> usize {
@@ -3323,7 +3677,9 @@ mod tests {
         let will = Arc::new(session.take_will().await.unwrap());
 
         let pending = holding(&will);
-        session.set_pending_will(0, pending.abort_handle()).await;
+        session
+            .set_pending_will(0, pending.abort_handle(), (*will).clone())
+            .await;
         assert!(session.snapshot().await.will_pending);
         session.set_generation(1).await;
         assert!(pending.await.unwrap_err().is_cancelled());
@@ -3332,13 +3688,17 @@ mod tests {
 
         // One left by a connection already superseded is freed at once
         let stale = holding(&will);
-        session.set_pending_will(0, stale.abort_handle()).await;
+        session
+            .set_pending_will(0, stale.abort_handle(), (*will).clone())
+            .await;
         assert!(stale.await.unwrap_err().is_cancelled());
         assert_eq!(Arc::strong_count(&will), 1);
 
         // Once claimed, a takeover no longer cuts the will off
         let claimed = holding(&will);
-        session.set_pending_will(1, claimed.abort_handle()).await;
+        session
+            .set_pending_will(1, claimed.abort_handle(), (*will).clone())
+            .await;
         assert!(session.claim_pending_will(1).await);
         session.set_generation(2).await;
         tokio::task::yield_now().await;
