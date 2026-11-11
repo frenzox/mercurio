@@ -69,22 +69,36 @@ impl Admitted {
 
 /// Binds the admin socket `config` asks for, as a trusted listener. None
 /// when `socket` is empty, or when the socket can't be set up safely, which
-/// is logged: the broker then runs without it.
-pub fn open(config: &AdminConfig) -> Option<(ListenerConfig, AdminSocket)> {
+/// is logged: the broker then runs without it. An error when another
+/// process serves the socket, likely another broker, which a new one must
+/// not take the socket from.
+pub fn open(config: &AdminConfig) -> Result<Option<(ListenerConfig, AdminSocket)>, String> {
     if config.socket.is_empty() {
-        return None;
+        return Ok(None);
     }
     let path = Path::new(&config.socket);
+    if in_use(path) {
+        return Err(format!(
+            "Another process serves the admin socket {}; stop it, or set another `socket` in [admin]",
+            path.display()
+        ));
+    }
     match bind(path, &config.group) {
         Ok(opened) => {
             info!("Serving the admin socket on {}", path.display());
-            Some(opened)
+            Ok(Some(opened))
         }
         Err(e) => {
             warn!("Running without the admin socket {}: {}", path.display(), e);
-            None
+            Ok(None)
         }
     }
+}
+
+/// Whether a process accepts connections on the Unix socket at `path`, as
+/// opposed to a socket file left behind by one that stopped.
+pub fn in_use(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 fn bind(path: &Path, group_name: &str) -> Result<(ListenerConfig, AdminSocket), String> {
@@ -132,6 +146,42 @@ fn bind(path: &Path, group_name: &str) -> Result<(ListenerConfig, AdminSocket), 
         admitted.admits(peer.uid(), peer.gid())
     }));
     Ok((config, socket))
+}
+
+/// Binds the Unix socket of a `[[listeners]]` entry at `path`, born
+/// owner-only and then given `group` and `mode`; `mode` defaults to 0660
+/// with a group and 0600 without. A socket left there by a broker that
+/// stopped is replaced, one another process serves is refused.
+pub fn bind_listener(
+    path: &Path,
+    mode: Option<u32>,
+    group: Option<&str>,
+) -> Result<UnixListener, String> {
+    let failed = |e: &dyn std::fmt::Display| format!("Failed to listen on {}: {e}", path.display());
+    if in_use(path) {
+        return Err(failed(&"another process serves this socket"));
+    }
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+        fs::remove_file(path).map_err(|e| failed(&e))?;
+    }
+    let gid = match group {
+        Some(name) => Some(
+            lookup_group(name)
+                .map_err(|e| failed(&format!("can't read group `{name}`: {e}")))?
+                .ok_or_else(|| failed(&format!("group `{name}` doesn't exist")))?
+                .gid,
+        ),
+        None => None,
+    };
+    let listener = bind_owner_only(path).map_err(|e| failed(&e))?;
+    let mode = mode.unwrap_or(if gid.is_some() { 0o660 } else { 0o600 });
+    let opened = std::os::unix::fs::lchown(path, None, gid)
+        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(mode)));
+    if let Err(e) = opened {
+        let _ = fs::remove_file(path);
+        return Err(failed(&e));
+    }
+    Ok(listener)
 }
 
 /// Binds a Unix socket at `path` whose file is born owner-only, so no one
@@ -401,6 +451,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_socket_another_process_serves_is_left_alone() {
+        let dir = private_dir("live");
+        let path = dir.join("admin.sock");
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let config = AdminConfig {
+            socket: path.to_str().unwrap().to_string(),
+            group: String::new(),
+        };
+        let Err(error) = open(&config) else {
+            panic!("took over a live socket");
+        };
+        assert!(error.contains(&config.socket), "{error}");
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        live.set_nonblocking(true).unwrap();
+        assert!(live.accept().is_ok(), "the first process still serves");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_sockets_get_their_mode_and_group() {
+        let dir = private_dir("listener");
+        let path = dir.join("mqtt.sock");
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o777;
+
+        let listener = bind_listener(&path, None, None).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // A second broker would take the socket from the first
+        assert!(bind_listener(&path, None, None).is_err());
+        drop(listener);
+        let _listener = bind_listener(&path, Some(0o666), None).unwrap();
+        assert_eq!(mode(&path), 0o666);
+        let _client = UnixStream::connect(&path).await.unwrap();
+
+        if let Some(name) = own_group_name() {
+            let grouped = dir.join("grouped.sock");
+            let _listener = bind_listener(&grouped, None, Some(&name)).unwrap();
+            let meta = fs::symlink_metadata(&grouped).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o660);
+            assert_eq!(meta.gid(), unsafe { libc::getgid() });
+        }
+        let unknown = dir.join("unknown.sock");
+        let error = bind_listener(&unknown, None, Some("mercurio-no-such-group")).unwrap_err();
+        assert!(error.contains("mercurio-no-such-group"), "{error}");
+        assert!(!unknown.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn unsafe_or_missing_places_are_refused() {
         let dir = private_dir("refused");
         let file = dir.join("file");
@@ -419,7 +517,7 @@ mod tests {
             socket: String::new(),
             group: String::new(),
         };
-        assert!(open(&off).is_none());
+        assert!(open(&off).unwrap().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

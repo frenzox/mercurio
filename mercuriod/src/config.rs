@@ -180,6 +180,13 @@ pub struct ListenerConfig {
     /// Unix domain socket to listen on; either this or `port`
     pub path: Option<String>,
 
+    /// With `path`, the socket's mode in octal, such as `"0660"`; 0660 with
+    /// `group` and 0600 without by default (Linux)
+    pub mode: Option<String>,
+
+    /// With `path`, the group the socket belongs to (Linux)
+    pub group: Option<String>,
+
     #[serde(default)]
     pub protocol: Protocol,
 
@@ -245,12 +252,28 @@ pub struct PluginConfig {
     /// Copies run at once; defaults to the number of CPUs
     pub instances: Option<usize>,
 
-    /// Longest one call may run; defaults to `plugin_timeout`'s 5 seconds
+    /// Longest one call may run; defaults to, and may not exceed, `[server]
+    /// plugin_timeout`
     pub timeout_ms: Option<u64>,
 
     /// Memory each copy may use
     #[serde(default = "default_plugin_memory_mb")]
     pub memory_mb: usize,
+}
+
+impl ListenerConfig {
+    /// `mode`, as permission bits.
+    pub fn socket_mode(&self) -> Result<Option<u32>, String> {
+        let Some(mode) = &self.mode else {
+            return Ok(None);
+        };
+        match u32::from_str_radix(mode, 8) {
+            Ok(bits) if bits <= 0o777 => Ok(Some(bits)),
+            _ => Err(format!(
+                "[[listeners]] `mode` = \"{mode}\" is not permission bits in octal, such as \"0660\""
+            )),
+        }
+    }
 }
 
 impl PluginConfig {
@@ -330,7 +353,8 @@ pub fn redacted_url(url: &str) -> Cow<'_, str> {
 }
 
 /// `url` of an HTTP auth service with any user info and query redacted, as
-/// reqwest sends the first as basic auth and the second may carry a key; the
+/// ureq sends the first, as it is, in a basic `Authorization` header and the
+/// second may carry a key; the
 /// whole URL when an `@` appears elsewhere than in a clean authority, and
 /// secrets in the path are not recognised.
 pub fn redacted_http_url(url: &str) -> Cow<'_, str> {
@@ -482,6 +506,17 @@ impl Config {
     /// Refuses settings that parse but would be unsafe.
     fn check(&self) -> Result<(), String> {
         for listener in &self.listeners {
+            listener.socket_mode()?;
+            if listener.path.is_none() {
+                if let Some(key) = [("mode", &listener.mode), ("group", &listener.group)]
+                    .into_iter()
+                    .find_map(|(key, value)| value.as_ref().map(|_| key))
+                {
+                    return Err(format!(
+                        "[[listeners]] `{key}` applies to a Unix socket `path`, not to a TCP `port`"
+                    ));
+                }
+            }
             // `tenantA` would also let clients reach `tenantAB/...`
             if let Some(mount_point) = &listener.mount_point {
                 if !mount_point.ends_with('/') {
@@ -520,7 +555,49 @@ impl Config {
                 return Err(format!("No [[plugins]] entry is named `{name}`"));
             }
         }
+        self.check_plugin_timeouts()?;
         self.check_bridges()
+    }
+
+    /// Refuses timeouts the broker's own limit on a plugin call would cut
+    /// short, so a slow answer is never taken for a denial in silence.
+    fn check_plugin_timeouts(&self) -> Result<(), String> {
+        let limit = self.server.plugin_timeout();
+        if limit.is_zero() {
+            return Err("[server] plugin_timeout must be at least 1 second".into());
+        }
+        if self.server.plugin_tick_interval == 0 {
+            return Err("[server] plugin_tick_interval must be at least 1 second".into());
+        }
+        let http = std::iter::once(("[auth.http]", &self.auth))
+            .chain(
+                self.listeners
+                    .iter()
+                    .filter_map(|l| l.auth.as_ref())
+                    .map(|auth| ("[listeners.auth.http]", auth)),
+            )
+            .filter_map(|(table, auth)| Some((table, auth.http.as_ref()?)));
+        for (table, http) in http {
+            if Duration::from_secs(http.timeout_seconds) > limit {
+                return Err(format!(
+                    "{table} `timeout_seconds` = {} is longer than [server] `plugin_timeout` = {}, which would cut the request short; lower the first or raise the second",
+                    http.timeout_seconds, self.server.plugin_timeout
+                ));
+            }
+        }
+        for plugin in &self.plugins {
+            if let Some(ms) = plugin
+                .timeout_ms
+                .filter(|ms| Duration::from_millis(*ms) > limit)
+            {
+                return Err(format!(
+                    "[[plugins]] `{}`: `timeout_ms` = {ms} is longer than [server] `plugin_timeout` = {} seconds, which would cut its calls short; lower the first or raise the second",
+                    plugin.name(),
+                    self.server.plugin_timeout
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_bridges(&self) -> Result<(), String> {
@@ -560,7 +637,8 @@ impl Config {
 }
 
 fn read_table(path: &Path) -> Result<toml::Table, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     toml::from_str(&content).map_err(|e| format!("{}: {e}", path.display()).into())
 }
 
@@ -719,6 +797,15 @@ pub struct ServerConfig {
     /// unset
     pub max_connections_per_ip: Option<usize>,
 
+    /// Seconds one call of a plugin hook may take, built-in and WebAssembly
+    /// plugins alike; one that takes longer denies, or drops the message
+    #[serde(default = "default_plugin_timeout")]
+    pub plugin_timeout: u64,
+
+    /// Seconds between calls of plugins' `on_tick`
+    #[serde(default = "default_plugin_tick_interval")]
+    pub plugin_tick_interval: u64,
+
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsServerConfig,
@@ -760,6 +847,8 @@ impl Default for ServerConfig {
             max_session_expiry: None,
             max_retained_messages: None,
             max_connections_per_ip: None,
+            plugin_timeout: default_plugin_timeout(),
+            plugin_tick_interval: default_plugin_tick_interval(),
             tls: TlsServerConfig::default(),
         }
     }
@@ -927,7 +1016,27 @@ fn default_max_inflight() -> u16 {
     Limits::default().max_inflight
 }
 
+fn default_plugin_timeout() -> u64 {
+    mercurio_server::server::ServerConfig::default()
+        .plugin_timeout
+        .as_secs()
+}
+
+fn default_plugin_tick_interval() -> u64 {
+    mercurio_server::server::ServerConfig::default()
+        .plugin_tick_interval
+        .as_secs()
+}
+
 impl ServerConfig {
+    pub fn plugin_timeout(&self) -> Duration {
+        Duration::from_secs(self.plugin_timeout)
+    }
+
+    pub fn plugin_tick_interval(&self) -> Duration {
+        Duration::from_secs(self.plugin_tick_interval)
+    }
+
     pub fn limits(&self) -> Result<Limits, String> {
         let maximum_qos = QoS::from(self.max_qos);
         if maximum_qos == QoS::Invalid {
@@ -1103,6 +1212,8 @@ fn default_allow_anonymous() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde::Deserialize;
 
     use super::{redacted_http_url, redacted_url, AdminConfig, Config, Protocol, StorageConfig};
@@ -1294,6 +1405,31 @@ mod tests {
     }
 
     #[test]
+    fn test_unix_listeners_take_an_octal_mode_and_a_group() {
+        let config = |extra: &str| -> Config {
+            toml::from_str(&format!("[[listeners]]\n{extra}\n")).unwrap()
+        };
+        let set = config("path = \"/run/m.sock\"\nmode = \"0660\"\ngroup = \"mqtt\"");
+        assert!(set.check().is_ok());
+        assert_eq!(set.listeners[0].socket_mode().unwrap(), Some(0o660));
+        assert_eq!(set.listeners[0].group.as_deref(), Some("mqtt"));
+        assert_eq!(
+            config("path = \"/run/m.sock\"").listeners[0].socket_mode(),
+            Ok(None)
+        );
+        for (extra, key) in [
+            ("path = \"/run/m.sock\"\nmode = \"0999\"", "mode"),
+            ("path = \"/run/m.sock\"\nmode = \"1777\"", "mode"),
+            ("path = \"/run/m.sock\"\nmode = \"rw\"", "mode"),
+            ("port = 1884\nmode = \"0660\"", "mode"),
+            ("port = 1884\ngroup = \"mqtt\"", "group"),
+        ] {
+            let error = config(extra).check().unwrap_err();
+            assert!(error.contains(&format!("`{key}`")), "{extra}: {error}");
+        }
+    }
+
+    #[test]
     fn test_parse_listeners() {
         let config: Config = toml::from_str(
             r#"
@@ -1371,6 +1507,49 @@ mod tests {
         assert_eq!(config.server.limits().unwrap().max_connect_packet_size, 512);
         let config: Config = toml::from_str("[server]\nmax_connect_packet_size = 0\n").unwrap();
         assert!(config.server.limits().is_err());
+    }
+
+    #[test]
+    fn test_plugin_timeout_and_tick_interval_are_configurable() {
+        let config: Config = toml::from_str("").unwrap();
+        let defaults = mercurio_server::server::ServerConfig::default();
+        assert_eq!(config.server.plugin_timeout(), defaults.plugin_timeout);
+        assert_eq!(
+            config.server.plugin_tick_interval(),
+            defaults.plugin_tick_interval
+        );
+        let config: Config =
+            toml::from_str("[server]\nplugin_timeout = 12\nplugin_tick_interval = 3\n").unwrap();
+        assert!(config.check().is_ok());
+        assert_eq!(config.server.plugin_timeout(), Duration::from_secs(12));
+        assert_eq!(config.server.plugin_tick_interval(), Duration::from_secs(3));
+        for zero in ["plugin_timeout = 0", "plugin_tick_interval = 0"] {
+            let config: Config = toml::from_str(&format!("[server]\n{zero}\n")).unwrap();
+            assert!(config.check().is_err(), "{zero}");
+        }
+    }
+
+    #[test]
+    fn test_timeouts_longer_than_plugin_timeout_are_refused() {
+        let check = |toml: &str| toml::from_str::<Config>(toml).unwrap().check();
+        for (toml, key) in [
+            ("[auth.http]\nacl_url = \"http://h/acl\"\ntimeout_seconds = 10\n", "timeout_seconds"),
+            (
+                "[[listeners]]\nport = 1884\n[listeners.auth.http]\nacl_url = \"http://h/acl\"\ntimeout_seconds = 6\n",
+                "timeout_seconds",
+            ),
+            ("[[plugins]]\npath = \"a.wasm\"\ntimeout_ms = 5001\n", "timeout_ms"),
+        ] {
+            let error = check(toml).unwrap_err();
+            assert!(
+                error.contains(&format!("`{key}`")) && error.contains("`plugin_timeout`"),
+                "{toml}: {error}"
+            );
+            let raised = format!("[server]\nplugin_timeout = 10\n{toml}");
+            assert!(check(&raised).is_ok(), "{raised}");
+        }
+        assert!(check("[auth.http]\nacl_url = \"http://h/acl\"\ntimeout_seconds = 5\n").is_ok());
+        assert!(check("[[plugins]]\npath = \"a.wasm\"\ntimeout_ms = 5000\n").is_ok());
     }
 
     #[test]
@@ -1472,8 +1651,8 @@ mod tests {
         std::fs::write(conf_d.join("auth.toml"), "[auth]\nenable = true\n").unwrap();
         let error = Config::from_file(&main).unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
-        // main prints the error with Debug
-        let shown = format!("{error:?}");
+        // As main prints it
+        let shown = error.to_string();
         assert!(shown.contains("`enable`"), "{shown}");
         assert!(shown.contains("main.toml"), "{shown}");
         assert!(shown.contains("auth"), "{shown}");

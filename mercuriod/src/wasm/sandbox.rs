@@ -9,7 +9,7 @@ use std::{
 };
 
 use http_body_util::BodyExt;
-use wasmtime::{component::ResourceTable, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{component::ResourceTable, ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{sockets::SocketAddrUse, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
@@ -21,7 +21,7 @@ pub(crate) struct State {
     http: WasiHttpCtx,
     hooks: AllowHttp,
     table: ResourceTable,
-    pub(crate) limits: StoreLimits,
+    pub(crate) limits: Limits,
     kv: Arc<Kv>,
     /// Epoch ticks left for the running call
     pub(crate) ticks_left: u64,
@@ -146,9 +146,15 @@ impl Allowed {
         let sockets = sockets
             .iter()
             .map(|entry| {
-                entry
+                let addr: SocketAddr = entry
                     .parse()
-                    .map_err(|error| anyhow::anyhow!("`{entry}` in allow_sockets: {error}"))
+                    .map_err(|error| anyhow::anyhow!("`{entry}` in allow_sockets: {error}"))?;
+                if addr.ip().is_unspecified() || addr.port() == 0 {
+                    anyhow::bail!(
+                        "`{entry}` in allow_sockets: name the address and port to connect to"
+                    );
+                }
+                Ok(addr)
             })
             .collect::<anyhow::Result<_>>()?;
         Ok(Allowed { http, sockets })
@@ -167,15 +173,7 @@ impl State {
             .allow_tcp(networked)
             .allow_udp(networked)
             .socket_addr_check(move |addr, use_| {
-                let allowed = match use_ {
-                    // A connect binds to the wildcard address first, so
-                    // that bind has to pass for any connect to work
-                    SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
-                        addr.ip().is_unspecified() && addr.port() == 0
-                    }
-                    _ => sockets.contains(&addr),
-                };
-                Box::pin(std::future::ready(allowed))
+                Box::pin(std::future::ready(socket_allowed(&sockets, addr, use_)))
             })
             .build();
         let mut table = ResourceTable::new();
@@ -188,16 +186,85 @@ impl State {
                 name: Arc::clone(&name),
             },
             table,
-            limits: StoreLimitsBuilder::new()
-                .memory_size(memory)
-                .instances(INSTANCES)
-                .tables(TABLES)
-                .memories(MEMORIES)
-                .table_elements(TABLE_ELEMENTS)
-                .build(),
+            limits: Limits {
+                memory,
+                used: 0,
+                tables: StoreLimitsBuilder::new()
+                    .instances(INSTANCES)
+                    .tables(TABLES)
+                    .memories(MEMORIES)
+                    .table_elements(TABLE_ELEMENTS)
+                    .build(),
+            },
             kv,
             ticks_left: 0,
             name,
+        }
+    }
+}
+
+/// What one copy may allocate: `memory` bytes across all its linear
+/// memories, where wasmtime's `StoreLimits` caps each memory on its own;
+/// the counts and table sizes are left to `StoreLimits`.
+pub(crate) struct Limits {
+    memory: usize,
+    /// Bytes granted so far. Memories live as long as the copy's store, so
+    /// they only grow; a growth that fails after being granted stays
+    /// counted, which errs on the side of less memory
+    used: usize,
+    tables: StoreLimits,
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let more = desired.saturating_sub(current);
+        let used = self.used.saturating_add(more);
+        if used > self.memory || maximum.is_some_and(|max| desired > max) {
+            return Ok(false);
+        }
+        self.used = used;
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        self.tables.table_growing(current, desired, maximum)
+    }
+
+    fn instances(&self) -> usize {
+        self.tables.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.tables.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.tables.memories()
+    }
+}
+
+/// Whether a plugin allowed to reach `sockets` may use `addr` as `use_`
+/// says: connect to them and exchange datagrams with them, never listen.
+fn socket_allowed(sockets: &[SocketAddr], addr: SocketAddr, use_: SocketAddrUse) -> bool {
+    match use_ {
+        // A connect binds to the wildcard address first, so that bind has
+        // to pass for any connect to work
+        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => {
+            addr.ip().is_unspecified() && addr.port() == 0
+        }
+        SocketAddrUse::TcpListen | SocketAddrUse::TcpAccept => false,
+        SocketAddrUse::TcpConnect | SocketAddrUse::UdpSend | SocketAddrUse::UdpReceive => {
+            sockets.contains(&addr)
         }
     }
 }
@@ -362,6 +429,39 @@ mod tests {
     }
 
     #[test]
+    fn test_sockets_may_connect_out_but_never_listen() {
+        let allowed: SocketAddr = "10.0.0.5:6379".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let check = |addr, use_| socket_allowed(&[allowed], addr, use_);
+        assert!(check(wildcard, SocketAddrUse::TcpBind));
+        assert!(check(allowed, SocketAddrUse::TcpConnect));
+        assert!(check(allowed, SocketAddrUse::UdpSend));
+        assert!(check(allowed, SocketAddrUse::UdpReceive));
+        assert!(!check(wildcard, SocketAddrUse::UdpReceive));
+        assert!(!check(
+            "10.0.0.6:6379".parse().unwrap(),
+            SocketAddrUse::TcpConnect
+        ));
+        assert!(!check(
+            "0.0.0.0:1883".parse().unwrap(),
+            SocketAddrUse::TcpBind
+        ));
+        for use_ in [SocketAddrUse::TcpListen, SocketAddrUse::TcpAccept] {
+            assert!(!check(wildcard, use_));
+            assert!(!check(allowed, use_));
+            assert!(!socket_allowed(&[wildcard], wildcard, use_));
+        }
+    }
+
+    #[test]
+    fn test_wildcard_socket_entries_are_refused() {
+        for entry in ["0.0.0.0:0", "0.0.0.0:6379", "[::]:6379", "10.0.0.5:0"] {
+            let error = Allowed::parse(&[], &[entry.into()]).err().unwrap();
+            assert!(error.to_string().contains(&format!("`{entry}`")), "{error}");
+        }
+    }
+
+    #[test]
     fn test_requests_match_with_the_default_port() {
         let uri = |s: &str| s.parse::<http::Uri>().unwrap();
         assert_eq!(
@@ -413,6 +513,26 @@ mod tests {
         assert!(long.len() <= LOG_MESSAGE + "…".len(), "{}", long.len());
         assert!(long.ends_with('…'));
         assert_eq!(loggable("plain".into()), "plain");
+    }
+
+    #[test]
+    fn test_the_memory_limit_covers_all_memories_of_a_copy() {
+        use wasmtime::{Engine, Memory, MemoryType, Store};
+
+        const PAGE: usize = 64 << 10;
+        let allowed = Allowed::parse(&[], &[]).unwrap();
+        let state = State::new("t".into(), &allowed, 100 * PAGE, Arc::default());
+        let mut store = Store::new(&Engine::default(), state);
+        store.limiter(|state| &mut state.limits);
+
+        let first = Memory::new(&mut store, MemoryType::new(40, None)).unwrap();
+        let second = Memory::new(&mut store, MemoryType::new(40, None)).unwrap();
+        // 80 pages of 100 are taken, whichever memory asks for more
+        assert!(Memory::new(&mut store, MemoryType::new(40, None)).is_err());
+        assert!(second.grow(&mut store, 30).is_err());
+        assert!(first.grow(&mut store, 20).is_ok());
+        assert!(second.grow(&mut store, 1).is_err());
+        assert!(Memory::new(&mut store, MemoryType::new(0, None)).is_ok());
     }
 
     #[test]

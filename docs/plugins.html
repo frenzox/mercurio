@@ -137,10 +137,10 @@ allow_http = ["audit.internal:80"]</pre>
 <ul>
 <li>A plugin has no files, no environment variables and no standard input. Standard output and error are discarded; use <code>host::log</code>, which keeps the first 4 KiB of a message and escapes control characters such as newlines. A Rust plugin built with <code>mercurio-plugin</code> sends its panic messages to the broker's log, at error level.</li>
 <li><code>allow_http</code> lists the hosts it may send HTTP requests to, as <code>host</code> or <code>host:port</code>. An entry without a port means port 443. The scheme is not checked, so <code>http://host:443</code> is allowed too, and a plain-HTTP endpoint on port 80 needs <code>host:80</code>. Other hosts are refused.</li>
-<li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may open sockets to. A socket may bind only to the wildcard address with port 0, which is what a connect needs. DNS lookups are off, so use addresses. With an empty list the plugin can't create a socket at all.</li>
+<li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may connect TCP sockets to and exchange UDP datagrams with; a wildcard address or port 0 is refused at load. A socket may bind only to the wildcard address with port 0, which is what a connect needs, and may never listen or accept connections; a UDP socket drops datagrams from addresses not listed. DNS lookups are off, so use addresses. With an empty list the plugin can't create a socket at all.</li>
 <li>Each copy may hold at most 4096 host resources at once, such as sockets, streams and HTTP requests. A call that tries to hold more traps.</li>
-<li><code>memory_mb</code> caps the linear memory of each copy. The default is 64.</li>
-<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. The default is 5000. The broker's own limit per hook call is 5 seconds, so for hooks a larger value acts as 5 seconds. <code>init</code> when the plugin loads, or reloads, gets the full value.</li>
+<li><code>memory_mb</code> caps the linear memory of each copy, all its memories together. The default is 64.</li>
+<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. It defaults to <code>[server]</code> <code>plugin_timeout</code>, 5 seconds unless set, the broker's own limit per hook call, and may not be longer.</li>
 </ul>
 <p>A plugin that traps, runs out of memory or runs out of time fails that call as described above, and its copy is replaced. The broker logs the cause.</p>
 

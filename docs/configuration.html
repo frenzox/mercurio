@@ -41,6 +41,11 @@
 <p class="lead">Every option of <code>mercuriod</code>'s TOML configuration file, with its default. Every option is optional. An option or table the broker does not know, such as a misspelled one, stops it from starting with an error that names it.</p>
 <p>The broker reads <code>/etc/mercurio/config.toml</code>, or the file given with <code>-c</code>. A commented file with every option is provided as <code>mercuriod/contrib/config.toml</code>.</p>
 
+<h2 id="check">Checking a configuration</h2>
+<p><code>mercuriod --check</code> does what a start does short of listening and opening storage: it reads the configuration and its <code>include_dir</code>, checks the settings that depend on each other, loads the password, ACL and dynamic security files of <code>[auth]</code> and of every listener, loads the TLS certificates and keys, and compiles and initialises the WebAssembly plugins. It then exits with status 0. A problem makes it exit with status 1 and print the error a start would. It does not connect to PostgreSQL, bind ports or sockets, or contact bridges.</p>
+<pre><span class="comment"># As the broker's user, so files are read with its permissions</span>
+sudo -u mercurio mercuriod --check -c /etc/mercurio/config.toml &amp;&amp; sudo systemctl restart mercuriod</pre>
+
 <h2 id="include-dir">Top level</h2>
 <table>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
@@ -93,6 +98,8 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>max_session_expiry</code></td><td>unbounded</td><td>Most seconds any session may outlive its connection. MQTT 5 clients asking for longer, or for no expiry, are told to use this; it also bounds <code>persistent_client_expiration</code>. Worth setting where clients aren't trusted, as each stored session takes memory and storage.</td></tr>
 <tr><td><code>max_retained_messages</code></td><td>unbounded</td><td>Topics that may hold a retained message at once, about 20 of the broker's own <code>$SYS</code> topics included. Retaining a message on another topic is refused with Quota Exceeded; updating or clearing a retained topic is always allowed.</td></tr>
 <tr><td><code>max_connections_per_ip</code></td><td>unbounded</td><td>Connections one client address may hold at once, counted from the moment they are accepted, before any TLS or WebSocket handshake; further ones are closed. An IPv6 client counts as its /64 block, and an IPv4 client reaching an IPv6 socket as its IPv4 address. Behind a proxy sending PROXY headers, the address the header gives is counted, so set <code>proxy_from</code> too. Unbounded by default, as carrier NAT puts many devices behind one address.</td></tr>
+<tr><td><code>plugin_timeout</code></td><td><code>5</code></td><td>Seconds one call of a plugin hook may take, for the built-in password file, ACL file, HTTP and dynamic security checks as for <code>[[plugins]]</code>. A slower call denies, or drops the message. The broker refuses to start when <code>[auth.http]</code> <code>timeout_seconds</code> or a plugin's <code>timeout_ms</code> is longer.</td></tr>
+<tr><td><code>plugin_tick_interval</code></td><td><code>1</code></td><td>Seconds between calls of the plugins' <code>on_tick</code>.</td></tr>
 </table>
 
 <h3>Delivery</h3>
@@ -164,7 +171,7 @@ mount_point = "tenant1/"</pre>
 <tr><th>Option</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><code>user_url</code></td><td></td><td>Endpoint checking logins; replaces <code>password_file</code>.</td></tr>
 <tr><td><code>acl_url</code></td><td></td><td>Endpoint checking topic access; replaces <code>acl_file</code>.</td></tr>
-<tr><td><code>timeout_seconds</code></td><td><code>5</code></td><td>Longest wait for an answer; a timeout denies.</td></tr>
+<tr><td><code>timeout_seconds</code></td><td><code>5</code></td><td>Longest wait for an answer; a timeout denies. No longer than <code>[server]</code> <code>plugin_timeout</code>.</td></tr>
 <tr><td><code>cache_seconds</code></td><td><code>30</code></td><td>How long topic answers are reused.</td></tr>
 </table>
 
@@ -183,6 +190,8 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>host</code></td><td><code>"127.0.0.1"</code></td><td>Address to listen on.</td></tr>
 <tr><td><code>port</code></td><td></td><td>TCP port. Either this or <code>path</code>.</td></tr>
 <tr><td><code>path</code></td><td></td><td>Unix domain socket. Either this or <code>port</code>.</td></tr>
+<tr><td><code>group</code></td><td></td><td>With <code>path</code>, the group the socket belongs to. The broker's user must be a member, or root. Linux only.</td></tr>
+<tr><td><code>mode</code></td><td><code>"0660"</code> with <code>group</code>, <code>"0600"</code> without</td><td>With <code>path</code>, the socket's permission bits in octal. Clients need write permission to connect, so the default lets only the broker's user, and the members of <code>group</code>, in; <code>"0666"</code> lets in every local user. The socket is created owner-only and opened up once its group is set. A socket left by a broker that stopped is replaced; one another process serves stops the broker with an error. Linux only.</td></tr>
 <tr><td><code>protocol</code></td><td><code>"mqtt"</code></td><td><code>"mqtt"</code> or <code>"websocket"</code>.</td></tr>
 <tr><td><code>http_dir</code></td><td></td><td>With <code>"websocket"</code>, serve this directory's files to plain HTTP requests.</td></tr>
 <tr><td><code>proxy_protocol</code></td><td><code>false</code></td><td>Connections start with a PROXY protocol header, v1 or v2.</td></tr>
@@ -225,10 +234,10 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>name</code></td><td>file name without <code>.wasm</code></td><td>Names the plugin in logs, in <code>$CONTROL/&lt;name&gt;/...</code> and in listener <code>plugins</code>. It can't be empty, contain <code>/</code>, <code>+</code> or <code>#</code>, or be the name of a built-in plugin: <code>dynamic-security</code>, <code>password-file</code>, <code>http-auth</code>, <code>acl-file</code>, <code>plain</code> or <code>credentials</code>.</td></tr>
 <tr><td><code>config</code></td><td><code>{}</code></td><td>Table of strings passed to the plugin's <code>init</code>.</td></tr>
 <tr><td><code>allow_http</code></td><td><code>[]</code></td><td>Hosts it may send HTTP requests to, as <code>"host"</code> (port 443) or <code>"host:port"</code>. The scheme isn't checked, so a plain-HTTP endpoint on the default port needs <code>"host:80"</code>.</td></tr>
-<tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may open sockets to, as <code>"address:port"</code>.</td></tr>
+<tr><td><code>allow_sockets</code></td><td><code>[]</code></td><td>Addresses it may connect sockets to, as <code>"address:port"</code>. It can never listen.</td></tr>
 <tr><td><code>instances</code></td><td>number of CPUs</td><td>Copies that run calls at once.</td></tr>
-<tr><td><code>timeout_ms</code></td><td><code>5000</code></td><td>Longest one call, or <code>init</code>, may run. A hook call is also bound by the broker's own 5-second limit, so for hooks a larger value acts as 5000; <code>init</code> at load gets the full value.</td></tr>
-<tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Memory each copy may use.</td></tr>
+<tr><td><code>timeout_ms</code></td><td><code>[server]</code> <code>plugin_timeout</code></td><td>Longest one call, or <code>init</code>, may run. No longer than <code>plugin_timeout</code>, which bounds every hook call too.</td></tr>
+<tr><td><code>memory_mb</code></td><td><code>64</code></td><td>Linear memory each copy may use, all its memories together.</td></tr>
 </table>
 <p>Only the file at <code>path</code> is reread on SIGHUP; other changes need a restart.</p>
 

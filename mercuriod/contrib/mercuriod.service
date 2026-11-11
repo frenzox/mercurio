@@ -12,6 +12,9 @@ User=mercurio
 Group=mercurio
 DynamicUser=yes
 ExecStart=/usr/bin/mercuriod --config /etc/mercurio/config.toml
+# Not an ExecStartPre=: a restart stops the running broker first, so a check
+# there would only repeat the start's own and compile plugins twice. Check
+# before restarting instead: sudo -u mercurio mercuriod --check
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5

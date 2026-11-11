@@ -181,7 +181,9 @@ impl Pool {
         };
         self.arm(&mut instance.store);
         // When this future is dropped mid-call the copy goes with it
+        let cancelled = Cancelled { pool: self, hook };
         let result = tokio::time::timeout(self.timeout, call(&mut instance)).await;
+        std::mem::forget(cancelled);
         match result {
             Ok(Ok(value)) => {
                 self.put(instance);
@@ -206,5 +208,22 @@ impl Pool {
     fn arm(&self, store: &mut Store<State>) {
         store.data_mut().ticks_left = (self.timeout.as_millis() / TICK.as_millis()) as u64;
         store.set_epoch_deadline(1);
+    }
+}
+
+/// Counts a call as failed when it is dropped before it finishes, as the
+/// broker drops a hook call that outlives its `plugin_timeout`; forgotten
+/// once the call returns.
+struct Cancelled<'a> {
+    pool: &'a Pool,
+    hook: &'a str,
+}
+
+impl Drop for Cancelled<'_> {
+    fn drop(&mut self) {
+        self.pool.failed(format!(
+            "Cancelled in {} before it finished, as when the broker's plugin_timeout runs out",
+            self.hook
+        ));
     }
 }

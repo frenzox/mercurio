@@ -77,6 +77,7 @@ mercuriod dynsec-init -f &lt;FILE&gt; [-u &lt;USER&gt;]</pre>
 <tr><td><code>-c, --config &lt;FILE&gt;</code></td><td>Configuration file</td><td><code>/etc/mercurio/config.toml</code></td></tr>
 <tr><td><code>-l, --listen &lt;ADDR&gt;</code></td><td>Override the main listen address, such as <code>0.0.0.0:1883</code></td><td>from the configuration</td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Log at debug level</td><td></td></tr>
+<tr><td><code>--check</code></td><td>Check the configuration and exit; see <a href="configuration.html#check">Checking a configuration</a></td><td></td></tr>
 </table>
 <p>Without a file at the default path, the broker starts with the defaults: plain MQTT on <code>127.0.0.1:1883</code>, no authentication, state in memory. A missing file at a path given with <code>-c</code> is an error.</p>
 <pre><span class="comment"># Defaults</span>

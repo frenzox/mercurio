@@ -43,9 +43,22 @@ mercuriod dynsec-init -f <FILE> [-u <USER>]
 | `-c, --config <FILE>` | Path to configuration file | `/etc/mercurio/config.toml` |
 | `-l, --listen <ADDR>` | Override the listen address, such as `0.0.0.0:1883` | - |
 | `-v, --verbose` | Log at debug level | - |
+| `--check` | Check the configuration and exit | - |
 
 Without a configuration file at the default path, the broker starts with
 the defaults below. A missing file at a path given with `-c` is an error.
+
+`mercuriod --check` does what a start does short of listening and opening
+storage: it reads the configuration and its `include_dir`, loads the
+password, ACL and dynamic security files, the TLS certificates and keys,
+and the WebAssembly plugins, then exits with status 0. A problem makes it
+exit with status 1 and the error a start would print. Run it as the
+broker's user, so it reads the files as the broker would, before
+restarting the broker after a change:
+
+```bash
+sudo -u mercurio mercuriod --check && sudo systemctl restart mercuriod
+```
 
 ## Configuration
 
@@ -176,6 +189,13 @@ max_inflight = 64
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
 # max_connections_per_ip = 100
+# Seconds one call of a plugin hook may take, for built-in authentication
+# and access control as for [[plugins]]; a slower call denies, or drops the
+# message. [auth.http] timeout_seconds and a plugin's timeout_ms may not
+# exceed it
+# plugin_timeout = 5
+# Seconds between calls of the plugins' on_tick
+# plugin_tick_interval = 1
 
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
@@ -262,6 +282,7 @@ allow_anonymous = false
 # [auth.http]
 # user_url = "http://auth.internal/mqtt/user"
 # acl_url = "http://auth.internal/mqtt/acl"
+# No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
 
@@ -292,9 +313,15 @@ group = "mercurio"
 # port = 8080
 # protocol = "websocket"
 #
-# Unix domain socket, for clients on the same machine
+# Unix domain socket, for clients on the same machine. It belongs to the
+# broker's user with mode 0600, so only that user may connect, unless
+# `group` and `mode` open it to others (Linux only)
 # [[listeners]]
 # path = "/run/mercurio/mqtt.sock"
+# Group the socket belongs to; the mode is then 0660 unless set
+# group = "mqtt"
+# Permission bits in octal
+# mode = "0660"
 #
 # Any TCP listener may also set max_connections, on top of the broker-wide
 # limit, and bind_interface
@@ -378,7 +405,8 @@ group = "mercurio"
 # allow_sockets = ["10.0.0.5:6379"]
 # Copies that run calls at once; the number of CPUs by default
 # instances = 4
-# Longest one call may run, in milliseconds
+# Longest one call may run, in milliseconds; plugin_timeout by default, and
+# no longer than it
 # timeout_ms = 5000
 # Memory each copy may use, in MiB
 # memory_mb = 64
@@ -392,7 +420,9 @@ send no user name in. Credentials that are sent are always checked.
 
 The password file holds one `user:hash` line per user, with Argon2 hashes.
 Files written by `mosquitto_passwd` work too: their `$7$` (PBKDF2-SHA512)
-and `$6$` (SHA-512) hashes are recognised.
+and `$6$` (SHA-512) hashes are recognised. Any other hash field, such as a
+plain-text password or an empty one, stops the file from loading, with an
+error naming its line.
 Manage it with:
 
 ```bash
