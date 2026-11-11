@@ -26,11 +26,12 @@ pub struct ConnectArgs {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure"]
+        conflicts_with_all = ["host", "port", "tls", "cafile", "insecure", "cert", "key"]
     )]
     pub unix: Option<PathBuf>,
 
-    /// Client ID (auto-generated if not specified)
+    /// Client ID [default: one the broker assigns, or a random one where
+    /// the MQTT version needs it]
     #[arg(short = 'i', long)]
     pub client_id: Option<String>,
 
@@ -38,7 +39,8 @@ pub struct ConnectArgs {
     #[arg(short = 'u', long)]
     pub username: Option<String>,
 
-    /// Password for authentication
+    /// Password for authentication; other users can see it in `ps`, so
+    /// prefer the tool's variable, or leave it out with -u to be asked
     #[arg(short = 'P', long)]
     pub password: Option<String>,
 
@@ -55,6 +57,15 @@ pub struct ConnectArgs {
     /// implies --tls
     #[arg(long)]
     pub insecure: bool,
+
+    /// Client certificate (PEM) to log in with; needs --key and implies
+    /// --tls
+    #[arg(long, value_name = "PATH", requires = "key")]
+    pub cert: Option<String>,
+
+    /// Private key (PEM) of the --cert certificate
+    #[arg(long, value_name = "PATH", requires = "cert")]
+    pub key: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectArgs {
@@ -70,11 +81,37 @@ impl std::fmt::Debug for ConnectArgs {
             .field("tls", &self.tls)
             .field("cafile", &self.cafile)
             .field("insecure", &self.insecure)
+            .field("cert", &self.cert)
+            .field("key", &self.key)
             .finish()
     }
 }
 
 impl ConnectArgs {
+    /// `command`, which flattens these arguments, with the password also
+    /// read from the environment `variable` when `-P` isn't given. An empty
+    /// variable counts as unset, and `--help` never shows its value.
+    pub fn password_variable(command: clap::Command, variable: &'static str) -> clap::Command {
+        // Systemd units and CI often leave variables empty, which means
+        // unset, as for the shell's `${VAR:-}`
+        if std::env::var_os(variable).is_some_and(|value| value.is_empty()) {
+            return command;
+        }
+        command.mut_arg("password", |arg| arg.env(variable).hide_env_values(true))
+    }
+
+    /// With a user name and no password, asks for the password when
+    /// standard error is a terminal. Elsewhere, as in scripts, it connects
+    /// with the user name alone.
+    pub fn ask_password(&mut self) -> std::io::Result<()> {
+        use std::io::IsTerminal;
+
+        if self.username.is_some() && self.password.is_none() && std::io::stderr().is_terminal() {
+            self.password = Some(rpassword::prompt_password("Password: ")?);
+        }
+        Ok(())
+    }
+
     /// Connection options for these arguments; everything else keeps the
     /// defaults of [`ConnectOptions::new`].
     pub fn to_connect_options(&self) -> ConnectOptions {
@@ -96,6 +133,9 @@ impl ConnectArgs {
         }
         if self.insecure {
             options = options.danger_skip_tls_verify(true);
+        }
+        if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
+            options = options.client_cert(cert, key);
         }
         options
     }
@@ -137,6 +177,38 @@ mod tests {
     }
 
     #[test]
+    fn the_password_can_come_from_a_variable() {
+        let parse_with = |variable: &'static str, args: &[&str]| {
+            let command = ConnectArgs::password_variable(Cli::command(), variable);
+            let matches = command
+                .try_get_matches_from(std::iter::once("test").chain(args.iter().copied()))
+                .unwrap();
+            <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+                .unwrap()
+                .connect
+                .password
+        };
+        std::env::set_var("MERCURIO_CLIENT_TEST_PASSWORD", "from-env");
+        std::env::set_var("MERCURIO_CLIENT_TEST_EMPTY", "");
+        assert_eq!(
+            parse_with("MERCURIO_CLIENT_TEST_PASSWORD", &[]).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            parse_with("MERCURIO_CLIENT_TEST_PASSWORD", &["-P", "flag"]).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(parse_with("MERCURIO_CLIENT_TEST_EMPTY", &[]), None);
+        assert_eq!(parse_with("MERCURIO_CLIENT_TEST_UNSET", &[]), None);
+
+        let help = ConnectArgs::password_variable(Cli::command(), "MERCURIO_CLIENT_TEST_PASSWORD")
+            .render_help()
+            .to_string();
+        assert!(help.contains("MERCURIO_CLIENT_TEST_PASSWORD"), "{help}");
+        assert!(!help.contains("from-env"), "{help}");
+    }
+
+    #[test]
     fn arguments_are_well_formed() {
         Cli::command().debug_assert();
     }
@@ -161,6 +233,18 @@ mod tests {
             let options = parse(args).unwrap().to_connect_options();
             assert!(options.tls.enabled, "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_client_certificate_needs_its_key_and_turns_tls_on() {
+        let options = parse(&["--cert", "client.pem", "--key", "client.key"])
+            .unwrap()
+            .to_connect_options();
+        assert!(options.tls.enabled);
+        assert_eq!(options.tls.cert_path.as_deref(), Some("client.pem"));
+        assert_eq!(options.tls.key_path.as_deref(), Some("client.key"));
+        assert!(parse(&["--cert", "client.pem"]).is_err());
+        assert!(parse(&["--key", "client.key"]).is_err());
     }
 
     #[test]
@@ -190,6 +274,7 @@ mod tests {
             &["--tls"],
             &["--cafile", "ca.pem"],
             &["--insecure"],
+            &["--cert", "c.pem", "--key", "c.key"],
         ] {
             let args: Vec<&str> = ["--unix", "/x.sock"]
                 .into_iter()

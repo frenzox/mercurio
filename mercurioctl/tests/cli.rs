@@ -145,7 +145,9 @@ async fn broker_commands_print_their_data() {
     let retained = broker.json(&["retained", "list"]).await;
     assert_eq!(retained["messages"][0]["topic"], "home/temp", "{retained}");
     assert_eq!(
-        broker.json(&["retained", "delete", "home/#"]).await,
+        broker
+            .json(&["retained", "delete", "home/#", "--yes"])
+            .await,
         json!({ "deleted": 1 })
     );
     assert_eq!(
@@ -155,6 +157,104 @@ async fn broker_commands_print_their_data() {
     assert_eq!(
         broker.json(&["bridge", "list"]).await["bridges"][0]["name"],
         "cloud"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn destructive_commands_need_yes_off_a_terminal() {
+    let broker = start("confirm").await;
+    let sensor = broker.client("sensor-1").await;
+    for topic in ["home/a", "home/b"] {
+        sensor
+            .publish_with_retain(topic, "1", QoS::AtLeastOnce, true)
+            .await
+            .unwrap();
+    }
+
+    let unconfirmed = broker.ctl(&["retained", "delete", "home/#"]).await;
+    assert_eq!(
+        unconfirmed.status.code(),
+        Some(3),
+        "{}",
+        stderr(&unconfirmed)
+    );
+    assert!(
+        stderr(&unconfirmed).contains("--yes"),
+        "{}",
+        stderr(&unconfirmed)
+    );
+    assert_eq!(
+        broker.json(&["retained", "list"]).await["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A topic without wildcards deletes one message, with no question
+    assert_eq!(
+        broker.json(&["retained", "delete", "home/a"]).await,
+        json!({ "deleted": 1 })
+    );
+    assert_eq!(
+        broker.json(&["retained", "delete", "home/+", "-y"]).await,
+        json!({ "deleted": 1 })
+    );
+
+    let unconfirmed = broker.ctl(&["client", "delete-session", "sensor-1"]).await;
+    assert_eq!(
+        unconfirmed.status.code(),
+        Some(3),
+        "{}",
+        stderr(&unconfirmed)
+    );
+    let confirmed = broker
+        .ctl(&[
+            "client",
+            "delete-session",
+            "sensor-1",
+            "--disconnect",
+            "--yes",
+        ])
+        .await;
+    assert_eq!(confirmed.status.code(), Some(0), "{}", stderr(&confirmed));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failures_with_json_are_json_on_standard_error() {
+    let broker = start("json-errors").await;
+    let missing = broker.ctl(&["client", "show", "nobody", "--json"]).await;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty(), "{}", stdout(&missing));
+    let error: Value = serde_json::from_slice(&missing.stderr)
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr(&missing)));
+    assert_eq!(error["code"], "notFound", "{error}");
+    assert!(
+        error["error"].as_str().unwrap().contains("nobody"),
+        "{error}"
+    );
+
+    let unreachable = mercurioctl(
+        &[
+            "--unix",
+            "/nonexistent/mercurio.sock",
+            "--json",
+            "broker",
+            "info",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(unreachable.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&unreachable.stderr)
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr(&unreachable)));
+    assert_eq!(error["code"], Value::Null, "{error}");
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("/nonexistent/mercurio.sock"),
+        "{error}"
     );
 }
 

@@ -1,7 +1,10 @@
 //! `mercurioctl dynsec`: the commands of mercuriod's dynamic security
 //! plugin, named as `mosquitto_ctrl dynsec` names them, in kebab-case.
 
-use clap::Subcommand;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+
+use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 
 use crate::client::Failure;
@@ -24,8 +27,10 @@ pub enum Dynsec {
         username: String,
         /// Its password, which other users can see in `ps`; leave it out to
         /// be asked, and give an empty one for none
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["password_file", "password_stdin"])]
         password: Option<String>,
+        #[command(flatten)]
+        source: PasswordSource,
         /// A role of its own (can be repeated)
         #[arg(long = "role", value_name = "ROLENAME")]
         roles: Vec<String>,
@@ -40,7 +45,10 @@ pub enum Dynsec {
         username: String,
         /// The new password, which other users can see in `ps`; leave it out
         /// to be asked
+        #[arg(conflicts_with_all = ["password_file", "password_stdin"])]
         password: Option<String>,
+        #[command(flatten)]
+        source: PasswordSource,
     },
     /// Let a disabled client log in again
     EnableClient { username: String },
@@ -118,6 +126,60 @@ pub enum Dynsec {
     GetDefaultAclAccess,
 }
 
+/// Where a new client password comes from, for scripts, instead of the
+/// command line or a prompt.
+#[derive(Args, Debug)]
+pub struct PasswordSource {
+    /// Read the password from the first line of this file
+    #[arg(long, value_name = "PATH", conflicts_with = "password_stdin")]
+    password_file: Option<PathBuf>,
+    /// Read the password from the first line of standard input
+    #[arg(long)]
+    password_stdin: bool,
+}
+
+impl PasswordSource {
+    /// The password from the file or standard input, if one was named.
+    fn read(&self) -> Result<Option<String>, Failure> {
+        match &self.password_file {
+            Some(path) => {
+                let file = std::fs::File::open(path)
+                    .map_err(|e| Failure::Usage(format!("can't read {}: {e}", path.display())))?;
+                self.read_from(&mut BufReader::new(file))
+            }
+            None => self.read_from(&mut std::io::stdin().lock()),
+        }
+    }
+
+    /// The first line of `input`, when the password comes from a file or
+    /// standard input; `input` is standard input or the opened file.
+    pub fn read_from(&self, input: &mut dyn BufRead) -> Result<Option<String>, Failure> {
+        if self.password_file.is_none() && !self.password_stdin {
+            return Ok(None);
+        }
+        let mut line = String::new();
+        input
+            .read_line(&mut line)
+            .map_err(|e| Failure::Usage(format!("can't read the password: {e}")))?;
+        let line = line.strip_suffix('\n').unwrap_or(&line);
+        Ok(Some(line.strip_suffix('\r').unwrap_or(line).to_string()))
+    }
+}
+
+/// The password given on the command line, read from where `source` names,
+/// or asked for with `read_password`.
+fn new_password(
+    given: Option<String>,
+    source: &PasswordSource,
+    username: &str,
+    read_password: impl FnOnce(&str) -> Result<String, Failure>,
+) -> Result<String, Failure> {
+    match given.or(source.read()?) {
+        Some(password) => Ok(password),
+        None => read_password(username),
+    }
+}
+
 /// The command object `command` sends. `read_password` asks for a password
 /// left out of the command line, for the client it names.
 pub fn command(
@@ -134,13 +196,11 @@ pub fn command(
         Dynsec::CreateClient {
             username,
             password,
+            source,
             roles,
             groups,
         } => {
-            let password = match password {
-                Some(password) => password,
-                None => read_password(&username)?,
-            };
+            let password = new_password(password, &source, &username, read_password)?;
             // Without one the client can't log in until it gets one
             let password = (!password.is_empty()).then_some(password);
             let groups: Vec<Value> = groups
@@ -158,11 +218,12 @@ pub fn command(
             )
         }
         Dynsec::DeleteClient { username } => named("deleteClient", json!({ "username": username })),
-        Dynsec::SetClientPassword { username, password } => {
-            let password = match password {
-                Some(password) => password,
-                None => read_password(&username)?,
-            };
+        Dynsec::SetClientPassword {
+            username,
+            password,
+            source,
+        } => {
+            let password = new_password(password, &source, &username, read_password)?;
             if password.is_empty() {
                 return Err(Failure::Usage("the password can't be empty".to_string()));
             }
@@ -442,6 +503,64 @@ mod tests {
                 .into_iter()
                 .chain(wrong.iter().copied());
             assert!(Cli::try_parse_from(argv).is_err(), "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn passwords_come_from_a_file_or_standard_input() {
+        let file = std::env::temp_dir().join(format!("mercurioctl-pw-{}", std::process::id()));
+        std::fs::write(&file, "from-file\r\nignored\n").unwrap();
+        let path = file.to_str().unwrap();
+        let created = super::command(
+            parse(&["create-client", "alice", "--password-file", path]),
+            |_| panic!("asked for a password"),
+        )
+        .unwrap();
+        assert_eq!(created["password"], "from-file");
+        let changed = super::command(
+            parse(&["set-client-password", "alice", "--password-file", path]),
+            |_| panic!("asked for a password"),
+        )
+        .unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(changed["password"], "from-file");
+
+        let missing = super::command(
+            parse(&[
+                "set-client-password",
+                "alice",
+                "--password-file",
+                "/nonexistent/pw",
+            ]),
+            |_| panic!("asked for a password"),
+        );
+        assert!(matches!(missing, Err(Failure::Usage(_))), "{missing:?}");
+
+        let source = match parse(&["create-client", "alice", "--password-stdin"]) {
+            Dynsec::CreateClient { source, .. } => source,
+            other => panic!("parsed as {other:?}"),
+        };
+        let mut stdin = std::io::Cursor::new(b"typed\nrest".to_vec());
+        assert_eq!(
+            source.read_from(&mut stdin).unwrap().as_deref(),
+            Some("typed")
+        );
+
+        for both in [
+            &["create-client", "a", "--password", "x", "--password-stdin"][..],
+            &[
+                "create-client",
+                "a",
+                "--password-file",
+                "f",
+                "--password-stdin",
+            ],
+            &["set-client-password", "a", "x", "--password-file", "f"],
+        ] {
+            let argv = ["mercurioctl", "dynsec"]
+                .into_iter()
+                .chain(both.iter().copied());
+            assert!(Cli::try_parse_from(argv).is_err(), "{both:?}");
         }
     }
 

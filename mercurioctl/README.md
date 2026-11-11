@@ -40,7 +40,8 @@ mercurioctl client list --connected
 mercurioctl client disconnect sensor-7 --no-will
 mercurioctl ban add address 203.0.113.0/24 --duration 3600 --reason flooding
 
-# Retained messages under sensors/, and deleting them
+# Retained messages under sensors/, and deleting them; a filter with
+# wildcards asks first, and needs --yes in scripts
 mercurioctl retained list 'sensors/#'
 mercurioctl retained delete 'sensors/#'
 
@@ -59,7 +60,7 @@ mercurioctl -H broker.example.com -p 8883 --tls -u admin dynsec list-clients --j
 Connection options go before the command, and each can also be set with
 its `MERCURIOCTL_` variable, such as `MERCURIOCTL_HOST`. With none of
 them set, mercurioctl uses the admin socket. `-u` without `-P` asks for
-the password.
+the password on a terminal; `MERCURIOCTL_PASSWORD` keeps it out of `ps`.
 
 | Option | Meaning | Default |
 |---|---|---|
@@ -67,12 +68,17 @@ the password.
 | `--unix` | Broker over a Unix socket | |
 | `-u, --username`, `-P, --password` | Credentials | |
 | `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
+| `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
 | `--json` | Print the response data as JSON | tables |
 | `--timeout` | Seconds to wait for the answer (`MERCURIOCTL_TIMEOUT`) | `10` |
 
 Exit status: 0 on success, 1 when the broker refused the command, 2 when
 it couldn't be reached, refused the login or didn't answer in time, 3 on
 wrong usage.
+
+`mercurioctl completions <shell>` prints a completion script for bash,
+zsh, fish, elvish or PowerShell, such as
+`mercurioctl completions bash > ~/.local/share/bash-completion/completions/mercurioctl`.
 
 Run `mercurioctl --help`, or `--help` after any command, for the rest, or
 see the [mercurioctl guide](https://frenzox.github.io/mercurio/mercurioctl.html)

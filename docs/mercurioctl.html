@@ -67,6 +67,7 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <tr><td><code>--unix PATH</code></td><td><code>MERCURIOCTL_UNIX</code></td><td>Broker over a Unix socket</td><td></td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td><code>MERCURIOCTL_USERNAME</code>, <code>MERCURIOCTL_PASSWORD</code></td><td>Credentials</td><td></td></tr>
 <tr><td><code>--tls</code>, <code>--cafile</code>, <code>--insecure</code></td><td><code>MERCURIOCTL_TLS</code>, <code>MERCURIOCTL_CAFILE</code>, <code>MERCURIOCTL_INSECURE</code></td><td>TLS, its CA, or no verification; <code>--cafile</code> and <code>--insecure</code> imply <code>--tls</code></td><td></td></tr>
+<tr><td><code>--cert PATH</code>, <code>--key PATH</code></td><td><code>MERCURIOCTL_CERT</code>, <code>MERCURIOCTL_KEY</code></td><td>Client certificate and its private key, both PEM; each needs the other, and they imply <code>--tls</code></td><td></td></tr>
 <tr><td><code>-i, --client-id</code></td><td><code>MERCURIOCTL_CLIENT_ID</code></td><td>Client id</td><td>assigned by the broker</td></tr>
 <tr><td><code>--timeout SECONDS</code></td><td><code>MERCURIOCTL_TIMEOUT</code></td><td>Longest wait for the answer, connecting included</td><td><code>10</code></td></tr>
 <tr><td><code>--json</code></td><td></td><td>Print the answer's data as JSON</td><td>tables</td></tr>
@@ -74,7 +75,7 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <p><code>MERCURIOCTL_TLS</code> and <code>MERCURIOCTL_INSECURE</code> take <code>1</code>/<code>0</code>, <code>yes</code>/<code>no</code>, <code>on</code>/<code>off</code> or <code>true</code>/<code>false</code>. An empty variable counts as unset.</p>
 <ul>
 <li>Any connection option but <code>-i</code> turns the admin socket default off: <code>-u ops</code> alone connects to <code>localhost:1883</code>.</li>
-<li><code>-u</code> without <code>-P</code> asks for the password. A <code>-P</code> on the command line is visible to other users in <code>ps</code>.</li>
+<li><code>-u</code> without <code>-P</code> asks for the password when standard error is a terminal; elsewhere it logs in with the user name alone. A <code>-P</code> on the command line is visible to other users in <code>ps</code>, so scripts should set <code>MERCURIOCTL_PASSWORD</code> instead.</li>
 <li><code>--json</code> and <code>--timeout</code> can go anywhere on the line.</li>
 <li>Through the admin socket, a user who may not use it gets Permission denied: run mercurioctl with <code>sudo</code>, or join the group.</li>
 <li>Over the network, the user needs permission for each command and for its answers: see <a href="admin.html#remote">Over the network</a>.</li>
@@ -87,13 +88,13 @@ mercurioctl --unix /run/user/1000/mercurio/admin.sock broker info</pre>
 <tr><td><code>client list</code> <code>[--connected | --offline]</code> <code>[--prefix P]</code> <code>[--user U]</code> <code>[--address A]</code></td><td><code>listClients</code></td></tr>
 <tr><td><code>client show &lt;clientid&gt;</code></td><td><code>getClient</code></td></tr>
 <tr><td><code>client disconnect &lt;clientid&gt; [--no-will] [--reason-code C]</code></td><td><code>disconnectClient</code>; <code>C</code> in decimal or <code>0x..</code></td></tr>
-<tr><td><code>client delete-session &lt;clientid&gt; [--disconnect]</code></td><td><code>deleteSession</code></td></tr>
+<tr><td><code>client delete-session &lt;clientid&gt; [--disconnect] [--yes]</code></td><td><code>deleteSession</code>; asks for confirmation first, or needs <code>--yes</code> off a terminal</td></tr>
 <tr><td><code>ban add</code> <code>&lt;clientid|username|address&gt;</code> <code>&lt;value&gt;</code> <code>[--prefix]</code> <code>[--duration S]</code> <code>[--reason R]</code></td><td><code>addBan</code></td></tr>
 <tr><td><code>ban remove &lt;type&gt; &lt;value&gt; [--prefix]</code></td><td><code>removeBan</code></td></tr>
 <tr><td><code>ban list</code></td><td><code>listBans</code></td></tr>
 <tr><td><code>retained list [filter]</code></td><td><code>listRetained</code>, <code>#</code> by default</td></tr>
 <tr><td><code>retained show &lt;topic&gt;</code></td><td><code>getRetained</code></td></tr>
-<tr><td><code>retained delete &lt;filter&gt;</code></td><td><code>deleteRetained</code></td></tr>
+<tr><td><code>retained delete &lt;filter&gt; [--yes]</code></td><td><code>deleteRetained</code>; a filter with <code>+</code> or <code>#</code> asks for confirmation first, or needs <code>--yes</code> off a terminal</td></tr>
 <tr><td><code>subscription list [--prefix P]</code></td><td><code>listSubscriptions</code></td></tr>
 <tr><td><code>subscription subscribers &lt;filter&gt;</code></td><td><code>getSubscribers</code></td></tr>
 <tr><td><code>broker info</code></td><td><code>getBrokerInfo</code></td></tr>
@@ -128,6 +129,7 @@ mercurioctl dynsec create-client s1 --group sensors
 mercurioctl dynsec get-client s1</pre>
 <ul>
 <li><code>create-client</code> without <code>--password</code> asks for one twice. An empty one creates a client that can't log in until <code>set-client-password</code>.</li>
+<li>In scripts, <code>create-client</code> and <code>set-client-password</code> take the password from the first line of a file with <code>--password-file PATH</code>, or of standard input with <code>--password-stdin</code>, which keeps it out of <code>ps</code>: <code>pass show mqtt/s1 | mercurioctl dynsec set-client-password s1 --password-stdin</code>.</li>
 <li><code>add-role-acl</code> takes the ACL type, the topic, <code>allow</code> or <code>deny</code>, and an optional priority.</li>
 <li>mosquitto_ctrl's <code>modifyClient</code>, <code>modifyGroup</code> and <code>modifyRole</code> don't exist here; use the add, remove and set commands. Its <code>init</code> is <code>mercuriod dynsec-init</code>, which writes the file before the broker starts.</li>
 <li>When dynamic security isn't enabled, nothing answers: mercurioctl waits for <code>--timeout</code>, exits with status 2 and asks whether it is enabled.</li>
@@ -142,8 +144,14 @@ monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0  
 <li>A list longer than what was shown ends with a line such as <code>1-100 of 250; --offset 100 shows the next ones</code>.</li>
 <li><code>--json</code> prints the answer's <code>data</code> as the broker sends it, with the field names and Unix times of the <a href="admin.html#commands">command reference</a>, and nothing for commands without data.</li>
 <li><code>broker config</code> always prints JSON.</li>
+<li>With <code>--json</code>, a failure prints as one JSON object on standard error, <code>{"error": "no client `x`", "code": "notFound"}</code>, with the broker's error code, or <code>null</code> when there is none. The exit status stays the same. Mistakes on the command line itself, which clap reports before <code>--json</code> is read, stay plain text.</li>
 <li>A table cell holds one line, so <code>retained show</code> prints a payload's line breaks as spaces. <code>--json</code> keeps them: <code>mercurioctl retained show status/door --json | jq -r .payload</code>.</li>
 </ul>
+
+<h2 id="completions">Shell completions</h2>
+<p><code>mercurioctl completions &lt;shell&gt;</code> prints a completion script for <code>bash</code>, <code>zsh</code>, <code>fish</code>, <code>elvish</code> or <code>powershell</code>:</p>
+<pre>mercurioctl completions bash &gt; ~/.local/share/bash-completion/completions/mercurioctl
+mercurioctl completions zsh &gt; "${fpath[1]}/_mercurioctl"</pre>
 
 <h2 id="exit-status">Exit status</h2>
 <table>
@@ -151,7 +159,7 @@ monitor    -         true       127.0.0.1:41302  2026-11-10 20:39:05Z  1     0  
 <tr><td><code>0</code></td><td>Success</td></tr>
 <tr><td><code>1</code></td><td>The broker refused: the command failed, with its <code>code</code> in parentheses after the message, or access control refused the request or its answer topic. <code>broker reload</code> also exits 1 when any file failed to load, after printing the table.</td></tr>
 <tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, closed the connection, or didn't answer within <code>--timeout</code></td></tr>
-<tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or mismatched passwords</td></tr>
+<tr><td><code>3</code></td><td>Wrong usage, such as an unknown option, mismatched passwords, or a destructive command not confirmed</td></tr>
 </table>
 <p>Messages go to standard error, so scripts can read the output:</p>
 <pre><span class="comment"># Disconnect every client of a retired user</span>

@@ -1,6 +1,7 @@
 //! The command line.
 
 use clap::{builder::BoolishValueParser, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use mercurio_client::cli::ConnectArgs;
 
 use crate::dynsec::Dynsec;
@@ -54,7 +55,8 @@ pub fn command() -> clap::Command {
         ("tls", "MERCURIOCTL_TLS"),
         ("cafile", "MERCURIOCTL_CAFILE"),
         ("insecure", "MERCURIOCTL_INSECURE"),
-        ("password", "MERCURIOCTL_PASSWORD"),
+        ("cert", "MERCURIOCTL_CERT"),
+        ("key", "MERCURIOCTL_KEY"),
         ("timeout", "MERCURIOCTL_TIMEOUT"),
         #[cfg(unix)]
         ("unix", "MERCURIOCTL_UNIX"),
@@ -67,18 +69,13 @@ pub fn command() -> clap::Command {
         command = command.mut_arg(id, |arg| {
             let arg = arg.env(variable);
             match id {
-                // --help would show the value otherwise
-                "password" => arg.hide_env_values(true).help(
-                    "Password for authentication; other users can see it in `ps`, \
-                     so leave it out with -u to be asked",
-                ),
                 // 1, 0, yes, no, on and off, as well as true and false
                 "tls" | "insecure" => arg.value_parser(BoolishValueParser::new()),
                 _ => arg,
             }
         });
     }
-    command
+    ConnectArgs::password_variable(command, "MERCURIOCTL_PASSWORD")
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,6 +107,14 @@ pub enum Command {
     /// Dynamic security: clients, groups, roles and their ACLs
     #[command(subcommand)]
     Dynsec(Dynsec),
+    /// Print a completion script for a shell, as for
+    /// `mercurioctl completions bash > /etc/bash_completion.d/mercurioctl`
+    Completions { shell: Shell },
+}
+
+/// Writes the completion script for `shell` to `out`.
+pub fn completions(shell: Shell, out: &mut dyn std::io::Write) {
+    clap_complete::generate(shell, &mut command(), "mercurioctl", out);
 }
 
 #[derive(Subcommand, Debug)]
@@ -170,6 +175,9 @@ pub enum ClientCommand {
         /// Disconnect the client first if it is connected
         #[arg(long)]
         disconnect: bool,
+        /// Don't ask for confirmation; needed off a terminal
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -240,7 +248,38 @@ pub enum RetainedCommand {
     Show { topic: String },
     /// Delete the retained message of a topic, or of every topic a filter
     /// with wildcards matches
-    Delete { filter: String },
+    Delete {
+        filter: String,
+        /// Don't ask for confirmation of a filter with wildcards; needed off
+        /// a terminal
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+impl Command {
+    /// What to ask before running this command, for those that delete more
+    /// than one named thing or can't be undone; `None` when nothing needs
+    /// asking or `--yes` was given.
+    pub fn confirmation(&self) -> Option<String> {
+        match self {
+            Command::Retained(RetainedCommand::Delete { filter, yes: false })
+                if filter.contains(['#', '+']) =>
+            {
+                Some(format!(
+                    "Delete the retained message of every topic matching {filter}?"
+                ))
+            }
+            Command::Client(ClientCommand::DeleteSession {
+                clientid,
+                yes: false,
+                ..
+            }) => Some(format!(
+                "Delete the session of {clientid}, with its subscriptions and queued messages?"
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -289,7 +328,7 @@ fn parse_reason_code(value: &str) -> Result<u8, String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{command, parse_reason_code, Cli};
+    use super::{command, completions, parse_reason_code, Cli, Command};
 
     #[test]
     fn connection_options_name_their_variables() {
@@ -305,6 +344,8 @@ mod tests {
             "MERCURIOCTL_TLS",
             "MERCURIOCTL_CAFILE",
             "MERCURIOCTL_INSECURE",
+            "MERCURIOCTL_CERT",
+            "MERCURIOCTL_KEY",
             "MERCURIOCTL_TIMEOUT",
         ] {
             assert!(help.contains(variable), "{variable} missing from:\n{help}");
@@ -314,6 +355,28 @@ mod tests {
     #[test]
     fn arguments_are_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_cover_the_commands() {
+        for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+            let cli = Cli::try_parse_from(["mercurioctl", "completions", shell]).unwrap();
+            let Command::Completions { shell } = cli.command else {
+                panic!("expected completions");
+            };
+            let mut script = Vec::new();
+            completions(shell, &mut script);
+            let script = String::from_utf8(script).unwrap();
+            for word in [
+                "mercurioctl",
+                "dynsec",
+                "create-client",
+                "retained",
+                "timeout",
+            ] {
+                assert!(script.contains(word), "{word} missing for {shell}");
+            }
+        }
     }
 
     #[test]

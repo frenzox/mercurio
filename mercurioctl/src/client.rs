@@ -31,6 +31,16 @@ impl Failure {
             Failure::Usage(_) => 3,
         }
     }
+
+    /// The failure as `--json` prints it: the message and the broker's
+    /// error code, null when there is none.
+    pub fn to_json(&self) -> Value {
+        let (code, message) = match self {
+            Failure::Rejected { code, message } => (code.as_deref(), message),
+            Failure::Connection(message) | Failure::Usage(message) => (None, message),
+        };
+        json!({ "error": message, "code": code })
+    }
 }
 
 impl fmt::Display for Failure {
@@ -66,7 +76,8 @@ pub fn resolve(mut args: ConnectArgs, admin_socket: &Path) -> ConnectArgs {
             && args.password.is_none()
             && !args.tls
             && args.cafile.is_none()
-            && !args.insecure;
+            && !args.insecure
+            && args.cert.is_none();
         if none_given && admin_socket.exists() {
             args.unix = Some(admin_socket.to_path_buf());
         }
@@ -274,6 +285,7 @@ mod tests {
             &["--tls"],
             &["--cafile", "ca.pem"],
             &["--insecure"],
+            &["--cert", "c.pem", "--key", "c.key"],
         ] {
             assert_eq!(resolve(connect(options), &socket).unix, None, "{options:?}");
         }
@@ -333,6 +345,14 @@ mod tests {
             message: "no client `x`".to_string(),
         };
         assert_eq!(rejected.to_string(), "no client `x` (notFound)");
+        assert_eq!(
+            rejected.to_json(),
+            json!({ "error": "no client `x`", "code": "notFound" })
+        );
+        assert_eq!(
+            Failure::Usage("no".to_string()).to_json(),
+            json!({ "error": "no", "code": null })
+        );
         assert_eq!(rejected.exit_code(), 1);
         assert_eq!(Failure::Connection("refused".to_string()).exit_code(), 2);
         assert_eq!(Failure::Usage("no".to_string()).exit_code(), 3);
