@@ -1,5 +1,6 @@
 use super::retained::RETAINED_PAGE;
 use super::*;
+use crate::error::Error;
 use mercurio_core::protocol::ProtocolVersion;
 use mercurio_packets::{
     connect::{self, ConnectPayload, ConnectProperties},
