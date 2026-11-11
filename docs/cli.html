@@ -134,14 +134,14 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>-H, --host</code></td><td>Broker host name</td><td><code>localhost</code></td></tr>
 <tr><td><code>-p, --port</code></td><td>Broker port</td><td><code>1883</code></td></tr>
 <tr><td><code>--unix PATH</code></td><td>Connect through this Unix socket instead of TCP; not with <code>-H</code>, <code>-p</code> or the TLS options</td><td></td></tr>
-<tr><td><code>-i, --client-id</code></td><td>Client id. Left out, it is empty and the broker assigns one; MQTT 3.1 takes no empty id, nor 3.1.1 with <code>-c</code>, so there recado sends a random <code>recado-</code> id</td><td>assigned by the broker</td></tr>
+<tr><td><code>-i, --client-id</code></td><td>Client id. Left out, it is empty and the broker assigns one; MQTT 3.1 takes no empty id, so there recado sends a random <code>recado-</code> id</td><td>assigned by the broker</td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials. The password can also come from <code>RECADO_PASSWORD</code>, which other users can't see in <code>ps</code>; <code>-u</code> alone asks for it when standard error is a terminal</td><td></td></tr>
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
-<tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
+<tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting. Needs <code>-i</code>, as with mosquitto: a session kept under an id nobody knows could never be resumed</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
 <tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code>; also <code>3.1.1</code>, <code>3.1</code> and mosquitto's <code>mqttv5</code>, <code>mqttv311</code>, <code>mqttv31</code>. Anything else is an error</td><td><code>5</code></td></tr>
-<tr><td><code>--tls</code></td><td>Connect with TLS</td><td></td></tr>
-<tr><td><code>--cafile</code></td><td>CA certificate to verify the broker with; implies <code>--tls</code></td><td>system roots</td></tr>
+<tr><td><code>--tls</code></td><td>Connect with TLS, verifying the broker with the operating system's certificate store (on Linux the system CA bundle, such as /etc/ssl/certs; the Keychain on macOS; the certificate store on Windows), or, when that holds no usable certificate, the Mozilla roots bundled with the client</td><td></td></tr>
+<tr><td><code>--cafile</code></td><td>CA certificates (PEM) to verify the broker with, the only ones then trusted; implies <code>--tls</code></td><td>the operating system's store</td></tr>
 <tr><td><code>--insecure</code></td><td>Skip certificate verification, for testing only; implies <code>--tls</code></td><td></td></tr>
 <tr><td><code>--cert PATH</code>, <code>--key PATH</code></td><td>Client certificate and its private key, both PEM, for brokers that authenticate clients by certificate; each needs the other, and they imply <code>--tls</code></td><td></td></tr>
 <tr><td><code>-v, --verbose</code></td><td>Verbose output</td><td></td></tr>
@@ -169,7 +169,7 @@ recado completions zsh &gt; "${fpath[1]}/_recado"</pre>
 <tr><th>Status</th><th>Means</th></tr>
 <tr><td><code>0</code></td><td>Success, or <code>sub</code> stopped by Ctrl-C, SIGTERM or its reader going away. On Ctrl-C and SIGTERM it disconnects cleanly, so the broker drops its will</td></tr>
 <tr><td><code>1</code></td><td>The broker refused a subscription, or a QoS 1 or 2 message; the message names the filter and the reason</td></tr>
-<tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, or closed the connection; with <code>--reconnect</code>, when the client gives up</td></tr>
+<tr><td><code>2</code></td><td>The broker couldn't be reached, refused the login, or closed the connection; with <code>--reconnect</code>, when the broker refuses the reconnection for good, as for bad credentials or a ban, and the message says why</td></tr>
 <tr><td><code>3</code></td><td>Wrong usage, such as an unknown option or a QoS above 2</td></tr>
 <tr><td><code>4</code></td><td><code>sub -W</code> ran out of time, such as before <code>-C</code>'s messages all arrived</td></tr>
 </table>

@@ -9,9 +9,8 @@ use std::{
 
 use bytes::Bytes;
 use mercurio_client::{
-    Authenticator, ClientError, ConnectOptions, DisconnectReason, Event, MqttClient,
+    Authenticator, ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ReasonCode,
 };
-use mercurio_core::reason::ReasonCode;
 use mercurio_server::{
     plugin::{ready, AuthExchange, AuthResult, BoxFuture, ClientInfo, Plugin},
     server::ServerConfig,

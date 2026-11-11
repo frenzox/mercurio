@@ -69,15 +69,16 @@ Connection options, for both commands:
 | `-H, --host` | Broker host | `localhost` |
 | `-p, --port` | Broker port | `1883` |
 | `--unix` | Unix socket, instead of host and port | |
-| `-i, --client-id` | Client id; for MQTT 3.1, and 3.1.1 with `-c`, recado makes up a `recado-` id | assigned by the broker |
+| `-i, --client-id` | Client id; for MQTT 3.1, which takes no empty id, recado makes up a `recado-` id. `-c` needs it | assigned by the broker |
 | `-u, --username`, `-P, --password` | Credentials; the password also comes from `RECADO_PASSWORD`, and `-u` alone asks for it on a terminal | |
 | `-V, --protocol-version` | `5`, `311` or `31`, or mosquitto's `mqttv5`, `mqttv311`, `mqttv31` | `5` |
-| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
+| `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a
 message, 2 when it couldn't be reached, refused the login or closed the
-connection, 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
+connection (with `--reconnect`, when it refuses the reconnection for good,
+saying why), 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
 go to standard error.
 
 `recado completions <shell>` prints a completion script for bash, zsh,

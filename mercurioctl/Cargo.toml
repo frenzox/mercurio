@@ -17,7 +17,6 @@ path = "src/main.rs"
 [dependencies]
 mercurio-client = { path = "../mercurio-client", version = "0.4.1", features = ["clap"] }
 
-bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 rpassword = "7"

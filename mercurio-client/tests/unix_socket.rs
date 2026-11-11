@@ -44,5 +44,15 @@ async fn clients_connect_through_unix_sockets() {
 async fn a_missing_socket_fails_to_connect() {
     let path = std::env::temp_dir().join("mercurio-client-no-such.sock");
     let result = MqttClient::connect(ConnectOptions::unix(path)).await;
-    assert!(matches!(result, Err(ClientError::ConnectionFailed(_))));
+    let Err(error @ ClientError::ConnectionFailed(_)) = result else {
+        panic!("connecting to a missing socket gave {:?}", result.err());
+    };
+    // The I/O error stays available to tell causes apart
+    let ClientError::ConnectionFailed(io) = &error else {
+        unreachable!()
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+    let source = std::error::Error::source(&error).expect("the I/O error is the source");
+    assert!(source.downcast_ref::<std::io::Error>().is_some());
+    assert!(error.is_transient(), "the socket may appear later");
 }

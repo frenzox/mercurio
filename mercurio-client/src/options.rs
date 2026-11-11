@@ -1,7 +1,9 @@
 use std::fmt;
+use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 #[cfg(unix)]
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -80,7 +82,20 @@ pub(crate) fn check_length(
 }
 
 /// MQTT 5 properties of an application message. MQTT 3.x ignores them.
+///
+/// Start from `MessageProperties::default()` and set what the message has:
+///
+/// ```
+/// use mercurio_client::MessageProperties;
+///
+/// let properties = MessageProperties::default()
+///     .content_type("application/json")
+///     .response_topic("replies/me")
+///     .user_property("source", "sensor-1");
+/// assert_eq!(properties.content_type.as_deref(), Some("application/json"));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageProperties {
     /// The payload is UTF-8 text
     pub payload_is_utf8: bool,
@@ -97,6 +112,42 @@ pub struct MessageProperties {
 }
 
 impl MessageProperties {
+    /// Marks the payload as UTF-8 text, or not.
+    pub fn payload_is_utf8(mut self, utf8: bool) -> Self {
+        self.payload_is_utf8 = utf8;
+        self
+    }
+
+    /// Seconds the broker keeps the message for subscribers yet to get it.
+    pub fn message_expiry(mut self, seconds: u32) -> Self {
+        self.message_expiry = Some(seconds);
+        self
+    }
+
+    /// Describes the payload, such as a MIME type.
+    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
+
+    /// Where a reply to this message should be published.
+    pub fn response_topic(mut self, topic: impl Into<String>) -> Self {
+        self.response_topic = Some(topic.into());
+        self
+    }
+
+    /// Data that ties a reply to its request.
+    pub fn correlation_data(mut self, data: impl Into<Bytes>) -> Self {
+        self.correlation_data = Some(data.into());
+        self
+    }
+
+    /// Adds a user property after those already set; a name may repeat.
+    pub fn user_property(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.user_properties.push((name.into(), value.into()));
+        self
+    }
+
     pub(crate) fn to_publish(&self) -> Option<PublishProperties> {
         if *self == MessageProperties::default() {
             return None;
@@ -152,8 +203,9 @@ impl MessageProperties {
     }
 }
 
-/// Will message configuration.
+/// Will message configuration, built with [`Will::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Will {
     pub topic: String,
     pub payload: Bytes,
@@ -261,9 +313,12 @@ impl fmt::Debug for SharedAuthenticator {
     }
 }
 
+/// The stream to the broker a connector is opening.
+pub(crate) type Connecting = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Stream>>> + Send>>;
+
 /// Opens the stream to the broker in place of TCP and TLS.
 #[derive(Clone)]
-pub(crate) struct Connector(pub Arc<dyn Fn() -> std::io::Result<Box<dyn Stream>> + Send + Sync>);
+pub(crate) struct Connector(pub Arc<dyn Fn() -> Connecting + Send + Sync>);
 
 impl fmt::Debug for Connector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -273,18 +328,32 @@ impl fmt::Debug for Connector {
 
 /// TLS configuration for client connections.
 #[derive(Debug, Clone, Default)]
-pub struct TlsOptions {
-    /// Enable TLS for the connection.
+pub(crate) struct TlsOptions {
     pub enabled: bool,
-    /// Path to custom CA certificate file (PEM format).
-    /// If not set, system root certificates are used.
+    /// The only CA trusted, in place of the operating system's store
     pub ca_path: Option<String>,
-    /// Skip server certificate verification (insecure, for testing only).
     pub danger_skip_verify: bool,
     /// Client certificate chain (PEM) to authenticate with.
     pub cert_path: Option<String>,
     /// Private key (PEM) of the client certificate.
     pub key_path: Option<String>,
+    /// Protocols offered in ALPN
+    pub alpn: Vec<Vec<u8>>,
+    /// The caller's own rustls configuration, replacing all of the above
+    #[cfg(feature = "tls")]
+    pub config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl TlsOptions {
+    /// Whether settings the caller's own configuration replaces were made.
+    #[cfg(feature = "tls")]
+    fn has_settings(&self) -> bool {
+        self.ca_path.is_some()
+            || self.cert_path.is_some()
+            || self.key_path.is_some()
+            || self.danger_skip_verify
+            || !self.alpn.is_empty()
+    }
 }
 
 /// Options for connecting to an MQTT broker.
@@ -300,7 +369,7 @@ pub struct ConnectOptions {
     pub(crate) session_expiry: u32,
     pub(crate) will: Option<Will>,
     pub(crate) protocol_version: ProtocolVersion,
-    pub(crate) connect_timeout_secs: u64,
+    pub(crate) connect_timeout: Duration,
     pub(crate) tls: TlsOptions,
     pub(crate) reconnect_delay: Option<Duration>,
     pub(crate) reconnect_max: Option<Duration>,
@@ -313,6 +382,9 @@ pub struct ConnectOptions {
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
     pub(crate) connector: Option<Connector>,
+    /// Speak MQTT over a WebSocket at this path
+    #[cfg(feature = "websocket")]
+    pub(crate) websocket_path: Option<String>,
     /// Connect through this Unix socket instead of TCP
     #[cfg(unix)]
     pub(crate) unix_path: Option<PathBuf>,
@@ -332,7 +404,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("session_expiry", &self.session_expiry)
             .field("will", &self.will)
             .field("protocol_version", &self.protocol_version)
-            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("connect_timeout", &self.connect_timeout)
             .field("tls", &self.tls)
             .field("reconnect_delay", &self.reconnect_delay)
             .field("reconnect_max", &self.reconnect_max)
@@ -351,6 +423,8 @@ impl std::fmt::Debug for ConnectOptions {
             )
             .field("authenticator", &self.authenticator)
             .field("connector", &self.connector);
+        #[cfg(feature = "websocket")]
+        debug.field("websocket_path", &self.websocket_path);
         #[cfg(unix)]
         debug.field("unix_path", &self.unix_path);
         debug.finish()
@@ -361,11 +435,40 @@ impl ConnectOptions {
     pub(crate) fn check(&self) -> crate::error::Result<()> {
         #[cfg(unix)]
         if self.unix_path.is_some() && self.tls.enabled {
-            return Err(ClientError::Tls(
+            return Err(ClientError::tls(
                 "TLS isn't supported over a Unix socket; a CA path, a client \
-                 certificate or skipping verification turns it on"
-                    .to_string(),
+                 certificate or skipping verification turns it on",
+                None,
             ));
+        }
+        #[cfg(feature = "tls")]
+        if self.tls.config.is_some() && self.tls.has_settings() {
+            return Err(ClientError::InvalidArgument(
+                "tls_config replaces the CA path, client certificate, ALPN and \
+                 skipping verification; set them in the configuration instead"
+                    .into(),
+            ));
+        }
+        #[cfg(not(feature = "tls"))]
+        if self.tls.enabled {
+            return Err(ClientError::tls(
+                "TLS needs the client built with its `tls` feature",
+                None,
+            ));
+        }
+        #[cfg(feature = "websocket")]
+        if let Some(path) = &self.websocket_path {
+            if !path.starts_with('/') {
+                return Err(ClientError::InvalidArgument(format!(
+                    "WebSocket path `{path}` doesn't start with /"
+                )));
+            }
+            #[cfg(unix)]
+            if self.unix_path.is_some() {
+                return Err(ClientError::InvalidArgument(
+                    "WebSocket isn't supported over a Unix socket".into(),
+                ));
+            }
         }
         if let Some(client_id) = &self.client_id {
             check_length("client id", client_id)?;
@@ -395,7 +498,7 @@ impl ConnectOptions {
             session_expiry: 0,
             will: None,
             protocol_version: ProtocolVersion::V5,
-            connect_timeout_secs: 30,
+            connect_timeout: Duration::from_secs(30),
             tls: TlsOptions::default(),
             reconnect_delay: None,
             reconnect_max: None,
@@ -408,6 +511,8 @@ impl ConnectOptions {
             request_problem_information: true,
             authenticator: None,
             connector: None,
+            #[cfg(feature = "websocket")]
+            websocket_path: None,
             #[cfg(unix)]
             unix_path: None,
         }
@@ -424,16 +529,19 @@ impl ConnectOptions {
         }
     }
 
-    /// Enable TLS for the connection. Setting a CA path, a client
-    /// certificate or skipping verification enables it too; the last call
-    /// wins.
+    /// Enable TLS for the connection. The broker is verified with the
+    /// operating system's certificate store, or with the Mozilla roots
+    /// bundled with the client if that store holds no usable certificate,
+    /// unless [`ca_path`](Self::ca_path) names the CA to trust. Setting a
+    /// CA path, a client certificate, ALPN protocols or skipping
+    /// verification enables it too; the last call wins.
     pub fn tls(mut self, enabled: bool) -> Self {
         self.tls.enabled = enabled;
         self
     }
 
-    /// Set custom CA certificate file path for TLS verification, and
-    /// enable TLS.
+    /// Trust only the CA certificates in this PEM file, in place of the
+    /// operating system's store, and enable TLS.
     pub fn ca_path(mut self, path: impl Into<String>) -> Self {
         self.tls.enabled = true;
         self.tls.ca_path = Some(path.into());
@@ -458,6 +566,31 @@ impl ConnectOptions {
     pub fn danger_skip_tls_verify(mut self, skip: bool) -> Self {
         self.tls.enabled |= skip;
         self.tls.danger_skip_verify = skip;
+        self
+    }
+
+    /// Offer these protocols in the TLS handshake's ALPN, as brokers that
+    /// share port 443 with other services may need, and enable TLS.
+    pub fn alpn_protocols<I, P>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<Vec<u8>>,
+    {
+        self.tls.enabled = true;
+        self.tls.alpn = protocols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Use this rustls configuration for TLS, and enable TLS: for full
+    /// control over trust, client certificates held in memory, ALPN or
+    /// certificate verification. It replaces the CA path, the client
+    /// certificate, ALPN and skipping verification, and connecting with
+    /// any of them set as well fails as contradictory. The broker's host
+    /// name is still the server name checked.
+    #[cfg(feature = "tls")]
+    pub fn tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls.enabled = true;
+        self.tls.config = Some(config);
         self
     }
 
@@ -608,16 +741,44 @@ impl ConnectOptions {
         self
     }
 
-    /// Open the stream to the broker with `connect`, on every connection
-    /// and reconnection, instead of connecting to the host and port.
-    pub fn connector<S, F>(mut self, connect: F) -> Self
+    /// Open the stream to the broker with the future `connect` returns, on
+    /// every connection and reconnection, instead of connecting to the
+    /// host and port: for transports of your own, such as a proxy or an
+    /// in-process broker. The future has the connect timeout to finish, and
+    /// an error it returns fails the attempt as
+    /// [`ConnectionFailed`](ClientError::ConnectionFailed). The client's
+    /// TLS settings don't apply to the stream.
+    ///
+    /// ```no_run
+    /// use mercurio_client::ConnectOptions;
+    ///
+    /// let options = ConnectOptions::new("broker", 1883)
+    ///     .connector(|| tokio::net::TcpStream::connect("10.0.0.7:1883"));
+    /// ```
+    pub fn connector<S, F, Fut>(mut self, connect: F) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-        F: Fn() -> std::io::Result<S> + Send + Sync + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<S>> + Send + 'static,
     {
         self.connector = Some(Connector(Arc::new(move || {
-            connect().map(|stream| Box::new(stream) as Box<dyn Stream>)
+            let connecting = connect();
+            Box::pin(async move {
+                connecting
+                    .await
+                    .map(|stream| Box::new(stream) as Box<dyn Stream>)
+            })
         })));
+        self
+    }
+
+    /// Speak MQTT over a WebSocket at `path`, such as `/mqtt`, on the host
+    /// and port: `ws://`, or `wss://` with TLS on, verified with the same
+    /// TLS settings. The client asks for the `mqtt` subprotocol and refuses
+    /// a broker that doesn't select it. Needs the `websocket` feature.
+    #[cfg(feature = "websocket")]
+    pub fn websocket(mut self, path: impl Into<String>) -> Self {
+        self.websocket_path = Some(path.into());
         self
     }
 
@@ -638,9 +799,10 @@ impl ConnectOptions {
         })
     }
 
-    /// Set the connection timeout in seconds.
-    pub fn connect_timeout(mut self, seconds: u64) -> Self {
-        self.connect_timeout_secs = seconds;
+    /// Longest the connection may take to open, TLS handshake and CONNECT
+    /// included, 30 seconds unless set.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 }
@@ -669,6 +831,14 @@ mod tests {
         assert!(spread.len() > 1, "no jitter");
         // A maximum below the minimum gives way
         assert_eq!(Backoff::new(ms(100), ms(10)).next_delay(), ms(100));
+    }
+
+    #[test]
+    fn test_connect_timeout_takes_a_duration_as_the_other_timeouts() {
+        let options = ConnectOptions::new("localhost", 1883);
+        assert_eq!(options.connect_timeout, Duration::from_secs(30));
+        let options = options.connect_timeout(Duration::from_millis(1500));
+        assert_eq!(options.connect_timeout, Duration::from_millis(1500));
     }
 
     #[test]
@@ -707,16 +877,70 @@ mod tests {
         assert!(options().tls(false).ca_path("ca.pem").tls.enabled);
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_a_tls_configuration_of_its_own_excludes_the_other_tls_settings() {
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        );
+        let options = || ConnectOptions::new("broker", 8883).tls_config(config.clone());
+        assert!(options().tls.enabled);
+        assert!(options().check().is_ok());
+        for contradictory in [
+            options().ca_path("ca.pem"),
+            options().client_cert("c.pem", "k.pem"),
+            options().danger_skip_tls_verify(true),
+            options().alpn_protocols(["mqtt"]),
+        ] {
+            let Err(error @ ClientError::InvalidArgument(_)) = contradictory.check() else {
+                panic!("contradictory TLS settings were accepted");
+            };
+            assert!(error.to_string().contains("tls_config"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_alpn_protocols_turn_tls_on() {
+        let options = ConnectOptions::new("broker", 443).alpn_protocols(["x-amzn-mqtt-ca"]);
+        assert!(options.tls.enabled);
+        assert_eq!(options.tls.alpn, [b"x-amzn-mqtt-ca".to_vec()]);
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn test_tls_needs_the_tls_feature() {
+        let options = || ConnectOptions::new("broker", 8883);
+        for options in [
+            options().tls(true),
+            options().ca_path("ca.pem"),
+            options().client_cert("c.pem", "k.pem"),
+            options().danger_skip_tls_verify(true),
+        ] {
+            let Err(error @ ClientError::Tls { .. }) = options.check() else {
+                panic!("TLS accepted without the tls feature");
+            };
+            assert!(error.to_string().contains("`tls` feature"), "{error}");
+            assert!(!error.is_transient());
+        }
+        assert!(options().check().is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_tls_is_refused_over_unix_sockets() {
         let options = ConnectOptions::unix("/run/mercurio/admin.sock").tls(true);
-        assert!(matches!(options.check(), Err(ClientError::Tls(_))));
+        assert!(matches!(options.check(), Err(ClientError::Tls { .. })));
         let options = ConnectOptions::unix("/run/mercurio/admin.sock").ca_path("ca.pem");
-        let Err(ClientError::Tls(message)) = options.check() else {
+        let Err(error @ ClientError::Tls { .. }) = options.check() else {
             panic!("a CA path over a Unix socket was accepted");
         };
-        assert!(message.contains("CA"), "{message}");
+        assert!(error.to_string().contains("CA"), "{error}");
         assert!(ConnectOptions::unix("/run/mercurio/admin.sock")
             .check()
             .is_ok());

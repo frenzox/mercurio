@@ -11,6 +11,7 @@ use crate::options::MessageProperties;
 #[non_exhaustive]
 pub enum Event {
     /// A message was received on a subscribed topic.
+    #[non_exhaustive]
     Message {
         topic: String,
         payload: Bytes,
@@ -32,6 +33,7 @@ pub enum Event {
 
     /// The client reconnected after losing the connection. Without
     /// `session_present` the broker forgot the subscriptions.
+    #[non_exhaustive]
     Reconnected { session_present: bool },
 
     /// Reconnecting failed for good, as when the broker refused the
@@ -39,6 +41,7 @@ pub enum Event {
     /// `None`.
     ///
     /// [`MqttClient::recv`]: crate::MqttClient::recv
+    #[non_exhaustive]
     Stopped { error: Arc<ClientError> },
 }
 
@@ -59,6 +62,7 @@ pub enum DisconnectReason {
     ClientInitiated,
 
     /// The broker sent DISCONNECT, saying why.
+    #[non_exhaustive]
     ServerInitiated {
         reason: ReasonCode,
         /// A human-readable explanation, when the broker sent one
@@ -80,8 +84,43 @@ pub enum DisconnectReason {
     ProtocolError(String),
 }
 
+/// What the broker settled for a connection in its CONNACK, with each
+/// value the broker left out taking its MQTT default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnAckInfo {
+    /// The broker resumed a session it kept for this client id
+    pub session_present: bool,
+    /// Keep-alive in effect, in seconds: the broker's Server Keep Alive
+    /// when it sent one, the requested one otherwise
+    pub keep_alive: u16,
+    /// Highest QoS the broker accepts in PUBLISH
+    pub maximum_qos: QoS,
+    /// Whether the broker accepts retained messages
+    pub retain_available: bool,
+    /// QoS 1 and 2 messages the broker takes from this client at once
+    pub receive_maximum: u16,
+    /// Largest packet the broker accepts, if it set a limit
+    pub maximum_packet_size: Option<u32>,
+    /// Highest topic alias the broker accepts from this client; 0 for none
+    pub topic_alias_maximum: u16,
+    /// Seconds the broker keeps the session after the connection closes:
+    /// its own value when it overrode the requested one
+    pub session_expiry: u32,
+    /// The answer to `request_response_information`, often a topic prefix
+    /// for response topics
+    pub response_information: Option<String>,
+    /// Whether subscriptions may use wildcards
+    pub wildcard_subscriptions: bool,
+    /// Whether shared subscriptions are available
+    pub shared_subscriptions: bool,
+    /// Whether subscriptions may carry identifiers
+    pub subscription_identifiers: bool,
+}
+
 /// Result of a subscription request.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SubscribeResult {
     pub topic: String,
     /// The QoS the broker granted, which may be lower than requested
@@ -93,6 +132,7 @@ pub struct SubscribeResult {
 
 /// Result of unsubscribing from one topic filter.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UnsubscribeResult {
     pub topic: String,
     pub success: bool,

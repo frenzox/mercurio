@@ -44,14 +44,13 @@ async fn message_properties_and_subscription_ids_reach_the_subscriber() {
         .await
         .unwrap();
 
-    let properties = MessageProperties {
-        payload_is_utf8: true,
-        message_expiry: Some(60),
-        content_type: Some("text/plain".into()),
-        response_topic: Some("reply".into()),
-        correlation_data: Some(Bytes::from_static(b"42")),
-        user_properties: vec![("k".into(), "v".into())],
-    };
+    let properties = MessageProperties::default()
+        .payload_is_utf8(true)
+        .message_expiry(60)
+        .content_type("text/plain")
+        .response_topic("reply")
+        .correlation_data(Bytes::from_static(b"42"))
+        .user_property("k", "v");
     let publisher = MqttClient::connect(options(addr, "pub")).await.unwrap();
     publisher
         .publish_with_properties("req", "hi", QoS::AtLeastOnce, false, properties.clone())
@@ -69,13 +68,9 @@ async fn message_properties_and_subscription_ids_reach_the_subscriber() {
     assert_eq!(subscription_ids, [7]);
     // The broker counts the expiry down while the message waits
     assert!(received.message_expiry.is_some_and(|e| e <= 60));
-    assert_eq!(
-        MessageProperties {
-            message_expiry: Some(60),
-            ..received
-        },
-        properties
-    );
+    let mut expected = received.clone();
+    expected.message_expiry = Some(60);
+    assert_eq!(expected, properties);
 }
 
 #[tokio::test]
@@ -135,10 +130,7 @@ async fn will_delay_and_properties_are_sent() {
 
     let will = Will::new("w", "bye")
         .delay(5)
-        .properties(MessageProperties {
-            content_type: Some("text/plain".into()),
-            ..Default::default()
-        });
+        .properties(MessageProperties::default().content_type("text/plain"));
     let _client = MqttClient::connect(
         ConnectOptions::new("127.0.0.1", port)
             .client_id("c")

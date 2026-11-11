@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use mercurio_core::topic::{validate_publish_topic, validate_subscribe_filter};
 use mercurio_packets::auth::{AuthPacket, AuthProperties};
 use mercurio_packets::connack::ConnAckProperties;
 use mercurio_packets::connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties};
-use mercurio_packets::disconnect::DisconnectPacket;
+use mercurio_packets::disconnect::{DisconnectPacket, DisconnectProperties};
 use mercurio_packets::pingreq::PingReqPacket;
 use mercurio_packets::puback::PubAckPacket;
 use mercurio_packets::pubcomp::PubCompPacket;
@@ -36,13 +36,14 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
-use crate::connection::Connection;
-use crate::error::{ClientError, Result};
-use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
+use crate::connection::{Connection, Stream};
+use crate::error::{transient_refusal, ClientError, Result};
+use crate::event::{
+    AckToken, ConnAckInfo, DisconnectReason, Event, SubscribeResult, UnsubscribeResult,
+};
 use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
 };
-use crate::tls::build_tls_connector;
 
 /// Command sent to the client event loop.
 enum Command {
@@ -57,6 +58,7 @@ enum Command {
         response: oneshot::Sender<Result<Vec<UnsubscribeResult>>>,
     },
     Disconnect {
+        packet: DisconnectPacket,
         response: oneshot::Sender<Result<()>>,
     },
     Reauthenticate {
@@ -73,9 +75,13 @@ enum Command {
 pub struct MqttClient {
     command_tx: mpsc::Sender<Command>,
     event_rx: Mutex<mpsc::Receiver<Event>>,
-    #[allow(dead_code)]
     client_id: String,
-    response_information: Option<String>,
+    /// What the latest CONNACK settled, replaced on reconnecting
+    connack: Arc<RwLock<ConnAckInfo>>,
+    /// MQTT 5, whose DISCONNECT carries a reason and properties
+    reports_reasons: bool,
+    /// The session expiry CONNECT asked for
+    session_expiry: u32,
 }
 
 impl MqttClient {
@@ -86,43 +92,56 @@ impl MqttClient {
         // Reconnecting must present the same identity to find the session
         options.client_id = Some(session.client_id.clone());
         let client_id = session.client_id.clone();
-        let response_information = session.response_information.clone();
+        let connack = Arc::new(RwLock::new(session.connack.clone()));
+        let reports_reasons = options.protocol_version.supports_reason_codes();
+        let session_expiry = options.session_expiry;
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
         tokio::spawn(Self::event_loop(
-            connection, session, command_rx, event_tx, options,
+            connection,
+            session,
+            command_rx,
+            event_tx,
+            options,
+            Arc::clone(&connack),
         ));
 
         Ok(MqttClient {
             command_tx,
             event_rx: Mutex::new(event_rx),
             client_id,
-            response_information,
+            connack,
+            reports_reasons,
+            session_expiry,
         })
     }
 
     /// Opens the transport and performs the CONNECT handshake.
     async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
+        let mut connection = Connection::new(Self::open_stream(options).await?, options);
+        let session = Self::perform_connect(&mut connection, options).await?;
+        Ok((connection, session))
+    }
+
+    /// Opens the byte stream to the broker, TLS handshake included.
+    async fn open_stream(options: &ConnectOptions) -> Result<Box<dyn Stream>> {
+        let connect_timeout = options.connect_timeout;
         if let Some(connector) = &options.connector {
-            let stream =
-                (connector.0)().map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(stream, options);
-            let session = Self::perform_connect(&mut connection, options).await?;
-            return Ok((connection, session));
+            return timeout(connect_timeout, (connector.0)())
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(ClientError::ConnectionFailed);
         }
 
-        let connect_timeout = Duration::from_secs(options.connect_timeout_secs);
         #[cfg(unix)]
         if let Some(path) = &options.unix_path {
             info!("Connecting to MQTT broker at {}", path.display());
             let stream = timeout(connect_timeout, tokio::net::UnixStream::connect(path))
                 .await
                 .map_err(|_| ClientError::Timeout)?
-                .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
-            let mut connection = Connection::new(stream, options);
-            let session = Self::perform_connect(&mut connection, options).await?;
-            return Ok((connection, session));
+                .map_err(ClientError::ConnectionFailed)?;
+            return Ok(Box::new(stream));
         }
 
         let addr = format!("{}:{}", options.host, options.port);
@@ -131,24 +150,25 @@ impl MqttClient {
         let stream = timeout(connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+            .map_err(ClientError::ConnectionFailed)?;
         // Each packet is written whole, so Nagle would only delay it
         let _ = stream.set_nodelay(true);
 
-        let mut connection = if options.tls.enabled {
-            info!("Establishing TLS connection");
-            let (connector, server_name) = build_tls_connector(&options.tls, &options.host)?;
-            let tls_stream = timeout(connect_timeout, connector.connect(server_name, stream))
-                .await
-                .map_err(|_| ClientError::Timeout)?
-                .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
-            Connection::new(tls_stream, options)
+        #[cfg(feature = "tls")]
+        let stream: Box<dyn Stream> = if options.tls.enabled {
+            Box::new(crate::tls::handshake(options, stream).await?)
         } else {
-            Connection::new(stream, options)
+            Box::new(stream)
         };
-
-        let session = Self::perform_connect(&mut connection, options).await?;
-        Ok((connection, session))
+        #[cfg(not(feature = "tls"))]
+        let stream: Box<dyn Stream> = Box::new(stream);
+        #[cfg(feature = "websocket")]
+        if let Some(path) = &options.websocket_path {
+            return Ok(Box::new(
+                crate::websocket::handshake(options, stream, path).await?,
+            ));
+        }
+        Ok(stream)
     }
 
     /// Perform the MQTT CONNECT handshake.
@@ -163,13 +183,15 @@ impl MqttClient {
 
         // Answer the broker's challenges until it sends CONNACK
         let connack = loop {
-            let packet = timeout(
-                Duration::from_secs(options.connect_timeout_secs),
-                connection.read_packet(),
-            )
-            .await
-            .map_err(|_| ClientError::Timeout)??
-            .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
+            let packet = timeout(options.connect_timeout, connection.read_packet())
+                .await
+                .map_err(|_| ClientError::Timeout)??
+                .ok_or_else(|| {
+                    ClientError::ConnectionFailed(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the broker closed the connection before answering CONNECT",
+                    ))
+                })?;
             let ControlPacket::Auth(auth) = packet else {
                 break packet;
             };
@@ -183,8 +205,7 @@ impl MqttClient {
             connection.write_packet(answer).await?;
         };
 
-        let response_information;
-        let (session_present, client_id, keep_alive, limits) = match connack {
+        let (client_id, limits, connack) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
                     // A refusal may name the server to use instead
@@ -236,29 +257,44 @@ impl MqttClient {
                         .map_err(ClientError::AuthenticationFailed)?;
                 }
                 let limits = BrokerLimits::from_connack(ack.properties.as_ref());
-                response_information = ack
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.response_information.as_ref())
-                    .map(|r| r.value.clone());
-                (ack.flags.session_present, client_id, keep_alive, limits)
+                let p = ack.properties.as_ref();
+                let connack = ConnAckInfo {
+                    session_present: ack.flags.session_present,
+                    keep_alive,
+                    maximum_qos: limits.maximum_qos,
+                    retain_available: limits.retain_available,
+                    receive_maximum: limits.receive_maximum,
+                    maximum_packet_size: limits.maximum_packet_size,
+                    topic_alias_maximum: p
+                        .and_then(|p| p.topic_alias_max.as_ref())
+                        .map_or(0, |t| t.value),
+                    // The broker says so only when it overrides the request
+                    session_expiry: p
+                        .and_then(|p| p.session_expiry_interval.as_ref())
+                        .map_or(options.session_expiry, |s| s.value),
+                    response_information: p
+                        .and_then(|p| p.response_information.as_ref())
+                        .map(|r| r.value.clone()),
+                    wildcard_subscriptions: limits.wildcard_subscriptions,
+                    shared_subscriptions: limits.shared_subscriptions,
+                    subscription_identifiers: limits.subscription_identifiers,
+                };
+                (client_id, limits, connack)
             }
             _ => return Err(ClientError::Protocol("Expected CONNACK packet".to_string())),
         };
 
         info!(
             "Connected to MQTT broker, client_id: {}, session_present: {}",
-            client_id, session_present
+            client_id, connack.session_present
         );
 
         connection.set_max_packet_size(limits.maximum_packet_size);
-        connection.set_write_timeout(options.write_timeout_for(keep_alive));
+        connection.set_write_timeout(options.write_timeout_for(connack.keep_alive));
         Ok(Session {
             client_id,
-            keep_alive,
             limits,
-            session_present,
-            response_information,
+            connack,
         })
     }
 
@@ -324,6 +360,7 @@ impl MqttClient {
         mut command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
         options: ConnectOptions,
+        connack: Arc<RwLock<ConnAckInfo>>,
     ) {
         let mut state = EventLoop {
             connection,
@@ -347,7 +384,7 @@ impl MqttClient {
             unacknowledged: VecDeque::new(),
             next_delivery: 0,
         };
-        let mut keep_alive = session.keep_alive;
+        let mut keep_alive = session.connack.keep_alive;
         let mut backoff = options.reconnect_backoff();
 
         loop {
@@ -380,11 +417,11 @@ impl MqttClient {
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
             state.topic_aliases.clear();
-            keep_alive = session.keep_alive;
-            state.deliver(Event::Reconnected {
-                session_present: session.session_present,
-            });
-            state.resume(session.session_present).await;
+            keep_alive = session.connack.keep_alive;
+            let session_present = session.connack.session_present;
+            *connack.write().unwrap_or_else(|e| e.into_inner()) = session.connack;
+            state.deliver(Event::Reconnected { session_present });
+            state.resume(session_present).await;
         }
 
         // Fail every request still waiting for the broker, and refuse new
@@ -400,18 +437,12 @@ impl MqttClient {
         }
     }
 
-    /// Handle a disconnect command.
-    async fn handle_disconnect(connection: &mut Connection) -> Result<()> {
-        let disconnect = DisconnectPacket {
+    /// A normal DISCONNECT, after which the broker discards the will.
+    fn normal_disconnect() -> DisconnectPacket {
+        DisconnectPacket {
             reason: ReasonCode::NormalDisconnection,
             properties: None,
-        };
-
-        connection
-            .write_packet(ControlPacket::Disconnect(disconnect))
-            .await?;
-
-        Ok(())
+        }
     }
 
     /// Publish a message to a topic. For QoS 1 and 2 this waits until the
@@ -473,7 +504,7 @@ impl MqttClient {
                 response: response_tx,
             }))
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
         Ok(PendingPublish(response_rx))
     }
 
@@ -514,7 +545,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -530,7 +561,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -545,7 +576,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -560,26 +591,97 @@ impl MqttClient {
         self.command_tx
             .send(Command::Ack(token))
             .await
-            .map_err(|_| ClientError::SendError)
+            .map_err(|_| ClientError::Closed)
     }
 
-    /// Disconnect from the broker gracefully.
+    /// Disconnect from the broker gracefully, with a normal DISCONNECT:
+    /// the broker discards the will.
     pub async fn disconnect(&self) -> Result<()> {
+        self.send_disconnect(Self::normal_disconnect()).await
+    }
+
+    /// Disconnect from the broker with an MQTT 5 `reason`, such as
+    /// `DisconnectWithWillMessage` to have the broker publish the will
+    /// anyway, and, with `session_expiry`, a new number of seconds the
+    /// broker keeps the session. Reasons only a broker sends are refused,
+    /// as is a non-zero session expiry when CONNECT asked for none
+    /// [MQTT-3.14.2-2]; MQTT 3.x supports neither.
+    pub async fn disconnect_with(
+        &self,
+        reason: ReasonCode,
+        session_expiry: Option<u32>,
+    ) -> Result<()> {
+        let code = reason.get_code();
+        if !self.reports_reasons {
+            if code != 0 || session_expiry.is_some() {
+                return Err(ClientError::NotSupported(
+                    "DISCONNECT reasons and session expiry before MQTT 5",
+                ));
+            }
+            return self.disconnect().await;
+        }
+        // Table 2-4 of MQTT 5: the reasons a client may send
+        if !matches!(
+            code,
+            0x00 | 0x04 | 0x80..=0x83 | 0x90 | 0x93..=0x97 | 0x99
+        ) {
+            return Err(ClientError::InvalidArgument(format!(
+                "a client doesn't disconnect with {reason}"
+            )));
+        }
+        if self.session_expiry == 0 && session_expiry.is_some_and(|s| s > 0) {
+            return Err(ClientError::InvalidArgument(
+                "a session that CONNECT ended with the connection can't be kept".into(),
+            ));
+        }
+        self.send_disconnect(DisconnectPacket {
+            reason: if code == 0 {
+                ReasonCode::NormalDisconnection
+            } else {
+                reason
+            },
+            properties: session_expiry.map(|seconds| DisconnectProperties {
+                session_expiry_interval: Some(SessionExpiryInterval::new(seconds)),
+                ..Default::default()
+            }),
+        })
+        .await
+    }
+
+    async fn send_disconnect(&self, packet: DisconnectPacket) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Disconnect {
+                packet,
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
 
     /// What the broker answered to `request_response_information`, often a
     /// topic prefix this client may use for response topics.
-    pub fn response_information(&self) -> Option<&str> {
-        self.response_information.as_deref()
+    pub fn response_information(&self) -> Option<String> {
+        self.connack().response_information
+    }
+
+    /// The client id in use: the one given in the options, or the one the
+    /// broker assigned when none was. Reconnecting presents the same id.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// What the broker settled in its latest CONNACK, such as the
+    /// keep-alive in effect and the limits it announced, updated when the
+    /// client reconnects. Read it after `Event::Reconnected` for the
+    /// values of the new connection.
+    pub fn connack(&self) -> ConnAckInfo {
+        self.connack
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Receive the next event from the broker.
@@ -664,10 +766,8 @@ impl Future for PendingPublish {
 /// What CONNACK settled for a connection.
 struct Session {
     client_id: String,
-    keep_alive: u16,
     limits: BrokerLimits,
-    session_present: bool,
-    response_information: Option<String>,
+    connack: ConnAckInfo,
 }
 
 /// Whether a connection that ended this way is worth reopening. A broker
@@ -690,13 +790,7 @@ fn should_reconnect(reason: &DisconnectReason) -> bool {
 fn refused_for_good(error: &ClientError) -> bool {
     match error {
         ClientError::Redirected { .. } => true,
-        ClientError::ConnectionRefused(reason) => !matches!(
-            reason,
-            ReasonCode::ServerUnavailable
-                | ReasonCode::ServerBusy
-                | ReasonCode::QuotaExceeded
-                | ReasonCode::ConnectionRateExceeded
-        ),
+        ClientError::ConnectionRefused(reason) => !transient_refusal(*reason),
         _ => false,
     }
 }
@@ -907,7 +1001,8 @@ impl EventLoop {
                     let Some(cmd) = cmd else {
                         // Every handle is gone: nobody can read events or
                         // send requests any more
-                        let _ = MqttClient::handle_disconnect(&mut self.connection).await;
+                        let disconnect = ControlPacket::Disconnect(MqttClient::normal_disconnect());
+                        let _ = self.connection.write_packet(disconnect).await;
                         return DisconnectReason::ClientInitiated;
                     };
                     match cmd {
@@ -922,8 +1017,11 @@ impl EventLoop {
                             self.reauthenticate(response).await;
                         }
                         Command::Ack(token) => self.acknowledge(token).await,
-                        Command::Disconnect { response } => {
-                            let result = MqttClient::handle_disconnect(&mut self.connection).await;
+                        Command::Disconnect { packet, response } => {
+                            let result = self
+                                .connection
+                                .write_packet(ControlPacket::Disconnect(packet))
+                                .await;
                             let _ = response.send(result);
                             return DisconnectReason::ClientInitiated;
                         }
@@ -996,7 +1094,7 @@ impl EventLoop {
     /// Starts re-authenticating [MQTT-4.12.1-1].
     async fn reauthenticate(&mut self, response: oneshot::Sender<Result<()>>) {
         let Some(authenticator) = &self.authenticator else {
-            let _ = response.send(Err(ClientError::Protocol(
+            let _ = response.send(Err(ClientError::InvalidArgument(
                 "no authenticator configured".into(),
             )));
             return;
@@ -1114,7 +1212,7 @@ impl EventLoop {
                         }
                         // Delivered on a connection that is gone
                         Command::Ack(_) => {}
-                        Command::Disconnect { response } => {
+                        Command::Disconnect { response, .. } => {
                             let _ = response.send(Ok(()));
                             return Err(None);
                         }

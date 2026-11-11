@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use mercurio_client::{
     ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ProtocolVersion, QoS,
+    ReasonCode,
 };
-use mercurio_core::reason::ReasonCode;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -109,7 +109,8 @@ async fn resumed_session_gets_unacknowledged_packets_again() {
     assert!(matches!(
         events[1],
         Event::Reconnected {
-            session_present: true
+            session_present: true,
+            ..
         }
     ));
 }
@@ -124,7 +125,8 @@ async fn lost_session_starts_unacknowledged_messages_over() {
     assert!(matches!(
         events[1],
         Event::Reconnected {
-            session_present: false
+            session_present: false,
+            ..
         }
     ));
 }
@@ -306,7 +308,7 @@ async fn a_permanent_refusal_stops_the_client_with_its_reason() {
         matches!(events[0], Event::Disconnected { .. }),
         "{events:?}"
     );
-    let Event::Stopped { error } = &events[1] else {
+    let Event::Stopped { error, .. } = &events[1] else {
         panic!("no final event: {events:?}");
     };
     assert!(

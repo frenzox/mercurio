@@ -44,12 +44,14 @@ pub struct ConnectArgs {
     #[arg(short = 'P', long)]
     pub password: Option<String>,
 
-    /// Enable TLS for the connection
+    /// Enable TLS for the connection, verifying the broker with the
+    /// operating system's certificate store, or with the Mozilla roots
+    /// bundled with the client when that store holds none
     #[arg(long)]
     pub tls: bool,
 
-    /// Path to CA certificate file (PEM format) for TLS verification;
-    /// implies --tls
+    /// CA certificates (PEM) to verify the broker with, the only ones then
+    /// trusted; implies --tls
     #[arg(long)]
     pub cafile: Option<String>,
 

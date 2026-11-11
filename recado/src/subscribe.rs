@@ -89,7 +89,7 @@ struct SubscriptionArgs {
 pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     args.connection.connect.ask_password()?;
     // Connect to broker
-    let mut options = args.will.apply(args.connection.to_connect_options());
+    let mut options = args.will.apply(args.connection.to_connect_options()?);
     let reconnect = args.reconnect;
     if let Some(seconds) = reconnect {
         options = options.reconnect(Duration::from_secs(seconds));
@@ -191,19 +191,26 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                     }
                     Some(Event::Disconnected { reason }) => {
                         // With reconnection on, the client says when it
-                        // gives up by closing the event stream
+                        // gives up with Event::Stopped
                         if reconnect.is_none() {
                             return Err(Failure::disconnected(&reason));
                         }
                         eprintln!("recado: {}; reconnecting", Failure::disconnected(&reason));
                     }
-                    Some(Event::Reconnected { session_present }) => {
+                    Some(Event::Reconnected {
+                        session_present, ..
+                    }) => {
                         eprintln!("recado: reconnected");
                         // A broker that lost the session lost the
                         // subscriptions with it
                         if !session_present {
                             subscribe().await?;
                         }
+                    }
+                    Some(Event::Stopped { error, .. }) => {
+                        return Err(Failure::Connection(format!(
+                            "gave up reconnecting: {error}"
+                        )));
                     }
                     // Events added in later versions of the client
                     Some(_) => {}

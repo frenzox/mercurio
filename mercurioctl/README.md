@@ -67,7 +67,7 @@ the password on a terminal; `MERCURIOCTL_PASSWORD` keeps it out of `ps`.
 | `-H, --host`, `-p, --port` | Broker over TCP | admin socket, else `localhost:1883` |
 | `--unix` | Broker over a Unix socket | |
 | `-u, --username`, `-P, --password` | Credentials | |
-| `--tls`, `--cafile`, `--insecure` | TLS, its CA, or no verification; `--cafile` and `--insecure` imply `--tls` | |
+| `--tls`, `--cafile`, `--insecure` | TLS, verified with the operating system's certificate store or only the `--cafile` CA, or not at all; `--cafile` and `--insecure` imply `--tls` | |
 | `--cert`, `--key` | Client certificate and its key (PEM); imply `--tls` | |
 | `--json` | Print the response data as JSON | tables |
 | `--timeout` | Seconds to wait for the answer (`MERCURIOCTL_TIMEOUT`) | `10` |

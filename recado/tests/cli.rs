@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
+use mercurio_client::Bytes;
 use mercurio_client::{ConnectOptions, MessageProperties, MqttClient, QoS};
 use mercurio_server::{
     auth::SimpleCredentialValidator,
@@ -201,13 +201,68 @@ async fn logs_go_to_standard_error() {
 async fn mqtt_3_without_a_client_id_still_connects() {
     let broker = start().await;
     for args in [
-        &["pub", "-V", "311", "-c", "-t", "a", "-m", "x"][..],
-        &["pub", "-V", "31", "-t", "a", "-m", "x"],
+        &["pub", "-V", "31", "-t", "a", "-m", "x"][..],
         &["pub", "-V", "311", "-t", "a", "-m", "x"],
     ] {
         let output = broker.run(args).await;
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeping_the_session_needs_a_client_id() {
+    let broker = start().await;
+    for version in ["5", "311", "31"] {
+        let output = broker
+            .run(&["pub", "-V", version, "-c", "-t", "a", "-m", "x"])
+            .await;
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "-V {version}: {message}");
+        assert!(message.contains("-i"), "{message}");
+        assert_eq!(message.lines().count(), 1, "{message}");
+
+        let output = broker
+            .run(&[
+                "pub", "-V", version, "-c", "-i", "kept", "-t", "a", "-m", "x",
+            ])
+            .await;
+        assert!(output.status.success(), "-V {version}: {}", stderr(&output));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn giving_up_reconnecting_reports_why() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Accepts once, then refuses the reconnection for good
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 256];
+        let _ = socket.read(&mut buffer).await.unwrap();
+        socket.write_all(&[0x20, 0x03, 0, 0, 0]).await.unwrap();
+        let n = socket.read(&mut buffer).await.unwrap();
+        assert_eq!(buffer[0], 0x82, "SUBSCRIBE {:02x?}", &buffer[..n]);
+        let suback = [0x90, 0x04, buffer[2], buffer[3], 0x00, 0x00];
+        socket.write_all(&suback).await.unwrap();
+        drop(socket);
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = socket.read(&mut buffer).await.unwrap();
+        // Not Authorized
+        socket.write_all(&[0x20, 0x03, 0, 0x87, 0]).await.unwrap();
+        let _ = socket.read(&mut buffer).await;
+    });
+
+    let output = Broker { port }
+        .run(&["sub", "-i", "s", "-t", "a", "--reconnect", "1"])
+        .await;
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(2), "{message}");
+    let last = message.lines().last().unwrap_or_default();
+    assert!(last.contains("gave up reconnecting"), "{message}");
+    assert!(last.contains("NotAuthorized"), "{message}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -428,16 +483,12 @@ async fn json_lines_carry_the_message_and_its_properties() {
         )
         .await;
     let sender = broker.client("sender").await;
-    let properties = MessageProperties {
-        content_type: Some("text/plain".to_string()),
-        response_topic: Some("replies/me".to_string()),
-        correlation_data: Some(Bytes::from_static(&[0x01, 0xff])),
-        user_properties: vec![
-            ("k".to_string(), "v1".to_string()),
-            ("k".to_string(), "v2".to_string()),
-        ],
-        ..Default::default()
-    };
+    let properties = MessageProperties::default()
+        .content_type("text/plain")
+        .response_topic("replies/me")
+        .correlation_data(Bytes::from_static(&[0x01, 0xff]))
+        .user_property("k", "v1")
+        .user_property("k", "v2");
     sender
         .publish_with_properties("json/text", "héllo", QoS::AtLeastOnce, false, properties)
         .await

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use mercurio_client::{ClientError, ConnectOptions, DisconnectReason, Event, MqttClient};
-use mercurio_core::reason::ReasonCode;
+use mercurio_client::{
+    ClientError, ConnectOptions, DisconnectReason, Event, MqttClient, ReasonCode,
+};
 use mercurio_server::server::{Redirect, ServerConfig};
 use tokio::{net::TcpListener, time::timeout};
 
@@ -57,7 +58,7 @@ async fn redirection_names_the_other_server() {
     let result = MqttClient::connect(ConnectOptions::new("127.0.0.1", port)).await;
     assert!(matches!(
         result,
-        Err(ClientError::Redirected { reason: ReasonCode::ServerMoved, ref server_reference })
+        Err(ClientError::Redirected { reason: ReasonCode::ServerMoved, ref server_reference, .. })
             if server_reference == "elsewhere:1883"
     ));
 }
