@@ -10,7 +10,7 @@ use mercurio_packets::{
     pubrec::PubRecPacket,
     pubrel::PubRelPacket,
     subscribe::{RetainHandling, SubscribePayload, SubscriptionOptions},
-    unsubscribe::UnsubscribePayload,
+    unsubscribe::{UnsubscribePacket, UnsubscribePayload},
     Packet,
 };
 use mercurio_storage::memory::MemoryStore;
