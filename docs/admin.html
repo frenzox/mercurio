@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Administration · Mercurio</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+<a class="brand" href="index.html">Mer<span>curio</span></a>
+<h2>Getting started</h2>
+<ul>
+<li><a href="index.html">Overview</a></li>
+<li><a href="install.html">Installing &amp; running</a></li>
+<li><a href="configuration.html">Configuration reference</a></li>
+</ul>
+<h2>Broker</h2>
+<ul>
+<li><a href="security.html">Authentication &amp; access</a></li>
+<li><a href="listeners.html">Listeners &amp; transports</a></li>
+<li><a href="bridges.html">Bridges</a></li>
+<li><a href="operations.html">Operations &amp; monitoring</a></li>
+<li><a href="admin.html" aria-current="page">Administration</a></li>
+</ul>
+<h2>Clients &amp; libraries</h2>
+<ul>
+<li><a href="cli.html">Command-line client</a></li>
+<li><a href="client.html">Rust client library</a></li>
+<li><a href="embedding.html">Embedding the broker</a></li>
+</ul>
+<h2>Guides</h2>
+<ul>
+<li><a href="plugins.html">WebAssembly plugins</a></li>
+<li><a href="migrating.html">Migrating from mosquitto</a></li>
+</ul>
+</nav>
+<main>
+<h1>Administration</h1>
+<p class="lead">Look at and change a running broker: its clients and sessions, bans, retained messages and subscriptions, its log level and files, without restarting it.</p>
+<p>The broker takes JSON commands on the MQTT topic <code>$CONTROL/broker/v1</code>, from any MQTT 5 client that access control allows, and from anyone on its host who may use its <a href="#socket">admin socket</a>. <code>mercurioctl</code> runs each of these commands from the command line. This page describes the commands, who may run them, and what changes for setups upgrading from mercuriod 0.4.</p>
+
+<h2 id="socket">The admin socket</h2>
+<pre>[admin]
+socket = "/run/mercurio/admin.sock"   <span class="comment"># "" turns it off</span>
+group = "mercurio"</pre>
+<p>mercuriod serves this Unix socket by default. Clients connecting through it skip authentication and access control: they may run every command, dynamic security's included. So the broker checks who connects, from the user and group the kernel reports for the socket, and closes everyone else at once:</p>
+<ul>
+<li>root and the user the broker runs as;</li>
+<li>members of <code>group</code>, and users whose primary group it is.</li>
+</ul>
+<p>The socket file belongs to the broker's user and to <code>group</code>, with mode <code>0660</code>. With <code>group = ""</code>, or a group that doesn't exist, it is <code>0600</code> and only root and the broker's user get in.</p>
+<p>The packages run the broker as the <code>mercurio</code> user, and its systemd unit creates <code>/run/mercurio</code>, so the defaults work as installed. To let a user administer the broker:</p>
+<pre>sudo usermod -aG mercurio alice
+sudo systemctl restart mercuriod</pre>
+<p>The broker reads the group's members when it starts, so a new member needs a restart of the broker, and a new login before their own processes carry the group. Changes to <code>[admin]</code> also need a restart.</p>
+<p>With another <code>socket</code> path, every directory on it must be writable only by root or the broker's user: anyone who can write to one of them could put their own socket in its place. The broker refuses a socket whose directory belongs to another user or is writable by its group or by others; the directories above it are up to you. A broker that can't create its socket, such as one started by hand where <code>/run/mercurio</code> doesn't exist, logs a warning and runs without it. For a broker run as yourself:</p>
+<pre>mkdir -m 700 -p "$XDG_RUNTIME_DIR/mercurio"</pre>
+<pre>[admin]
+socket = "/run/user/1000/mercurio/admin.sock"</pre>
+<p>The admin socket needs Linux; elsewhere <code>[admin]</code> is ignored with a warning.</p>
+
+<h2 id="remote">Over the network</h2>
+<p>Any MQTT client may send commands once access control allows it. Like every <code>$CONTROL</code> topic, <code>$CONTROL/broker/v1</code> is refused unless a rule grants it. Each command is also checked on its own, as a publish to <code>$CONTROL/broker/v1/&lt;command&gt;</code>: a client granted <code>$CONTROL/broker/v1/listClients</code> may list clients and nothing else. The client must also be allowed to subscribe to, and receive, the topic its answers come on.</p>
+<p>With an <a href="security.html#acl">ACL file</a>:</p>
+<pre><span class="comment"># Every command</span>
+user ops
+topic readwrite $CONTROL/broker/v1/#
+
+<span class="comment"># Only listing and showing clients</span>
+user monitor
+topic write $CONTROL/broker/v1
+topic write $CONTROL/broker/v1/listClients
+topic write $CONTROL/broker/v1/getClient
+topic read $CONTROL/broker/v1/response/#</pre>
+<p><code>write</code> alone isn't enough: without <code>read</code>, subscribing to the answers is refused.</p>
+<p>With <a href="security.html#dynamic-security">dynamic security</a>, <code>mercuriod dynsec-init</code> gives its <code>admin</code> role <code>publishClientSend</code>, <code>subscribePattern</code> and <code>publishClientReceive</code> on <code>$CONTROL/broker/v1/#</code>; give other roles the same ACLs, or narrower ones. With <a href="security.html#http">HTTP authentication</a>, <code>acl_url</code> is asked about <code>$CONTROL/broker/v1</code> and <code>$CONTROL/broker/v1/&lt;command&gt;</code> with <code>acc</code> 2, and about the answer topic with 4 and 1.</p>
+<p>Bridges and other in-process connections run every command without checks, as the admin socket's clients do.</p>
+
+<h2 id="protocol">The protocol</h2>
+<p>A request is a JSON object with a list of commands, published to <code>$CONTROL/broker/v1</code>. The commands run in order, and the answer holds one response for each, in the same order:</p>
+<pre>mosquitto_rr -V mqttv5 -u ops -P "$OPS_PASSWORD" \
+    -t '$CONTROL/broker/v1' -e '$CONTROL/broker/v1/response/ops' \
+    -m '{"commands": [
+          {"command": "getLogLevel", "correlationData": "1"},
+          {"command": "listBans", "count": 2},
+          {"command": "nope"}
+        ]}'</pre>
+<pre>{"responses":[{"command":"getLogLevel","correlationData":"1","data":{"level":"info"}},
+ {"command":"listBans","data":{"bans":[],"totalCount":0}},
+ {"command":"nope","error":"unknown command `nope`","code":"invalidArgument"}]}</pre>
+<ul>
+<li>A command that succeeds may return <code>data</code>. One that fails returns <code>error</code>, a message for people, and <code>code</code>, for scripts. A command's <code>correlationData</code> comes back in its response.</li>
+<li>The answer goes only to the client that sent the request: on the request's MQTT 5 Response Topic, with its Correlation Data, or on <code>$CONTROL/broker/v1/response</code> for a request without one, such as an MQTT 3.1.1 client's. Either way the client receives it only while subscribed to that topic, so one client must subscribe and publish. <code>mosquitto_rr</code> does; separate <code>mosquitto_sub</code> and <code>mosquitto_pub</code> commands never see an answer.</li>
+<li>A payload that isn't a list of commands gets one response, with an empty <code>command</code> and <code>invalidArgument</code>.</li>
+<li>An answer larger than the client's Maximum Packet Size is dropped. Page through long lists instead of asking for everything in one message.</li>
+<li><code>v1</code> only gains commands, optional arguments and response fields. A change that would break scripts goes to a <code>v2</code>.</li>
+</ul>
+
+<h3 id="errors">Errors</h3>
+<table>
+<tr><th><code>code</code></th><th>Means</th></tr>
+<tr><td><code>notAuthorized</code></td><td>Access control doesn't grant <code>$CONTROL/broker/v1/&lt;command&gt;</code></td></tr>
+<tr><td><code>notFound</code></td><td>What the command names, such as a client, a ban or a retained message, doesn't exist</td></tr>
+<tr><td><code>invalidArgument</code></td><td>An unknown command, or a missing or malformed argument</td></tr>
+<tr><td><code>conflict</code></td><td>The command can't run in the current state, such as deleting the session of a connected client</td></tr>
+<tr><td><code>unavailable</code></td><td>The broker can't serve it now: storage failed, a wait timed out, or the command is served by mercuriod and the broker runs without it</td></tr>
+</table>
+<p>A client that may not publish to <code>$CONTROL/broker/v1</code> at all gets no answer; at QoS 1, its PUBACK says Not Authorized.</p>
+
+<h3 id="paging">Lists</h3>
+<p>List commands take <code>offset</code>, 0 by default, and <code>count</code>, 100 by default and at most 1000. Beside the items they return <code>totalCount</code>, the length of the whole list. The rest of a list of 250 clients is <code>{"command": "listClients", "offset": 100}</code>, then <code>"offset": 200</code>.</p>
+
+<h2 id="commands">Commands</h2>
+<p>Arguments go in the command object beside <code>command</code>; those marked <code>?</code> are optional, with their default in parentheses. A client is any session, connected or not. Times are Unix seconds, and durations seconds. <a href="security.html#dynamic-security">Dynamic security</a> has its own commands, on <code>$CONTROL/dynamic-security/v1</code>.</p>
+
+<h3 id="clients">Clients and sessions</h3>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>listClients</code></td><td><code>connected?</code>, <code>clientidPrefix?</code>, <code>username?</code>, <code>address?</code> (an IP address or CIDR range), <code>offset?</code>, <code>count?</code></td><td><code>clients</code>, by client id: <code>clientid</code>, <code>username</code>, <code>connected</code>, <code>address</code>, <code>listener</code>, <code>protocolVersion</code>, <code>connectedSince</code> or <code>disconnectedSince</code>, and the counts <code>subscriptions</code>, <code>queued</code>, <code>inflight</code></td></tr>
+<tr><td><code>getClient</code></td><td><code>clientid</code></td><td>The same fields, with <code>subscriptions</code> listing each <code>filter</code> with its <code>qos</code>, <code>noLocal</code>, <code>retainAsPublished</code> and <code>subscriptionIdentifier</code>; and <code>keepAlive</code>, <code>cleanStart</code>, <code>sessionExpiry</code> (null for never), <code>sessionExpiresIn</code> while disconnected, <code>willPending</code>, <code>messagesIn</code>, <code>messagesOut</code>, <code>bytesIn</code>, <code>bytesOut</code>. <code>notFound</code> without such a session.</td></tr>
+<tr><td><code>disconnectClient</code></td><td><code>clientid</code>, <code>sendWill?</code> (true), <code>reasonCode?</code> (152, 0x98 Administrative Action)</td><td>Nothing. Closes the connection; MQTT 5 clients get a DISCONNECT with the reason code, which must be an error code the MQTT 5 specification lets a server send in a DISCONNECT, such as 0x8B or 0x98; <code>invalidArgument</code> for any other. The session stays. <code>notFound</code> if the client isn't connected.</td></tr>
+<tr><td><code>deleteSession</code></td><td><code>clientid</code>, <code>disconnect?</code> (false)</td><td>Nothing. Removes the session with its subscriptions, queued messages and pending will. <code>conflict</code> while the client is connected, which includes the client deleting its own session, unless <code>disconnect</code> is true, which first closes it with 0x98 and without its will; <code>unavailable</code> if closing takes more than 5 seconds.</td></tr>
+</table>
+
+<h3 id="ban-commands">Bans</h3>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>addBan</code></td><td><code>type</code> (<code>clientid</code>, <code>username</code> or <code>address</code>), <code>value</code>, <code>prefix?</code> (false; <code>clientid</code> and <code>username</code> only, <code>invalidArgument</code> with <code>address</code>), <code>duration?</code> (never expires), <code>reason?</code></td><td>Nothing. See <a href="#bans">Bans</a>.</td></tr>
+<tr><td><code>removeBan</code></td><td><code>type</code>, <code>value</code>, <code>prefix?</code> (false)</td><td>Nothing. <code>notFound</code> without such a ban.</td></tr>
+<tr><td><code>listBans</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>bans</code>: <code>type</code>, <code>value</code>, <code>prefix</code>, <code>reason</code>, <code>createdAt</code>, <code>expiresAt</code> (null for never)</td></tr>
+</table>
+
+<h3 id="retained">Retained messages</h3>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>listRetained</code></td><td><code>filter?</code> (<code>#</code>), <code>offset?</code>, <code>count?</code></td><td><code>messages</code>, by topic: <code>topic</code>, <code>qos</code>, <code>size</code> in bytes, <code>expiresIn</code> (null for never), and <code>preview</code>, the first 64 bytes as text, null when they aren't UTF-8. As in subscriptions, <code>#</code> doesn't match <code>$SYS</code> topics.</td></tr>
+<tr><td><code>getRetained</code></td><td><code>topic</code></td><td><code>topic</code>, <code>qos</code>, <code>expiresIn</code>, the payload as <code>payload</code> when it is UTF-8 or as <code>payloadBase64</code> otherwise, and <code>properties</code>: <code>payloadFormatIndicator</code>, <code>contentType</code>, <code>responseTopic</code>, <code>correlationDataBase64</code> and <code>userProperties</code>, each when set. <code>notFound</code> without one.</td></tr>
+<tr><td><code>deleteRetained</code></td><td><code>filter</code></td><td><code>deleted</code>: how many. A topic deletes its own message; a filter with wildcards deletes every one it matches.</td></tr>
+</table>
+
+<h3 id="subscriptions">Subscriptions</h3>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>listSubscriptions</code></td><td><code>filterPrefix?</code>, <code>offset?</code>, <code>count?</code></td><td><code>subscriptions</code>, sorted: each <code>filter</code> with its number of <code>subscribers</code>. Shared subscriptions appear as <code>$share/&lt;group&gt;/&lt;filter&gt;</code>.</td></tr>
+<tr><td><code>getSubscribers</code></td><td><code>filter</code></td><td><code>subscribers</code> of exactly that filter: <code>clientid</code>, <code>qos</code>, <code>noLocal</code>, <code>retainAsPublished</code>, <code>subscriptionIdentifier</code>. Not paged.</td></tr>
+</table>
+
+<h3 id="broker">The broker</h3>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>getBrokerInfo</code></td><td></td><td><code>version</code>, <code>startedAt</code>, <code>uptime</code>, <code>storage</code> (<code>memory</code>, <code>sqlite</code> or <code>postgres</code>), and <code>stats</code>: the <a href="operations.html#sys">$SYS statistics</a> by their topic under <code>$SYS/broker/</code></td></tr>
+<tr><td><code>listListeners</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>listeners</code>, the main one first: <code>address</code> or <code>path</code>, <code>protocol</code>, <code>tls</code>, <code>mountPoint</code>, <code>connections</code></td></tr>
+<tr><td><code>listPlugins</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>plugins</code>: <code>name</code>, <code>kind</code> (<code>builtin</code>, <code>rust</code> or <code>wasm</code>), <code>hooks</code>. WebAssembly plugins add <code>instances</code>, <code>failures</code> since the broker started, and <code>lastError</code>.</td></tr>
+</table>
+<p>mercuriod serves the following ones; a broker <a href="embedding.html">embedded</a> without them answers <code>unavailable</code>.</p>
+<table>
+<tr><th>Command</th><th>Arguments</th><th>Returns</th></tr>
+<tr><td><code>listBridges</code></td><td><code>offset?</code>, <code>count?</code></td><td><code>bridges</code>: <code>name</code>, <code>connected</code>, <code>remoteAddress</code>, <code>connectedSince</code> or <code>disconnectedSince</code>, and <code>queued</code>, the messages waiting for the bridge on this broker</td></tr>
+<tr><td><code>getConfig</code></td><td></td><td>The configuration in use, with the keys of the TOML file. Passwords, credentials in URLs and every plugin <code>config</code> table read <code>"&lt;redacted&gt;"</code>.</td></tr>
+<tr><td><code>getLogLevel</code></td><td></td><td><code>level</code></td></tr>
+<tr><td><code>setLogLevel</code></td><td><code>level</code>: directives as <a href="configuration.html#logging"><code>[logging] level</code></a> takes them</td><td>Nothing. The level lasts until the broker restarts. <code>invalidArgument</code> for an empty or malformed level.</td></tr>
+<tr><td><code>reload</code></td><td></td><td>Rereads the files <a href="security.html#reloading">SIGHUP</a> rereads, and returns <code>items</code>, one per file: <code>item</code>, the plugin it configures (<code>password-file</code>, <code>acl-file</code>, <code>dynamic-security</code> or a <code>[[plugins]]</code> name), <code>path</code>, <code>ok</code>, and <code>error</code> when it failed. A file that failed keeps its previous contents.</td></tr>
+</table>
+
+<h2 id="bans">Bans</h2>
+<p>A ban refuses clients by client id, user name or address, until it expires or is removed:</p>
+<pre>{"command": "addBan", "type": "address", "value": "203.0.113.0/24", "duration": 3600, "reason": "flooding"}</pre>
+<ul>
+<li>Connected clients that match are disconnected at once with Banned (0x8A), without publishing their will. New connections that match are refused at CONNECT with Banned, or Not Authorized for MQTT 3.x clients.</li>
+<li><code>clientid</code> and <code>username</code> bans match the whole value, or with <code>prefix</code> every value starting with it. A user name ban matches the user the broker verified, so never an anonymous client. A client id ban matches the id the broker assigned to clients that sent none.</li>
+<li><code>address</code> bans take an IP address or CIDR range and match the client's address, or behind a load balancer the one its PROXY header gives. An IPv6 range never matches IPv4 clients, <code>::/0</code> included: ban <code>0.0.0.0/0</code> as well to refuse everyone. IPv4 clients on an IPv6 listener are matched as IPv4.</li>
+<li>Adding a ban with the type, value and prefix of an existing one replaces its duration and reason.</li>
+<li>A ban leaves stored sessions alone. A will already waiting for a client that disconnected before the ban, delayed by its Will Delay Interval or restored after a restart, is still published; delete the session with <code>deleteSession</code> to drop it.</li>
+<li>With SQLite or PostgreSQL storage, bans survive restarts, and a standby broker loads them when it takes over. In memory, they last until the broker stops.</li>
+</ul>
+
+<h2 id="upgrading">Upgrading from mercuriod 0.4</h2>
+<ul>
+<li><strong>Answers to <code>$CONTROL</code> requests go only to the client that sent the request</strong>, for dynamic security and plugins as well. A client subscribed to <code>$CONTROL/dynamic-security/v1/response</code> no longer sees the answers to other clients' commands, so a script that subscribes with one client and publishes with another, such as <code>recado sub</code> beside <code>recado pub</code>, gets nothing back. Install <a href="mercurioctl.html"><code>mercurioctl</code></a> and use it, or one client that subscribes and then publishes, as <a href="#protocol"><code>mosquitto_rr</code></a> does.</li>
+<li><strong>Dynamic security files created by earlier versions</strong> give the administrator role <code>$CONTROL/dynamic-security/#</code> and <code>$SYS/#</code> only. Dynamic security commands keep working from anywhere, and every command works through the admin socket. To run the broker's commands over the network too, add the ACLs <code>mercuriod dynsec-init</code> now grants, for example through the admin socket as root (a user newly added to the socket's group needs a new login and a broker restart first):
+<pre>for acltype in publishClientSend subscribePattern publishClientReceive; do
+    sudo mercurioctl dynsec add-role-acl admin "$acltype" '$CONTROL/broker/v1/#' allow
+done</pre></li>
+<li><strong>ACL files</strong> need <code>topic readwrite $CONTROL/broker/v1/#</code>, or <a href="#remote">narrower grants</a>, for the users who administer the broker over the network.</li>
+<li><strong>The admin socket is on by default</strong>, at <code>/run/mercurio/admin.sock</code>, for root, the broker's user and the <code>mercurio</code> group. <code>socket = ""</code> under <code>[admin]</code> turns it off.</li>
+<li><strong>Logging:</strong> with <code>connection_messages = false</code>, a <code>level</code> naming <code>mercurio::connections</code> now turns connection messages on, and an empty <code>level</code> means <code>info</code>. See <a href="operations.html#logging">Logging</a>.</li>
+</ul>
+<footer>Mercurio documentation · MQTT 3.1, 3.1.1 and 5.0 broker and client in Rust</footer>
+</main>
+</body>
+</html>
