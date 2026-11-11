@@ -18,7 +18,6 @@ use tokio::{
 use tracing::{info, warn};
 
 use mercurio_core::{
-    codec::VariableByteInteger,
     message::{unix_millis, Message, MessageOrigin, MessageProperties},
     properties::{
         AssignedClientIdentifier, AuthenticationData, AuthenticationMethod, MaximumPacketSize,
@@ -173,7 +172,8 @@ fn publish_properties(
     Some(PublishProperties {
         subscription_identifiers: subscription_identifiers
             .iter()
-            .map(|id| SubscriptionIdentifier::new(VariableByteInteger(*id)))
+            // A stored identifier outside the range can't be sent
+            .filter_map(|id| SubscriptionIdentifier::new(*id))
             .collect(),
         payload_format_indicator: properties.payload_format_indicator.clone(),
         message_expiry_interval: properties.message_expiry_interval.clone(),
@@ -1218,7 +1218,7 @@ impl Session {
                     .map(|p| {
                         p.subscription_identifiers
                             .iter()
-                            .map(|id| id.value.0)
+                            .map(|id| id.value())
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -1374,11 +1374,7 @@ impl Session {
             .properties
             .as_ref()
             .and_then(|p| p.subscription_id.as_ref())
-            .map(|id| id.value.0);
-        // An identifier of 0 is a protocol error
-        if subscription_identifier == Some(0) {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+            .map(|id| id.value());
 
         // A client can't opt out of its own messages on a shared subscription
         // [MQTT-3.8.3-4]
@@ -3056,7 +3052,7 @@ mod tests {
     ) -> mercurio_packets::subscribe::SubscribePacket {
         let mut packet = subscribe_packet(topic_filter, QoS::AtMostOnce);
         packet.properties = Some(mercurio_packets::subscribe::SubscribeProperties {
-            subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(identifier))),
+            subscription_id: SubscriptionIdentifier::new(identifier),
             user_property: None,
         });
         packet
@@ -3086,7 +3082,7 @@ mod tests {
         let mut identifiers: Vec<u32> = properties
             .subscription_identifiers
             .iter()
-            .map(|id| id.value.0)
+            .map(|id| id.value())
             .collect();
         identifiers.sort();
         assert_eq!(identifiers, [7, 9]);
@@ -3122,20 +3118,11 @@ mod tests {
         let mut session = create_test_session();
         let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
 
-        let zero = session
-            .handle_subscribe(subscribe_with_identifier("z", 0), &broker, &no_plugins())
-            .await;
-        assert!(matches!(
-            zero,
-            Err(mercurio_core::error::Error::Reason(
-                ReasonCode::ProtocolError
-            ))
-        ));
-
+        // An identifier of 0 can't be built; the decoder refuses it
         let from_client = ControlPacket::Publish(PublishPacket {
             topic_name: "t".into(),
             properties: Some(PublishProperties {
-                subscription_identifiers: vec![SubscriptionIdentifier::new(VariableByteInteger(1))],
+                subscription_identifiers: SubscriptionIdentifier::new(1).into_iter().collect(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -3561,7 +3548,7 @@ mod tests {
                 assert_eq!(publish.qos_level, QoS::AtMostOnce);
                 assert!(publish.retain);
                 let identifiers = &publish.properties.unwrap().subscription_identifiers;
-                assert_eq!(identifiers[0].value.0, 7);
+                assert_eq!(identifiers[0].value(), 7);
                 topics.push(publish.topic_name);
             }
         }

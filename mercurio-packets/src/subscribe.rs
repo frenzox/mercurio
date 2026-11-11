@@ -347,9 +347,7 @@ mod tests {
 
         let properties = SubscribeProperties {
             user_property: vec![UserProperty::new("key".to_string(), "value".to_string())].into(),
-            subscription_id: Some(SubscriptionIdentifier::new(
-                mercurio_core::codec::VariableByteInteger(32),
-            )),
+            subscription_id: SubscriptionIdentifier::new(32),
         };
 
         let subs_opt = SubscriptionOptions {

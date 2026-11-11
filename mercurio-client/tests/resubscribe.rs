@@ -37,7 +37,7 @@ fn contents(subscribe: &SubscribePacket) -> (Vec<(String, SubscriptionOptions)>,
         .properties
         .as_ref()
         .and_then(|p| p.subscription_id.as_ref())
-        .map(|id| id.value.0);
+        .map(|id| id.value());
     (filters, id)
 }
 

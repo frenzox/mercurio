@@ -125,7 +125,7 @@ impl ControlPacket {
         };
         let remaining_len = VariableByteInteger::decode(&mut remaining_bytes)?;
         let header_len = src.len() - remaining_bytes.len();
-        Ok(header_len + remaining_len.0 as usize)
+        Ok(header_len + remaining_len.value() as usize)
     }
 
     /// Removes one packet from the front of `src` and decodes it in the
@@ -294,7 +294,7 @@ where
         return Err(ReasonCode::MalformedPacket.into());
     }
 
-    let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+    let remaining_len = VariableByteInteger::decode(buffer)?.value() as usize;
     if buffer.remaining() < remaining_len {
         return Err(Error::PacketIncomplete);
     }
@@ -352,8 +352,11 @@ pub(crate) fn encode_length(
     len: usize,
     buffer: &mut BytesMut,
 ) -> core::result::Result<(), EncodeError> {
-    let len = u32::try_from(len).map_err(|_| EncodeError::TooLarge)?;
-    VariableByteInteger(len).encode(buffer)
+    u32::try_from(len)
+        .ok()
+        .and_then(VariableByteInteger::new)
+        .ok_or(EncodeError::TooLarge)?
+        .encode(buffer)
 }
 
 /// Writes a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
@@ -391,16 +394,25 @@ pub(crate) fn check_authentication(
     Ok(())
 }
 
+/// Size of the Variable Byte Integer that writes `len`; a length too large
+/// for one counts as the four bytes of the largest.
+fn length_size(len: usize) -> usize {
+    u32::try_from(len)
+        .ok()
+        .and_then(VariableByteInteger::new)
+        .map_or(4, |len| len.encoded_size())
+}
+
 /// Size of a whole packet whose body is `remaining_len` bytes: the first
 /// byte, the Remaining Length and the body.
 pub(crate) fn packet_size(remaining_len: usize) -> usize {
-    1 + VariableByteInteger(remaining_len as u32).encoded_size() + remaining_len
+    1 + length_size(remaining_len) + remaining_len
 }
 
 /// Size of a property list with its length prefix.
 pub(crate) fn property_list_size<P: Encoder>(properties: &P) -> usize {
     let len = properties.encoded_size();
-    VariableByteInteger(len as u32).encoded_size() + len
+    length_size(len) + len
 }
 
 /// A property block that sets nothing reads as no block at all: the two

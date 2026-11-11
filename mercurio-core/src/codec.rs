@@ -43,10 +43,7 @@ pub trait Encoder {
 
 /// The longest packet MQTT can frame: the fixed header byte, a four-byte
 /// Remaining Length, and the 268,435,455 bytes that length can count.
-pub const MAX_PACKET_SIZE: usize = 1 + 4 + MAX_VARIABLE_BYTE_INTEGER as usize;
-
-/// The largest value a Variable Byte Integer can carry.
-const MAX_VARIABLE_BYTE_INTEGER: u32 = 268_435_455;
+pub const MAX_PACKET_SIZE: usize = 1 + 4 + VariableByteInteger::MAX as usize;
 
 /// Writes the two-byte length of a string or binary value (section 1.5.4),
 /// which can't be over 65,535.
@@ -110,8 +107,8 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 /// before the last byte, and with [`ReasonCode::MalformedPacket`] when a
 /// fourth byte still has its continuation bit set or the value uses more
 /// bytes than it needs [MQTT-1.5.5-1].
-/// Encoding refuses values above 268,435,455 with
-/// [`EncodeError::TooLarge`]; packets that large would be longer than
+/// [`new`](VariableByteInteger::new) refuses values above 268,435,455, so
+/// every value encodes; packets that large would be longer than
 /// [`MAX_PACKET_SIZE`].
 ///
 /// ```
@@ -119,18 +116,46 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 /// use mercurio_core::codec::{Decoder, Encoder, VariableByteInteger};
 ///
 /// let mut buffer = BytesMut::new();
-/// VariableByteInteger(321).encode(&mut buffer).unwrap();
+/// let value = VariableByteInteger::new(321).unwrap();
+/// value.encode(&mut buffer).unwrap();
 /// assert_eq!(&buffer[..], &[0xc1, 0x02]);
-/// assert_eq!(VariableByteInteger::decode(&mut buffer).unwrap().0, 321);
+/// assert_eq!(VariableByteInteger::decode(&mut buffer).unwrap().value(), 321);
+/// assert_eq!(VariableByteInteger::new(268_435_456), None);
 /// ```
-#[derive(PartialEq, Eq, Debug, Default, Clone)]
-pub struct VariableByteInteger(pub u32);
+#[derive(PartialEq, Eq, Debug, Default, Clone, Copy, Hash)]
+pub struct VariableByteInteger(u32);
+
+impl VariableByteInteger {
+    /// The largest value a Variable Byte Integer can carry.
+    pub const MAX: u32 = 268_435_455;
+
+    /// `value` as a Variable Byte Integer, or `None` above [`Self::MAX`].
+    pub const fn new(value: u32) -> Option<Self> {
+        if value <= Self::MAX {
+            Some(VariableByteInteger(value))
+        } else {
+            None
+        }
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+
+    /// A property identifier, which is always far below the maximum.
+    pub(crate) const fn from_id(id: u32) -> Self {
+        VariableByteInteger(id)
+    }
+}
+
+impl From<VariableByteInteger> for u32 {
+    fn from(value: VariableByteInteger) -> u32 {
+        value.0
+    }
+}
 
 impl Encoder for VariableByteInteger {
     fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
-        if self.0 > MAX_VARIABLE_BYTE_INTEGER {
-            return Err(EncodeError::TooLarge);
-        }
         encode_var_byte_integer(self.0, buffer);
         Ok(())
     }
@@ -140,9 +165,7 @@ impl Encoder for VariableByteInteger {
             0..=127 => 1,
             128..=16383 => 2,
             16384..=2097151 => 3,
-            2097152..=268435455 => 4,
-            // Too large for MQTT; encode refuses it
-            _ => 5,
+            _ => 4,
         }
     }
 }
@@ -370,13 +393,14 @@ mod tests {
         let value: u16 = 325;
         let mut encoded = BytesMut::new();
 
-        VariableByteInteger(value as u32)
+        VariableByteInteger::new(value.into())
+            .unwrap()
             .encode(&mut encoded)
             .unwrap();
         assert_eq!(encoded, Bytes::from(vec![0xc5, 0x02]));
 
         let decoded = VariableByteInteger::decode(&mut encoded)?;
-        assert_eq!(decoded.0 as u16, value);
+        assert_eq!(decoded.value(), u32::from(value));
 
         Ok(())
     }
@@ -404,22 +428,21 @@ mod tests {
         }
 
         let mut minimal = Bytes::from_static(&[0x80, 0x01]);
-        assert_eq!(VariableByteInteger::decode(&mut minimal).unwrap().0, 128);
+        assert_eq!(
+            VariableByteInteger::decode(&mut minimal).unwrap().value(),
+            128
+        );
         let mut zero = Bytes::from_static(&[0x00]);
-        assert_eq!(VariableByteInteger::decode(&mut zero).unwrap().0, 0);
+        assert_eq!(VariableByteInteger::decode(&mut zero).unwrap().value(), 0);
     }
 
     #[test]
     fn test_oversized_integer_is_refused() {
+        assert_eq!(VariableByteInteger::new(268_435_456), None);
+        let largest = VariableByteInteger::new(268_435_455).unwrap();
         let mut encoded = BytesMut::new();
-        assert_eq!(
-            VariableByteInteger(268_435_456).encode(&mut encoded),
-            Err(EncodeError::TooLarge)
-        );
-        assert!(encoded.is_empty());
-        VariableByteInteger(268_435_455)
-            .encode(&mut encoded)
-            .unwrap();
+        largest.encode(&mut encoded).unwrap();
+        assert_eq!(encoded.len(), largest.encoded_size());
         assert_eq!(encoded.len(), 4);
     }
 

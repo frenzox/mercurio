@@ -45,7 +45,7 @@ macro_rules! def_prop {
                 if !self.is_valid() {
                     return Err(EncodeError::InvalidProperty(Self::$i));
                 }
-                VariableByteInteger(Self::$i).encode(buffer)?;
+                VariableByteInteger::from_id(Self::$i).encode(buffer)?;
 
                 $(
                     self.$n.encode(buffer)?;
@@ -56,7 +56,7 @@ macro_rules! def_prop {
             fn encoded_size(&self) -> usize {
                 let mut len = 0;
 
-                len += VariableByteInteger(Self::$i).encoded_size();
+                len += VariableByteInteger::from_id(Self::$i).encoded_size();
 
                 $(
                     len += self.$n.encoded_size();
@@ -99,10 +99,48 @@ def_prop!(CorrelationData {
     value: Bytes
 });
 
-def_prop!(SubscriptionIdentifier {
-    ID: 0x0b,
-    value: VariableByteInteger
-} valid: |p| p.value.0 != 0);
+/// An MQTT 5 property. Its meaning is described on the [`Property`]
+/// variant of the same name.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct SubscriptionIdentifier {
+    value: VariableByteInteger,
+}
+
+impl SubscriptionIdentifier {
+    /// Property identifier, encoded as a Variable Byte Integer before the
+    /// value.
+    pub const ID: u32 = 0x0b;
+
+    /// The identifier `value`, or `None` outside 1 to 268,435,455.
+    pub fn new(value: u32) -> Option<Self> {
+        VariableByteInteger::new(value)
+            .filter(|_| value != 0)
+            .map(|value| SubscriptionIdentifier { value })
+    }
+
+    pub fn value(&self) -> u32 {
+        self.value.value()
+    }
+}
+
+impl Encoder for SubscriptionIdentifier {
+    fn encode(&self, buffer: &mut BytesMut) -> Result<(), EncodeError> {
+        VariableByteInteger::from_id(Self::ID).encode(buffer)?;
+        self.value.encode(buffer)
+    }
+
+    fn encoded_size(&self) -> usize {
+        VariableByteInteger::from_id(Self::ID).encoded_size() + self.value.encoded_size()
+    }
+}
+
+/// An identifier of 0 is a protocol error.
+impl Decoder for SubscriptionIdentifier {
+    fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        SubscriptionIdentifier::new(VariableByteInteger::decode(buffer)?.value())
+            .ok_or_else(|| ReasonCode::ProtocolError.into())
+    }
+}
 
 def_prop!(SessionExpiryInterval {
     ID: 0x11,
@@ -360,7 +398,6 @@ fn decode_with_id<T: Buf>(id: u32, buffer: &mut T) -> crate::Result<Property> {
         Property::RequestProblemInformation(p) => p.is_valid(),
         Property::RequestResponseInformation(p) => p.is_valid(),
         Property::MaximumQoS(p) => p.is_valid(),
-        Property::SubscriptionIdentifier(p) => p.is_valid(),
         Property::TopicAlias(p) => p.is_valid(),
         Property::ReceiveMaximum(p) => p.is_valid(),
         Property::MaximumPacketSize(p) => p.is_valid(),
@@ -412,7 +449,7 @@ where
     T: Buf,
     F: FnMut(Property) -> crate::Result<()>,
 {
-    let len = VariableByteInteger::decode(buffer)?.0 as usize;
+    let len = VariableByteInteger::decode(buffer)?.value() as usize;
     if buffer.remaining() < len {
         return Err(ReasonCode::MalformedPacket.into());
     }
@@ -440,7 +477,7 @@ where
 
 impl Decoder for Property {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let id = VariableByteInteger::decode(buffer)?.0;
+        let id = VariableByteInteger::decode(buffer)?.value();
 
         decode_with_id(id, buffer)
     }
@@ -496,6 +533,19 @@ mod tests {
 #[cfg(test)]
 mod encode_tests {
     use super::*;
+
+    #[test]
+    fn test_subscription_identifier_is_1_to_268_435_455() {
+        assert_eq!(SubscriptionIdentifier::new(0), None);
+        assert_eq!(SubscriptionIdentifier::new(268_435_456), None);
+        let largest = SubscriptionIdentifier::new(268_435_455).unwrap();
+        let mut buffer = BytesMut::new();
+        largest.encode(&mut buffer).unwrap();
+        assert_eq!(
+            Property::decode(&mut buffer.freeze()).unwrap(),
+            Property::SubscriptionIdentifier(largest)
+        );
+    }
 
     #[test]
     fn test_values_the_decoder_refuses_are_not_encoded() {

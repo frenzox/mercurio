@@ -276,7 +276,7 @@ mod tests {
             .unwrap()
             .subscription_identifiers
             .iter()
-            .map(|s| s.value.0)
+            .map(|s| s.value())
             .collect();
         assert_eq!(identifiers, [3, 9]);
     }

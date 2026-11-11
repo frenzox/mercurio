@@ -14,7 +14,7 @@ use arbitrary::Arbitrary;
 use bytes::{Bytes, BytesMut};
 use libfuzzer_sys::fuzz_target;
 use mercurio_core::{
-    codec::{Decoder, VariableByteInteger},
+    codec::Decoder,
     properties::*,
     protocol::{PacketType, ProtocolVersion},
     qos::QoS,
@@ -367,9 +367,7 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
                 user_property: user_properties(user),
                 subscription_identifiers: subscription_identifiers
                     .into_iter()
-                    .map(|n| {
-                        SubscriptionIdentifier::new(VariableByteInteger((n % 268_435_455) + 1))
-                    })
+                    .filter_map(|n| SubscriptionIdentifier::new((n % 268_435_455) + 1))
                     .collect(),
                 content_type: content_type.map(|s| ContentType::new(text(s))),
             });
@@ -472,9 +470,8 @@ fn build(packet: Packet, version: ProtocolVersion) -> Option<ControlPacket> {
             let properties = v5
                 .then(|| {
                     present(SubscribeProperties {
-                        subscription_id: subscription_id.map(|n| {
-                            SubscriptionIdentifier::new(VariableByteInteger((n % 268_435_455) + 1))
-                        }),
+                        subscription_id: subscription_id
+                            .and_then(|n| SubscriptionIdentifier::new((n % 268_435_455) + 1)),
                         user_property: user_properties(user),
                     })
                 })

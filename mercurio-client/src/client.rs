@@ -7,7 +7,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use mercurio_core::codec::VariableByteInteger;
 use mercurio_core::properties::{
     AuthenticationData, AuthenticationMethod, MaximumPacketSize, ReceiveMaximum,
     RequestProblemInformation, RequestResponseInformation, SessionExpiryInterval,
@@ -1884,7 +1883,8 @@ impl EventLoop {
         let subscribe = SubscribePacket {
             packet_id,
             properties: subscription_id.map(|id| SubscribeProperties {
-                subscription_id: Some(SubscriptionIdentifier::new(VariableByteInteger(id))),
+                // In range: `subscribe` checked it
+                subscription_id: SubscriptionIdentifier::new(id),
                 user_property: None,
             }),
             payload,
@@ -2276,7 +2276,7 @@ impl EventLoop {
                 .map(|p| {
                     p.subscription_identifiers
                         .iter()
-                        .map(|s| s.value.0)
+                        .map(|s| s.value())
                         .collect()
                 })
                 .unwrap_or_default();
