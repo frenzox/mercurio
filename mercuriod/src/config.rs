@@ -9,7 +9,7 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, QueueLimits, Transport},
+    server::{Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareStrategy, Transport},
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -249,6 +249,32 @@ pub struct ListenerConfig {
 
     /// Concurrent connections allowed on this listener
     pub max_connections: Option<usize>,
+
+    /// New connections per second this listener accepts on average
+    pub max_connection_rate: Option<u32>,
+
+    /// New connections this listener accepts at once after a quiet spell;
+    /// `max_connection_rate` by default
+    pub connection_rate_burst: Option<u32>,
+
+    /// Replaces `[server] max_packet_size` for this listener's clients
+    pub max_packet_size: Option<usize>,
+
+    /// Replaces `[server] max_connect_packet_size` for this listener's
+    /// clients
+    pub max_connect_packet_size: Option<usize>,
+
+    /// Replaces `[server] max_keepalive` for this listener's clients
+    pub max_keepalive: Option<u16>,
+
+    /// Replaces `[server] connect_timeout`, in seconds, for this listener's
+    /// clients
+    pub connect_timeout: Option<u64>,
+
+    /// Each client's id is the user name it authenticated as; clients
+    /// without one are refused
+    #[serde(default)]
+    pub use_username_as_clientid: bool,
 
     /// With `protocol = "websocket"`, serve the files of this directory to
     /// plain HTTP requests
@@ -772,6 +798,14 @@ pub struct ServerConfig {
     #[serde(default = "default_max_queued_bytes")]
     pub max_queued_bytes: usize,
 
+    /// Which message a full queue drops
+    #[serde(default)]
+    pub queue_overflow: QueueOverflow,
+
+    /// How a shared subscription's group picks the member a message goes to
+    #[serde(default)]
+    pub shared_subscription_strategy: SharedStrategy,
+
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
     #[serde(default)]
@@ -854,8 +888,42 @@ pub struct ServerConfig {
     pub persistent_client_expiration: Option<u64>,
 
     /// Most seconds any session may outlive its connection; MQTT 5 clients
-    /// asking for longer are told to use this. Unbounded when unset
-    pub max_session_expiry: Option<u64>,
+    /// asking for longer are told to use this. A week by default;
+    /// `"unlimited"` lets sessions live forever
+    #[serde(default = "default_max_session_expiry")]
+    pub max_session_expiry: ExpiryBound,
+
+    /// Sessions outliving their connection the broker may hold, connected
+    /// or not; unbounded when unset
+    pub max_sessions: Option<usize>,
+
+    /// PUBLISH packets per second one client may send on average; the
+    /// broker stops reading from a client going faster. Unlimited when unset
+    pub max_publish_rate: Option<u32>,
+
+    /// PUBLISH packets a client may send at once after a quiet spell;
+    /// `max_publish_rate` by default
+    pub publish_rate_burst: Option<u32>,
+
+    /// Payload bytes per second one client may publish on average
+    pub max_publish_bytes_rate: Option<u32>,
+
+    /// Payload bytes a client may publish at once after a quiet spell;
+    /// `max_publish_bytes_rate` by default
+    pub publish_bytes_burst: Option<u32>,
+
+    /// Failed logins from one address within `login_failure_window` that
+    /// get it banned for `login_failure_ban`; 0 turns this off
+    #[serde(default = "default_login_failure_attempts")]
+    pub login_failure_attempts: u32,
+
+    /// Seconds over which failed logins are counted
+    #[serde(default = "default_login_failure_window")]
+    pub login_failure_window: u64,
+
+    /// Seconds an address is banned for once it failed too often
+    #[serde(default = "default_login_failure_ban")]
+    pub login_failure_ban: u64,
 
     /// Topics that may hold a retained message at once, the broker's own
     /// `$SYS` topics not counted; unbounded when unset
@@ -895,6 +963,8 @@ impl Default for ServerConfig {
             max_queued_messages: default_max_queued_messages(),
             max_queued_qos0_messages: default_max_queued_qos0_messages(),
             max_queued_bytes: default_max_queued_bytes(),
+            queue_overflow: QueueOverflow::default(),
+            shared_subscription_strategy: SharedStrategy::default(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
@@ -914,7 +984,15 @@ impl Default for ServerConfig {
             auto_id_prefix: String::new(),
             clientid_prefixes: Vec::new(),
             persistent_client_expiration: None,
-            max_session_expiry: None,
+            max_session_expiry: default_max_session_expiry(),
+            max_sessions: None,
+            max_publish_rate: None,
+            publish_rate_burst: None,
+            max_publish_bytes_rate: None,
+            publish_bytes_burst: None,
+            login_failure_attempts: default_login_failure_attempts(),
+            login_failure_window: default_login_failure_window(),
+            login_failure_ban: default_login_failure_ban(),
             max_retained_messages: None,
             max_connections_per_ip: None,
             plugin_timeout: default_plugin_timeout(),
@@ -922,6 +1000,90 @@ impl Default for ServerConfig {
             tls: TlsServerConfig::default(),
         }
     }
+}
+
+/// A longest time, in seconds, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ExpiryBound {
+    Seconds(u64),
+    Unlimited(Unlimited),
+}
+
+/// The word `"unlimited"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Unlimited {
+    Unlimited,
+}
+
+impl ExpiryBound {
+    fn duration(self) -> Option<Duration> {
+        match self {
+            ExpiryBound::Seconds(seconds) => Some(Duration::from_secs(seconds)),
+            ExpiryBound::Unlimited(_) => None,
+        }
+    }
+}
+
+/// The rate `per_second`, `name` in the configuration, with `burst`,
+/// one second's worth by default.
+pub fn rate(
+    name: &str,
+    per_second: Option<u32>,
+    burst: Option<u32>,
+) -> Result<Option<Rate>, String> {
+    let Some(per_second) = per_second else {
+        return match burst {
+            Some(_) => Err(format!("a burst for {name} needs {name}")),
+            None => Ok(None),
+        };
+    };
+    let burst = burst.unwrap_or(per_second);
+    if per_second == 0 || burst == 0 {
+        return Err(format!("{name} and its burst must be at least 1"));
+    }
+    Ok(Some(Rate::new(per_second, burst)))
+}
+
+fn default_login_failure_attempts() -> u32 {
+    10
+}
+
+fn default_login_failure_window() -> u64 {
+    60
+}
+
+fn default_login_failure_ban() -> u64 {
+    300
+}
+
+/// A week: sessions of clients that never return don't pile up forever,
+/// while devices offline over a weekend find theirs.
+fn default_max_session_expiry() -> ExpiryBound {
+    ExpiryBound::Seconds(7 * 24 * 3600)
+}
+
+/// How a shared subscription's group picks a member.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedStrategy {
+    #[default]
+    RoundRobin,
+    Random,
+    Sticky,
+    Hash,
+}
+
+/// Which message a full queue drops.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueOverflow {
+    /// The message arriving
+    #[default]
+    DropNewest,
+    /// The oldest queued messages of the same kind
+    DropOldest,
 }
 
 /// TLS configuration for the server.
@@ -1146,6 +1308,15 @@ impl ServerConfig {
         Duration::from_secs(self.plugin_tick_interval)
     }
 
+    pub fn share_strategy(&self) -> ShareStrategy {
+        match self.shared_subscription_strategy {
+            SharedStrategy::RoundRobin => ShareStrategy::RoundRobin,
+            SharedStrategy::Random => ShareStrategy::Random,
+            SharedStrategy::Sticky => ShareStrategy::Sticky,
+            SharedStrategy::Hash => ShareStrategy::Hash,
+        }
+    }
+
     pub fn limits(&self) -> Result<Limits, String> {
         let maximum_qos = QoS::from(self.max_qos);
         if maximum_qos == QoS::Invalid {
@@ -1169,6 +1340,10 @@ impl ServerConfig {
         limits.queue.max_messages = self.max_queued_messages;
         limits.queue.max_bytes = Some(self.max_queued_bytes);
         limits.queue.upgrade_qos = self.upgrade_outgoing_qos;
+        limits.queue.overflow = match self.queue_overflow {
+            QueueOverflow::DropNewest => Overflow::DropNewest,
+            QueueOverflow::DropOldest => Overflow::DropOldest,
+        };
         limits.max_connections = Some(self.max_connections);
         limits.topic_alias_maximum = self.max_topic_alias;
         limits.receive_maximum = self.receive_maximum;
@@ -1182,7 +1357,30 @@ impl ServerConfig {
         limits.check_retain_source = self.check_retain_source;
         limits.max_subscriptions = Some(self.max_subscriptions);
         limits.max_topic_filter_length = self.max_topic_filter_length;
-        limits.max_session_expiry = self.max_session_expiry.map(Duration::from_secs);
+        limits.max_session_expiry = self.max_session_expiry.duration();
+        limits.max_sessions = self.max_sessions;
+        limits.max_publish_rate = rate(
+            "max_publish_rate",
+            self.max_publish_rate,
+            self.publish_rate_burst,
+        )?;
+        limits.max_publish_bytes_rate = rate(
+            "max_publish_bytes_rate",
+            self.max_publish_bytes_rate,
+            self.publish_bytes_burst,
+        )?;
+        if self.login_failure_attempts > 0 {
+            if self.login_failure_window == 0 || self.login_failure_ban == 0 {
+                return Err(
+                    "login_failure_window and login_failure_ban must be at least 1 second".into(),
+                );
+            }
+            limits.login_failures = Some(LoginFailures::new(
+                self.login_failure_attempts,
+                Duration::from_secs(self.login_failure_window),
+                Duration::from_secs(self.login_failure_ban),
+            ));
+        }
         limits.max_retained_messages = self.max_retained_messages;
         limits.max_connections_per_ip = self.max_connections_per_ip;
         Ok(limits)
@@ -1656,6 +1854,101 @@ mod tests {
         assert_eq!(config.server.limits().unwrap().max_inflight, 5);
         let config: Config = toml::from_str("[server]\nmax_inflight = 0\n").unwrap();
         assert!(config.server.limits().is_err());
+    }
+
+    #[test]
+    fn test_sessions_expire_after_a_week_unless_unlimited() {
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits().unwrap()
+        };
+        assert_eq!(
+            limits("").max_session_expiry,
+            Some(Duration::from_secs(604_800))
+        );
+        assert_eq!(
+            limits("[server]\nmax_session_expiry = 60\n").max_session_expiry,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            limits("[server]\nmax_session_expiry = \"unlimited\"\n").max_session_expiry,
+            None
+        );
+        assert!(toml::from_str::<Config>("[server]\nmax_session_expiry = \"forever\"\n").is_err());
+        assert_eq!(limits("").max_sessions, None);
+        assert_eq!(limits("[server]\nmax_sessions = 5\n").max_sessions, Some(5));
+    }
+
+    #[test]
+    fn test_shared_subscription_strategy_is_read() {
+        let strategy = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.share_strategy()
+        };
+        use mercurio_server::server::ShareStrategy;
+        assert_eq!(strategy(""), ShareStrategy::RoundRobin);
+        assert_eq!(
+            strategy("[server]\nshared_subscription_strategy = \"hash\"\n"),
+            ShareStrategy::Hash
+        );
+        assert!(
+            toml::from_str::<Config>("[server]\nshared_subscription_strategy = \"first\"\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_failed_logins_ban_after_ten_a_minute_unless_off() {
+        use mercurio_server::server::LoginFailures;
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        assert_eq!(
+            limits("").unwrap().login_failures,
+            Some(LoginFailures::new(
+                10,
+                Duration::from_secs(60),
+                Duration::from_secs(300)
+            ))
+        );
+        assert_eq!(
+            limits("[server]\nlogin_failure_attempts = 0\n")
+                .unwrap()
+                .login_failures,
+            None
+        );
+        assert!(limits("[server]\nlogin_failure_ban = 0\n").is_err());
+    }
+
+    #[test]
+    fn test_publish_rates_take_a_second_of_burst_by_default() {
+        use mercurio_server::server::Rate;
+        let limits = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits()
+        };
+        let set = limits("[server]\nmax_publish_rate = 50\nmax_publish_bytes_rate = 1000\npublish_bytes_burst = 5000\n").unwrap();
+        assert_eq!(set.max_publish_rate, Some(Rate::new(50, 50)));
+        assert_eq!(set.max_publish_bytes_rate, Some(Rate::new(1000, 5000)));
+        assert_eq!(limits("").unwrap().max_publish_rate, None);
+        assert!(limits("[server]\npublish_rate_burst = 5\n").is_err());
+        assert!(limits("[server]\nmax_publish_rate = 0\n").is_err());
+    }
+
+    #[test]
+    fn test_queue_overflow_reaches_the_limits() {
+        let overflow = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.limits().unwrap().queue.overflow
+        };
+        use mercurio_server::server::Overflow;
+        assert_eq!(overflow(""), Overflow::DropNewest);
+        assert_eq!(
+            overflow("[server]\nqueue_overflow = \"drop_oldest\"\n"),
+            Overflow::DropOldest
+        );
+        assert!(toml::from_str::<Config>("[server]\nqueue_overflow = \"oldest\"\n").is_err());
     }
 
     #[test]

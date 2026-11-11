@@ -2,7 +2,12 @@ mod common;
 
 use std::{net::SocketAddr, time::Duration};
 
-use mercurio_server::server::{AuthConfig, ListenerConfig, ServerConfig, Transport};
+use std::sync::Arc;
+
+use mercurio_server::{
+    plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin},
+    server::{AuthConfig, ListenerConfig, ServerConfig, Transport},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -145,4 +150,114 @@ async fn listeners_can_limit_their_connections() {
 
     // while the broker's other listeners are unaffected
     assert_eq!(connect(main, b'2').await.1, 0x00);
+}
+
+#[tokio::test]
+async fn listeners_can_lower_packet_size_keepalive_and_connect_time() {
+    let (main, strict) = start_broker(|listener| {
+        let mut value = listener;
+        value.max_packet_size = Some(64);
+        value.max_keepalive = Some(30);
+        value.connect_timeout = Some(Duration::from_millis(300));
+        value
+    })
+    .await;
+
+    // Maximum Packet Size (0x27) of 64, Server Keep Alive (0x13) of 30
+    let connack = connack_of(strict, b's').await;
+    assert!(connack.windows(5).any(|w| w == [0x27, 0, 0, 0, 64]));
+    assert!(connack.windows(3).any(|w| w == [0x13, 0, 30]));
+    let connack = connack_of(main, b'm').await;
+    assert!(!connack.windows(5).any(|w| w == [0x27, 0, 0, 0, 64]));
+    assert!(!connack.windows(3).any(|w| w == [0x13, 0, 30]));
+
+    // A silent connection is closed after the listener's own timeout
+    let mut idle = TcpStream::connect(strict).await.unwrap();
+    let mut received = Vec::new();
+    timeout(Duration::from_secs(2), idle.read_to_end(&mut received))
+        .await
+        .expect("still open after the listener's connect timeout")
+        .unwrap();
+    let mut idle = TcpStream::connect(main).await.unwrap();
+    let mut byte = [0u8; 1];
+    assert!(timeout(Duration::from_secs(1), idle.read(&mut byte))
+        .await
+        .is_err());
+}
+
+async fn connack_of(addr: SocketAddr, client_id: u8) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x01, client_id,
+        ])
+        .await
+        .unwrap();
+    common::read_connack(&mut stream).await
+}
+
+/// Lets in any user with the password `secret`.
+struct Passwords;
+
+impl Plugin for Passwords {
+    fn name(&self) -> &str {
+        "passwords"
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        _: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        let allowed = credentials.password == b"secret";
+        Box::pin(async move {
+            match allowed {
+                true => Decision::Allow,
+                false => Decision::Deny,
+            }
+        })
+    }
+}
+
+/// MQTT 5 CONNECT with `client_id` and, when given, a user name with the
+/// password `secret`; the CONNACK.
+async fn connect_as(addr: SocketAddr, client_id: &str, user: Option<&str>) -> Vec<u8> {
+    let mut body = vec![0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05];
+    body.push(if user.is_some() { 0xc2 } else { 0x02 });
+    body.extend_from_slice(&[0x00, 0x3c, 0x00]);
+    let field = |body: &mut Vec<u8>, value: &[u8]| {
+        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        body.extend_from_slice(value);
+    };
+    field(&mut body, client_id.as_bytes());
+    if let Some(user) = user {
+        field(&mut body, user.as_bytes());
+        field(&mut body, b"secret");
+    }
+    let mut packet = vec![0x10, body.len() as u8];
+    packet.extend(body);
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&packet).await.unwrap();
+    common::read_connack(&mut stream).await
+}
+
+#[tokio::test]
+async fn listeners_can_use_the_user_name_as_client_id() {
+    let (_, named) = start_broker(|listener| {
+        let mut value = listener;
+        value.use_username_as_clientid = true;
+        value.plugins = Some(vec![Arc::new(Passwords) as Arc<dyn Plugin>]);
+        value
+    })
+    .await;
+
+    // Assigned Client Identifier (0x12) "alice", whatever the client sent
+    let connack = connect_as(named, "device-7", Some("alice")).await;
+    assert_eq!(connack[3], 0x00);
+    let assigned = [&[0x12, 0x00, 0x05][..], b"alice"].concat();
+    assert!(connack.windows(8).any(|w| w == assigned), "{connack:?}");
+    assert_eq!(connect_as(named, "", Some("bob")).await[3], 0x00);
+    // Not Authorized without a verified user name
+    assert_eq!(connect_as(named, "device-8", None).await[3], 0x87);
 }

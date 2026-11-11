@@ -317,6 +317,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.proxy_from = prepared.proxy_from;
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
+        value.max_connection_rate = config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
+        value.max_packet_size = extra.max_packet_size;
+        value.max_connect_packet_size = extra.max_connect_packet_size;
+        value.max_keepalive = extra.max_keepalive;
+        value.connect_timeout = extra.connect_timeout.map(Duration::from_secs);
+        value.use_username_as_clientid = extra.use_username_as_clientid;
         value.http_dir = extra.http_dir.clone().map(Into::into);
         value.health = extra.health;
         value.metrics = extra.metrics;
@@ -372,6 +382,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
     server_config.plugin_timeout = config.server.plugin_timeout();
     server_config.plugin_tick_interval = config.server.plugin_tick_interval();
+    server_config.share_strategy = config.server.share_strategy();
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(hangup, reloadable));
 
@@ -498,6 +509,14 @@ async fn prepare(
     for extra in &config.listeners {
         if extra.port.is_some() == extra.path.is_some() {
             return Err("Each [[listeners]] entry needs either `port` or `path`".into());
+        }
+        config::rate(
+            "max_connection_rate",
+            extra.max_connection_rate,
+            extra.connection_rate_burst,
+        )?;
+        if extra.max_connect_packet_size == Some(0) {
+            return Err("A listener's max_connect_packet_size must be at least 1".into());
         }
         let names = extra.plugins.as_deref();
         let (auth, plugins) = match &extra.auth {

@@ -159,6 +159,27 @@ host = "0.0.0.0"
 port = 8883
 max_connections = 500</pre>
 <p>Connections beyond the limit are closed right after being accepted. The broker-wide <code>[server] max_connections</code> still applies, and a flood on one listener can't use up the slots of another.</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8883
+max_connection_rate = 50     <span class="comment"># new connections a second, on average</span>
+connection_rate_burst = 200  <span class="comment"># at once after a quiet spell; max_connection_rate by default</span></pre>
+<p>Connections beyond the rate are closed right after being accepted, before any handshake, as those beyond <code>max_connections</code> are. A reconnect storm after an outage then reaches the broker at a pace it can authenticate.</p>
+<p>A listener may also replace some <code>[server]</code> limits for its own clients; those it leaves out come from <code>[server]</code>:</p>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8884
+max_packet_size = 65536         <span class="comment"># largest packet, in bytes</span>
+max_connect_packet_size = 4096  <span class="comment"># largest CONNECT, before authentication</span>
+max_keepalive = 120             <span class="comment"># longest keep-alive of MQTT 5 clients, in seconds</span>
+connect_timeout = 5             <span class="comment"># seconds to finish the handshakes and send CONNECT</span></pre>
+
+<h2 id="username-as-clientid">User names as client ids</h2>
+<pre>[[listeners]]
+host = "0.0.0.0"
+port = 8883
+use_username_as_clientid = true</pre>
+<p>Each client's session gets the user name the client authenticated as for client id, whatever client id it sent, as with mosquitto's option of the same name. MQTT 5 clients are told the id in the CONNACK's Assigned Client Identifier. A client without a verified user name, anonymous or one that sent a name its credentials didn't prove, is refused with Not Authorized. Each user then has one session, and a client can never take over the client id of another user. A trusted listener verifies no user names, so it can't use this.</p>
 
 <h2 id="tenant">Example: a multi-tenant broker</h2>
 <pre><span class="comment"># /etc/mercurio/config.toml</span>

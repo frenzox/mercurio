@@ -119,9 +119,9 @@ persistent_client_expiration = 604800  <span class="comment"># one week</span></
 <tr><td><code>publish/messages/dropped/too_large</code></td><td>Messages larger than the subscriber's Maximum Packet Size</td></tr>
 <tr><td><code>publish/messages/dropped/not_authorized</code></td><td>Messages on a topic the subscriber may not read, although its subscription matched</td></tr>
 <tr><td><code>publish/messages/dropped/no_share_member</code></td><td>Messages no member of a shared subscription's group could take</td></tr>
-<tr><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td><td>Batches of session changes written again after a storage error, and given up on, their changes lost on the next restart</td></tr>
-<tr><td><code>storage/failed batches</code></td><td>Batches of changes storage refused for good since start; the clients they belonged to are written whole again once storage takes it</td></tr>
-<tr><td><code>storage/dirty clients</code></td><td>Clients whose stored state differs from the broker's until it is written whole again</td></tr>
+<tr><td><code>storage/batches/retried</code></td><td>Batches of session changes written again after a storage error, since start</td></tr>
+<tr><td><code>storage/batches/dropped</code></td><td>Batches of session changes storage refused for good since start; the clients they belonged to are written whole again once storage takes it</td></tr>
+<tr><td><code>storage/clients/dirty</code></td><td>Clients whose stored state differs from the broker's until it is written whole again</td></tr>
 <tr><td><code>load/messages/received/1min</code>, <code>5min</code>, <code>15min</code></td><td>Messages received per minute, averaged over 1, 5 and 15 minutes</td></tr>
 <tr><td><code>load/messages/sent/…</code>, <code>load/bytes/received/…</code>, <code>load/bytes/sent/…</code>, <code>load/connections/…</code></td><td>The same for messages sent, bytes and new connections</td></tr>
 <tr><td><code>connection/&lt;client id&gt;/state</code></td><td><code>1</code> or <code>0</code> for each <a href="bridges.html">bridge</a></td></tr>
@@ -165,7 +165,8 @@ mercurio_uptime_seconds 86400</pre>
 <tr><td><code>mercurio_retained_messages</code></td><td>gauge</td><td><code>retained messages/count</code></td></tr>
 <tr><td><code>mercurio_subscriptions</code></td><td>gauge</td><td><code>subscriptions/count</code></td></tr>
 <tr><td><code>mercurio_messages_dropped_total{cause}</code></td><td>counter</td><td><code>publish/messages/dropped/&lt;cause&gt;</code>; their sum is <code>publish/messages/dropped</code></td></tr>
-<tr><td><code>mercurio_storage_batches_retried_total</code>, <code>mercurio_storage_batches_dropped_total</code></td><td>counter</td><td><code>store/batches/retried</code>, <code>store/batches/dropped</code></td></tr>
+<tr><td><code>mercurio_storage_batches_retried_total</code>, <code>mercurio_storage_batches_dropped_total</code></td><td>counter</td><td><code>storage/batches/retried</code>, <code>storage/batches/dropped</code></td></tr>
+<tr><td><code>mercurio_storage_dirty_clients</code></td><td>gauge</td><td><code>storage/clients/dirty</code></td></tr>
 <tr><td><code>mercurio_connections_total</code></td><td>counter</td><td>Connections accepted; the rate is <code>load/connections/…</code></td></tr>
 <tr><td><code>mercurio_uptime_seconds</code></td><td>gauge</td><td><code>uptime</code></td></tr>
 </table>

@@ -3,18 +3,20 @@
 //! never waits for storage; a change reaches storage before it takes effect.
 
 use std::{
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use mercurio_core::message::unix_millis;
 use mercurio_storage::{BanStore, StoredBan};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use tracing::{info, warn};
 
 use crate::{
     admin::{storage_failed, AdminError, Ban, BanKey, BanKind, NewBan},
-    server::AddressRange,
+    server::{address_key, AddressRange},
 };
 
 pub(crate) fn unix_secs() -> u64 {
@@ -344,6 +346,112 @@ impl Bans {
     }
 }
 
+/// When failed logins get an address banned for a while.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LoginFailures {
+    /// Failed logins from one address within `window` that get it banned
+    pub attempts: u32,
+    pub window: Duration,
+    /// How long the ban lasts; whole seconds, at least one
+    pub ban: Duration,
+}
+
+impl LoginFailures {
+    pub fn new(attempts: u32, window: Duration, ban: Duration) -> Self {
+        LoginFailures {
+            attempts,
+            window,
+            ban,
+        }
+    }
+}
+
+/// Addresses whose failed logins are tracked at once. An attacker cycling
+/// through addresses can't grow the table past it; while it is full of
+/// recent failures, new addresses go untracked.
+const MAX_TRACKED: usize = 16_384;
+
+/// The recent failed logins of each client address, counted as the
+/// per-address connection limit counts them: IPv6 by /64, IPv4-mapped
+/// addresses as IPv4.
+pub(crate) struct FailedLogins {
+    limits: LoginFailures,
+    failures: std::sync::Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+}
+
+impl FailedLogins {
+    pub(crate) fn new(limits: LoginFailures) -> Self {
+        FailedLogins {
+            limits,
+            failures: Default::default(),
+        }
+    }
+
+    /// Counts a failed login from `ip`. Once its address has failed
+    /// `attempts` times within the window, bans it through `bans` for the
+    /// ban's duration and starts counting again. Loopback addresses are
+    /// never banned.
+    pub(crate) async fn failed(&self, ip: IpAddr, bans: &Bans) {
+        let key = address_key(ip);
+        if ip.to_canonical().is_loopback() || self.limits.attempts == 0 {
+            return;
+        }
+        if !self.count(key) {
+            return;
+        }
+        let range = match key {
+            IpAddr::V4(_) => key.to_string(),
+            IpAddr::V6(_) => format!("{key}/64"),
+        };
+        let seconds = self.limits.ban.as_secs().clamp(1, u64::from(u32::MAX));
+        let reason = format!(
+            "automatic: {} failed logins within {} s",
+            self.limits.attempts,
+            self.limits.window.as_secs()
+        );
+        let mut ban = NewBan::new(BanKey::new(BanKind::Address, range.clone()));
+        ban.duration = Some(seconds as u32);
+        ban.reason = Some(reason);
+        match bans.add(ban).await {
+            Ok(_) => warn!(
+                "Banned `{}` for {} s after {} failed logins",
+                range, seconds, self.limits.attempts
+            ),
+            Err(e) => warn!("Failed to ban `{}` after failed logins: {}", range, e),
+        }
+    }
+
+    /// Records a failure of `key` now; true when it reaches the limit.
+    fn count(&self, key: IpAddr) -> bool {
+        let now = Instant::now();
+        let window = self.limits.window;
+        let recent = |at: &Instant| now.saturating_duration_since(*at) < window;
+        let mut failures = self.failures.lock().unwrap();
+        if !failures.contains_key(&key) && failures.len() >= MAX_TRACKED {
+            failures.retain(|_, times| times.back().is_some_and(recent));
+            if failures.len() >= MAX_TRACKED {
+                return false;
+            }
+        }
+        let times = failures.entry(key).or_default();
+        while times.front().is_some_and(|at| !recent(at)) {
+            times.pop_front();
+        }
+        times.push_back(now);
+        if times.len() < self.limits.attempts as usize {
+            return false;
+        }
+        failures.remove(&key);
+        true
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.failures.lock().unwrap().len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use mercurio_storage::memory::MemoryStore;
@@ -366,6 +474,82 @@ mod tests {
             },
             range,
         }
+    }
+
+    fn throttle(attempts: u32) -> FailedLogins {
+        FailedLogins::new(LoginFailures::new(
+            attempts,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_logins_within_the_window_ban_the_address() {
+        let bans = Bans::load(None).await.unwrap();
+        let logins = throttle(3);
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        logins.failed(ip, &bans).await;
+        logins.failed(ip, &bans).await;
+        // The first failure leaves the window before the third comes
+        tokio::time::advance(Duration::from_secs(61)).await;
+        logins.failed(ip, &bans).await;
+        assert!(!bans.refuses_address(ip));
+        logins.failed(ip, &bans).await;
+        assert!(!bans.refuses_address(ip));
+        logins.failed(ip, &bans).await;
+        assert!(bans.refuses_address(ip));
+
+        let listed = bans.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].value, "192.0.2.7");
+        assert!(listed[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("automatic"));
+        let expires_in = listed[0].expires_at.unwrap() - unix_secs();
+        assert!((299..=300).contains(&expires_in), "{expires_in}");
+        assert_eq!(logins.tracked(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_logins_count_by_block_and_spare_loopback() {
+        let bans = Bans::load(None).await.unwrap();
+        let logins = throttle(2);
+        logins
+            .failed("2001:db8:0:1::1".parse().unwrap(), &bans)
+            .await;
+        logins
+            .failed("2001:db8:0:1::2".parse().unwrap(), &bans)
+            .await;
+        assert!(bans.refuses_address("2001:db8:0:1:ffff::9".parse().unwrap()));
+        assert!(!bans.refuses_address("2001:db8:0:2::1".parse().unwrap()));
+        assert_eq!(bans.list()[0].value, "2001:db8:0:1::/64");
+
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            logins.failed(ip, &bans).await;
+            logins.failed(ip, &bans).await;
+            assert!(!bans.refuses_address(ip));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_logins_track_a_bounded_number_of_addresses() {
+        let bans = Bans::load(None).await.unwrap();
+        let logins = throttle(2);
+        let nth = |n: usize| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n as u32));
+        for n in 0..MAX_TRACKED + 10 {
+            logins.failed(nth(n), &bans).await;
+        }
+        assert_eq!(logins.tracked(), MAX_TRACKED);
+        // Once their failures leave the window, new addresses take their place
+        tokio::time::advance(Duration::from_secs(61)).await;
+        logins.failed(nth(MAX_TRACKED + 20), &bans).await;
+        assert_eq!(logins.tracked(), 1);
+        logins.failed(nth(MAX_TRACKED + 20), &bans).await;
+        assert!(bans.refuses_address(nth(MAX_TRACKED + 20)));
     }
 
     fn client<'a>(

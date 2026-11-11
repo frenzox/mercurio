@@ -52,7 +52,7 @@ use mercurio_packets::{
 
 use crate::{
     acl::Access,
-    broker::Broker,
+    broker::{Broker, Publisher},
     connection::Connection,
     plugin::{
         is_control, AuthResult, Chain, ClientInfo, ConnectionInfo, Event, Exchange, MessageAction,
@@ -298,6 +298,8 @@ struct Shared {
     queue: Arc<MessageQueue>,
     /// Identifies this session's subscriptions in the topic tree
     subscriber_id: u64,
+    /// A hash of the client id, which never changes for a session
+    client_key: u64,
     /// Generation of the latest connection to use this session. Changed
     /// with `state` locked, so checks made under that lock see it settled;
     /// readable without the lock by the session manager.
@@ -350,8 +352,9 @@ struct State {
     /// Will message to be published on abnormal disconnect
     will_message: Option<WillMessage>,
     /// The task holding the will of the last connection until its delay
-    /// passes, with a copy of that will; a newer generation aborts it
-    pending_will: Option<(AbortHandle, WillMessage)>,
+    /// passes, with a copy of that will and the connection's generation; a
+    /// connection that takes the session over aborts it
+    pending_will: Option<(AbortHandle, WillMessage, u64)>,
     /// Re-authentication in progress, if any
     auth_exchange: Option<Exchange>,
     /// User name verified by authentication, the one access control trusts
@@ -414,6 +417,23 @@ impl From<Session> for SessionDropGuard {
     }
 }
 
+/// Takes the session's subscriptions out of the topic tree once the
+/// session leaves the session manager, even when what removed it is
+/// cancelled before it unsubscribed: nothing is queued for a session no one
+/// can reach.
+impl Drop for SessionDropGuard {
+    fn drop(&mut self) {
+        let shared = &self.session.shared;
+        if let Ok(mut state) = shared.state.try_lock() {
+            return state.unsubscribe_all(shared.subscriber_id);
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let session = self.session.clone();
+            runtime.spawn(async move { session.unsubscribe_all().await });
+        }
+    }
+}
+
 impl SessionDropGuard {
     pub(crate) fn new(
         connect_packet: ConnectPacket,
@@ -444,6 +464,12 @@ impl Session {
         stats: Arc<Stats>,
     ) -> Self {
         let client_id = connect_packet.payload.client_id.clone();
+        let client_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            client_id.hash(&mut hasher);
+            hasher.finish()
+        };
         let will_message = WillMessage::from_connect_packet(&connect_packet);
         let presence = Presence::default();
         let queue = MessageQueue::new(queue_limits).counted_in(stats);
@@ -486,6 +512,7 @@ impl Session {
                 }),
                 queue: Arc::new(queue),
                 subscriber_id: NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed),
+                client_key,
                 generation: AtomicU64::new(0),
                 owes_retained: AtomicBool::new(false),
             }),
@@ -521,7 +548,23 @@ impl Session {
     pub(crate) async fn set_generation(&self, generation: u64) {
         let mut state = self.shared.state.lock().await;
         self.shared.generation.store(generation, Ordering::Release);
-        if let Some((will, _)) = state.pending_will.take() {
+        if let Some((will, _, _)) = state.pending_will.take() {
+            will.abort();
+        }
+    }
+
+    /// Hands the session to `generation`, a connection that has yet to
+    /// start it, keeping the will an earlier connection left waiting: if
+    /// that connection is abandoned, the will is still due.
+    pub(crate) async fn hand_over(&self, generation: u64) {
+        let _state = self.shared.state.lock().await;
+        self.shared.generation.store(generation, Ordering::Release);
+    }
+
+    /// Drops the will an earlier connection left waiting for its delay, as
+    /// its client is back.
+    pub(crate) async fn drop_pending_will(&self) {
+        if let Some((will, _, _)) = self.shared.state.lock().await.pending_will.take() {
             will.abort();
         }
     }
@@ -537,7 +580,7 @@ impl Session {
     ) {
         let mut state = self.shared.state.lock().await;
         if self.generation() == generation {
-            state.pending_will = Some((task, will));
+            state.pending_will = Some((task, will, generation));
         } else {
             task.abort();
         }
@@ -548,7 +591,7 @@ impl Session {
     /// will is never cut off half published.
     pub(crate) async fn claim_pending_will(&self, generation: u64) -> bool {
         let mut state = self.shared.state.lock().await;
-        if self.generation() != generation {
+        if state.pending_will.as_ref().map(|(_, _, g)| *g) != Some(generation) {
             return false;
         }
         state.pending_will = None;
@@ -1027,7 +1070,7 @@ impl Session {
         };
 
         let subscribers = broker
-            .publish_from(&topic, message, Some(self.shared.subscriber_id))
+            .publish_from(&topic, message, Some(self.publisher()))
             .await
             .map_err(storage_failure)?;
 
@@ -1110,6 +1153,14 @@ impl Session {
         self.shared.subscriber_id
     }
 
+    /// This session as the publisher of a message.
+    fn publisher(&self) -> Publisher {
+        Publisher {
+            session: self.shared.subscriber_id,
+            key: self.shared.client_key,
+        }
+    }
+
     /// Records a new connection to the session and returns the counters
     /// of its traffic.
     pub(crate) async fn attach(
@@ -1145,6 +1196,15 @@ impl Session {
         state.presence.disconnected_at = Some(now / 1000);
         state.presence.session_expiry = expiry;
         state.presence.expires_at = expiry.map(|e| now + e.as_millis() as u64);
+    }
+
+    /// Records that a connection is starting the session to outlive it by
+    /// `expiry`, so storing the session whole before the connection is
+    /// attached keeps that expiry.
+    pub(crate) async fn set_expiry(&self, expiry: Option<Duration>) {
+        let presence = &mut self.shared.state.lock().await.presence;
+        presence.session_expiry = expiry;
+        presence.expires_at = None;
     }
 
     /// Records a session restored from storage as disconnected from now on.
@@ -1202,7 +1262,7 @@ impl Session {
             expires_at: state.presence.expires_at,
             owner: state.owner.clone(),
         })];
-        let pending = state.pending_will.as_ref().map(|(_, will)| will);
+        let pending = state.pending_will.as_ref().map(|(_, will, _)| will);
         if let Some(will) = state.will_message.as_ref().or(pending) {
             writes.push(Write::StoreWill(will.clone().into()));
         }
@@ -1287,6 +1347,12 @@ impl Session {
     /// Records the user name authentication verified for this connection.
     pub(crate) async fn set_verified_user(&self, username: Option<String>) {
         self.shared.state.lock().await.verified_user = username;
+    }
+
+    /// Holds the session's state until dropped, so whatever needs it waits.
+    #[cfg(test)]
+    pub(crate) async fn hold_state(&self) -> impl Sized + '_ {
+        self.shared.state.lock().await
     }
 
     /// Records the address and connection of the client now connected to
@@ -1708,13 +1774,7 @@ impl Session {
     /// when the session ends, so nothing is queued for it anymore.
     pub(crate) async fn unsubscribe_all(&self) {
         let mut session = self.shared.state.lock().await;
-        if let Some(topics) = session.topics.take() {
-            for topic_filter in session.subscriptions.keys() {
-                topics.unsubscribe(topic_filter, self.shared.subscriber_id);
-            }
-        }
-        session.subscriptions.clear();
-        session.retained.clear();
+        session.unsubscribe_all(self.shared.subscriber_id);
     }
 
     /// Whether new subscriptions are owed retained messages not yet queued.
@@ -2075,6 +2135,18 @@ impl State {
         client.peer = self.peer;
         client.connection = self.connection_info.clone();
         client
+    }
+
+    /// Removes every subscription of the session `subscriber_id` from the
+    /// topic tree.
+    fn unsubscribe_all(&mut self, subscriber_id: u64) {
+        if let Some(topics) = self.topics.take() {
+            for topic_filter in self.subscriptions.keys() {
+                topics.unsubscribe(topic_filter, subscriber_id);
+            }
+        }
+        self.subscriptions.clear();
+        self.retained.clear();
     }
 
     /// Replaces the topic of an outgoing PUBLISH with an alias where the

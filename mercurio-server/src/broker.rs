@@ -19,6 +19,7 @@ pub(crate) struct Broker<S: RetainedMessageStore> {
     /// Storage backend for retained messages, `$SYS` ones in memory
     storage: Arc<SysOverlay<S>>,
     stats: Arc<Stats>,
+    share_strategy: ShareStrategy,
 }
 
 impl<S: RetainedMessageStore> Clone for Broker<S> {
@@ -27,8 +28,39 @@ impl<S: RetainedMessageStore> Clone for Broker<S> {
             subscriptions: self.subscriptions.clone(),
             storage: Arc::clone(&self.storage),
             stats: Arc::clone(&self.stats),
+            share_strategy: self.share_strategy,
         }
     }
+}
+
+/// How a shared subscription's group picks the member a message goes to.
+/// Whatever the strategy, a connected member whose queue takes the message
+/// comes first; the strategy decides which member is tried first, and the
+/// others follow in turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShareStrategy {
+    /// Each message to the member after the one that took the last
+    #[default]
+    RoundRobin,
+    /// Each message to a member picked at random
+    Random,
+    /// Every message to the member that took the last one, for as long as
+    /// it is connected and its queue takes them
+    Sticky,
+    /// The messages of one publishing client to the same member, picked by
+    /// a hash of its client id, so they stay in order; messages from the
+    /// broker itself, such as wills, go round robin
+    Hash,
+}
+
+/// The client session a message comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Publisher {
+    /// Its subscriber id, for No Local
+    pub session: u64,
+    /// A hash of its client id, for `ShareStrategy::Hash`
+    pub key: u64,
 }
 
 impl<S: RetainedMessageStore> Broker<S> {
@@ -37,7 +69,14 @@ impl<S: RetainedMessageStore> Broker<S> {
             subscriptions: TopicTree::new(),
             storage: Arc::new(SysOverlay::new(storage)),
             stats: Default::default(),
+            share_strategy: ShareStrategy::default(),
         }
+    }
+
+    /// Picks the members of shared subscriptions with `strategy`.
+    pub(crate) fn with_share_strategy(mut self, strategy: ShareStrategy) -> Self {
+        self.share_strategy = strategy;
+        self
     }
 
     /// The retained messages, `$SYS` ones included, for the admin API.
@@ -119,14 +158,15 @@ impl<S: RetainedMessageStore> Broker<S> {
         self.publish_from(topic, message, None).await.map(|_| ())
     }
 
-    /// Publishes a message on behalf of the session `origin`, if any.
+    /// Publishes a message on behalf of `publisher`, if a client sent it.
     /// Returns how many subscriptions matched it.
     pub(crate) async fn publish_from(
         &self,
         topic: &str,
         message: Message,
-        origin: Option<u64>,
+        publisher: Option<Publisher>,
     ) -> Result<usize> {
+        let origin = publisher.map(|p| p.session);
         // Handle retained message storage
         if message.retain {
             if message.payload.as_ref().is_none_or(|p| p.is_empty()) {
@@ -146,11 +186,21 @@ impl<S: RetainedMessageStore> Broker<S> {
             }
         }
 
-        // Each share group's message goes to the next connected member whose
-        // queue takes it, and only to a disconnected one, whose queue waits
-        // for its client to return, when no connected member can
+        // Each share group's message goes to the first connected member
+        // whose queue takes it, from where the strategy starts, and only to
+        // a disconnected one, whose queue waits for its client to return,
+        // when no connected member can
+        let strategy = self.share_strategy;
         let matches = self.subscriptions.matching_with(topic, |members, turn| {
-            let order = (0..members.len()).map(|i| (turn + i) % members.len());
+            let len = members.len();
+            // `turn` follows the member chosen last
+            let start = match (strategy, publisher) {
+                (ShareStrategy::Random, _) => rand::random::<usize>() % len,
+                (ShareStrategy::Sticky, _) => (turn + len - 1) % len,
+                (ShareStrategy::Hash, Some(publisher)) => (publisher.key % len as u64) as usize,
+                _ => turn,
+            };
+            let order = (0..len).map(|i| (start + i) % len);
             let offer = |want_connected: bool| {
                 order.clone().find(|&i| {
                     let member = &members[i].1;
@@ -300,7 +350,7 @@ mod tests {
                 .unwrap();
         }
 
-        let counters = crate::sys::counters(&stats, 0, 0, 0, 0, (0, 0));
+        let counters = crate::sys::counters(&stats, 0, 0, 0, 0, Default::default());
         let stat = |name: &str| counters.iter().find(|(n, _)| *n == name).unwrap().1;
         assert_eq!(stat("publish/messages/dropped/no_share_member"), 1);
         assert_eq!(stat("publish/messages/dropped"), 1);
@@ -324,6 +374,102 @@ mod tests {
         }
         let counts: Vec<usize> = members.iter().map(|m| m.queue.len()).collect();
         assert_eq!(counts, [3, 0, 3]);
+    }
+
+    /// Publishes `count` messages to a group of `members` connected members
+    /// with `strategy`, `publisher` being the publishing client's key;
+    /// how many each member got.
+    async fn shares(
+        strategy: ShareStrategy,
+        members: &[Subscriber],
+        count: usize,
+        publisher: Option<Publisher>,
+    ) -> Vec<usize> {
+        let broker = Broker::new(Arc::new(MemoryStore::new())).with_share_strategy(strategy);
+        for member in members {
+            broker.subscribe("$share/g/jobs", member.session_id, member.clone());
+        }
+        for _ in 0..count {
+            broker
+                .publish_from("jobs", create_test_message("jobs", "x", false), publisher)
+                .await
+                .unwrap();
+        }
+        members.iter().map(|m| m.queue.len()).collect()
+    }
+
+    fn connected_members(count: u64) -> Vec<Subscriber> {
+        (1..=count)
+            .map(|id| share_member(id, QueueLimits::default(), true))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sticky_shares_keep_to_one_member_while_it_takes_messages() {
+        let small = QueueLimits {
+            max_qos0: 3,
+            ..Default::default()
+        };
+        let members: Vec<Subscriber> = (1..=3).map(|id| share_member(id, small, true)).collect();
+        let broker =
+            Broker::new(Arc::new(MemoryStore::new())).with_share_strategy(ShareStrategy::Sticky);
+        for member in &members {
+            broker.subscribe("$share/g/jobs", member.session_id, member.clone());
+        }
+        let publish = |n| {
+            let broker = broker.clone();
+            async move {
+                for _ in 0..n {
+                    broker
+                        .publish("jobs", create_test_message("jobs", "x", false))
+                        .await
+                        .unwrap();
+                }
+            }
+        };
+        let counts = || {
+            let mut counts: Vec<usize> = members.iter().map(|m| m.queue.len()).collect();
+            counts.sort();
+            counts
+        };
+        publish(3).await;
+        assert_eq!(counts(), [0, 0, 3]);
+        // Once its member is full, the next one is stuck to instead
+        publish(2).await;
+        assert_eq!(counts(), [0, 2, 3]);
+        publish(1).await;
+        assert_eq!(counts(), [0, 3, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_hashed_shares_send_one_publisher_to_one_member() {
+        let members = connected_members(4);
+        let publisher = |key| Some(Publisher { session: 99, key });
+        let counts = shares(ShareStrategy::Hash, &members, 8, publisher(7)).await;
+        assert_eq!(counts.iter().filter(|&&n| n == 8).count(), 1);
+        // The same publisher lands on the same member again
+        let again = shares(ShareStrategy::Hash, &members, 8, publisher(7)).await;
+        assert_eq!(
+            counts.iter().position(|&n| n == 8),
+            again.iter().position(|&n| n == 16)
+        );
+        // Publishers spread over the members
+        let mut reached = std::collections::HashSet::new();
+        for key in 0..64 {
+            let before: Vec<usize> = members.iter().map(|m| m.queue.len()).collect();
+            let after = shares(ShareStrategy::Hash, &members, 1, publisher(key)).await;
+            reached.insert(after.iter().zip(&before).position(|(a, b)| a != b));
+        }
+        assert_eq!(reached.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_random_shares_reach_every_member_and_prefer_connected_ones() {
+        let mut members = connected_members(3);
+        members.push(share_member(4, QueueLimits::default(), false));
+        let counts = shares(ShareStrategy::Random, &members, 300, None).await;
+        assert!(counts[..3].iter().all(|&n| n > 30), "{counts:?}");
+        assert_eq!(counts[3], 0);
     }
 
     #[tokio::test]
