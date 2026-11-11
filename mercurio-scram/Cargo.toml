@@ -11,10 +11,10 @@ keywords = ["mqtt", "scram", "sasl", "authentication"]
 categories = ["authentication", "cryptography"]
 
 [dependencies]
-base64 = "0.23.1"
+base64.workspace = true
 getrandom = "0.4"
 hmac = "0.13"
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
-sha2 = "0.11.1"
+pbkdf2.workspace = true
+sha2.workspace = true
 stringprep = "0.1.5"
 subtle = "2.6"

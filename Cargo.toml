@@ -13,6 +13,33 @@ members = [
     "mercurioctl",
 ]
 
+# Third-party crates more than one member uses. Members add their own
+# features; default features stay off where a no_std or library crate needs
+# them off, so those crates opt back in with "std" or the features they use.
+# The members still name each other by path and version in their own
+# manifests, which release-plz bumps on release.
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.23.1"
+bytes = { version = "1.12.1", default-features = false }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+futures-util = { version = "0.3", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+rpassword = "7"
+rustls = "0.23.46"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2"
+tokio = "1.24"
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+webpki-roots = "1"
+
 [profile.release]
 debug = true  # Enable debug symbols for profiling
 

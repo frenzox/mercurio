@@ -26,21 +26,21 @@ mercurio-scram = { path = "../mercurio-scram", version = "0.1.0" }
 mercurio-storage = { path = "../mercurio-storage", version = "0.3.3", features = ["sqlite", "postgres"] }
 
 argon2 = "0.5"
-clap = { version = "4", features = ["derive"] }
-rpassword = "7"
-serde = { version = "1", features = ["derive"] }
+clap.workspace = true
+rpassword.workspace = true
+serde.workspace = true
 toml = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde_json = "1.0.154"
-bytes = "1.12.1"
-sha2 = "0.11.1"
-base64 = "0.23.1"
-pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+serde_json.workspace = true
+bytes = { workspace = true, features = ["std"] }
+sha2.workspace = true
+base64.workspace = true
+pbkdf2.workspace = true
 ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
-rustls = "0.23.46"
-socket2 = { version = "0.6.5", features = ["all"] }
+rustls.workspace = true
+socket2.workspace = true
 libc = "0.2.191"
 wasmtime = { version = "50.0", optional = true, default-features = false, features = ["anyhow", "runtime", "std", "cranelift", "async", "component-model", "parallel-compilation"] }
 wasmtime-wasi = { version = "50.0", optional = true, default-features = false, features = ["p2"] }

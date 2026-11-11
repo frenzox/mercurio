@@ -15,6 +15,6 @@ default = ["std"]
 std = ["mercurio-core/std"]
 
 [dependencies]
-bytes = { version = "1.0", default-features = false }
+bytes.workspace = true
 
 mercurio-core = { path = "../mercurio-core", version = "0.2.0", default-features = false }
