@@ -220,6 +220,7 @@ for client in admin.clients(&amp;query).await.items {
 }</pre>
 <ul>
 <li>Methods return plain structs. Failures are an <code>AdminError</code>, whose <code>code</code> is the protocol's.</li>
+<li>Each mount point has its own client ids, so the methods acting on one client, <code>client</code>, <code>disconnect</code> and <code>delete_session</code>, take a <code>SessionKey</code>: the client id and the mount point, <code>None</code> for a listener without one. <code>Admin::session_key</code> finds it from a client id as the protocol's <code>mountpoint</code> argument does, and <code>ClientSummary</code> carries both.</li>
 <li>The broker serves the same commands over MQTT on <code>$CONTROL/broker/v1</code>, to clients access control allows. <code>ServerConfig::admin_extension</code> takes an <code>AdminExtension</code> for commands the broker doesn't know: mercuriod adds its bridge, configuration, log level and reload commands this way. Without one, those answer <code>unavailable</code>.</li>
 <li>A <code>ListenerConfig</code> on a Unix socket can be <code>trusted</code>: its clients skip authentication and access control, and run every command. Give it a <code>peer_filter</code> to choose clients by their user and group ids, as mercuriod's admin socket does, or keep the socket's permissions tight. <code>Server::new</code> refuses a trusted listener on TCP, with its own authentication or plugins, with <code>proxy_protocol</code> or serving WebSocket.</li>
 </ul>
