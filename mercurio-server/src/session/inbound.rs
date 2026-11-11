@@ -14,10 +14,10 @@ use mercurio_packets::{
     puback::PubAckPacket, pubcomp::PubCompPacket, publish::PublishPacket, pubrec::PubRecPacket,
     pubrel::PubRelPacket, ControlPacket,
 };
-use mercurio_storage::RetainedMessageStore;
+use mercurio_storage::{RetainedMessageStore, Write};
 use tracing::warn;
 
-use super::{message_properties, Session};
+use super::{message_properties, Handled, Session};
 use crate::{
     acl::Access,
     broker::Broker,
@@ -35,6 +35,23 @@ fn storage_failure(error: Error) -> Error {
 
 impl Session {
     pub(crate) async fn handle_publish<S: RetainedMessageStore>(
+        &mut self,
+        packet: PublishPacket,
+        broker: &Broker<S>,
+        chain: &Chain,
+    ) -> Result<Handled> {
+        let response = self.answer_publish(packet, broker, chain).await?;
+        // A PUBREC that accepts the message leaves its id awaiting PUBREL
+        let write = match &response {
+            Some(ControlPacket::PubRec(pubrec)) if pubrec.reason.code() < 0x80 => {
+                Some(Write::StoreIncomingQos2(pubrec.packet_id))
+            }
+            _ => None,
+        };
+        Ok(Handled { response, write })
+    }
+
+    async fn answer_publish<S: RetainedMessageStore>(
         &mut self,
         mut packet: PublishPacket,
         broker: &Broker<S>,
@@ -407,10 +424,7 @@ impl Session {
         }
     }
 
-    pub(crate) async fn handle_pubrel(
-        &mut self,
-        packet: PubRelPacket,
-    ) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubrel(&mut self, packet: PubRelPacket) -> Result<Handled> {
         let mut session = self.shared.state.lock().await;
         let reason = if session.incoming_qos2.remove(&packet.packet_id) {
             ReasonCode::Success
@@ -418,11 +432,14 @@ impl Session {
             session.unknown_packet_id_reason()
         };
 
-        Ok(Some(ControlPacket::PubComp(PubCompPacket {
-            packet_id: packet.packet_id,
-            reason,
-            properties: None,
-        })))
+        Ok(Handled {
+            response: Some(ControlPacket::PubComp(PubCompPacket {
+                packet_id: packet.packet_id,
+                reason,
+                properties: None,
+            })),
+            write: Some(Write::RemoveIncomingQos2(packet.packet_id)),
+        })
     }
 
     /// Adds the packet ids of incoming QoS 2 messages awaiting PUBREL,

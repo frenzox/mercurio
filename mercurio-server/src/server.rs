@@ -49,7 +49,7 @@ use mercurio_packets::{
     pubrel::PubRelPacket,
     ControlPacket,
 };
-use mercurio_storage::{memory::MemoryStore, MqttStore, SessionKey, SessionOwner};
+use mercurio_storage::{memory::MemoryStore, MqttStore, SessionKey, SessionOwner, Write};
 
 use crate::{
     acl::Access,
@@ -64,7 +64,7 @@ use crate::{
     },
     proxy,
     session::{
-        cap_expiry_interval, cap_session_expiry, effective_keepalive, Outgoing, Session,
+        cap_expiry_interval, cap_session_expiry, effective_keepalive, Handled, Outgoing, Session,
         WillMessage,
     },
     session_manager::{
@@ -2552,9 +2552,9 @@ where
                 .restore_inflight(start_result.inflight_to_retry)
                 .await;
             let resend = session.pending_retransmissions().await;
-            for packet_id in resend.dropped {
-                self.session_manager.remove_inflight(&key, packet_id).await;
-            }
+            self.session_manager
+                .save_changes(&key, resend.dropped.into_iter().map(Write::RemoveInflight))
+                .await;
             for packet in resend.packets {
                 Box::pin(self.connection.write_packet(packet)).await?;
             }
@@ -3073,60 +3073,25 @@ where
         if packet.packet_id() == Some(0) {
             return Err(ReasonCode::ProtocolError.into());
         }
-        let response = match packet {
+        let Handled { response, write } = match packet {
             HotPacket::Publish(publish) => {
                 Stats::add(&self.stats.messages_received);
-                let response = session
+                session
                     .handle_publish(publish, &self.broker, &self.chain)
-                    .await?;
-                // The client now awaits PUBREL's answer for this id
-                if let Some(ControlPacket::PubRec(pubrec)) = &response {
-                    if pubrec.reason.code() < 0x80 {
-                        self.session_manager
-                            .store_incoming_qos2(key, pubrec.packet_id)
-                            .await;
-                    }
-                }
-                response
+                    .await?
             }
-            HotPacket::PubAck(ack) => {
-                let packet_id = ack.packet_id;
-                let response = session.handle_puback(ack).await?;
-                self.session_manager.remove_inflight(key, packet_id).await;
-                response
-            }
-            HotPacket::PubRec(rec) => {
-                let (packet_id, failed) = (rec.packet_id, rec.reason.code() >= 0x80);
-                let response = session.handle_pubrec(rec).await?;
-                if failed {
-                    self.session_manager.remove_inflight(key, packet_id).await;
-                }
-                // After PUBREC only PUBREL remains to be sent for a QoS 2 message
-                if let Some(ControlPacket::PubRel(pubrel)) = &response {
-                    if pubrel.reason == ReasonCode::Success {
-                        self.session_manager
-                            .release_inflight(key, pubrel.packet_id)
-                            .await;
-                    }
-                }
-                response
-            }
-            HotPacket::PubRel(rel) => {
-                let packet_id = rel.packet_id;
-                let response = session.handle_pubrel(rel).await?;
-                self.session_manager
-                    .remove_incoming_qos2(key, packet_id)
-                    .await;
-                response
-            }
-            HotPacket::PubComp(comp) => {
-                let packet_id = comp.packet_id;
-                let response = session.handle_pubcomp(comp).await?;
-                self.session_manager.remove_inflight(key, packet_id).await;
-                response
-            }
-            HotPacket::PingReq => Some(ControlPacket::PingResp(PingRespPacket {})),
+            HotPacket::PubAck(ack) => session.handle_puback(ack).await?,
+            HotPacket::PubRec(rec) => session.handle_pubrec(rec).await?,
+            HotPacket::PubRel(rel) => session.handle_pubrel(rel).await?,
+            HotPacket::PubComp(comp) => session.handle_pubcomp(comp).await?,
+            HotPacket::PingReq => Handled {
+                response: Some(ControlPacket::PingResp(PingRespPacket {})),
+                write: None,
+            },
         };
+        if let Some(write) = write {
+            self.session_manager.save_changes(key, [write]).await;
+        }
         if let Some(response) = response {
             debug!("Sending {} to client {}", describe(&response), key);
             self.connection.write_packet(response).await?;
@@ -3239,22 +3204,12 @@ where
                     Some(packet) => packet,
                 };
 
-                let is_subscription_change = matches!(
-                    packet,
-                    ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
-                );
-
                 let maybe_res = session
                     .process_incoming(packet, &self.broker, &self.chain)
                     .await?;
 
-                // Persist what subscribe/unsubscribe operations changed
-                if is_subscription_change {
-                    let changes = session.take_subscription_changes().await;
-                    self.session_manager
-                        .save_subscription_changes(key, changes)
-                        .await;
-                }
+                let changes = session.take_changes().await;
+                self.session_manager.save_changes(key, changes).await;
 
                 // A re-authentication may land on a banned user name; the
                 // ban is in force before addBan walks the connected clients,

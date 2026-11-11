@@ -39,12 +39,6 @@ impl Session {
         session.subscriptions.values().cloned().collect()
     }
 
-    /// What SUBSCRIBE and UNSUBSCRIBE packets changed since this was last
-    /// called, as writes to store them.
-    pub(crate) async fn take_subscription_changes(&self) -> Vec<Write> {
-        std::mem::take(&mut self.shared.state.lock().await.subscription_changes)
-    }
-
     /// Restore subscriptions by re-subscribing to the broker.
     /// Called when resuming a persisted session.
     pub(crate) async fn restore_subscriptions<S: RetainedMessageStore>(
@@ -224,7 +218,7 @@ impl Session {
 
             session.topics = Some(broker.topics());
             session
-                .subscription_changes
+                .changes
                 .push(Write::AddSubscription(subscription.clone()));
             session
                 .subscriptions
@@ -259,7 +253,7 @@ impl Session {
             session.retained.retain(|d| d.filter != unsub.topic_filter);
             let reason_code = if session.subscriptions.remove(&unsub.topic_filter).is_some() {
                 session
-                    .subscription_changes
+                    .changes
                     .push(Write::RemoveSubscription(unsub.topic_filter.clone()));
                 ReasonCode::Success
             } else {

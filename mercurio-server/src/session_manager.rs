@@ -1555,7 +1555,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
             if session.give_up(handback.held).await {
                 if let Held::Unacknowledged(packet_id) = handback.held {
-                    self.remove_inflight(key, packet_id).await;
+                    self.save_changes(key, [Write::RemoveInflight(packet_id)])
+                        .await;
                 }
             }
         }
@@ -1584,8 +1585,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.storage.is_durable() && self.shared.persistent.lock().unwrap().contains(key)
     }
 
-    /// Stores the subscriptions added and removed, one write each.
-    pub(crate) async fn save_subscription_changes(&self, key: &SessionKey, changes: Vec<Write>) {
+    /// Stores what the client's packets changed, one write each, for a
+    /// session that outlives its connection.
+    pub(crate) async fn save_changes(
+        &self,
+        key: &SessionKey,
+        changes: impl IntoIterator<Item = Write>,
+    ) {
         if self.is_persistent(key) {
             for change in changes {
                 self.writers.write_paced(key, Box::new([change])).await;
@@ -1627,43 +1633,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers
             .write_paced(key, Box::new([Write::Dequeue(sequence)]))
             .await;
-    }
-
-    /// Mark a QoS 2 message as released once the client sent PUBREC.
-    pub(crate) async fn release_inflight(&self, key: &SessionKey, packet_id: u16) {
-        if self.is_persistent(key) {
-            self.writers
-                .write_paced(key, Box::new([Write::ReleaseInflight(packet_id)]))
-                .await;
-        }
-    }
-
-    /// Remove an inflight message after acknowledgment.
-    pub(crate) async fn remove_inflight(&self, key: &SessionKey, packet_id: u16) {
-        if self.is_persistent(key) {
-            self.writers
-                .write_paced(key, Box::new([Write::RemoveInflight(packet_id)]))
-                .await;
-        }
-    }
-
-    /// Records an incoming QoS 2 message acknowledged with PUBREC, so a
-    /// copy the client sends again after a restart isn't forwarded twice.
-    pub(crate) async fn store_incoming_qos2(&self, key: &SessionKey, packet_id: u16) {
-        if self.is_persistent(key) {
-            self.writers
-                .write_paced(key, Box::new([Write::StoreIncomingQos2(packet_id)]))
-                .await;
-        }
-    }
-
-    /// Forgets an incoming QoS 2 message once the client sent PUBREL.
-    pub(crate) async fn remove_incoming_qos2(&self, key: &SessionKey, packet_id: u16) {
-        if self.is_persistent(key) {
-            self.writers
-                .write_paced(key, Box::new([Write::RemoveIncomingQos2(packet_id)]))
-                .await;
-        }
     }
 }
 
@@ -2036,7 +2005,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .save_subscription_changes(
+            .save_changes(
                 &key("c"),
                 vec![Write::AddSubscription(StoredSubscription::new(
                     "a",
@@ -2052,7 +2021,9 @@ mod tests {
         // Changes made meanwhile don't pile up waiting for storage
         tokio::time::timeout(Duration::from_secs(1), async {
             for _ in 0..20_000 {
-                manager.remove_inflight(&key("c"), 1).await;
+                manager
+                    .save_changes(&key("c"), [Write::RemoveInflight(1)])
+                    .await;
             }
         })
         .await
@@ -2088,11 +2059,15 @@ mod tests {
 
         storage.fail(false);
         started.session.restore_incoming_qos2(vec![7]).await;
-        manager.store_incoming_qos2(&key("c"), 7).await;
+        manager
+            .save_changes(&key("c"), [Write::StoreIncomingQos2(7)])
+            .await;
         manager.flush().await;
         assert_eq!(failures(&manager), (1, 0));
         assert_eq!(storage.load_incoming_qos2(&key("c")).await.unwrap(), [7]);
-        manager.remove_incoming_qos2(&key("c"), 7).await;
+        manager
+            .save_changes(&key("c"), [Write::RemoveIncomingQos2(7)])
+            .await;
         manager.flush().await;
         assert!(storage
             .load_incoming_qos2(&key("c"))
@@ -2329,7 +2304,7 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscription_changes(&key("c"), session.take_subscription_changes().await)
+            .save_changes(&key("c"), session.take_changes().await)
             .await;
         manager.end_connection(started.lease, None).await;
 
@@ -2831,7 +2806,9 @@ mod tests {
         assert_eq!(stored.topic, "test/topic");
 
         // Remove inflight message
-        manager.remove_inflight(&key("client1"), 1).await;
+        manager
+            .save_changes(&key("client1"), [Write::RemoveInflight(1)])
+            .await;
         manager.flush().await;
 
         // Verify it's removed
@@ -3134,7 +3111,7 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "gw-01");
         manager
-            .save_subscription_changes(
+            .save_changes(
                 &key("gw-01"),
                 vec![Write::AddSubscription(StoredSubscription::new(
                     "alice/#",
@@ -3217,7 +3194,7 @@ mod tests {
 
         for (started, filter) in [(&alice, "a/#"), (&bob, "b/#")] {
             manager
-                .save_subscription_changes(
+                .save_changes(
                     started.lease.key(),
                     vec![Write::AddSubscription(StoredSubscription::new(
                         filter,
@@ -3907,7 +3884,7 @@ mod tests {
             .unwrap();
         mark_persistent(&manager, "c");
         manager
-            .save_subscription_changes(
+            .save_changes(
                 &key("c"),
                 vec![Write::AddSubscription(StoredSubscription::new(
                     "a",
@@ -3970,8 +3947,12 @@ mod tests {
         assert_eq!(all.len(), 5);
 
         // Remove some
-        manager.remove_inflight(&key("client1"), 2).await;
-        manager.remove_inflight(&key("client1"), 4).await;
+        manager
+            .save_changes(&key("client1"), [Write::RemoveInflight(2)])
+            .await;
+        manager
+            .save_changes(&key("client1"), [Write::RemoveInflight(4)])
+            .await;
         manager.flush().await;
 
         // Verify remaining

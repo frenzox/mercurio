@@ -24,7 +24,7 @@ use mercurio_packets::{
 use mercurio_storage::{InflightMessage, Write};
 use tracing::warn;
 
-use super::{message_properties, Session, State};
+use super::{message_properties, Handled, Session, State};
 use crate::{error::Result, sys::DropCause};
 
 /// The PUBLISH properties forwarding a message's application properties,
@@ -131,9 +131,10 @@ impl Inflight {
     }
 
     /// PUBACK: the client took the QoS 1 message.
-    fn acknowledge(&mut self, packet_id: u16) {
+    fn acknowledge(&mut self, packet_id: u16) -> Write {
         self.unacknowledged_messages.remove(&packet_id);
         self.unsent.retain(|id| *id != packet_id);
+        Write::RemoveInflight(packet_id)
     }
 
     /// PUBREC: the client took the QoS 2 message, which awaits PUBCOMP
@@ -155,15 +156,17 @@ impl Inflight {
 
     /// A PUBREC with a failure reason: the client won't take the message,
     /// which ends its exchange.
-    fn refuse(&mut self, packet_id: u16) {
+    fn refuse(&mut self, packet_id: u16) -> Write {
         self.unacknowledged_messages.remove(&packet_id);
         self.unsent.retain(|id| *id != packet_id);
         self.pubrecs.remove(&packet_id);
+        Write::RemoveInflight(packet_id)
     }
 
     /// PUBCOMP: the QoS 2 exchange is over.
-    fn complete(&mut self, packet_id: u16) {
+    fn complete(&mut self, packet_id: u16) -> Write {
         self.pubrecs.remove(&packet_id);
+        Write::RemoveInflight(packet_id)
     }
 
     /// Lets go of an unacknowledged message. False if it wasn't held.
@@ -295,26 +298,24 @@ pub(crate) struct Outgoing {
 }
 
 impl Session {
-    pub(crate) async fn handle_puback(
-        &mut self,
-        packet: PubAckPacket,
-    ) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_puback(&mut self, packet: PubAckPacket) -> Result<Handled> {
         let mut session = self.shared.state.lock().await;
-        session.inflight.acknowledge(packet.packet_id);
-        Ok(None)
+        Ok(Handled {
+            response: None,
+            write: Some(session.inflight.acknowledge(packet.packet_id)),
+        })
     }
 
-    pub(crate) async fn handle_pubrec(
-        &mut self,
-        packet: PubRecPacket,
-    ) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubrec(&mut self, packet: PubRecPacket) -> Result<Handled> {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
 
         // A failure reason ends the exchange: the client won't take the message
         if packet.reason.code() >= 0x80 {
-            session.inflight.refuse(packet_id);
-            return Ok(None);
+            return Ok(Handled {
+                response: None,
+                write: Some(session.inflight.refuse(packet_id)),
+            });
         }
 
         let reason = if session.inflight.release(packet_id) {
@@ -323,20 +324,23 @@ impl Session {
             session.unknown_packet_id_reason()
         };
 
-        Ok(Some(ControlPacket::PubRel(PubRelPacket {
-            packet_id,
-            reason,
-            properties: None,
-        })))
+        // After PUBREC only PUBREL remains to be sent for a QoS 2 message
+        Ok(Handled {
+            response: Some(ControlPacket::PubRel(PubRelPacket {
+                packet_id,
+                reason,
+                properties: None,
+            })),
+            write: (reason == ReasonCode::Success).then_some(Write::ReleaseInflight(packet_id)),
+        })
     }
 
-    pub(crate) async fn handle_pubcomp(
-        &mut self,
-        packet: PubCompPacket,
-    ) -> Result<Option<ControlPacket>> {
+    pub(crate) async fn handle_pubcomp(&mut self, packet: PubCompPacket) -> Result<Handled> {
         let mut session = self.shared.state.lock().await;
-        session.inflight.complete(packet.packet_id);
-        Ok(None)
+        Ok(Handled {
+            response: None,
+            write: Some(session.inflight.complete(packet.packet_id)),
+        })
     }
 
     /// The messages that reached this session through a shared

@@ -203,6 +203,14 @@ impl From<&ConnectPacket> for ClientSettings {
     }
 }
 
+/// What handling a PUBLISH or one of its acknowledgements gives: the
+/// packet to answer with, if any, and the write that stores what it
+/// changed, made along with the change.
+pub(crate) struct Handled {
+    pub response: Option<ControlPacket>,
+    pub write: Option<Write>,
+}
+
 /// Source of unique subscriber ids, one per session.
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -285,8 +293,9 @@ struct State {
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
     max_topic_filter_length: usize,
-    /// What SUBSCRIBE and UNSUBSCRIBE changed since they were last stored
-    subscription_changes: Vec<Write>,
+    /// What the client's packets changed since it was last stored, as the
+    /// writes that store it
+    changes: Vec<Write>,
     max_retained_messages: Option<usize>,
     /// What the admin API reports about the connection
     presence: Presence,
@@ -387,7 +396,7 @@ impl Session {
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
                     max_topic_filter_length: usize::MAX,
-                    subscription_changes: Vec::new(),
+                    changes: Vec::new(),
                     max_retained_messages: None,
                     presence,
                 }),
@@ -721,6 +730,12 @@ impl Session {
         }
     }
 
+    /// What the client's packets handled through `process_incoming`
+    /// changed since this was last called, as writes to store them.
+    pub(crate) async fn take_changes(&self) -> Vec<Write> {
+        std::mem::take(&mut self.shared.state.lock().await.changes)
+    }
+
     pub(crate) async fn process_incoming<S: RetainedMessageStore>(
         &mut self,
         packet: ControlPacket,
@@ -742,12 +757,29 @@ impl Session {
             return Err(ReasonCode::ProtocolError.into());
         }
 
-        match packet {
+        let handled = match packet {
             ControlPacket::Publish(packet) => self.handle_publish(packet, broker, chain).await,
             ControlPacket::PubAck(packet) => self.handle_puback(packet).await,
             ControlPacket::PubRec(packet) => self.handle_pubrec(packet).await,
             ControlPacket::PubRel(packet) => self.handle_pubrel(packet).await,
             ControlPacket::PubComp(packet) => self.handle_pubcomp(packet).await,
+            packet => return self.process_other(packet, broker, chain).await,
+        }?;
+        if let Some(write) = handled.write {
+            self.shared.state.lock().await.changes.push(write);
+        }
+        Ok(handled.response)
+    }
+
+    /// Handles the packets that change nothing storage keeps but
+    /// subscriptions, which record their changes themselves.
+    async fn process_other<S: RetainedMessageStore>(
+        &mut self,
+        packet: ControlPacket,
+        broker: &Broker<S>,
+        chain: &Chain,
+    ) -> Result<Option<ControlPacket>> {
+        match packet {
             ControlPacket::Subscribe(packet) => self.handle_subscribe(packet, broker, chain).await,
             ControlPacket::Unsubscribe(packet) => {
                 self.handle_unsubscribe(packet, broker, chain).await

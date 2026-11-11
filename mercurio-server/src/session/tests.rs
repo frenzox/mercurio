@@ -6,6 +6,7 @@ use mercurio_core::{
 };
 use mercurio_packets::{
     connect::{self, ConnectPayload, ConnectProperties},
+    pubcomp::PubCompPacket,
     publish::PublishPacket,
     pubrec::PubRecPacket,
     pubrel::PubRelPacket,
@@ -173,10 +174,7 @@ async fn test_subscription_changes_are_recorded_one_by_one() {
             })
             .collect()
     };
-    assert_eq!(
-        described(session.take_subscription_changes().await),
-        ["+a", "+b"]
-    );
+    assert_eq!(described(session.take_changes().await), ["+a", "+b"]);
 
     let unsubscribe = |filter: &str| UnsubscribePacket {
         packet_id: 2,
@@ -191,8 +189,8 @@ async fn test_subscription_changes_are_recorded_one_by_one() {
             .await
             .unwrap();
     }
-    assert_eq!(described(session.take_subscription_changes().await), ["-a"]);
-    assert!(session.take_subscription_changes().await.is_empty());
+    assert_eq!(described(session.take_changes().await), ["-a"]);
+    assert!(session.take_changes().await.is_empty());
 }
 
 #[tokio::test]
@@ -687,6 +685,59 @@ async fn test_failed_pubrec_ends_the_exchange() {
     let state = session.shared.state.lock().await;
     assert!(state.inflight.pubrecs.is_empty());
     assert!(state.inflight.unacknowledged_messages.is_empty());
+}
+
+/// Each step of an exchange hands back the write that stores it, which
+/// `process_incoming` keeps for `take_changes`.
+#[tokio::test]
+async fn test_exchanges_record_what_they_change_for_storage() {
+    let mut session = create_test_session();
+    let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+    let outgoing = send_qos2_to(&mut session, &broker).await;
+    let incoming = 9;
+    for packet in [
+        pubrec(outgoing, ReasonCode::Success),
+        ControlPacket::PubComp(PubCompPacket {
+            packet_id: outgoing,
+            reason: ReasonCode::Success,
+            properties: None,
+        }),
+        qos2_publish("t", incoming, false),
+        pubrel_packet(incoming),
+    ] {
+        session
+            .process_incoming(packet, &broker, &no_plugins())
+            .await
+            .unwrap();
+    }
+
+    let changes = session.take_changes().await;
+    assert!(
+        matches!(
+            changes[..],
+            [
+                Write::AddSubscription(_),
+                Write::ReleaseInflight(a),
+                Write::RemoveInflight(b),
+                Write::StoreIncomingQos2(c),
+                Write::RemoveIncomingQos2(d),
+            ] if a == outgoing && b == outgoing && c == incoming && d == incoming
+        ),
+        "{changes:?}"
+    );
+
+    // A PUBREC refusing the message ends it in storage too
+    let refused = send_qos2_to(&mut session, &broker).await;
+    let handled = session
+        .handle_pubrec(PubRecPacket {
+            packet_id: refused,
+            reason: ReasonCode::UnspecifiedError,
+            properties: None,
+        })
+        .await
+        .unwrap();
+    assert!(handled.response.is_none());
+    assert!(matches!(handled.write, Some(Write::RemoveInflight(id)) if id == refused));
 }
 
 #[tokio::test]
