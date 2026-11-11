@@ -20,17 +20,64 @@ pub use bindings::mercurio::plugin::types::{
     Level, Message, MessageAction, Qos, Registration, Subscribed, Success, Unsubscribed,
 };
 
+/// A plugin's settings, the `config` table of its `[[plugins]]` entry in
+/// the broker configuration, as [`Plugin::init`] gets them.
+///
+/// The settings are the same for every copy of the plugin and never change
+/// while it runs, so, unlike state that changes, they may be kept in a
+/// static: each copy has its own memory and runs `init` once before any
+/// other hook, so a [`std::sync::OnceLock`] set in `init` holds them for
+/// that copy's hooks.
+///
+/// ```rust,ignore
+/// static PREFIX: OnceLock<String> = OnceLock::new();
+///
+/// fn init(config: Config) -> Result<Registration, String> {
+///     let _ = PREFIX.set(config.require("prefix")?.to_string());
+///     // ...
+/// }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Config(Vec<(String, String)>);
+
+impl Config {
+    /// The value of `key`, if set.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The value of `key`, or an error naming it, to return from `init`.
+    pub fn require(&self, key: &str) -> Result<&str, String> {
+        self.get(key).ok_or_else(|| format!("missing `{key}`"))
+    }
+
+    /// Every setting, in the order the broker passed them.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+impl From<Vec<(String, String)>> for Config {
+    fn from(settings: Vec<(String, String)>) -> Self {
+        Config(settings)
+    }
+}
+
 /// A broker plugin. Every hook but `init` has a default that does nothing;
 /// `init` says which ones the broker calls. Hooks are plain functions:
 /// the broker may run several copies of a plugin at once and keeps none of
 /// them in particular, so state shared between calls belongs in
-/// [`host::kv_set`].
+/// [`host::kv_set`]. Settings, which never change, may stay in each copy,
+/// see [`Config`].
 pub trait Plugin {
     /// Called once per copy of the plugin, before any other hook, with the
     /// plugin's settings from the broker configuration. Returns the hooks
     /// the broker calls and the enhanced authentication methods the plugin
     /// implements; an error stops the broker from loading the plugin.
-    fn init(config: Vec<(String, String)>) -> Result<Registration, String>;
+    fn init(config: Config) -> Result<Registration, String>;
 
     /// Checks the user name and password of a CONNECT, when the plugin
     /// registered [`Hooks::AUTHENTICATE`] and the broker requires
@@ -171,7 +218,7 @@ macro_rules! export_plugin {
                     config: ::std::vec::Vec<(::std::string::String, ::std::string::String)>,
                 ) -> ::core::result::Result<$crate::Registration, ::std::string::String> {
                     $crate::__log_panics();
-                    <$plugin as $crate::Plugin>::init(config)
+                    <$plugin as $crate::Plugin>::init($crate::Config::from(config))
                 }
                 fn authenticate(
                     client: $crate::ClientInfo,
@@ -225,4 +272,22 @@ macro_rules! export_plugin {
     $crate::bindings::export_guest!(__MercurioGuest with_types_in $crate::bindings);
         };
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn test_config_finds_settings_by_key() {
+        let config = Config::from(vec![
+            ("url".to_string(), "https://example.com".to_string()),
+            ("empty".to_string(), String::new()),
+        ]);
+        assert_eq!(config.get("url"), Some("https://example.com"));
+        assert_eq!(config.get("empty"), Some(""));
+        assert_eq!(config.get("other"), None);
+        assert_eq!(config.require("other"), Err("missing `other`".to_string()));
+        assert_eq!(config.iter().count(), 2);
+    }
 }

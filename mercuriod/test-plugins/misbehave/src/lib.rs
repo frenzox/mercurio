@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use mercurio_plugin::{
-    export_plugin, host, AuthResult, ClientInfo, Decision, Hooks, Message, MessageAction, Plugin,
-    Qos, Registration, Success,
+    export_plugin, host, AuthResult, ClientInfo, Config, Decision, Hooks, Message, MessageAction,
+    Plugin, Qos, Registration, Success,
 };
 use wasip2::{
     http::{
@@ -17,11 +17,10 @@ use wasip2::{
 struct Misbehave;
 
 impl Plugin for Misbehave {
-    fn init(config: Vec<(String, String)>) -> Result<Registration, String> {
+    fn init(config: Config) -> Result<Registration, String> {
         let sleep = config
-            .iter()
-            .find(|(key, _)| key == "init_sleep_ms")
-            .and_then(|(_, value)| value.parse().ok());
+            .get("init_sleep_ms")
+            .and_then(|value| value.parse().ok());
         if let Some(ms) = sleep {
             std::thread::sleep(Duration::from_millis(ms));
         }

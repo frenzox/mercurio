@@ -2,13 +2,13 @@
 //! of their publisher.
 
 use mercurio_plugin::{
-    export_plugin, ClientInfo, Hooks, Message, MessageAction, Plugin, Registration,
+    export_plugin, ClientInfo, Config, Hooks, Message, MessageAction, Plugin, Registration,
 };
 
 struct PayloadRewrite;
 
 impl Plugin for PayloadRewrite {
-    fn init(_config: Vec<(String, String)>) -> Result<Registration, String> {
+    fn init(_config: Config) -> Result<Registration, String> {
         Ok(Registration {
             hooks: Hooks::ON_MESSAGE,
             auth_methods: Vec::new(),
