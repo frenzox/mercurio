@@ -11,20 +11,72 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-async fn start_broker(db: &PathBuf) -> (SocketAddr, oneshot::Sender<()>) {
+/// A broker on a runtime of its own, as a process of its own would be.
+/// Stopping it ends every task it left, so the database is free for the
+/// next.
+struct Broker {
+    runtime: Option<tokio::runtime::Runtime>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl Broker {
+    async fn stop(mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        sleep(Duration::from_millis(100)).await;
+        self.runtime.take().unwrap().shutdown_background();
+    }
+}
+
+impl Drop for Broker {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+async fn start_broker(db: &PathBuf) -> (SocketAddr, Broker) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let storage = Arc::new(SqliteStore::new(db).unwrap());
+    // The broker stopped before lets go of the database once its runtime
+    // has dropped its tasks
+    let mut attempts = 0;
+    let storage = loop {
+        match SqliteStore::new(db) {
+            Ok(store) => break Arc::new(store),
+            Err(_) if attempts < 50 => {
+                attempts += 1;
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let listener = listener.into_std().unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
-    tokio::spawn(mercurio_server::server::run_with_storage(
-        listener,
-        ServerConfig::default(),
-        storage,
-        async {
-            let _ = stopped.await;
+    runtime.spawn(async move {
+        let listener = TcpListener::from_std(listener).unwrap();
+        mercurio_server::server::run_with_storage(
+            listener,
+            ServerConfig::default(),
+            storage,
+            async {
+                let _ = stopped.await;
+            },
+        )
+        .await
+    });
+    (
+        addr,
+        Broker {
+            runtime: Some(runtime),
+            stop: Some(stop),
         },
-    ));
-    (addr, stop)
+    )
 }
 
 /// MQTT 5 CONNECT with a one hour session expiry; returns whether the
@@ -64,8 +116,7 @@ async fn sessions_and_retained_messages_survive_a_restart() {
         .unwrap();
     sleep(Duration::from_millis(100)).await;
     drop((subscriber, publisher));
-    stop.send(()).unwrap();
-    sleep(Duration::from_millis(100)).await;
+    stop.stop().await;
 
     let (addr, _stop) = start_broker(&db).await;
     let (mut subscriber, resumed) = connect(addr, b's', false).await;
@@ -153,8 +204,7 @@ async fn messages_for_offline_clients_survive_a_restart() {
         publish(&mut publisher, id, payload).await;
     }
     sleep(Duration::from_millis(200)).await;
-    stop.send(()).unwrap();
-    sleep(Duration::from_millis(100)).await;
+    stop.stop().await;
 
     // After the restart the offline session still collects messages
     let (addr, _stop) = start_broker(&db).await;

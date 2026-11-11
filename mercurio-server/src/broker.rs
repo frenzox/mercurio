@@ -105,9 +105,8 @@ impl<S: RetainedMessageStore> Broker<S> {
         self.subscriptions.subscribe(filter, id, subscriber);
     }
 
-    /// The retained messages matching a topic filter. Looked up apart from
-    /// subscribing, as most subscriptions are sent none: shared ones, those
-    /// restored, and those asking not to be.
+    /// The retained messages matching a topic filter.
+    #[cfg(test)]
     pub(crate) async fn retained(&self, filter: &str) -> Result<Vec<Message>> {
         self.storage
             .get_retained(filter)
@@ -115,10 +114,25 @@ impl<S: RetainedMessageStore> Broker<S> {
             .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
     }
 
+    /// At most `limit` of the retained messages matching a topic filter, in
+    /// topic order, after the topic `after`. Looked up apart from
+    /// subscribing, as most subscriptions are sent none: shared ones, those
+    /// restored, and those asking not to be.
+    pub(crate) async fn retained_page(
+        &self,
+        filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        self.storage
+            .get_retained_page(filter, after, limit)
+            .await
+            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+    }
+
     /// Whether `max` topics hold retained messages already, `topic` not one
-    /// of them, so retaining another would exceed it.
-    // ponytail: counts the store each time, a COUNT(*) on PostgreSQL; keep a
-    // count in memory if retained publishes get frequent under a cap
+    /// of them, so retaining another would exceed it. The count is kept in
+    /// memory, so the store is only asked about `topic` once at the limit.
     pub(crate) async fn retained_full(&self, topic: &str, max: usize) -> Result<bool> {
         if is_sys(topic) {
             return Ok(false);
@@ -130,10 +144,18 @@ impl<S: RetainedMessageStore> Broker<S> {
         }
         let existing = self
             .storage
-            .get_retained(topic)
+            .get_retained_page(topic, None, 1)
             .await
             .map_err(storage_error)?;
         Ok(existing.is_empty())
+    }
+
+    /// Removes the expired retained messages from storage, which lookups
+    /// already leave out.
+    pub(crate) async fn remove_expired_retained(&self) {
+        if let Err(e) = self.storage.remove_expired_retained().await {
+            warn!("Can't remove the expired retained messages: {}", e);
+        }
     }
 
     /// Removes the subscription of `id` to a topic filter. Returns whether it
@@ -517,6 +539,93 @@ mod tests {
             .await
             .unwrap();
         assert!(broker.retained("$SYS/#").await.unwrap().is_empty());
+    }
+
+    /// A store counting how often it is asked for its count.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        counted: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RetainedMessageStore for CountingStore {
+        async fn store_retained(
+            &self,
+            topic: &str,
+            message: Option<Message>,
+        ) -> mercurio_storage::Result<bool> {
+            self.inner.store_retained(topic, message).await
+        }
+
+        async fn get_retained_page(
+            &self,
+            topic_filter: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> mercurio_storage::Result<Vec<Message>> {
+            self.inner
+                .get_retained_page(topic_filter, after, limit)
+                .await
+        }
+
+        async fn clear_all_retained(&self) -> mercurio_storage::Result<()> {
+            self.inner.clear_all_retained().await
+        }
+
+        async fn count_retained(&self) -> mercurio_storage::Result<usize> {
+            self.counted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.count_retained().await
+        }
+
+        async fn remove_expired_retained(&self) -> mercurio_storage::Result<usize> {
+            self.inner.remove_expired_retained().await
+        }
+    }
+
+    /// The broker counts the stored retained messages itself once it has
+    /// read their count, rather than ask the store on every retained
+    /// publish under a limit.
+    #[tokio::test]
+    async fn test_the_retained_count_is_kept_in_memory() {
+        let storage = Arc::new(CountingStore::default());
+        storage
+            .inner
+            .store_retained("old", Some(create_test_message("old", "x", false)))
+            .await
+            .unwrap();
+        let broker = Broker::new(Arc::clone(&storage));
+        for topic in ["a", "b", "a", "c"] {
+            assert!(!broker.retained_full(topic, 10).await.unwrap());
+            broker
+                .publish(topic, create_test_message(topic, "x", true))
+                .await
+                .unwrap();
+        }
+        assert_eq!(broker.retained_count().await, 4);
+        broker
+            .publish("b", create_test_message("b", "", true))
+            .await
+            .unwrap();
+        broker
+            .publish("never", create_test_message("never", "", true))
+            .await
+            .unwrap();
+        assert_eq!(broker.retained_count().await, 3);
+        assert!(broker.retained_full("d", 3).await.unwrap());
+        assert!(!broker.retained_full("a", 3).await.unwrap());
+
+        let mut expired = create_test_message("e", "x", true);
+        expired.expires_at = Some(1);
+        broker.publish("e", expired).await.unwrap();
+        assert_eq!(broker.retained_count().await, 4);
+        broker.remove_expired_retained().await;
+        assert_eq!(broker.retained_count().await, 3);
+        assert_eq!(
+            storage.counted.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]

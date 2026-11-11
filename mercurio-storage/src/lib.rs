@@ -7,6 +7,8 @@ pub mod memory;
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 use std::sync::Arc;
 
@@ -56,13 +58,23 @@ impl StorageError {
     pub(crate) fn database(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         let error: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
         #[cfg(feature = "sqlite")]
-        if let Some(rusqlite::Error::SqliteFailure(failure, _)) = error.downcast_ref() {
-            if matches!(
-                failure.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            ) {
+        match error.downcast_ref() {
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
                 return StorageError::Transient(error);
             }
+            // A stored value that can't be read as what it stands for
+            Some(
+                rusqlite::Error::FromSqlConversionFailure(..)
+                | rusqlite::Error::InvalidColumnType(..)
+                | rusqlite::Error::IntegralValueOutOfRange(..)
+                | rusqlite::Error::Utf8Error(..),
+            ) => return StorageError::SerializationError(error.to_string()),
+            _ => {}
         }
         StorageError::Database(error)
     }
@@ -87,7 +99,7 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// Serializable session state for persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionState {
     pub client_id: String,
     pub subscriptions: Vec<StoredSubscription>,
@@ -136,7 +148,7 @@ impl StoredSubscription {
 }
 
 /// Will message for persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredWillMessage {
     pub topic: String,
     pub payload: Bytes,
@@ -179,7 +191,7 @@ pub trait BanStore: Send + Sync {
 }
 
 /// Inflight message for QoS 1/2 tracking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InflightMessage {
     pub packet_id: u16,
     pub topic: String,
@@ -201,127 +213,97 @@ pub struct InflightMessage {
     pub subscription_identifiers: Vec<u32>,
 }
 
-/// Trait for session persistence.
-///
-/// Implementations store and retrieve session state for clients,
-/// enabling session resumption across broker restarts.
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    /// Save session state for a client.
-    async fn save_session(&self, client_id: &str, session: &SessionState) -> Result<()>;
-
-    /// Load session state for a client.
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>>;
-
-    /// Delete session state for a client.
-    async fn delete_session(&self, client_id: &str) -> Result<()>;
-
-    /// List all stored session client IDs.
-    async fn list_sessions(&self) -> Result<Vec<String>>;
-}
-
 /// Trait for retained message storage.
 ///
 /// Retained messages are stored per topic and delivered to new subscribers.
 #[async_trait]
 pub trait RetainedMessageStore: Send + Sync {
-    /// Store a retained message for a topic.
-    /// Pass None to clear the retained message.
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()>;
+    /// Stores the retained message of a topic, or with None clears it.
+    /// Returns whether the topic held a retained message before, expired or
+    /// not, so a caller can keep `count_retained` up to date itself.
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool>;
 
-    /// Get retained messages matching a topic filter (supports wildcards).
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>>;
+    /// At most `limit` of the retained messages matching `topic_filter`, in
+    /// the byte order of their topics, from the first topic after `after`
+    /// on. Expired messages are left out. Fewer than `limit` means there
+    /// are no more.
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
+
+    /// Every retained message matching `topic_filter`, a page at a time.
+    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
+        const PAGE: usize = 1000;
+        let mut found: Vec<Message> = Vec::new();
+        loop {
+            let after = found.last().map(|m| m.topic.to_string());
+            let page = self
+                .get_retained_page(topic_filter, after.as_deref(), PAGE)
+                .await?;
+            let last = page.len() < PAGE;
+            found.extend(page);
+            if last {
+                return Ok(found);
+            }
+        }
+    }
 
     /// Clear all retained messages.
     async fn clear_all_retained(&self) -> Result<()>;
 
-    /// How many retained messages are stored, expired ones possibly
-    /// included until they are next looked up.
+    /// How many retained messages are stored, expired ones included until
+    /// `remove_expired_retained` removes them.
     async fn count_retained(&self) -> Result<usize>;
-}
 
-/// Trait for will message storage.
-///
-/// Will messages are published when a client disconnects abnormally.
-#[async_trait]
-pub trait WillStore: Send + Sync {
-    /// Store a will message for a client.
-    async fn store_will(&self, client_id: &str, will: &StoredWillMessage) -> Result<()>;
-
-    /// Get the will message for a client.
-    async fn get_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>>;
-
-    /// Delete the will message for a client.
-    async fn delete_will(&self, client_id: &str) -> Result<()>;
-}
-
-/// Trait for inflight message storage (QoS 1/2 tracking).
-///
-/// Tracks messages that have been sent but not yet acknowledged,
-/// enabling message retry and exactly-once delivery.
-#[async_trait]
-pub trait InflightStore: Send + Sync {
-    /// Store an inflight message for a client.
-    async fn store_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-        message: &InflightMessage,
-    ) -> Result<()>;
-
-    /// Get an inflight message by packet ID.
-    async fn get_inflight(
-        &self,
-        client_id: &str,
-        packet_id: u16,
-    ) -> Result<Option<InflightMessage>>;
-
-    /// Remove an inflight message (after acknowledgment).
-    async fn remove_inflight(&self, client_id: &str, packet_id: u16) -> Result<()>;
-
-    /// Mark a QoS 2 message as released: the client sent PUBREC, so only
-    /// PUBREL remains and the payload is no longer needed.
-    async fn release_inflight(&self, client_id: &str, packet_id: u16) -> Result<()>;
-
-    /// Get all inflight messages for a client (for retry on reconnect).
-    async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
-
-    /// Record that the client's QoS 2 message with this packet id was
-    /// taken and acknowledged with PUBREC, so a copy the client sends again
-    /// before its PUBREL isn't forwarded twice.
-    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
-
-    /// The client sent PUBREL for this packet id.
-    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
-
-    /// The packet ids of the client's QoS 2 messages awaiting PUBREL.
-    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
-}
-
-/// Messages waiting to be sent to the clients of sessions that outlive
-/// their connection, kept so they survive a restart. Each message is
-/// identified by its sequence in the client's queue.
-#[async_trait]
-pub trait QueueStore: Send + Sync {
-    /// Whether stored queues outlive the process. Stores that don't are
-    /// never asked to keep a copy of the queues the broker already holds.
-    fn is_durable(&self) -> bool {
-        true
+    /// Removes the expired retained messages, which lookups already leave
+    /// out, and returns how many. The broker calls it now and then rather
+    /// than have each lookup delete them.
+    async fn remove_expired_retained(&self) -> Result<usize> {
+        Ok(0)
     }
+}
 
-    /// Stores `message` at position `sequence` of the client's queue,
-    /// replacing what is stored there.
-    async fn enqueue(&self, client_id: &str, sequence: u64, message: &Message) -> Result<()>;
+/// The topics a lookup with a topic filter reads, before each is matched
+/// against the filter.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TopicRange {
+    /// A filter without wildcards matches one topic
+    Exact(String),
+    /// Those from `start` on, and before `end` if there is one: all that
+    /// start with the filter's part before its first wildcard
+    From { start: String, end: Option<String> },
+}
 
-    /// Removes the message at position `sequence` of the client's queue, if
-    /// it is stored.
-    async fn dequeue(&self, client_id: &str, sequence: u64) -> Result<()>;
+impl TopicRange {
+    pub(crate) fn of(filter: &str) -> TopicRange {
+        let Some(wildcard) = filter.find(['+', '#']) else {
+            return TopicRange::Exact(filter.to_string());
+        };
+        // `a/#` matches `a` too
+        let start = filter[..wildcard].trim_end_matches('/').to_string();
+        let end = after_prefix(&start);
+        TopicRange::From { start, end }
+    }
+}
 
-    /// The client's queued messages, in sequence order.
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
-
-    /// Removes the client's stored queue.
-    async fn clear_queue(&self, client_id: &str) -> Result<()>;
+/// The first string after every string starting with `prefix`, in byte
+/// order, which UTF-8 shares with code point order; None if there is none.
+fn after_prefix(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = match last as u32 + 1 {
+            0xD800 => Some('\u{E000}'),
+            next => char::from_u32(next),
+        };
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// A change to what is stored for one client.
@@ -368,9 +350,13 @@ pub enum Write {
     DeleteSession,
 }
 
-/// Applies a client's changes in batches, in order.
+/// Where the broker keeps what it holds for each client: its session and
+/// subscriptions, will, queue, in-flight messages and the packet ids of
+/// incoming QoS 2 messages awaiting PUBREL.
+///
+/// Every change goes through `apply`; the other methods read.
 #[async_trait]
-pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
+pub trait BatchStore: Send + Sync {
     /// Names the backend, as the broker's admin API reports it.
     fn backend_name(&self) -> &'static str {
         "custom"
@@ -382,91 +368,110 @@ pub trait BatchStore: SessionStore + WillStore + InflightStore + QueueStore {
         None
     }
 
+    /// Whether stored queues outlive the process. Stores that don't are
+    /// never asked to keep a copy of the queues the broker already holds.
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     /// Apply `writes` for `client_id` in order. Each write may be applied
     /// again after a failure, so applying one twice must be harmless.
     /// Stores that can should apply the batch atomically.
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
-        apply_each(self, client_id, writes).await
+    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()>;
+
+    /// The client's stored session, with its subscriptions in no particular
+    /// order.
+    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>>;
+
+    /// The client ids of every stored session.
+    async fn list_sessions(&self) -> Result<Vec<String>>;
+
+    /// The client's stored will.
+    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>>;
+
+    /// The client's messages sent and not yet acknowledged, in no particular
+    /// order.
+    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
+
+    /// The packet ids of the client's QoS 2 messages awaiting PUBREL.
+    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
+
+    /// The client's queued messages, each with its position in the queue,
+    /// in that order.
+    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
+
+    /// Removes the client's session and everything stored with it, as
+    /// `Write::DeleteSession` does.
+    async fn delete_session(&self, client_id: &str) -> Result<()> {
+        self.apply(client_id, &[Write::DeleteSession]).await
+    }
+
+    /// The client's stored session with everything stored with it.
+    async fn load_client(&self, client_id: &str) -> Result<Option<StoredClient>> {
+        let Some(session) = self.load_session(client_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(StoredClient {
+            session,
+            will: self.load_will(client_id).await?,
+            queue: self.load_queue(client_id).await?,
+            inflight: self.load_inflight(client_id).await?,
+            incoming_qos2: self.load_incoming_qos2(client_id).await?,
+        }))
+    }
+
+    /// At most `limit` stored sessions, each with everything stored with
+    /// it, ordered by client id in an order of the store's choosing, from
+    /// the first after the client id `after` on. Fewer than `limit` means
+    /// there are no more. The broker restores its sessions with this as it
+    /// starts, a page at a time.
+    ///
+    /// A client whose rows can't be decoded has its entry fail with
+    /// `StorageError::SerializationError`; others fail the whole call.
+    ///
+    /// The default reads each client on its own; stores should read each
+    /// kind of row for the whole page at once.
+    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
+        let mut client_ids = self.list_sessions().await?;
+        client_ids.retain(|id| after.is_none_or(|after| id.as_str() > after));
+        client_ids.sort_unstable();
+        client_ids.truncate(limit);
+        let mut clients = Vec::with_capacity(client_ids.len());
+        for client_id in client_ids {
+            let stored = match self.load_client(&client_id).await {
+                Ok(Some(stored)) => Ok(stored),
+                // Deleted since it was listed
+                Ok(None) => continue,
+                Err(e @ StorageError::SerializationError(_)) => Err(e),
+                Err(e) => return Err(e),
+            };
+            clients.push(LoadedClient { client_id, stored });
+        }
+        Ok(clients)
     }
 }
 
-/// Applies `writes` one at a time through the store's other methods: what
-/// `BatchStore::apply` does unless a store overrides it. A store that does
-/// can hand it the changes it has no batch form for, such as kinds of
-/// change added in later versions.
-pub async fn apply_each<S: BatchStore + ?Sized>(
-    store: &S,
-    client_id: &str,
-    writes: &[Write],
-) -> Result<()> {
-    for write in writes {
-        match write {
-            Write::SaveSession(state) => store.save_session(client_id, state).await?,
-            Write::AddSubscription(subscription) => {
-                if let Some(mut state) = store.load_session(client_id).await? {
-                    state
-                        .subscriptions
-                        .retain(|s| s.topic_filter != subscription.topic_filter);
-                    state.subscriptions.push(subscription.clone());
-                    store.save_session(client_id, &state).await?;
-                }
-            }
-            Write::RemoveSubscription(topic_filter) => {
-                if let Some(mut state) = store.load_session(client_id).await? {
-                    state
-                        .subscriptions
-                        .retain(|s| s.topic_filter != *topic_filter);
-                    store.save_session(client_id, &state).await?;
-                }
-            }
-            Write::SetExpiry {
-                interval,
-                expires_at,
-            } => {
-                if let Some(mut state) = store.load_session(client_id).await? {
-                    state.expiry_interval = Some(*interval);
-                    state.expires_at = Some(*expires_at);
-                    store.save_session(client_id, &state).await?;
-                }
-            }
-            Write::StoreWill(will) => store.store_will(client_id, will).await?,
-            Write::DeleteWill => store.delete_will(client_id).await?,
-            Write::StoreInflight(message) => {
-                store
-                    .store_inflight(client_id, message.packet_id, message)
-                    .await?
-            }
-            Write::ReleaseInflight(packet_id) => {
-                store.release_inflight(client_id, *packet_id).await?
-            }
-            Write::RemoveInflight(packet_id) => {
-                store.remove_inflight(client_id, *packet_id).await?
-            }
-            Write::StoreIncomingQos2(packet_id) => {
-                store.store_incoming_qos2(client_id, *packet_id).await?
-            }
-            Write::RemoveIncomingQos2(packet_id) => {
-                store.remove_incoming_qos2(client_id, *packet_id).await?
-            }
-            Write::Enqueue(sequence, message) => {
-                store.enqueue(client_id, *sequence, message).await?
-            }
-            Write::Dequeue(sequence) => store.dequeue(client_id, *sequence).await?,
-            Write::ClearQueue => store.clear_queue(client_id).await?,
-            Write::DeleteSession => {
-                store.delete_session(client_id).await?;
-                store.delete_will(client_id).await?;
-                store.clear_queue(client_id).await?;
-                for message in store.get_all_inflight(client_id).await? {
-                    store.remove_inflight(client_id, message.packet_id).await?;
-                }
-                for packet_id in store.get_incoming_qos2(client_id).await? {
-                    store.remove_incoming_qos2(client_id, packet_id).await?;
-                }
-            }
-        }
-    }
-    Ok(())
+/// A client's stored session with everything stored with it.
+#[derive(Debug, Clone)]
+pub struct StoredClient {
+    pub session: SessionState,
+    pub will: Option<StoredWillMessage>,
+    /// Its queued messages, each with its position in the queue, in that
+    /// order
+    pub queue: Vec<(u64, Message)>,
+    /// In no particular order
+    pub inflight: Vec<InflightMessage>,
+    /// The packet ids of its QoS 2 messages awaiting PUBREL
+    pub incoming_qos2: Vec<u16>,
+}
+
+/// A client as `BatchStore::load_clients` returns it.
+#[derive(Debug)]
+pub struct LoadedClient {
+    pub client_id: String,
+    /// What is stored for it, or `StorageError::SerializationError` when
+    /// some of it can't be decoded
+    pub stored: Result<StoredClient>,
 }
 
 /// Combined trait for full MQTT storage functionality.
@@ -478,263 +483,33 @@ pub trait MqttStore: BatchStore + RetainedMessageStore {}
 impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
 
 #[cfg(test)]
-pub(crate) mod testing {
-    use std::sync::Arc;
+mod range_tests {
+    use super::TopicRange;
 
-    use bytes::Bytes;
-    use mercurio_core::{message::Message, qos::QoS};
-
-    use super::{
-        BanStore, BatchStore, InflightMessage, SessionState, StoredBan, StoredSubscription, Write,
-    };
-
-    fn queued(payload: &str) -> Message {
-        Message {
-            packet_id: None,
-            topic: Arc::from("q"),
-            dup: false,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            payload: Some(Bytes::from(payload.to_string())),
-            properties: Default::default(),
-            expires_at: None,
-            subscription_identifiers: Vec::new(),
-            origin: None,
+    fn from(start: &str, end: Option<&str>) -> TopicRange {
+        TopicRange::From {
+            start: start.into(),
+            end: end.map(str::to_string),
         }
     }
 
-    /// What every durable store does with queued messages: each leaves the
-    /// queue on its own, in the batch that stores it in flight when it is
-    /// sent, batches apply in order, and applying one twice is harmless.
-    pub(crate) async fn queue_round_trip(store: &dyn BatchStore) {
-        let payloads = |queue: Vec<(u64, Message)>| -> Vec<(u64, String)> {
-            queue
-                .into_iter()
-                .map(|(sequence, message)| {
-                    let payload = message.payload.unwrap_or_default();
-                    (sequence, String::from_utf8(payload.to_vec()).unwrap())
-                })
-                .collect()
-        };
-        let sent = InflightMessage {
-            packet_id: 9,
-            topic: "q".into(),
-            payload: Some(Bytes::from_static(b"1")),
-            qos: QoS::AtLeastOnce,
-            dup: false,
-            retain: false,
-            expires_at: None,
-            sequence: 0,
-            released: false,
-            properties: Default::default(),
-            subscription_identifiers: Vec::new(),
-        };
-        let batch = [
-            Write::Enqueue(1, queued("1")),
-            Write::Enqueue(2, queued("2")),
-            Write::Enqueue(3, queued("3")),
-            Write::StoreInflight(sent),
-            Write::Dequeue(1),
-            Write::Dequeue(3),
-            Write::Enqueue(3, queued("3 again")),
-            Write::Enqueue(4, queued("4")),
-            Write::Dequeue(4),
-            // Removing what isn't stored is no error
-            Write::Dequeue(10),
-        ];
-        for _ in 0..2 {
-            store.apply("c", &batch).await.unwrap();
-            assert_eq!(
-                payloads(store.load_queue("c").await.unwrap()),
-                [(2, "2".to_string()), (3, "3 again".to_string())]
-            );
-            let inflight = store.get_all_inflight("c").await.unwrap();
-            assert_eq!(inflight.len(), 1);
-            assert_eq!(inflight[0].packet_id, 9);
-        }
-        store
-            .apply("other", &[Write::Enqueue(2, queued("other"))])
-            .await
-            .unwrap();
-        store.apply("c", &[Write::Dequeue(2)]).await.unwrap();
+    #[test]
+    fn test_topic_ranges() {
+        assert_eq!(TopicRange::of("a/b"), TopicRange::Exact("a/b".into()));
+        assert_eq!(TopicRange::of("#"), from("", None));
+        assert_eq!(TopicRange::of("+/c"), from("", None));
+        assert_eq!(TopicRange::of("a/#"), from("a", Some("b")));
+        assert_eq!(TopicRange::of("a/b/+/c"), from("a/b", Some("a/c")));
+        assert_eq!(TopicRange::of("a%_\\/+"), from("a%_\\", Some("a%_]")));
         assert_eq!(
-            payloads(store.load_queue("c").await.unwrap()),
-            [(3, "3 again".to_string())]
+            TopicRange::of("\u{D7FF}/#"),
+            from("\u{D7FF}", Some("\u{E000}"))
         );
-        assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
-    }
-
-    /// What every store does with subscriptions: a session saved whole
-    /// replaces them, single ones are added and removed in order, applying
-    /// a batch twice is harmless, and they leave with the session.
-    pub(crate) async fn subscriptions_round_trip(store: &dyn BatchStore) {
-        let sorted = |state: Option<SessionState>| {
-            let mut subscriptions = state.unwrap().subscriptions;
-            subscriptions.sort_by(|a, b| a.topic_filter.cmp(&b.topic_filter));
-            subscriptions
-        };
-        let detailed = StoredSubscription {
-            no_local: true,
-            retain_as_published: true,
-            subscription_identifier: Some(268_435_455),
-            // Commas, colons and wildcards are all valid in topic filters
-            ..StoredSubscription::new("a/+:x,y/#", QoS::ExactlyOnce)
-        };
-        let session = SessionState {
-            client_id: "c".into(),
-            subscriptions: vec![
-                StoredSubscription::new("old", QoS::AtMostOnce),
-                StoredSubscription::new("b", QoS::AtMostOnce),
-            ],
-            expiry_interval: Some(60),
-            expires_at: None,
-            owner: Default::default(),
-        };
-        // Without a stored session there is nothing to add to
-        store
-            .apply("c", &[Write::AddSubscription(detailed.clone())])
-            .await
-            .unwrap();
-        assert!(store.load_session("c").await.unwrap().is_none());
-
-        let batch = [
-            Write::SaveSession(session.clone()),
-            Write::AddSubscription(StoredSubscription::new("b", QoS::AtLeastOnce)),
-            Write::AddSubscription(detailed.clone()),
-            Write::RemoveSubscription("old".into()),
-            Write::AddSubscription(StoredSubscription::new("gone", QoS::AtMostOnce)),
-            Write::RemoveSubscription("gone".into()),
-            // Removing what isn't subscribed is no error
-            Write::RemoveSubscription("never".into()),
-        ];
-        for _ in 0..2 {
-            store.apply("c", &batch).await.unwrap();
-            assert_eq!(
-                sorted(store.load_session("c").await.unwrap()),
-                [
-                    detailed.clone(),
-                    StoredSubscription::new("b", QoS::AtLeastOnce)
-                ]
-            );
-        }
-
-        // Saving the session whole replaces the subscriptions
-        store
-            .apply("c", &[Write::SaveSession(session.clone())])
-            .await
-            .unwrap();
         assert_eq!(
-            sorted(store.load_session("c").await.unwrap()),
-            [
-                StoredSubscription::new("b", QoS::AtMostOnce),
-                StoredSubscription::new("old", QoS::AtMostOnce)
-            ]
+            TopicRange::of("a\u{10FFFF}/#"),
+            from("a\u{10FFFF}", Some("b"))
         );
-
-        let mut other = session.clone();
-        other.client_id = "other".into();
-        store
-            .apply("other", &[Write::SaveSession(other)])
-            .await
-            .unwrap();
-        store.apply("c", &[Write::DeleteSession]).await.unwrap();
-        assert!(store.load_session("c").await.unwrap().is_none());
-        store
-            .apply(
-                "c",
-                &[Write::SaveSession(SessionState {
-                    subscriptions: Vec::new(),
-                    ..session
-                })],
-            )
-            .await
-            .unwrap();
-        assert!(sorted(store.load_session("c").await.unwrap()).is_empty());
-        assert_eq!(sorted(store.load_session("other").await.unwrap()).len(), 2);
-    }
-
-    /// What every store does with the packet ids of incoming QoS 2
-    /// messages: batches apply in order, applying one twice is harmless, and
-    /// deleting the session removes them.
-    pub(crate) async fn incoming_qos2_round_trip(store: &dyn BatchStore) {
-        let sorted = |mut ids: Vec<u16>| {
-            ids.sort_unstable();
-            ids
-        };
-        let batch = [
-            Write::StoreIncomingQos2(1),
-            Write::StoreIncomingQos2(u16::MAX),
-            Write::StoreIncomingQos2(7),
-            Write::RemoveIncomingQos2(7),
-            Write::RemoveIncomingQos2(1),
-            Write::StoreIncomingQos2(1),
-        ];
-        for _ in 0..2 {
-            store.apply("c", &batch).await.unwrap();
-            assert_eq!(
-                sorted(store.get_incoming_qos2("c").await.unwrap()),
-                [1, u16::MAX]
-            );
-        }
-        store
-            .apply("other", &[Write::StoreIncomingQos2(1)])
-            .await
-            .unwrap();
-        // Removing what isn't stored is no error
-        store
-            .apply("c", &[Write::RemoveIncomingQos2(2)])
-            .await
-            .unwrap();
-
-        store.apply("c", &[Write::DeleteSession]).await.unwrap();
-        assert!(store.get_incoming_qos2("c").await.unwrap().is_empty());
-        assert_eq!(store.get_incoming_qos2("other").await.unwrap(), [1]);
-    }
-
-    pub(crate) fn ban(kind: &str, value: &str, prefix: bool) -> StoredBan {
-        StoredBan {
-            kind: kind.into(),
-            value: value.into(),
-            prefix,
-            reason: None,
-            created_at: 1_800_000_000,
-            expires_at: None,
-        }
-    }
-
-    /// What every `BanStore` does: a ban is named by its kind, value and
-    /// prefix flag, and storing one again replaces it.
-    pub(crate) async fn bans_round_trip(store: &dyn BanStore) {
-        let sorted = |mut bans: Vec<StoredBan>| {
-            bans.sort_by(|a, b| (&a.kind, &a.value, a.prefix).cmp(&(&b.kind, &b.value, b.prefix)));
-            bans
-        };
-        assert!(store.load_bans().await.unwrap().is_empty());
-
-        let mut exact = ban("clientid", "c", false);
-        exact.reason = Some("spam".into());
-        exact.expires_at = Some(1_800_003_600);
-        let prefixed = ban("clientid", "c", true);
-        let address = ban("address", "10.0.0.0/8", false);
-        for stored in [&exact, &prefixed, &address] {
-            store.store_ban(stored).await.unwrap();
-        }
-        assert_eq!(
-            sorted(store.load_bans().await.unwrap()),
-            vec![address.clone(), exact.clone(), prefixed.clone()]
-        );
-
-        exact.reason = None;
-        exact.expires_at = None;
-        exact.created_at = 1_800_000_100;
-        store.store_ban(&exact).await.unwrap();
-        store.delete_ban("clientid", "c", true).await.unwrap();
-        // Deleting what isn't stored is no error
-        store.delete_ban("username", "c", false).await.unwrap();
-        assert_eq!(
-            sorted(store.load_bans().await.unwrap()),
-            vec![address, exact]
-        );
+        assert_eq!(TopicRange::of("\u{10FFFF}/#"), from("\u{10FFFF}", None));
     }
 }
 

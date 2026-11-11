@@ -528,7 +528,7 @@ impl Retry {
 
 #[cfg(test)]
 mod tests {
-    use mercurio_storage::{memory::MemoryStore, SessionStore, WillStore};
+    use mercurio_storage::memory::MemoryStore;
 
     use super::*;
 
@@ -691,6 +691,6 @@ mod tests {
         writers.settle("c").await;
         tokio::task::yield_now().await;
         assert!(writers.entries.lock().unwrap().is_empty());
-        assert!(storage.get_will("c").await.unwrap().is_none());
+        assert!(storage.load_will("c").await.unwrap().is_none());
     }
 }

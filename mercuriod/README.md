@@ -790,7 +790,12 @@ The SQLite database runs in WAL mode: while the broker runs, it keeps
 `-wal` and `-shm` files next to the database, and recent changes may be
 only in the `-wal` file. To back it up while the broker runs, use
 `sqlite3 mercurio.db ".backup copy.db"`; a plain copy of the database file
-alone can miss those changes.
+alone can miss those changes. The broker creates the database readable by
+its owner only, and holds a lock on `mercurio.db.lock` while it runs, so a
+second broker started on the same database exits with an error; reading
+the database with `sqlite3`, as for a backup, still works. The database
+records its schema version, and a broker refuses a database written by a
+newer version of it.
 
 Only one broker serves from a PostgreSQL database at a time. Another one
 started on it exits, or, with `standby = true`, waits without listening and

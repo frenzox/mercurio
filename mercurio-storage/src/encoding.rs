@@ -3,7 +3,7 @@
 use bytes::BytesMut;
 use mercurio_core::{codec::Encoder, message::MessageProperties, qos::QoS};
 
-use crate::StoredSubscription;
+use crate::{Result, StorageError, StoredSubscription};
 
 pub(crate) fn qos_to_int(qos: QoS) -> i32 {
     match qos {
@@ -14,12 +14,16 @@ pub(crate) fn qos_to_int(qos: QoS) -> i32 {
     }
 }
 
-pub(crate) fn int_to_qos(val: i32) -> QoS {
+/// Fails for a value no version stores, rather than read it as a QoS the
+/// broker would then have to refuse.
+pub(crate) fn int_to_qos(val: i32) -> Result<QoS> {
     match val {
-        0 => QoS::AtMostOnce,
-        1 => QoS::AtLeastOnce,
-        2 => QoS::ExactlyOnce,
-        _ => QoS::Invalid,
+        0 => Ok(QoS::AtMostOnce),
+        1 => Ok(QoS::AtLeastOnce),
+        2 => Ok(QoS::ExactlyOnce),
+        _ => Err(StorageError::SerializationError(format!(
+            "{val} is not a QoS"
+        ))),
     }
 }
 
@@ -56,20 +60,75 @@ pub(crate) fn encode_subscriptions(subscriptions: &[StoredSubscription]) -> Stri
         .join("\0")
 }
 
-pub(crate) fn decode_subscriptions(encoded: &str) -> Vec<StoredSubscription> {
+/// Fails for subscriptions that can't be read whole, as every other
+/// stored row does, rather than leave them out.
+pub(crate) fn decode_subscriptions(encoded: &str) -> Result<Vec<StoredSubscription>> {
     encoded
         .split('\0')
-        .filter_map(|s| {
-            let (flags, rest) = s.split_at_checked(3)?;
-            let (identifier, topic_filter) = rest.split_once(':')?;
-            let flags: Vec<u8> = flags.bytes().map(|b| b.wrapping_sub(b'0')).collect();
-            Some(StoredSubscription {
+        .map(|s| {
+            let invalid =
+                || StorageError::SerializationError(format!("invalid stored subscription `{s}`"));
+            let (flags, rest) = s.split_at_checked(3).ok_or_else(invalid)?;
+            let (identifier, topic_filter) = rest.split_once(':').ok_or_else(invalid)?;
+            let flag = |index: usize| match flags.as_bytes()[index] {
+                b'0' => Ok(false),
+                b'1' => Ok(true),
+                _ => Err(invalid()),
+            };
+            let qos = flags.as_bytes()[0].wrapping_sub(b'0');
+            Ok(StoredSubscription {
                 topic_filter: topic_filter.to_string(),
-                qos: flags[0].into(),
-                no_local: flags[1] == 1,
-                retain_as_published: flags[2] == 1,
-                subscription_identifier: identifier.parse().ok(),
+                qos: int_to_qos(i32::from(qos)).map_err(|_| invalid())?,
+                no_local: flag(1)?,
+                retain_as_published: flag(2)?,
+                subscription_identifier: match identifier {
+                    "" => None,
+                    identifier => Some(identifier.parse().map_err(|_| invalid())?),
+                },
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subscriptions_that_cannot_be_read_are_an_error() {
+        let subscriptions = vec![
+            StoredSubscription {
+                no_local: true,
+                retain_as_published: false,
+                subscription_identifier: Some(7),
+                ..StoredSubscription::new("a/+:x", QoS::ExactlyOnce)
+            },
+            StoredSubscription::new("b", QoS::AtMostOnce),
+        ];
+        let encoded = encode_subscriptions(&subscriptions);
+        assert_eq!(decode_subscriptions(&encoded).unwrap(), subscriptions);
+
+        for bad in [
+            "9007:a",
+            "1x0:a",
+            "100",
+            "100x:a",
+            &format!("{encoded}\0junk"),
+        ] {
+            assert!(
+                matches!(
+                    decode_subscriptions(bad),
+                    Err(StorageError::SerializationError(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_qos_values_are_an_error() {
+        assert_eq!(int_to_qos(2).unwrap(), QoS::ExactlyOnce);
+        assert!(int_to_qos(3).is_err());
+        assert!(int_to_qos(-1).is_err());
+    }
 }
