@@ -89,7 +89,7 @@ struct SubscriptionArgs {
 pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
     args.connection.connect.ask_password()?;
     // Connect to broker
-    let mut options = args.will.apply(args.connection.to_connect_options());
+    let mut options = args.will.apply(args.connection.to_connect_options()?);
     let reconnect = args.reconnect;
     if let Some(seconds) = reconnect {
         options = options.reconnect(Duration::from_secs(seconds));

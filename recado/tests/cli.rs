@@ -201,12 +201,32 @@ async fn logs_go_to_standard_error() {
 async fn mqtt_3_without_a_client_id_still_connects() {
     let broker = start().await;
     for args in [
-        &["pub", "-V", "311", "-c", "-t", "a", "-m", "x"][..],
-        &["pub", "-V", "31", "-t", "a", "-m", "x"],
+        &["pub", "-V", "31", "-t", "a", "-m", "x"][..],
         &["pub", "-V", "311", "-t", "a", "-m", "x"],
     ] {
         let output = broker.run(args).await;
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeping_the_session_needs_a_client_id() {
+    let broker = start().await;
+    for version in ["5", "311", "31"] {
+        let output = broker
+            .run(&["pub", "-V", version, "-c", "-t", "a", "-m", "x"])
+            .await;
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "-V {version}: {message}");
+        assert!(message.contains("-i"), "{message}");
+        assert_eq!(message.lines().count(), 1, "{message}");
+
+        let output = broker
+            .run(&[
+                "pub", "-V", version, "-c", "-i", "kept", "-t", "a", "-m", "x",
+            ])
+            .await;
+        assert!(output.status.success(), "-V {version}: {}", stderr(&output));
     }
 }
 

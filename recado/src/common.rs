@@ -3,6 +3,8 @@
 use clap::{Args, ValueEnum};
 use mercurio_client::{cli::ConnectArgs, ConnectOptions, ProtocolVersion, QoS, Will};
 
+use crate::failure::Failure;
+
 /// Common connection arguments shared between pub and sub tools.
 #[derive(Args, Debug, Clone)]
 pub struct ConnectionArgs {
@@ -13,7 +15,8 @@ pub struct ConnectionArgs {
     #[arg(short = 'k', long, default_value = "60")]
     pub keep_alive: u16,
 
-    /// Keep the session after disconnecting instead of starting clean
+    /// Keep the session after disconnecting instead of starting clean;
+    /// needs -i
     #[arg(short = 'c', long)]
     pub no_clean_start: bool,
 
@@ -74,7 +77,7 @@ impl WillArgs {
 
 impl ConnectionArgs {
     /// Convert CLI arguments to ConnectOptions.
-    pub fn to_connect_options(&self) -> ConnectOptions {
+    pub fn to_connect_options(&self) -> Result<ConnectOptions, Failure> {
         let options = self
             .connect
             .to_connect_options()
@@ -82,26 +85,27 @@ impl ConnectionArgs {
             .clean_start(!self.no_clean_start)
             .session_expiry(self.session_expiry)
             .protocol_version(self.protocol_version.into());
-        match self.client_id() {
+        Ok(match self.client_id()? {
             Some(id) => options.client_id(id),
             None => options,
-        }
+        })
     }
 
-    /// The client id to send: the one given with -i, or one made up where
-    /// MQTT 3 needs an id and none was given. MQTT 3.1 takes no empty id,
-    /// and 3.1.1 only with a clean session. Otherwise the id stays empty
-    /// and the broker assigns one.
-    pub fn client_id(&self) -> Option<String> {
+    /// The client id to send: the one given with -i, or for MQTT 3.1, which
+    /// takes no empty id, one made up. Otherwise the id stays empty and the
+    /// broker assigns one. Keeping the session needs -i, as in
+    /// mosquitto_sub: a session under an id nobody knows can never be
+    /// resumed.
+    pub fn client_id(&self) -> Result<Option<String>, Failure> {
         if let Some(id) = &self.connect.client_id {
-            return Some(id.clone());
+            return Ok(Some(id.clone()));
         }
-        let needed = match self.protocol_version {
-            Protocol::V31 => true,
-            Protocol::V311 => self.no_clean_start,
-            Protocol::V5 => false,
-        };
-        needed.then(made_up_client_id)
+        if self.no_clean_start {
+            return Err(Failure::Usage(
+                "-c keeps the session, which needs a client id given with -i".to_string(),
+            ));
+        }
+        Ok((self.protocol_version == Protocol::V31).then(made_up_client_id))
     }
 }
 
@@ -168,7 +172,7 @@ mod tests {
     use clap::Parser;
     use mercurio_client::ProtocolVersion;
 
-    use super::ConnectionArgs;
+    use super::{ConnectionArgs, Failure};
 
     #[derive(Parser)]
     struct Cli {
@@ -205,16 +209,28 @@ mod tests {
                 .connection
                 .client_id()
         };
-        assert_eq!(id(&[]), None);
-        assert_eq!(id(&["-c"]), None);
-        assert_eq!(id(&["-V", "311"]), None);
-        assert_eq!(id(&["-V", "31", "-i", "me"]).as_deref(), Some("me"));
-        for args in [&["-V", "31"][..], &["-V", "311", "-c"]] {
-            let made_up = id(args).unwrap();
-            // MQTT 3.1 takes 1 to 23 characters
-            assert!(made_up.starts_with("recado-"), "{made_up}");
-            assert!((1..=23).contains(&made_up.len()), "{made_up}");
-            assert_ne!(id(args), Some(made_up), "{args:?}");
+        assert_eq!(id(&[]).unwrap(), None);
+        assert_eq!(id(&["-V", "311"]).unwrap(), None);
+        assert_eq!(
+            id(&["-V", "31", "-i", "me"]).unwrap().as_deref(),
+            Some("me")
+        );
+        assert_eq!(id(&["-c", "-i", "me"]).unwrap().as_deref(), Some("me"));
+        let made_up = id(&["-V", "31"]).unwrap().unwrap();
+        // MQTT 3.1 takes 1 to 23 characters
+        assert!(made_up.starts_with("recado-"), "{made_up}");
+        assert!((1..=23).contains(&made_up.len()), "{made_up}");
+        assert_ne!(id(&["-V", "31"]).unwrap(), Some(made_up));
+    }
+
+    #[test]
+    fn keeping_the_session_needs_a_client_id_with_every_version() {
+        for version in ["5", "311", "31"] {
+            let cli = Cli::try_parse_from(["recado", "-V", version, "-c"]).unwrap();
+            let Err(Failure::Usage(message)) = cli.connection.client_id() else {
+                panic!("-V {version} -c without -i was accepted");
+            };
+            assert!(message.contains("-i"), "{message}");
         }
     }
 

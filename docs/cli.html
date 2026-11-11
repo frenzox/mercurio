@@ -134,10 +134,10 @@ recado sub -t 'cameras/#' --format json | jq -r .payload_base64 | base64 -d</pre
 <tr><td><code>-H, --host</code></td><td>Broker host name</td><td><code>localhost</code></td></tr>
 <tr><td><code>-p, --port</code></td><td>Broker port</td><td><code>1883</code></td></tr>
 <tr><td><code>--unix PATH</code></td><td>Connect through this Unix socket instead of TCP; not with <code>-H</code>, <code>-p</code> or the TLS options</td><td></td></tr>
-<tr><td><code>-i, --client-id</code></td><td>Client id. Left out, it is empty and the broker assigns one; MQTT 3.1 takes no empty id, nor 3.1.1 with <code>-c</code>, so there recado sends a random <code>recado-</code> id</td><td>assigned by the broker</td></tr>
+<tr><td><code>-i, --client-id</code></td><td>Client id. Left out, it is empty and the broker assigns one; MQTT 3.1 takes no empty id, so there recado sends a random <code>recado-</code> id</td><td>assigned by the broker</td></tr>
 <tr><td><code>-u, --username</code>, <code>-P, --password</code></td><td>Credentials. The password can also come from <code>RECADO_PASSWORD</code>, which other users can't see in <code>ps</code>; <code>-u</code> alone asks for it when standard error is a terminal</td><td></td></tr>
 <tr><td><code>-k, --keep-alive</code></td><td>Keep-alive, in seconds</td><td><code>60</code></td></tr>
-<tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting</td><td></td></tr>
+<tr><td><code>-c, --no-clean-start</code></td><td>Keep the session after disconnecting. Needs <code>-i</code>, as with mosquitto: a session kept under an id nobody knows could never be resumed</td><td></td></tr>
 <tr><td><code>-x, --session-expiry</code></td><td>Seconds the broker keeps the session after the connection closes (MQTT 5)</td><td><code>0</code></td></tr>
 <tr><td><code>-V, --protocol-version</code></td><td><code>5</code>, <code>311</code> or <code>31</code>; also <code>3.1.1</code>, <code>3.1</code> and mosquitto's <code>mqttv5</code>, <code>mqttv311</code>, <code>mqttv31</code>. Anything else is an error</td><td><code>5</code></td></tr>
 <tr><td><code>--tls</code></td><td>Connect with TLS, verifying the broker with the operating system's certificate store (on Linux the system CA bundle, such as /etc/ssl/certs; the Keychain on macOS; the certificate store on Windows), or, when that holds no usable certificate, the Mozilla roots bundled with the client</td><td></td></tr>

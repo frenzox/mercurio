@@ -133,7 +133,7 @@ pub async fn run(mut args: PubArgs) -> Result<(), Failure> {
 
     args.connection.connect.ask_password()?;
     // Connect to broker
-    let options = args.will.apply(args.connection.to_connect_options());
+    let options = args.will.apply(args.connection.to_connect_options()?);
     let client = MqttClient::connect(options).await?;
 
     let properties = MessageProperties::from(args.properties);
