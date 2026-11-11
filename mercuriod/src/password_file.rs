@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 pub fn load(path: &str) -> Result<HashMap<String, String>, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read password file `{}`: {}", path, e))?;
-    parse(path, &content)
+    parse(path, &content, true)
 }
 
-fn parse(path: &str, content: &str) -> Result<HashMap<String, String>, String> {
+/// The file's users; with `check_hashes`, a hash no password can match,
+/// such as a plain-text password, is an error naming its line.
+fn parse(path: &str, content: &str, check_hashes: bool) -> Result<HashMap<String, String>, String> {
     let mut credentials = HashMap::new();
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -27,6 +29,16 @@ fn parse(path: &str, content: &str) -> Result<HashMap<String, String>, String> {
                 line_num + 1
             ));
         };
+        if check_hashes {
+            crate::credentials::check_hash(password_hash).map_err(|e| {
+                format!(
+                    "Invalid hash in password file `{}` at line {}: {}",
+                    path,
+                    line_num + 1,
+                    e
+                )
+            })?;
+        }
         credentials.insert(username.to_string(), password_hash.to_string());
     }
     Ok(credentials)
@@ -41,7 +53,8 @@ pub fn read_users(path: &str) -> Result<BTreeMap<String, String>, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(format!("Failed to read password file `{path}`: {e}")),
     };
-    Ok(parse(path, &content)?.into_iter().collect())
+    // A bad entry may be the one `passwd` is about to fix
+    Ok(parse(path, &content, false)?.into_iter().collect())
 }
 
 /// Refuses user names the password file cannot hold as they are.
@@ -204,6 +217,48 @@ mod tests {
             .iter()
             .map(|(u, h)| (u.to_string(), h.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn test_hashes_load_and_anything_else_names_its_line() {
+        let dir = TempDir::new("hashes");
+        let good = dir.file("good");
+        std::fs::write(
+            &good,
+            "# comment\n\
+             argon:$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0$NyLLmsFKZ9oYOtcaEe8gdiULhOKcU8bYpD4UrZ6/NXo\n\
+             pbkdf2:$7$101$lT8RRynk8Dr5uL1b$1FhG/H49+FnZ9qx8YFDOUZOiE+Yd+yOKjQ9AzfsTHwepsiXOTbzCSojC7kA3U/VicSJdksyipSowQpvFhpo0iQ==\n\
+             sha512:$6$pZufTypp2a6RmJv0$0E3Uw01KVS5L6/s+8dWtsoMjdF9mnjUcloZJLTWqsIQbvp1b3crPcunceFO+VmiVpj+Wde8NRnyJs4ZAFgaQUA==\n",
+        )
+        .unwrap();
+        assert_eq!(load(&good).unwrap().len(), 3);
+
+        for (line, hash) in [
+            (2, ""),
+            (2, "secret"),
+            (2, "$7$many$c2FsdA==$aGFzaA=="),
+            (2, "$6$not base64!$aGFzaA=="),
+            (2, "$6$c2FsdA=="),
+            (2, "$argon2id$garbage"),
+            (2, "$pbkdf2-sha256$i=1000$c2FsdA$aGFzaA"),
+        ] {
+            let path = dir.file("bad");
+            std::fs::write(&path, format!("ok:$6$c2FsdA==$aGFzaA==\nalice:{hash}\n")).unwrap();
+            let error = load(&path).unwrap_err();
+            assert!(error.contains(&format!("line {line}")), "{hash:?}: {error}");
+            assert!(
+                !error.contains(hash) || hash.is_empty(),
+                "{hash:?} shown: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_passwd_still_reads_a_file_with_a_bad_hash() {
+        let dir = TempDir::new("passwd-bad");
+        let path = dir.file("passwd");
+        std::fs::write(&path, "alice:\nbob:$6$c2FsdA==$aGFzaA==\n").unwrap();
+        assert_eq!(read_users(&path).unwrap().len(), 2);
     }
 
     #[test]

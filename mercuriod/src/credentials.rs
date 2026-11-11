@@ -7,13 +7,11 @@ use mercurio_server::plugin::{
     BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 
-/// Credential validator that supports argon2 password hashes.
-///
-/// The password file stores entries as `username:hash` where hash is an
-/// argon2id PHC string. Plaintext passwords (without `$` prefix) are also
-/// supported for backwards compatibility.
+/// Credential validator for the password file's `username:hash` entries,
+/// where the hash is an Argon2 PHC string, as `mercuriod passwd` writes, or
+/// one of `mosquitto_passwd`'s, see [`check_hash`].
 pub struct HashedCredentialValidator {
-    /// Map of username -> password hash (or plaintext).
+    /// Map of username -> password hash.
     credentials: HashMap<String, String>,
 }
 
@@ -32,21 +30,79 @@ impl HashedCredentialValidator {
             return false;
         };
 
-        if stored.starts_with("$6$") || stored.starts_with("$7$") {
-            mosquitto_hash_matches(stored, password)
-        } else if stored.starts_with('$') {
-            // Argon2 hashed password
-            let Ok(parsed_hash) = PasswordHash::new(stored) else {
-                return false;
-            };
-            Argon2::default()
-                .verify_password(password, &parsed_hash)
-                .is_ok()
-        } else {
-            // Plaintext fallback for backwards compatibility
-            constant_time_eq(stored.as_bytes(), password)
+        match Hash::parse(stored) {
+            Ok(Hash::Argon2(hash)) => Argon2::default().verify_password(password, &hash).is_ok(),
+            Ok(Hash::Mosquitto {
+                iterations,
+                salt,
+                hash,
+            }) => mosquitto_hash_matches(iterations, &salt, &hash, password),
+            Err(_) => false,
         }
     }
+}
+
+/// A password hash of the formats the password file may hold.
+enum Hash<'a> {
+    Argon2(PasswordHash<'a>),
+    /// Written by `mosquitto_passwd`: PBKDF2-HMAC-SHA512 with `iterations`,
+    /// its default since 2.0, or one SHA-512 of the password and salt
+    /// without, the default before
+    Mosquitto {
+        iterations: Option<u32>,
+        salt: Vec<u8>,
+        hash: Vec<u8>,
+    },
+}
+
+impl<'a> Hash<'a> {
+    /// Parses `$argon2id$...` (or `argon2i`, `argon2d`) PHC strings,
+    /// `$7$<iterations>$<salt>$<hash>` and `$6$<salt>$<hash>`, whose salts
+    /// and hashes are base64. The error does not repeat `stored`.
+    fn parse(stored: &'a str) -> Result<Hash<'a>, &'static str> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let fields: Vec<&str> = stored.split('$').collect();
+        let (iterations, salt, hash) = match fields[..] {
+            ["", "7", iterations, salt, hash] => match iterations.parse() {
+                Ok(iterations) if iterations > 0 => (Some(iterations), salt, hash),
+                _ => return Err("the iteration count of a `$7$` hash is not a positive number"),
+            },
+            ["", "7", ..] => {
+                return Err("a `$7$` hash has the form `$7$<iterations>$<salt>$<hash>`")
+            }
+            ["", "6", salt, hash] => (None, salt, hash),
+            ["", "6", ..] => return Err("a `$6$` hash has the form `$6$<salt>$<hash>`"),
+            ["", algorithm, ..] if algorithm.starts_with("argon2") => {
+                return match PasswordHash::new(stored) {
+                    Ok(hash) if hash.salt.is_some() && hash.hash.is_some() => {
+                        Ok(Hash::Argon2(hash))
+                    }
+                    _ => Err("the Argon2 hash is malformed"),
+                }
+            }
+            _ => {
+                return Err(
+                    "not a hash `mercuriod passwd` or `mosquitto_passwd` writes; \
+                     plain-text passwords are not accepted",
+                )
+            }
+        };
+        match (STANDARD.decode(salt), STANDARD.decode(hash)) {
+            (Ok(salt), Ok(hash)) if !hash.is_empty() => Ok(Hash::Mosquitto {
+                iterations,
+                salt,
+                hash,
+            }),
+            _ => Err("the salt or hash of a mosquitto hash is not base64"),
+        }
+    }
+}
+
+/// Refuses a password file hash no password can match, such as a
+/// plain-text password or an empty field.
+pub fn check_hash(stored: &str) -> Result<(), &'static str> {
+    Hash::parse(stored).map(drop)
 }
 
 impl Plugin for HashedCredentialValidator {
@@ -79,40 +135,28 @@ impl Plugin for HashedCredentialValidator {
     }
 }
 
-/// Checks a password against a hash written by `mosquitto_passwd`:
-/// `$7$<iterations>$<salt>$<hash>` for PBKDF2-HMAC-SHA512, its default since
-/// 2.0, or `$6$<salt>$<hash>` for one SHA-512 of the password and salt, the
-/// default before. Salts and hashes are base64.
-fn mosquitto_hash_matches(stored: &str, password: &[u8]) -> bool {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+/// Checks a password against a hash written by `mosquitto_passwd`.
+fn mosquitto_hash_matches(
+    iterations: Option<u32>,
+    salt: &[u8],
+    expected: &[u8],
+    password: &[u8],
+) -> bool {
     use sha2::{Digest, Sha512};
-
-    let fields: Vec<&str> = stored.split('$').collect();
-    let (iterations, salt, expected) = match fields[..] {
-        ["", "7", iterations, salt, hash] => match iterations.parse() {
-            Ok(iterations) => (Some(iterations), salt, hash),
-            Err(_) => return false,
-        },
-        ["", "6", salt, hash] => (None, salt, hash),
-        _ => return false,
-    };
-    let (Ok(salt), Ok(expected)) = (STANDARD.decode(salt), STANDARD.decode(expected)) else {
-        return false;
-    };
 
     let hash: Vec<u8> = match iterations {
         Some(iterations) => {
             let mut hash = [0u8; 64];
-            pbkdf2::pbkdf2_hmac::<Sha512>(password, &salt, iterations, &mut hash);
+            pbkdf2::pbkdf2_hmac::<Sha512>(password, salt, iterations, &mut hash);
             hash.to_vec()
         }
         None => Sha512::new()
             .chain_update(password)
-            .chain_update(&salt)
+            .chain_update(salt)
             .finalize()
             .to_vec(),
     };
-    constant_time_eq(&hash, &expected)
+    constant_time_eq(&hash, expected)
 }
 
 /// Compares in time independent of where the two differ, so timing tells
@@ -188,13 +232,16 @@ mod tests {
     }
 
     #[test]
-    fn test_plaintext_fallback() {
+    fn test_plaintext_is_not_a_password() {
         let mut creds = HashMap::new();
         creds.insert("legacy".to_string(), "plainpass".to_string());
+        creds.insert("truncated".to_string(), String::new());
         let validator = HashedCredentialValidator::new(creds);
 
-        assert!(validator.check("legacy", b"plainpass"));
-        assert!(!validator.check("legacy", b"wrong"));
+        assert!(!validator.check("legacy", b"plainpass"));
+        assert!(!validator.check("truncated", b""));
+        assert!(check_hash("plainpass").is_err());
+        assert!(check_hash("").is_err());
     }
 
     #[test]

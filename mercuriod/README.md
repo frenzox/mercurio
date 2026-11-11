@@ -392,7 +392,9 @@ send no user name in. Credentials that are sent are always checked.
 
 The password file holds one `user:hash` line per user, with Argon2 hashes.
 Files written by `mosquitto_passwd` work too: their `$7$` (PBKDF2-SHA512)
-and `$6$` (SHA-512) hashes are recognised.
+and `$6$` (SHA-512) hashes are recognised. Any other hash field, such as a
+plain-text password or an empty one, stops the file from loading, with an
+error naming its line.
 Manage it with:
 
 ```bash
