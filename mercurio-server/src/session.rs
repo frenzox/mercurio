@@ -2734,7 +2734,7 @@ mod tests {
             .await;
         assert!(matches!(
             failed,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ImplementationSpecificError
             ))
         ));
@@ -3147,7 +3147,7 @@ mod tests {
             .await;
         assert!(matches!(
             zero,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ProtocolError
             ))
         ));
@@ -3164,7 +3164,7 @@ mod tests {
             session
                 .process_incoming(from_client, &broker, &no_plugins())
                 .await,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ProtocolError
             ))
         ));
@@ -3217,7 +3217,7 @@ mod tests {
                 .process_incoming(aliased_publish(topic, alias), &broker, &no_plugins())
                 .await;
             assert!(
-                matches!(result, Err(mercurio_core::error::Error::MQTTReasonCode(r)) if r == reason),
+                matches!(result, Err(mercurio_core::error::Error::Reason(r)) if r == reason),
                 "alias {alias}"
             );
         }
@@ -3307,7 +3307,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(mercurio_core::error::Error::MQTTReasonCode(
+            Err(mercurio_core::error::Error::Reason(
                 ReasonCode::ProtocolError
             ))
         ));
@@ -3339,7 +3339,7 @@ mod tests {
                 .await;
             assert!(matches!(
                 result,
-                Err(mercurio_core::error::Error::MQTTReasonCode(
+                Err(mercurio_core::error::Error::Reason(
                     ReasonCode::ProtocolError
                 ))
             ));

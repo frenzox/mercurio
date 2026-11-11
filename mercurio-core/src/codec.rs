@@ -358,7 +358,7 @@ mod tests {
         let mut encoded = Bytes::from(vec![0xc5, 0xc5, 0xc5, 0xc5, 0x02]);
 
         match VariableByteInteger::decode(&mut encoded) {
-            Err(Error::MQTTReasonCode(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
+            Err(Error::Reason(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
             _ => unreachable!(),
         };
     }
@@ -369,7 +369,7 @@ mod tests {
             assert!(
                 matches!(
                     VariableByteInteger::decode(&mut Bytes::copy_from_slice(bytes)),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{bytes:02x?}"
             );

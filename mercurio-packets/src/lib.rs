@@ -525,7 +525,7 @@ mod tests {
             assert!(
                 matches!(
                     parse(ProtocolVersion::V3_1_1),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{bytes:02x?}"
             );
@@ -725,7 +725,7 @@ mod robustness_tests {
         let mut buffer = BytesMut::from(&repeated[..]);
         assert!(matches!(
             ControlPacket::parse_with_version(&mut buffer, ProtocolVersion::V5),
-            Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+            Err(Error::Reason(ReasonCode::ProtocolError))
         ));
 
         // The same with two User Properties, which may repeat
@@ -757,10 +757,7 @@ mod robustness_tests {
         for &(bytes, version) in packets {
             let result = ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
             assert!(
-                matches!(
-                    result,
-                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
-                ),
+                matches!(result, Err(Error::Reason(ReasonCode::ProtocolError))),
                 "{bytes:02x?} ({version}): {result:?}"
             );
         }
@@ -817,7 +814,7 @@ mod robustness_tests {
             assert!(
                 matches!(
                     parse(invalid),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{name}: {:?}",
                 parse(invalid)
@@ -908,7 +905,7 @@ mod robustness_tests {
             assert!(
                 matches!(
                     ControlPacket::parse_with_version(&mut buffer, version),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{:02x?}",
                 bytes
@@ -1067,7 +1064,7 @@ mod robustness_tests {
             assert!(
                 matches!(
                     decode_direct(name, decode, bytes),
-                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    Err(Error::Reason(ReasonCode::MalformedPacket))
                 ),
                 "{name}"
             );
@@ -1110,10 +1107,7 @@ mod property_list_tests {
         for bytes in [&[0x05, 0x26][..], &[0x02, 0x26, 0x00]] {
             for (i, result) in decode_all(bytes).into_iter().enumerate() {
                 assert!(
-                    matches!(
-                        result,
-                        Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
-                    ),
+                    matches!(result, Err(Error::Reason(ReasonCode::MalformedPacket))),
                     "{bytes:02x?} in decoder {i}: {result:?}"
                 );
             }
@@ -1139,7 +1133,7 @@ mod property_list_tests {
             assert!(
                 matches!(
                     decode(data_only),
-                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                    Err(Error::Reason(ReasonCode::ProtocolError))
                 ),
                 "decoder {i}"
             );

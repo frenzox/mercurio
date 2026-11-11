@@ -18,10 +18,12 @@ pub enum Error {
     #[cfg(feature = "std")]
     Io(std::io::Error),
 
-    /// MQTT protocol error with a reason code.
-    MQTTReasonCode(ReasonCode),
+    /// The packet breaks the protocol; the reason code says how, and is the
+    /// one to send the peer when its packet was the cause.
+    Reason(ReasonCode),
 
-    /// Storage backend error.
+    /// A storage backend failed, described by its message. The broker
+    /// carries it through the same results as protocol errors.
     Storage(String),
 }
 
@@ -31,7 +33,7 @@ impl fmt::Display for Error {
             Error::PacketIncomplete => write!(f, "Packet is not complete"),
             #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "I/O Error: {}", e),
-            Error::MQTTReasonCode(e) => write!(f, "MQTT Error: {}", e),
+            Error::Reason(e) => write!(f, "MQTT Error: {}", e),
             Error::Storage(s) => write!(f, "Storage error: {}", s),
         }
     }
@@ -56,6 +58,6 @@ impl From<std::io::Error> for Error {
 
 impl From<ReasonCode> for Error {
     fn from(e: ReasonCode) -> Self {
-        Error::MQTTReasonCode(e)
+        Error::Reason(e)
     }
 }

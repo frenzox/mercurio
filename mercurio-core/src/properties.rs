@@ -460,9 +460,7 @@ mod tests {
             assert!(
                 matches!(
                     decode(bytes),
-                    Err(crate::error::Error::MQTTReasonCode(
-                        ReasonCode::ProtocolError
-                    ))
+                    Err(crate::error::Error::Reason(ReasonCode::ProtocolError))
                 ),
                 "{bytes:02x?}"
             );
@@ -471,9 +469,7 @@ mod tests {
         // Response Topic "a/+"
         assert!(matches!(
             decode(&[0x08, 0x00, 0x03, b'a', b'/', b'+']),
-            Err(crate::error::Error::MQTTReasonCode(
-                ReasonCode::ProtocolError
-            ))
+            Err(crate::error::Error::Reason(ReasonCode::ProtocolError))
         ));
         assert!(decode(&[0x08, 0x00, 0x03, b'a', b'/', b'b']).is_ok());
 

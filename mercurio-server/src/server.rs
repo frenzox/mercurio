@@ -1566,9 +1566,9 @@ impl<St: MqttStore + 'static> Listener<St> {
                 // for as long as it runs, the whole connection
                 match handler.run(Box::new(p)).await {
                     // Closed by the broker's own shutdown
-                    Err(mercurio_core::error::Error::MQTTReasonCode(
-                        ReasonCode::ServerShuttingDown,
-                    )) => debug!(target: CONNECTIONS, "Connection closed for shutdown"),
+                    Err(mercurio_core::error::Error::Reason(ReasonCode::ServerShuttingDown)) => {
+                        debug!(target: CONNECTIONS, "Connection closed for shutdown")
+                    }
                     // Only the broker's own storage failing is its error;
                     // anything else a client can cause at will
                     Err(Error::Storage(e)) => {
@@ -1598,7 +1598,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 handler.peer,
                 describe(&packet)
             ),
-            Ok(Err(Error::MQTTReasonCode(ReasonCode::UnsupportedProtocolVersion))) => {
+            Ok(Err(Error::Reason(ReasonCode::UnsupportedProtocolVersion))) => {
                 debug!(
                     target: CONNECTIONS,
                     "{:?} asked for an unsupported protocol version", handler.peer
@@ -1620,7 +1620,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             }
             // MQTT 5 clients are told why their CONNECT was refused; earlier
             // versions have no reason code for it and are just disconnected
-            Ok(Err(Error::MQTTReasonCode(reason)))
+            Ok(Err(Error::Reason(reason)))
                 if handler.connection.connect_version() == Some(ProtocolVersion::V5) =>
             {
                 warn!(
@@ -2018,7 +2018,7 @@ where
         .await;
 
         let reason = match &result {
-            Err(Error::MQTTReasonCode(reason)) => Some(*reason),
+            Err(Error::Reason(reason)) => Some(*reason),
             _ => None,
         };
         // Plugins never saw a connection that failed before it was accepted
@@ -2030,7 +2030,7 @@ where
         }
 
         // Tell MQTT 5 clients why the server is closing the connection
-        if let Err(Error::MQTTReasonCode(reason)) = &result {
+        if let Err(Error::Reason(reason)) = &result {
             if protocol_version.supports_reason_codes() && reason.code() >= 0x80 {
                 let disconnect = ControlPacket::Disconnect(DisconnectPacket {
                     reason: *reason,

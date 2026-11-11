@@ -31,7 +31,7 @@ use crate::{
 /// packet does not list; see [`is_valid_for`](ReasonCode::is_valid_for).
 ///
 /// It is also the error type of protocol failures, through
-/// [`Error::MQTTReasonCode`](crate::error::Error::MQTTReasonCode).
+/// [`Error::Reason`](crate::error::Error::Reason).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
