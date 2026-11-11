@@ -413,6 +413,23 @@ impl From<Session> for SessionDropGuard {
     }
 }
 
+/// Takes the session's subscriptions out of the topic tree once the
+/// session leaves the session manager, even when what removed it is
+/// cancelled before it unsubscribed: nothing is queued for a session no one
+/// can reach.
+impl Drop for SessionDropGuard {
+    fn drop(&mut self) {
+        let shared = &self.session.shared;
+        if let Ok(mut state) = shared.state.try_lock() {
+            return state.unsubscribe_all(shared.subscriber_id);
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let session = self.session.clone();
+            runtime.spawn(async move { session.unsubscribe_all().await });
+        }
+    }
+}
+
 impl SessionDropGuard {
     pub(crate) fn new(
         connect_packet: ConnectPacket,
@@ -1307,6 +1324,12 @@ impl Session {
         self.shared.state.lock().await.verified_user = username;
     }
 
+    /// Holds the session's state until dropped, so whatever needs it waits.
+    #[cfg(test)]
+    pub(crate) async fn hold_state(&self) -> impl Sized + '_ {
+        self.shared.state.lock().await
+    }
+
     /// Records the address of the client now connected to this session.
     pub(crate) async fn set_peer(&self, peer: Option<SocketAddr>) {
         self.shared.state.lock().await.peer = peer;
@@ -1731,13 +1754,7 @@ impl Session {
     /// when the session ends, so nothing is queued for it anymore.
     pub(crate) async fn unsubscribe_all(&self) {
         let mut session = self.shared.state.lock().await;
-        if let Some(topics) = session.topics.take() {
-            for topic_filter in session.subscriptions.keys() {
-                topics.unsubscribe(topic_filter, self.shared.subscriber_id);
-            }
-        }
-        session.subscriptions.clear();
-        session.retained.clear();
+        session.unsubscribe_all(self.shared.subscriber_id);
     }
 
     /// Whether new subscriptions are owed retained messages not yet queued.
@@ -2092,6 +2109,18 @@ pub(crate) struct Outgoing {
 }
 
 impl State {
+    /// Removes every subscription of the session `subscriber_id` from the
+    /// topic tree.
+    fn unsubscribe_all(&mut self, subscriber_id: u64) {
+        if let Some(topics) = self.topics.take() {
+            for topic_filter in self.subscriptions.keys() {
+                topics.unsubscribe(topic_filter, subscriber_id);
+            }
+        }
+        self.subscriptions.clear();
+        self.retained.clear();
+    }
+
     /// Replaces the topic of an outgoing PUBLISH with an alias where the
     /// client accepts them, assigning new aliases until its maximum is
     /// reached. Only the copy sent is aliased: aliases end with the

@@ -3197,6 +3197,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_deletion_abandoned_midway_still_unsubscribes() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        let mut started = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        started
+            .session
+            .restore_subscriptions(vec![StoredSubscription::new("a", QoS::AtLeastOnce)], &broker)
+            .await
+            .unwrap();
+        manager
+            .end_connection(started.lease, Some(Duration::from_secs(3600)))
+            .await;
+
+        // The session is out of the map, and the deletion waits for it
+        let held = started.session.hold_state().await;
+        let mut deletion = Box::pin(manager.delete_session("c", false));
+        assert!(poll_briefly(&mut deletion).await.is_none());
+        assert!(manager.entry("c").await.is_none());
+        drop(deletion);
+        drop(held);
+
+        for _ in 0..100 {
+            if broker.topics().subscribers_of("a").is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the deleted session is still subscribed");
+    }
+
+    #[tokio::test]
     async fn test_admissions_are_bounded() {
         let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
         {
