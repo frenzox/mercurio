@@ -16,6 +16,7 @@ use mercurio_core::{
 use mercurio_packets::{
     connect::{ConnectFlags, ConnectPacket, ConnectPayload, ConnectProperties},
     publish::{PublishPacket, PublishProperties},
+    pubrel::PubRelPacket,
     subscribe::{SubscribePacket, SubscribePayload, SubscriptionOptions},
     ControlPacket,
 };
@@ -287,5 +288,64 @@ async fn in_flight_messages_keep_retain_and_expiry_across_a_crash() {
     assert_eq!(resent.payload.as_deref(), Some(&b"kept"[..]));
     assert_eq!(resent.packet_id, retained.packet_id);
     assert!(subscriber.receive().await.is_none(), "the expired one too");
+    broker.stop().await;
+}
+
+/// The broker remembers across a crash which of a client's QoS 2 messages
+/// it took and awaits PUBREL for, so a copy the client sends again isn't
+/// forwarded twice.
+#[tokio::test]
+async fn incoming_qos2_messages_are_forwarded_once_across_a_crash() {
+    let db = database("incoming");
+    let broker = Broker::start(&db);
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", Connect::default()).await;
+    subscriber.subscribe("t", QoS::AtMostOnce).await;
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    let publish = PublishPacket {
+        qos_level: QoS::ExactlyOnce,
+        packet_id: Some(5),
+        ..message("t", "once")
+    };
+    publisher
+        .send(ControlPacket::Publish(publish.clone()))
+        .await;
+    assert!(matches!(
+        publisher.receive().await,
+        Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5
+    ));
+    let delivered = subscriber.next_publish().await.unwrap();
+    assert_eq!(delivered.payload.as_deref(), Some(&b"once"[..]));
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    let resume = Connect {
+        clean_start: false,
+        ..Default::default()
+    };
+    let (mut subscriber, _) = Client::connect(broker.addr, "s", resume).await;
+    let (mut publisher, resumed) = Client::connect(broker.addr, "p", resume).await;
+    assert!(resumed);
+    publisher
+        .send(ControlPacket::Publish(PublishPacket {
+            dup: true,
+            ..publish
+        }))
+        .await;
+    assert!(matches!(
+        publisher.receive().await,
+        Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5 && r.reason == ReasonCode::Success
+    ));
+    publisher
+        .send(ControlPacket::PubRel(PubRelPacket {
+            packet_id: 5,
+            reason: ReasonCode::Success,
+            properties: None,
+        }))
+        .await;
+    assert!(matches!(
+        publisher.receive().await,
+        Some(ControlPacket::PubComp(ref c)) if c.packet_id == 5 && c.reason == ReasonCode::Success
+    ));
+    assert!(subscriber.receive().await.is_none(), "forwarded twice");
     broker.stop().await;
 }

@@ -285,6 +285,17 @@ pub trait InflightStore: Send + Sync {
 
     /// Get all inflight messages for a client (for retry on reconnect).
     async fn get_all_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
+
+    /// Record that the client's QoS 2 message with this packet id was
+    /// taken and acknowledged with PUBREC, so a copy the client sends again
+    /// before its PUBREL isn't forwarded twice.
+    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
+
+    /// The client sent PUBREL for this packet id.
+    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()>;
+
+    /// The packet ids of the client's QoS 2 messages awaiting PUBREL.
+    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
 }
 
 /// Messages waiting for disconnected clients, kept so they survive a
@@ -332,6 +343,11 @@ pub enum Write {
     ReleaseInflight(u16),
     /// The client acknowledged this packet id for good
     RemoveInflight(u16),
+    /// The client's QoS 2 message with this packet id was taken, and PUBREL
+    /// is awaited
+    StoreIncomingQos2(u16),
+    /// The client sent PUBREL for this packet id
+    RemoveIncomingQos2(u16),
     /// Store a message queued for a disconnected client, at this position
     /// in its queue
     Enqueue(u64, Message),
@@ -412,6 +428,12 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
             Write::RemoveInflight(packet_id) => {
                 store.remove_inflight(client_id, *packet_id).await?
             }
+            Write::StoreIncomingQos2(packet_id) => {
+                store.store_incoming_qos2(client_id, *packet_id).await?
+            }
+            Write::RemoveIncomingQos2(packet_id) => {
+                store.remove_incoming_qos2(client_id, *packet_id).await?
+            }
             Write::Enqueue(sequence, message) => {
                 store.enqueue(client_id, *sequence, message).await?
             }
@@ -422,6 +444,9 @@ pub async fn apply_each<S: BatchStore + ?Sized>(
                 store.clear_queue(client_id).await?;
                 for message in store.get_all_inflight(client_id).await? {
                     store.remove_inflight(client_id, message.packet_id).await?;
+                }
+                for packet_id in store.get_incoming_qos2(client_id).await? {
+                    store.remove_incoming_qos2(client_id, packet_id).await?;
                 }
             }
         }
@@ -439,7 +464,45 @@ impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{BanStore, StoredBan};
+    use super::{BanStore, BatchStore, StoredBan, Write};
+
+    /// What every store does with the packet ids of incoming QoS 2
+    /// messages: batches apply in order, applying one twice is harmless, and
+    /// deleting the session removes them.
+    pub(crate) async fn incoming_qos2_round_trip(store: &dyn BatchStore) {
+        let sorted = |mut ids: Vec<u16>| {
+            ids.sort_unstable();
+            ids
+        };
+        let batch = [
+            Write::StoreIncomingQos2(1),
+            Write::StoreIncomingQos2(u16::MAX),
+            Write::StoreIncomingQos2(7),
+            Write::RemoveIncomingQos2(7),
+            Write::RemoveIncomingQos2(1),
+            Write::StoreIncomingQos2(1),
+        ];
+        for _ in 0..2 {
+            store.apply("c", &batch).await.unwrap();
+            assert_eq!(
+                sorted(store.get_incoming_qos2("c").await.unwrap()),
+                [1, u16::MAX]
+            );
+        }
+        store
+            .apply("other", &[Write::StoreIncomingQos2(1)])
+            .await
+            .unwrap();
+        // Removing what isn't stored is no error
+        store
+            .apply("c", &[Write::RemoveIncomingQos2(2)])
+            .await
+            .unwrap();
+
+        store.apply("c", &[Write::DeleteSession]).await.unwrap();
+        assert!(store.get_incoming_qos2("c").await.unwrap().is_empty());
+        assert_eq!(store.get_incoming_qos2("other").await.unwrap(), [1]);
+    }
 
     pub(crate) fn ban(kind: &str, value: &str, prefix: bool) -> StoredBan {
         StoredBan {

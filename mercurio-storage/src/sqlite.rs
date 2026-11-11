@@ -159,6 +159,12 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
                 PRIMARY KEY (client_id, sequence)
             );
 
+            CREATE TABLE IF NOT EXISTS incoming_qos2 (
+                client_id TEXT NOT NULL,
+                packet_id INTEGER NOT NULL,
+                PRIMARY KEY (client_id, packet_id)
+            );
+
             CREATE TABLE IF NOT EXISTS bans (
                 kind TEXT NOT NULL,
                 value TEXT NOT NULL,
@@ -365,6 +371,18 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 params![client_id, packet_id],
             )?;
         }
+        Write::StoreIncomingQos2(packet_id) => {
+            conn.execute(
+                "INSERT OR IGNORE INTO incoming_qos2 (client_id, packet_id) VALUES (?1, ?2)",
+                params![client_id, packet_id],
+            )?;
+        }
+        Write::RemoveIncomingQos2(packet_id) => {
+            conn.execute(
+                "DELETE FROM incoming_qos2 WHERE client_id = ?1 AND packet_id = ?2",
+                params![client_id, packet_id],
+            )?;
+        }
         Write::Enqueue(sequence, message) => {
             conn.execute(
                 "INSERT OR REPLACE INTO queued_messages
@@ -396,6 +414,7 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 "will_messages",
                 "queued_messages",
                 "inflight_messages",
+                "incoming_qos2",
             ] {
                 conn.execute(
                     &format!("DELETE FROM {table} WHERE client_id = ?1"),
@@ -765,6 +784,27 @@ impl InflightStore for SqliteStore {
         self.blocking(move |conn| {
             let mut stmt = conn.prepare(&format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1"))?;
             let rows = stmt.query_map(params![client_id], inflight_from_row)?;
+            rows.collect()
+        })
+        .await
+    }
+
+    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.apply(client_id, &[Write::StoreIncomingQos2(packet_id)])
+            .await
+    }
+
+    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.apply(client_id, &[Write::RemoveIncomingQos2(packet_id)])
+            .await
+    }
+
+    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        let client_id = client_id.to_string();
+        self.blocking(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?;
+            let rows = stmt.query_map(params![client_id], |row| row.get(0))?;
             rows.collect()
         })
         .await
@@ -1170,6 +1210,11 @@ mod tests {
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_qos2() {
+        crate::testing::incoming_qos2_round_trip(&SqliteStore::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

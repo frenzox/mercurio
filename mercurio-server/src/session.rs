@@ -189,6 +189,14 @@ fn publish_properties(
 /// Lowers the session expiry an MQTT 5 client asks for to the server's
 /// maximum, no expiry included, so every later use of the CONNECT sees the
 /// expiry the session will have.
+/// Ends the connection of a client whose PUBLISH couldn't be stored, such
+/// as a retained message, without acknowledging it, so the client sends it
+/// again rather than lose it.
+fn storage_failure(error: mercurio_core::error::Error) -> mercurio_core::error::Error {
+    warn!("Failed to store a published message: {}", error);
+    ReasonCode::ImplementationSpecificError.into()
+}
+
 pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Limits) {
     let Some(max) = limits.max_session_expiry else {
         return;
@@ -771,7 +779,11 @@ impl Session {
         // clearing a retained topic is always allowed
         let retains = packet.retain && packet.payload.as_ref().is_some_and(|p| !p.is_empty());
         if let Some(max) = max_retained.filter(|_| retains) {
-            if broker.retained_full(&packet.topic_name, max).await? {
+            let full = broker
+                .retained_full(&packet.topic_name, max)
+                .await
+                .map_err(storage_failure)?;
+            if full {
                 warn!(
                     "Retained messages full, refusing one on `{}`",
                     packet.topic_name
@@ -818,30 +830,22 @@ impl Session {
             }
             QoS::ExactlyOnce => {
                 if let Some(packet_id) = packet.packet_id {
-                    let first_delivery = {
-                        let mut session = self.shared.state.lock().await;
-                        // The client may only have as many QoS 2 messages
-                        // awaiting PUBREL as advertised [MQTT-3.3.4-8]
-                        if !session.incoming_qos2.contains(&packet_id)
-                            && session.incoming_qos2.len() >= usize::from(session.receive_maximum)
-                        {
-                            return Err(ReasonCode::ReceiveMaximumExceeded.into());
-                        }
-                        session.incoming_qos2.insert(packet_id)
-                    };
-
+                    let session = self.shared.state.lock().await;
                     let pubrec = ControlPacket::PubRec(PubRecPacket {
                         packet_id,
                         reason: ReasonCode::Success,
                         properties: None,
                     });
-
                     // A retransmission before PUBREL was already delivered
                     // once; forwarding it again would break exactly-once.
-                    if !first_delivery {
+                    if session.incoming_qos2.contains(&packet_id) {
                         return Ok(Some(pubrec));
                     }
-
+                    // The client may only have as many QoS 2 messages
+                    // awaiting PUBREL as advertised [MQTT-3.3.4-8]
+                    if session.incoming_qos2.len() >= usize::from(session.receive_maximum) {
+                        return Err(ReasonCode::ReceiveMaximumExceeded.into());
+                    }
                     Ok(Some(pubrec))
                 } else {
                     Err(ReasonCode::ProtocolError.into())
@@ -850,6 +854,32 @@ impl Session {
             QoS::Invalid => Err(ReasonCode::ProtocolError.into()),
         };
 
+        // Recorded as delivered only once the broker took the message, so
+        // the client sends it again if it didn't
+        let new_qos2 = packet
+            .packet_id
+            .filter(|_| packet.qos_level == QoS::ExactlyOnce && response.is_ok());
+        let result = self.forward(packet, broker, chain, response).await;
+        if let (Ok(_), Some(packet_id)) = (&result, new_qos2) {
+            self.shared
+                .state
+                .lock()
+                .await
+                .incoming_qos2
+                .insert(packet_id);
+        }
+        result
+    }
+
+    /// Hands a PUBLISH the client may make to the plugins and the broker,
+    /// passing `response` on as its acknowledgement.
+    async fn forward<S: RetainedMessageStore>(
+        &mut self,
+        mut packet: PublishPacket,
+        broker: &Broker<S>,
+        chain: &Chain,
+        response: Result<Option<ControlPacket>>,
+    ) -> Result<Option<ControlPacket>> {
         let mut hooked_properties = None;
         if !chain.is_empty() {
             // Acknowledged whatever the plugins decide, so a dropped message
@@ -959,7 +989,8 @@ impl Session {
 
         let subscribers = broker
             .publish_from(&topic, message, Some(self.shared.subscriber_id))
-            .await?;
+            .await
+            .map_err(storage_failure)?;
 
         // MQTT 5 publishers learn when nobody received the message
         let reports_reasons = self
@@ -1751,6 +1782,17 @@ impl Session {
         }
     }
 
+    /// Adds the packet ids of incoming QoS 2 messages awaiting PUBREL,
+    /// loaded from storage, to a restored session.
+    pub(crate) async fn restore_incoming_qos2(&self, packet_ids: Vec<u16>) {
+        self.shared
+            .state
+            .lock()
+            .await
+            .incoming_qos2
+            .extend(packet_ids);
+    }
+
     /// Adds in-flight messages loaded from storage to a restored session.
     pub(crate) async fn restore_inflight(&self, inflight: Vec<InflightMessage>) {
         let mut session = self.shared.state.lock().await;
@@ -2433,6 +2475,113 @@ mod tests {
             .await
             .unwrap();
         next_publish(&mut subscriber).await;
+    }
+
+    /// Retained messages, which fail to store until `working` is set.
+    #[derive(Default)]
+    struct FlakyRetained {
+        inner: MemoryStore,
+        working: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RetainedMessageStore for FlakyRetained {
+        async fn store_retained(
+            &self,
+            topic: &str,
+            message: Option<Message>,
+        ) -> mercurio_storage::Result<()> {
+            if !self.working.load(Ordering::Relaxed) {
+                return Err(mercurio_storage::StorageError::OperationFailed(
+                    "disk full".into(),
+                ));
+            }
+            self.inner.store_retained(topic, message).await
+        }
+
+        async fn get_retained(&self, topic_filter: &str) -> mercurio_storage::Result<Vec<Message>> {
+            self.inner.get_retained(topic_filter).await
+        }
+
+        async fn clear_all_retained(&self) -> mercurio_storage::Result<()> {
+            self.inner.clear_all_retained().await
+        }
+
+        async fn count_retained(&self) -> mercurio_storage::Result<usize> {
+            self.inner.count_retained().await
+        }
+    }
+
+    /// A QoS 2 message the broker failed to take isn't acknowledged, and
+    /// the copy the client sends again is forwarded.
+    #[tokio::test]
+    async fn test_incoming_qos2_that_failed_to_store_is_taken_when_resent() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let storage = Arc::new(FlakyRetained::default());
+        let broker = crate::broker::Broker::new(Arc::clone(&storage));
+        subscriber
+            .handle_subscribe(
+                subscribe_packet("t", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
+            .await
+            .unwrap();
+        let retained = |dup| {
+            let ControlPacket::Publish(mut publish) = qos2_publish("t", 5, dup) else {
+                unreachable!()
+            };
+            publish.retain = true;
+            ControlPacket::Publish(publish)
+        };
+
+        let failed = publisher
+            .process_incoming(retained(false), &broker, &no_plugins())
+            .await;
+        assert!(matches!(
+            failed,
+            Err(mercurio_core::error::Error::MQTTReasonCode(
+                ReasonCode::ImplementationSpecificError
+            ))
+        ));
+        assert!(nothing_queued(&subscriber).await);
+
+        storage.working.store(true, Ordering::Relaxed);
+        let response = publisher
+            .process_incoming(retained(true), &broker, &no_plugins())
+            .await
+            .unwrap();
+        assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
+        timeout(Duration::from_secs(1), next_publish(&mut subscriber))
+            .await
+            .expect("the copy sent again is forwarded");
+        assert_eq!(broker.retained("t").await.unwrap().len(), 1);
+    }
+
+    /// Packet ids of QoS 2 messages a restored session had taken still
+    /// mark copies sent again as already delivered.
+    #[tokio::test]
+    async fn test_restored_incoming_qos2_ids_are_not_forwarded_again() {
+        let mut publisher = create_test_session();
+        let mut subscriber = create_test_session();
+        let broker = crate::broker::Broker::new(Arc::new(MemoryStore::new()));
+        subscriber
+            .handle_subscribe(
+                subscribe_packet("t", QoS::ExactlyOnce),
+                &broker,
+                &no_plugins(),
+            )
+            .await
+            .unwrap();
+
+        publisher.restore_incoming_qos2(vec![5]).await;
+        let response = publisher
+            .process_incoming(qos2_publish("t", 5, true), &broker, &no_plugins())
+            .await
+            .unwrap();
+        assert!(matches!(response, Some(ControlPacket::PubRec(ref r)) if r.packet_id == 5));
+        assert!(nothing_queued(&subscriber).await);
     }
 
     #[tokio::test]

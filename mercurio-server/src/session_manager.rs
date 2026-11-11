@@ -419,12 +419,13 @@ impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
     }
 }
 
-/// A session read from storage: its subscriptions, queue and in-flight
-/// messages.
+/// A session read from storage: its subscriptions, queue, in-flight
+/// messages and the packet ids of incoming QoS 2 messages awaiting PUBREL.
 type StoredSession = (
     Vec<StoredSubscription>,
     Vec<(u64, Message)>,
     Vec<InflightMessage>,
+    Vec<u16>,
 );
 
 /// Result of starting a session, includes subscriptions, will, and inflight to restore if resuming.
@@ -560,7 +561,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
         }
         let resume = resumed.is_some() || stored.is_some();
-        let (subscriptions_to_restore, queue_to_restore, inflight_to_retry) =
+        let (subscriptions_to_restore, queue_to_restore, inflight_to_retry, incoming_qos2) =
             stored.unwrap_or_default();
 
         let from_memory = resumed.is_some();
@@ -575,6 +576,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         };
         session.set_generation(generation).await;
         session.set_owner(owner.clone()).await;
+        session.restore_incoming_qos2(incoming_qos2).await;
 
         claim.on_drop = OnDrop::End(expiry);
         let discarded = {
@@ -670,7 +672,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 client_id
             );
         }
-        Ok(Some((stored_session.subscriptions, queue, inflight)))
+        let incoming_qos2 = self.storage.get_incoming_qos2(client_id).await?;
+        Ok(Some((
+            stored_session.subscriptions,
+            queue,
+            inflight,
+            incoming_qos2,
+        )))
     }
 
     /// Takes over `client_id` for a connection of `owner`: asks any
@@ -1181,6 +1189,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         session
             .restore_inflight(self.storage.get_all_inflight(client_id).await?)
             .await;
+        session
+            .restore_incoming_qos2(self.storage.get_incoming_qos2(client_id).await?)
+            .await;
         session.start_queue_journal(self.writers.get(client_id));
         self.shared
             .persistent
@@ -1345,6 +1356,25 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         if self.is_persistent(client_id) {
             self.writers
                 .write_paced(client_id, Box::new(Write::RemoveInflight(packet_id)))
+                .await;
+        }
+    }
+
+    /// Records an incoming QoS 2 message acknowledged with PUBREC, so a
+    /// copy the client sends again after a restart isn't forwarded twice.
+    pub(crate) async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) {
+        if self.is_persistent(client_id) {
+            self.writers
+                .write_paced(client_id, Box::new(Write::StoreIncomingQos2(packet_id)))
+                .await;
+        }
+    }
+
+    /// Forgets an incoming QoS 2 message once the client sent PUBREL.
+    pub(crate) async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) {
+        if self.is_persistent(client_id) {
+            self.writers
+                .write_paced(client_id, Box::new(Write::RemoveIncomingQos2(packet_id)))
                 .await;
         }
     }
@@ -1525,6 +1555,26 @@ mod tests {
             client_id: &str,
         ) -> mercurio_storage::Result<Vec<InflightMessage>> {
             self.inner.get_all_inflight(client_id).await
+        }
+
+        async fn store_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner.store_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn remove_incoming_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> mercurio_storage::Result<()> {
+            self.inner.remove_incoming_qos2(client_id, packet_id).await
+        }
+
+        async fn get_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner.get_incoming_qos2(client_id).await
         }
     }
 

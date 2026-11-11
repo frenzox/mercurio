@@ -261,7 +261,7 @@ async fn run<S: BatchStore>(
 /// stored in flight and then removed once acknowledged, which under load is
 /// most of them.
 fn compact(batch: &mut Vec<Write>) {
-    let mut removed = HashSet::new();
+    let (mut removed, mut released) = (HashSet::new(), HashSet::new());
     let (mut queue_cleared, mut session_deleted) = (false, false);
     let mut keep = vec![true; batch.len()];
     for (i, write) in batch.iter().enumerate().rev() {
@@ -274,6 +274,12 @@ fn compact(batch: &mut Vec<Write>) {
             }
             Write::ReleaseInflight(packet_id) => {
                 keep[i] = !session_deleted && !removed.contains(packet_id);
+            }
+            Write::RemoveIncomingQos2(packet_id) => {
+                released.insert(*packet_id);
+            }
+            Write::StoreIncomingQos2(packet_id) => {
+                keep[i] = !session_deleted && !released.contains(packet_id);
             }
             Write::Enqueue(..) => keep[i] = !session_deleted && !queue_cleared,
             Write::ClearQueue => queue_cleared = true,
@@ -378,6 +384,8 @@ mod tests {
                     Write::StoreInflight(m) => format!("store {}", m.packet_id),
                     Write::ReleaseInflight(p) => format!("release {p}"),
                     Write::RemoveInflight(p) => format!("remove {p}"),
+                    Write::StoreIncomingQos2(p) => format!("received {p}"),
+                    Write::RemoveIncomingQos2(p) => format!("pubrel {p}"),
                     Write::DeleteSession => "delete".into(),
                     _ => "other".into(),
                 })
@@ -400,6 +408,15 @@ mod tests {
         let mut batch = vec![inflight(3), Write::DeleteSession, inflight(4)];
         compact(&mut batch);
         assert_eq!(describe(&batch), ["delete", "store 4"]);
+
+        let mut batch = vec![
+            Write::StoreIncomingQos2(1),
+            Write::StoreIncomingQos2(2),
+            Write::RemoveIncomingQos2(1),
+            Write::StoreIncomingQos2(1),
+        ];
+        compact(&mut batch);
+        assert_eq!(describe(&batch), ["received 2", "pubrel 1", "received 1"]);
     }
 
     #[test]

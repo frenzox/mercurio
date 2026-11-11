@@ -2202,9 +2202,18 @@ where
         let response = match packet {
             HotPacket::Publish(publish) => {
                 Stats::add(&self.stats.messages_received);
-                session
+                let response = session
                     .handle_publish(publish, &self.broker, &self.chain)
-                    .await?
+                    .await?;
+                // The client now awaits PUBREL's answer for this id
+                if let Some(ControlPacket::PubRec(pubrec)) = &response {
+                    if pubrec.reason.get_code() < 0x80 {
+                        self.session_manager
+                            .store_incoming_qos2(client_id, pubrec.packet_id)
+                            .await;
+                    }
+                }
+                response
             }
             HotPacket::PubAck(ack) => {
                 let packet_id = ack.packet_id;
@@ -2232,7 +2241,14 @@ where
                 }
                 response
             }
-            HotPacket::PubRel(rel) => session.handle_pubrel(rel).await?,
+            HotPacket::PubRel(rel) => {
+                let packet_id = rel.packet_id;
+                let response = session.handle_pubrel(rel).await?;
+                self.session_manager
+                    .remove_incoming_qos2(client_id, packet_id)
+                    .await;
+                response
+            }
             HotPacket::PubComp(comp) => {
                 let packet_id = comp.packet_id;
                 let response = session.handle_pubcomp(comp).await?;

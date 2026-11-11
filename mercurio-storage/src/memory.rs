@@ -5,7 +5,7 @@
 //! across restarts is not required.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -29,6 +29,7 @@ pub struct MemoryStore {
     retained: Arc<RwLock<HashMap<String, Message>>>,
     wills: Arc<RwLock<HashMap<String, StoredWillMessage>>>,
     inflight: Arc<RwLock<HashMap<String, HashMap<u16, InflightMessage>>>>,
+    incoming_qos2: Arc<RwLock<HashMap<String, HashSet<u16>>>>,
     bans: Arc<RwLock<HashMap<BanKey, StoredBan>>>,
 }
 
@@ -280,6 +281,41 @@ impl InflightStore for MemoryStore {
             .map(|msgs| msgs.values().cloned().collect())
             .unwrap_or_default())
     }
+
+    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.incoming_qos2
+            .write()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?
+            .entry(client_id.to_string())
+            .or_default()
+            .insert(packet_id);
+        Ok(())
+    }
+
+    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        let mut incoming = self
+            .incoming_qos2
+            .write()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        if let Some(ids) = incoming.get_mut(client_id) {
+            ids.remove(&packet_id);
+            if ids.is_empty() {
+                incoming.remove(client_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        let incoming = self
+            .incoming_qos2
+            .read()
+            .map_err(|e| StorageError::OperationFailed(e.to_string()))?;
+        Ok(incoming
+            .get(client_id)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default())
+    }
 }
 
 /// Everything in memory is lost on restart anyway, so queues are not
@@ -447,6 +483,11 @@ mod tests {
         store.remove_inflight("client1", 1).await.unwrap();
         let loaded = store.get_inflight("client1", 1).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_qos2() {
+        crate::testing::incoming_qos2_round_trip(&MemoryStore::new()).await;
     }
 
     #[tokio::test]

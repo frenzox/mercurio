@@ -202,6 +202,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS retain BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT;
 ",
+    "
+    CREATE TABLE IF NOT EXISTS incoming_qos2 (
+        client_id TEXT NOT NULL,
+        packet_id INTEGER NOT NULL,
+        PRIMARY KEY (client_id, packet_id)
+    );
+
+    DROP TRIGGER IF EXISTS fence ON incoming_qos2;
+    CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON incoming_qos2
+        FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
+",
 ];
 
 /// The SQLSTATE the fence triggers refuse a write with.
@@ -734,6 +745,8 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
         Write::StoreInflight(_)
         | Write::ReleaseInflight(_)
         | Write::RemoveInflight(_)
+        | Write::StoreIncomingQos2(_)
+        | Write::RemoveIncomingQos2(_)
         | Write::Enqueue(..) => {
             unreachable!("applied in bulk by bulk_statements")
         }
@@ -752,6 +765,7 @@ fn statements(client_id: &str, write: &Write) -> Vec<(&'static str, Params)> {
                 "DELETE FROM inflight_messages WHERE client_id = $1",
                 vec![id()],
             ),
+            ("DELETE FROM incoming_qos2 WHERE client_id = $1", vec![id()]),
         ],
     }
 }
@@ -772,6 +786,8 @@ enum Fate<'a> {
 fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params)> {
     let mut fates: HashMap<u16, Fate> = HashMap::new();
     let mut queued: BTreeMap<u64, &Message> = BTreeMap::new();
+    // Whether each packet id ends up stored
+    let mut incoming: HashMap<u16, bool> = HashMap::new();
     for write in run {
         match write {
             Write::StoreInflight(message) => {
@@ -789,6 +805,12 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
             }
             Write::Enqueue(sequence, message) => {
                 queued.insert(*sequence, message);
+            }
+            Write::StoreIncomingQos2(packet_id) => {
+                incoming.insert(*packet_id, true);
+            }
+            Write::RemoveIncomingQos2(packet_id) => {
+                incoming.insert(*packet_id, false);
             }
             _ => unreachable!("only in-flight and queue changes run in bulk"),
         }
@@ -857,6 +879,29 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
             ],
         ));
     }
+    let incoming_ids = |stored: bool| -> Vec<i32> {
+        incoming
+            .iter()
+            .filter(|(_, s)| **s == stored)
+            .map(|(packet_id, _)| i32::from(*packet_id))
+            .collect()
+    };
+    let released_ids = incoming_ids(false);
+    if !released_ids.is_empty() {
+        statements.push((
+            "DELETE FROM incoming_qos2 WHERE client_id = $1 AND packet_id = ANY($2)",
+            vec![id(), Box::new(released_ids)],
+        ));
+    }
+    let received_ids = incoming_ids(true);
+    if !received_ids.is_empty() {
+        statements.push((
+            "INSERT INTO incoming_qos2 (client_id, packet_id)
+             SELECT $1, * FROM unnest($2::INTEGER[])
+             ON CONFLICT DO NOTHING",
+            vec![id(), Box::new(received_ids)],
+        ));
+    }
     let queued: Vec<(&u64, &&Message)> = queued.iter().collect();
     if !queued.is_empty() {
         statements.push((
@@ -900,6 +945,8 @@ fn in_bulk(write: &Write) -> bool {
         Write::StoreInflight(_)
             | Write::ReleaseInflight(_)
             | Write::RemoveInflight(_)
+            | Write::StoreIncomingQos2(_)
+            | Write::RemoveIncomingQos2(_)
             | Write::Enqueue(..)
     )
 }
@@ -1365,6 +1412,27 @@ impl InflightStore for PostgresStore {
         .map(inflight_from_row)
         .collect()
     }
+
+    async fn store_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.apply(client_id, &[Write::StoreIncomingQos2(packet_id)])
+            .await
+    }
+
+    async fn remove_incoming_qos2(&self, client_id: &str, packet_id: u16) -> Result<()> {
+        self.apply(client_id, &[Write::RemoveIncomingQos2(packet_id)])
+            .await
+    }
+
+    async fn get_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+        self.query(
+            "SELECT packet_id FROM incoming_qos2 WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await?
+        .iter()
+        .map(|row| Ok(row.try_get::<_, i32>(0).db()? as u16))
+        .collect()
+    }
 }
 
 #[async_trait]
@@ -1442,7 +1510,7 @@ mod tests {
             .unwrap()
             .batch_execute(
                 "TRUNCATE sessions, retained_messages, will_messages, inflight_messages,
-                 queued_messages, bans",
+                 queued_messages, bans, incoming_qos2",
             )
             .await
             .unwrap();
@@ -1771,6 +1839,14 @@ mod tests {
         assert!(store.load_session("c").await.unwrap().is_none());
         assert!(store.load_queue("c").await.unwrap().is_empty());
         assert!(store.get_all_inflight("c").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_qos2() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        let store = empty_store(&url).await;
+        crate::testing::incoming_qos2_round_trip(&store).await;
     }
 
     #[tokio::test]
