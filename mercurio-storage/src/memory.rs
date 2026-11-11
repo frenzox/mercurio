@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ops::Bound,
     sync::{Arc, RwLock},
 };
 
@@ -14,7 +15,7 @@ use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
     BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionState,
-    StorageError, StoredBan, StoredWillMessage, Write,
+    StorageError, StoredBan, StoredWillMessage, TopicRange, Write,
 };
 
 /// A ban's kind, value and prefix flag.
@@ -226,36 +227,60 @@ impl BanStore for MemoryStore {
 
 #[async_trait]
 impl RetainedMessageStore for MemoryStore {
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool> {
         let mut retained = self.retained.write().map_err(poisoned)?;
-        match message {
-            Some(msg) => {
-                retained.insert(topic.to_string(), msg);
-            }
-            None => {
-                retained.remove(topic);
-            }
-        }
-        Ok(())
+        Ok(match message {
+            Some(msg) => retained.insert(topic.to_string(), msg).is_some(),
+            None => retained.remove(topic).is_some(),
+        })
     }
 
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
-        let mut retained = self.retained.write().map_err(poisoned)?;
-
-        // Expired messages are dropped for good, not just skipped
-        retained.retain(|_, msg| !msg.is_expired());
-
-        let messages: Vec<Message> = retained
-            .iter()
-            .filter(|(topic, _)| topic_matches_filter(topic, topic_filter))
-            .map(|(_, msg)| {
-                let mut msg = msg.clone();
-                msg.retain = true; // Mark as retained when delivering
-                msg
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let retained = self.retained.read().map_err(poisoned)?;
+        let (start, end) = match TopicRange::of(topic_filter) {
+            TopicRange::Exact(topic) => {
+                let end = Bound::Included(topic.clone());
+                (topic, end)
+            }
+            TopicRange::From { start, end } => {
+                (start, end.map_or(Bound::Unbounded, Bound::Excluded))
+            }
+        };
+        let start = match after {
+            Some(after) if after >= start.as_str() => Bound::Excluded(after.to_string()),
+            _ => Bound::Included(start),
+        };
+        // A range that starts past its end is empty; BTreeMap would panic
+        if let (Bound::Excluded(after), Bound::Included(end) | Bound::Excluded(end)) =
+            (&start, &end)
+        {
+            if after >= end {
+                return Ok(Vec::new());
+            }
+        }
+        Ok(retained
+            .range((start, end))
+            .filter(|(topic, message)| {
+                !message.is_expired() && topic_matches_filter(topic, topic_filter)
             })
-            .collect();
+            .take(limit)
+            .map(|(_, message)| Message {
+                retain: true,
+                ..message.clone()
+            })
+            .collect())
+    }
 
-        Ok(messages)
+    async fn remove_expired_retained(&self) -> Result<usize> {
+        let mut retained = self.retained.write().map_err(poisoned)?;
+        let before = retained.len();
+        retained.retain(|_, message| !message.is_expired());
+        Ok(before - retained.len())
     }
 
     async fn clear_all_retained(&self) -> Result<()> {

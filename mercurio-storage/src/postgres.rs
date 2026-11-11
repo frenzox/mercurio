@@ -37,7 +37,8 @@ use tracing::{info, warn};
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
     BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionOwner,
-    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, Write,
+    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, TopicRange,
+    Write,
 };
 
 /// Longest wait for a connection or a statement, so a database that stops
@@ -225,6 +226,12 @@ const MIGRATIONS: &[&str] = &[
     DROP TRIGGER IF EXISTS fence ON subscriptions;
     CREATE TRIGGER fence BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON subscriptions
         FOR EACH STATEMENT EXECUTE FUNCTION mercurio_fence();
+",
+    // Lets the removal of expired retained messages find them without
+    // reading the table
+    "
+    CREATE INDEX IF NOT EXISTS retained_messages_expires_at
+        ON retained_messages (expires_at) WHERE expires_at IS NOT NULL;
 ",
 ];
 
@@ -1328,26 +1335,6 @@ fn decode_identifiers(ids: Option<String>) -> Result<Vec<u32>> {
         .map_err(|e| StorageError::SerializationError(format!("subscription identifiers: {e}")))
 }
 
-/// A LIKE pattern for the topics a filter can match: those starting with
-/// its part before the first wildcard. `a/#` also matches `a`, so a
-/// trailing `/` is left out.
-fn topic_prefix_pattern(filter: &str) -> String {
-    let prefix = filter
-        .split(['+', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('/');
-    let mut pattern = String::with_capacity(prefix.len() + 1);
-    for c in prefix.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            pattern.push('\\');
-        }
-        pattern.push(c);
-    }
-    pattern.push('%');
-    pattern
-}
-
 fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
     Ok(InflightMessage {
         packet_id: narrow(row.try_get::<_, i32>("packet_id").col()?, "packet id")?,
@@ -1372,19 +1359,68 @@ fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
     })
 }
 
+fn retained_from_row(row: &Row) -> Result<Message> {
+    let topic: String = row.try_get("topic").col()?;
+    let origin = row
+        .try_get::<_, Option<String>>("origin_client_id")
+        .col()?
+        .map(|client_id| -> Result<_> {
+            Ok(Arc::new(MessageOrigin {
+                client_id,
+                username: row.try_get("origin_username").col()?,
+            }))
+        })
+        .transpose()?;
+    Ok(Message {
+        packet_id: None,
+        topic: Arc::from(topic.as_str()),
+        dup: row.try_get("dup").col()?,
+        qos: int_to_qos(row.try_get("qos").col()?)?,
+        retain: true,
+        payload: row
+            .try_get::<_, Option<Vec<u8>>>("payload")
+            .col()?
+            .map(Bytes::from),
+        properties: decode_properties(row.try_get("properties").col()?)?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .col()?
+            .map(|t| t as u64),
+        subscription_identifiers: Vec::new(),
+        origin,
+    })
+}
+
+/// The retained lookup of `get_retained_page`: `$1` the first topic, read
+/// from on, or after if not `inclusive`, `$2` now, `$3` the limit, and `$4`
+/// the topic before which to stop, if `bounded`. Only reads, so it never
+/// waits for the lock the fence triggers take.
+fn retained_sql(inclusive: bool, bounded: bool) -> String {
+    format!(
+        "SELECT topic, payload, qos, dup, properties, expires_at,
+                origin_client_id, origin_username
+         FROM retained_messages
+         WHERE topic {} $1 {} AND (expires_at IS NULL OR expires_at > $2)
+         ORDER BY topic LIMIT $3",
+        if inclusive { ">=" } else { ">" },
+        if bounded { "AND topic < $4" } else { "" },
+    )
+}
+
 #[async_trait]
 impl RetainedMessageStore for PostgresStore {
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool> {
         let client = self.client().await?;
         let Some(msg) = message else {
             let statement = client
                 .prepare_cached("DELETE FROM retained_messages WHERE topic = $1")
                 .await
                 .db()?;
-            self.fence(client.execute(&statement, &[&topic]).await.db())?;
-            return Ok(());
+            let removed = self.fence(client.execute(&statement, &[&topic]).await.db())?;
+            return Ok(removed > 0);
         };
         let origin = msg.origin.as_deref();
+        // xmax is set on a row an ON CONFLICT clause updated
         let statement = client
             .prepare_cached(
                 "INSERT INTO retained_messages
@@ -1395,12 +1431,13 @@ impl RetainedMessageStore for PostgresStore {
                  payload = EXCLUDED.payload, qos = EXCLUDED.qos, dup = EXCLUDED.dup,
                  properties = EXCLUDED.properties, expires_at = EXCLUDED.expires_at,
                  origin_client_id = EXCLUDED.origin_client_id,
-                 origin_username = EXCLUDED.origin_username",
+                 origin_username = EXCLUDED.origin_username
+                 RETURNING xmax <> 0",
             )
             .await
             .db()?;
         let stored = client
-            .execute(
+            .query_one(
                 &statement,
                 &[
                     &topic,
@@ -1415,62 +1452,89 @@ impl RetainedMessageStore for PostgresStore {
             )
             .await
             .db();
-        self.fence(stored)?;
-        Ok(())
+        self.fence(stored)?.try_get(0).db()
     }
 
-    /// Reads only the topics sharing the filter's literal prefix, and drops
-    /// the expired ones among them for good, in one round trip.
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
-        let rows = self
+    /// Reads only the topics the filter's literal prefix allows, through the
+    /// primary key, whose C collation orders them by their bytes, in chunks,
+    /// as wildcards past the prefix are matched here.
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let now = unix_millis() as i64;
+        let (start, end) = match TopicRange::of(topic_filter) {
+            TopicRange::Exact(topic) => {
+                if after.is_some_and(|after| after >= topic.as_str()) || limit == 0 {
+                    return Ok(Vec::new());
+                }
+                return self
+                    .query(
+                        "SELECT topic, payload, qos, dup, properties, expires_at,
+                                origin_client_id, origin_username
+                         FROM retained_messages
+                         WHERE topic = $1 AND (expires_at IS NULL OR expires_at > $2)",
+                        &[&topic, &now],
+                    )
+                    .await?
+                    .iter()
+                    .map(retained_from_row)
+                    .collect();
+            }
+            TopicRange::From { start, end } => (start, end),
+        };
+        let (mut from, mut inclusive) = match after {
+            Some(after) if after >= start.as_str() => (after.to_string(), false),
+            _ => (start, true),
+        };
+        let chunk = limit.max(256) as i64;
+        let mut messages = Vec::new();
+        loop {
+            let sql = retained_sql(inclusive, end.is_some());
+            let rows = match &end {
+                Some(end) => self.query(&sql, &[&from, &now, &chunk, end]).await?,
+                None => self.query(&sql, &[&from, &now, &chunk]).await?,
+            };
+            let read = rows.len() as i64;
+            for row in &rows {
+                let topic: String = row.try_get("topic").col()?;
+                if topic_matches_filter(&topic, topic_filter) {
+                    messages.push(retained_from_row(row)?);
+                    if messages.len() == limit {
+                        return Ok(messages);
+                    }
+                }
+                from = topic;
+                inclusive = false;
+            }
+            if read < chunk {
+                return Ok(messages);
+            }
+        }
+    }
+
+    /// Checks first, as the deletion takes the fence's lock even when it
+    /// removes nothing.
+    async fn remove_expired_retained(&self) -> Result<usize> {
+        let now = unix_millis() as i64;
+        let any = self
             .query(
-                "WITH expired AS (
-                     DELETE FROM retained_messages WHERE topic LIKE $1 AND expires_at <= $2
-                 )
-                 SELECT topic, payload, qos, dup, properties, expires_at,
-                        origin_client_id, origin_username
-                 FROM retained_messages
-                 WHERE topic LIKE $1 AND (expires_at IS NULL OR expires_at > $2)",
-                &[&topic_prefix_pattern(topic_filter), &(unix_millis() as i64)],
+                "SELECT EXISTS (SELECT 1 FROM retained_messages WHERE expires_at <= $1)",
+                &[&now],
             )
             .await?;
-
-        let mut messages = Vec::new();
-        for row in rows {
-            let topic: String = row.try_get("topic").col()?;
-            if !topic_matches_filter(&topic, topic_filter) {
-                continue;
-            }
-            let origin = row
-                .try_get::<_, Option<String>>("origin_client_id")
-                .col()?
-                .map(|client_id| -> Result<_> {
-                    Ok(Arc::new(MessageOrigin {
-                        client_id,
-                        username: row.try_get("origin_username").col()?,
-                    }))
-                })
-                .transpose()?;
-            messages.push(Message {
-                packet_id: None,
-                topic: Arc::from(topic.as_str()),
-                dup: row.try_get("dup").col()?,
-                qos: int_to_qos(row.try_get("qos").col()?)?,
-                retain: true,
-                payload: row
-                    .try_get::<_, Option<Vec<u8>>>("payload")
-                    .col()?
-                    .map(Bytes::from),
-                properties: decode_properties(row.try_get("properties").col()?)?,
-                expires_at: row
-                    .try_get::<_, Option<i64>>("expires_at")
-                    .col()?
-                    .map(|t| t as u64),
-                subscription_identifiers: Vec::new(),
-                origin,
-            });
+        if !any[0].try_get::<_, bool>(0).db()? {
+            return Ok(0);
         }
-        Ok(messages)
+        let client = self.client().await?;
+        let statement = client
+            .prepare_cached("DELETE FROM retained_messages WHERE expires_at <= $1")
+            .await
+            .db()?;
+        let removed = self.fence(client.execute(&statement, &[&now]).await.db())?;
+        Ok(removed as usize)
     }
 
     async fn clear_all_retained(&self) -> Result<()> {
@@ -1593,15 +1657,6 @@ mod tests {
             .await
             .unwrap();
         store
-    }
-
-    #[test]
-    fn test_topic_prefix_pattern() {
-        assert_eq!(topic_prefix_pattern("#"), "%");
-        assert_eq!(topic_prefix_pattern("a/#"), "a%");
-        assert_eq!(topic_prefix_pattern("a/+/c"), "a%");
-        assert_eq!(topic_prefix_pattern("a/b"), "a/b%");
-        assert_eq!(topic_prefix_pattern("50%_off\\/+"), "50\\%\\_off\\\\%");
     }
 
     /// A database created by 0.2.0, at schema version 1, keeps its
@@ -1840,6 +1895,38 @@ mod tests {
 
         store.delete_session("bad").await.unwrap();
         assert!(store.load_session("bad").await.unwrap().is_none());
+    }
+
+    /// A retained lookup only reads, so it doesn't wait for the lock a
+    /// takeover holds on the lease, as a deletion through the fence trigger
+    /// would on every SUBSCRIBE.
+    #[tokio::test]
+    #[cfg_attr(not(postgres_tests), ignore = "set MERCURIO_TEST_POSTGRES_URL to run")]
+    async fn test_retained_lookups_take_no_lock() {
+        let url = database_url();
+        let _database = DATABASE.lock().await;
+        let database = empty_store(&url).await;
+        let (store, _lock) =
+            PostgresStore::connect_exclusive(&url, &ConnectOptions::default(), false)
+                .await
+                .unwrap()
+                .unwrap();
+        let mut expired = crate::testing::message("a/x", "");
+        expired.expires_at = Some(1);
+        store.store_retained("a/x", Some(expired)).await.unwrap();
+
+        let admin = database.client().await.unwrap();
+        admin
+            .batch_execute("BEGIN; SELECT * FROM mercurio_lease FOR UPDATE;")
+            .await
+            .unwrap();
+        let found = tokio::time::timeout(Duration::from_secs(2), store.get_retained("a/#")).await;
+        admin.batch_execute("ROLLBACK").await.unwrap();
+        assert!(found
+            .expect("the lookup waited for the lock")
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.remove_expired_retained().await.unwrap(), 1);
     }
 
     /// `url` with `user` and `password` in place of its credentials.

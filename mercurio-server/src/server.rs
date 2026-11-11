@@ -1158,6 +1158,9 @@ pub struct Server<St: MqttStore + 'static> {
     sys_interval: Option<Duration>,
 }
 
+/// How often expired retained messages are removed from storage.
+const RETAINED_SWEEP: Duration = Duration::from_secs(60);
+
 impl<St: MqttStore + 'static> Server<St> {
     /// Sets up a broker serving `listener` and `config`'s listeners, with
     /// its state in `storage`. Fails if the configuration can't be used or
@@ -1316,6 +1319,20 @@ impl<St: MqttStore + 'static> Server<St> {
                 interval,
             );
         }
+        // Lookups leave expired retained messages out; this removes them
+        let broker = server.broker.clone();
+        let mut stop = server.notify_shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut ticks = time::interval(RETAINED_SWEEP);
+            ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => {}
+                    _ = stop.recv() => break,
+                }
+                broker.remove_expired_retained().await;
+            }
+        });
         // Its own timer: the $SYS publisher may be off, or slower
         let bans = Arc::clone(&server.bans);
         let mut stop = server.notify_shutdown.subscribe();

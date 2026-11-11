@@ -24,7 +24,8 @@ use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
     BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionOwner,
-    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, Write,
+    SessionState, StorageError, StoredBan, StoredSubscription, StoredWillMessage, TopicRange,
+    Write,
 };
 
 /// SQLite storage backend implementing all storage traits.
@@ -131,7 +132,17 @@ fn create_private(path: &Path) -> Result<()> {
 /// Schema changes, applied in order, each in a transaction of its own; the
 /// database records how many it has in `user_version`. Released entries
 /// never change: a new schema change is a new entry.
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[create_schema];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] =
+    &[create_schema, index_retained_expiry];
+
+/// Lets the removal of expired retained messages find them without
+/// reading the table.
+fn index_retained_expiry(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS retained_messages_expires_at
+         ON retained_messages (expires_at) WHERE expires_at IS NOT NULL",
+    )
+}
 
 /// Brings the schema up to date.
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -440,6 +451,94 @@ fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
         retain: row.get(9)?,
         expires_at: row.get::<_, Option<i64>>(10)?.map(|t| t as u64),
     })
+}
+
+/// The retained lookup of `retained_page`: `?1` now, `?2` the topic or the
+/// range's start, `?3` the topic to read after, `?4` the limit and `?5` the
+/// range's end, if `bounded`.
+fn retained_sql(exact: bool, bounded: bool) -> String {
+    let mut sql = String::from(
+        "SELECT topic, payload, qos, dup, properties, expires_at,
+                origin_client_id, origin_username
+         FROM retained_messages
+         WHERE (expires_at IS NULL OR expires_at > ?1)",
+    );
+    sql.push_str(match exact {
+        true => " AND topic = ?2 AND (?3 IS NULL OR topic > ?3)",
+        false => " AND topic >= ?2 AND (?3 IS NULL OR topic > ?3)",
+    });
+    if bounded {
+        sql.push_str(" AND topic < ?5");
+    }
+    sql.push_str(" ORDER BY topic LIMIT ?4");
+    sql
+}
+
+/// Up to `limit` live retained messages matching `filter`, after `after`,
+/// in topic order. Reads only the topics the filter's literal prefix allows,
+/// through the primary key, in chunks, as wildcards past the prefix are
+/// matched here.
+fn retained_page(
+    conn: &Connection,
+    filter: &str,
+    after: Option<String>,
+    limit: usize,
+) -> rusqlite::Result<Vec<Message>> {
+    let (start, end) = match TopicRange::of(filter) {
+        TopicRange::Exact(topic) => (topic, None),
+        TopicRange::From { start, end } => (start, end),
+    };
+    let exact = !filter.contains(['+', '#']);
+    let mut stmt = conn.prepare_cached(&retained_sql(exact, end.is_some()))?;
+    let chunk = limit.max(256);
+    let now = unix_millis() as i64;
+    let mut cursor = after;
+    let mut messages = Vec::new();
+    loop {
+        let mut read = 0;
+        let mut last = None;
+        let mut rows = match &end {
+            Some(end) => stmt.query(params![now, start, cursor, chunk as i64, end])?,
+            None => stmt.query(params![now, start, cursor, chunk as i64])?,
+        };
+        while let Some(row) = rows.next()? {
+            read += 1;
+            let topic: String = row.get(0)?;
+            last = Some(topic.clone());
+            if !topic_matches_filter(&topic, filter) {
+                continue;
+            }
+            let payload: Option<Vec<u8>> = row.get(1)?;
+            let origin_client_id: Option<String> = row.get(6)?;
+            messages.push(Message {
+                packet_id: None,
+                topic: Arc::from(topic.as_str()),
+                dup: row.get(3)?,
+                qos: row.get::<_, Qos>(2)?.0,
+                retain: true,
+                payload: payload.map(Bytes::from),
+                properties: decode_properties(row.get(4)?)?,
+                expires_at: row.get::<_, Option<i64>>(5)?.map(|t| t as u64),
+                subscription_identifiers: Vec::new(),
+                origin: origin_client_id
+                    .map(|client_id| -> rusqlite::Result<_> {
+                        Ok(Arc::new(MessageOrigin {
+                            client_id,
+                            username: row.get(7)?,
+                        }))
+                    })
+                    .transpose()?,
+            });
+            if messages.len() == limit {
+                return Ok(messages);
+            }
+        }
+        if read < chunk {
+            return Ok(messages);
+        }
+        drop(rows);
+        cursor = last;
+    }
 }
 
 /// Applies one change; the caller holds the transaction.
@@ -832,10 +931,14 @@ impl BanStore for SqliteStore {
 
 #[async_trait]
 impl RetainedMessageStore for SqliteStore {
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()> {
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool> {
         let topic = topic.to_string();
 
         self.blocking(move |conn| {
+            // The one connection is held, so nothing changes in between
+            let existed = conn
+                .prepare_cached("SELECT 1 FROM retained_messages WHERE topic = ?1")?
+                .exists(params![topic])?;
             match message {
                 Some(msg) => {
                     let payload = msg.payload.as_ref().map(|b| b.to_vec());
@@ -866,65 +969,29 @@ impl RetainedMessageStore for SqliteStore {
                     )?;
                 }
             }
-            Ok(())
+            Ok(existed)
         })
         .await
     }
 
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
         let filter = topic_filter.to_string();
+        let after = after.map(str::to_string);
+        self.blocking(move |conn| retained_page(conn, &filter, after, limit))
+            .await
+    }
 
+    async fn remove_expired_retained(&self) -> Result<usize> {
         self.blocking(move |conn| {
-            // Expired messages are dropped for good, not just skipped
             conn.execute(
                 "DELETE FROM retained_messages WHERE expires_at <= ?1",
                 params![unix_millis() as i64],
-            )?;
-
-            let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, dup, properties, expires_at,
-                        origin_client_id, origin_username
-                 FROM retained_messages",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let topic: String = row.get(0)?;
-                let payload: Option<Vec<u8>> = row.get(1)?;
-                let qos = row.get::<_, Qos>(2)?.0;
-                let dup: bool = row.get(3)?;
-                let properties: Vec<u8> = row.get(4)?;
-                let expires_at: Option<i64> = row.get(5)?;
-                let origin_client_id: Option<String> = row.get(6)?;
-                let origin_username: Option<String> = row.get(7)?;
-                let origin = origin_client_id.map(|client_id| {
-                    Arc::new(MessageOrigin {
-                        client_id,
-                        username: origin_username,
-                    })
-                });
-                Ok((topic, payload, qos, dup, properties, expires_at, origin))
-            })?;
-
-            let mut messages = Vec::new();
-
-            for row in rows {
-                let (topic, payload, qos, dup, properties, expires_at, origin) = row?;
-                if topic_matches_filter(&topic, &filter) {
-                    messages.push(Message {
-                        packet_id: None,
-                        topic: Arc::from(topic.as_str()),
-                        dup,
-                        qos,
-                        retain: true,
-                        payload: payload.map(Bytes::from),
-                        properties: decode_properties(properties)?,
-                        expires_at: expires_at.map(|t| t as u64),
-                        subscription_identifiers: Vec::new(),
-                        origin,
-                    });
-                }
-            }
-
-            Ok(messages)
+            )
         })
         .await
     }
@@ -1191,16 +1258,51 @@ mod tests {
             .await
             .unwrap();
 
+        // Lookups leave them out, and leave them be
         let retained = store.get_retained("#").await.unwrap();
         assert_eq!(retained.len(), 1);
         assert_eq!(&*retained[0].topic, "new");
-        let count: i64 = store
-            .blocking(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM retained_messages", [], |r| r.get(0))
-            })
-            .await
+        assert_eq!(store.count_retained().await.unwrap(), 2);
+
+        assert_eq!(store.remove_expired_retained().await.unwrap(), 1);
+        assert_eq!(store.count_retained().await.unwrap(), 1);
+    }
+
+    /// How SQLite plans `sql`, one line per step.
+    fn plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let unbound = std::iter::repeat_n(Null, stmt.parameter_count());
+        let steps: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(unbound), |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(count, 1);
+        steps.join("\n")
+    }
+
+    /// Lookups read the topics their filter allows through the primary
+    /// key, and the removal of expired messages finds them by their index.
+    #[tokio::test]
+    async fn test_retained_lookups_use_the_indexes() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        for (exact, bounded) in [(true, false), (false, true), (false, false)] {
+            let plan = plan(&conn, &retained_sql(exact, bounded));
+            assert!(
+                plan.contains("USING INDEX sqlite_autoindex_retained_messages_1"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        let exact = plan(&conn, &retained_sql(true, false));
+        assert!(exact.contains("(topic=?)"), "{exact}");
+        let bounded = plan(&conn, &retained_sql(false, true));
+        assert!(bounded.contains("(topic>? AND topic<?)"), "{bounded}");
+        let removal = plan(&conn, "DELETE FROM retained_messages WHERE expires_at <= 5");
+        assert!(
+            removal.contains("retained_messages_expires_at"),
+            "{removal}"
+        );
     }
 
     #[tokio::test]

@@ -218,19 +218,92 @@ pub struct InflightMessage {
 /// Retained messages are stored per topic and delivered to new subscribers.
 #[async_trait]
 pub trait RetainedMessageStore: Send + Sync {
-    /// Store a retained message for a topic.
-    /// Pass None to clear the retained message.
-    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<()>;
+    /// Stores the retained message of a topic, or with None clears it.
+    /// Returns whether the topic held a retained message before, expired or
+    /// not, so a caller can keep `count_retained` up to date itself.
+    async fn store_retained(&self, topic: &str, message: Option<Message>) -> Result<bool>;
 
-    /// Get retained messages matching a topic filter (supports wildcards).
-    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>>;
+    /// At most `limit` of the retained messages matching `topic_filter`, in
+    /// the byte order of their topics, from the first topic after `after`
+    /// on. Expired messages are left out. Fewer than `limit` means there
+    /// are no more.
+    async fn get_retained_page(
+        &self,
+        topic_filter: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Message>>;
+
+    /// Every retained message matching `topic_filter`, a page at a time.
+    async fn get_retained(&self, topic_filter: &str) -> Result<Vec<Message>> {
+        const PAGE: usize = 1000;
+        let mut found: Vec<Message> = Vec::new();
+        loop {
+            let after = found.last().map(|m| m.topic.to_string());
+            let page = self
+                .get_retained_page(topic_filter, after.as_deref(), PAGE)
+                .await?;
+            let last = page.len() < PAGE;
+            found.extend(page);
+            if last {
+                return Ok(found);
+            }
+        }
+    }
 
     /// Clear all retained messages.
     async fn clear_all_retained(&self) -> Result<()>;
 
-    /// How many retained messages are stored, expired ones possibly
-    /// included until they are next looked up.
+    /// How many retained messages are stored, expired ones included until
+    /// `remove_expired_retained` removes them.
     async fn count_retained(&self) -> Result<usize>;
+
+    /// Removes the expired retained messages, which lookups already leave
+    /// out, and returns how many. The broker calls it now and then rather
+    /// than have each lookup delete them.
+    async fn remove_expired_retained(&self) -> Result<usize> {
+        Ok(0)
+    }
+}
+
+/// The topics a lookup with a topic filter reads, before each is matched
+/// against the filter.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TopicRange {
+    /// A filter without wildcards matches one topic
+    Exact(String),
+    /// Those from `start` on, and before `end` if there is one: all that
+    /// start with the filter's part before its first wildcard
+    From { start: String, end: Option<String> },
+}
+
+impl TopicRange {
+    pub(crate) fn of(filter: &str) -> TopicRange {
+        let Some(wildcard) = filter.find(['+', '#']) else {
+            return TopicRange::Exact(filter.to_string());
+        };
+        // `a/#` matches `a` too
+        let start = filter[..wildcard].trim_end_matches('/').to_string();
+        let end = after_prefix(&start);
+        TopicRange::From { start, end }
+    }
+}
+
+/// The first string after every string starting with `prefix`, in byte
+/// order, which UTF-8 shares with code point order; None if there is none.
+fn after_prefix(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = match last as u32 + 1 {
+            0xD800 => Some('\u{E000}'),
+            next => char::from_u32(next),
+        };
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// A change to what is stored for one client.
@@ -341,6 +414,37 @@ pub trait MqttStore: BatchStore + RetainedMessageStore {}
 
 /// Blanket implementation for any type implementing all storage traits.
 impl<T> MqttStore for T where T: BatchStore + RetainedMessageStore {}
+
+#[cfg(test)]
+mod range_tests {
+    use super::TopicRange;
+
+    fn from(start: &str, end: Option<&str>) -> TopicRange {
+        TopicRange::From {
+            start: start.into(),
+            end: end.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_topic_ranges() {
+        assert_eq!(TopicRange::of("a/b"), TopicRange::Exact("a/b".into()));
+        assert_eq!(TopicRange::of("#"), from("", None));
+        assert_eq!(TopicRange::of("+/c"), from("", None));
+        assert_eq!(TopicRange::of("a/#"), from("a", Some("b")));
+        assert_eq!(TopicRange::of("a/b/+/c"), from("a/b", Some("a/c")));
+        assert_eq!(TopicRange::of("a%_\\/+"), from("a%_\\", Some("a%_]")));
+        assert_eq!(
+            TopicRange::of("\u{D7FF}/#"),
+            from("\u{D7FF}", Some("\u{E000}"))
+        );
+        assert_eq!(
+            TopicRange::of("a\u{10FFFF}/#"),
+            from("a\u{10FFFF}", Some("b"))
+        );
+        assert_eq!(TopicRange::of("\u{10FFFF}/#"), from("\u{10FFFF}", None));
+    }
+}
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {

@@ -278,8 +278,13 @@ const RETAINED_PAGE: usize = 100;
 struct RetainedDelivery {
     filter: String,
     subscriber: Subscriber,
-    /// Looked up when the first page is due
-    messages: Option<VecDeque<Message>>,
+    /// The page looked up last, what is left of it
+    messages: VecDeque<Message>,
+    /// The topic of the last message looked up, after which the next page
+    /// starts
+    after: Option<String>,
+    /// The last page has been looked up
+    done: bool,
 }
 
 pub struct SessionDropGuard {
@@ -1504,7 +1509,9 @@ impl Session {
                 session.retained.push_back(RetainedDelivery {
                     filter: sub.topic_filter.clone(),
                     subscriber,
-                    messages: None,
+                    messages: VecDeque::new(),
+                    after: None,
+                    done: false,
                 });
                 self.shared.owes_retained.store(true, Ordering::Relaxed);
             } else if let Some(owed) = session
@@ -1747,10 +1754,20 @@ impl Session {
                 };
                 (delivery, state.check_retain_source)
             };
-            let messages = match &mut delivery.messages {
-                Some(messages) => messages,
-                None => match broker.retained(&delivery.filter).await {
-                    Ok(found) => delivery.messages.insert(found.into()),
+            // One page at a time, so a subscription matching many retained
+            // messages never has them all in memory
+            if delivery.messages.is_empty() && !delivery.done {
+                let page = broker
+                    .retained_page(&delivery.filter, delivery.after.as_deref(), RETAINED_PAGE)
+                    .await;
+                match page {
+                    Ok(page) => {
+                        delivery.done = page.len() < RETAINED_PAGE;
+                        if let Some(last) = page.last() {
+                            delivery.after = Some(last.topic.to_string());
+                        }
+                        delivery.messages = page.into();
+                    }
                     Err(e) => {
                         warn!(
                             "Can't look up retained messages for `{}`: {}",
@@ -1758,8 +1775,9 @@ impl Session {
                         );
                         continue;
                     }
-                },
-            };
+                }
+            }
+            let messages = &mut delivery.messages;
 
             while queue.len() < RETAINED_PAGE {
                 let Some(message) = messages.pop_front() else {
@@ -1786,7 +1804,8 @@ impl Session {
                 }
             }
 
-            if !messages.is_empty() {
+            let queue_full = !delivery.messages.is_empty();
+            if queue_full || !delivery.done {
                 // Unless the client unsubscribed or subscribed again meanwhile
                 let mut state = self.shared.state.lock().await;
                 if state.subscriptions.contains_key(&delivery.filter)
@@ -1794,7 +1813,9 @@ impl Session {
                 {
                     state.retained.push_front(delivery);
                 }
-                return;
+                if queue_full {
+                    return;
+                }
             }
         }
     }
@@ -2683,7 +2704,7 @@ mod tests {
             &self,
             topic: &str,
             message: Option<Message>,
-        ) -> mercurio_storage::Result<()> {
+        ) -> mercurio_storage::Result<bool> {
             if !self.working.load(Ordering::Relaxed) {
                 return Err(mercurio_storage::StorageError::OperationFailed(
                     "disk full".into(),
@@ -2692,8 +2713,15 @@ mod tests {
             self.inner.store_retained(topic, message).await
         }
 
-        async fn get_retained(&self, topic_filter: &str) -> mercurio_storage::Result<Vec<Message>> {
-            self.inner.get_retained(topic_filter).await
+        async fn get_retained_page(
+            &self,
+            topic_filter: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> mercurio_storage::Result<Vec<Message>> {
+            self.inner
+                .get_retained_page(topic_filter, after, limit)
+                .await
         }
 
         async fn clear_all_retained(&self) -> mercurio_storage::Result<()> {
@@ -3616,6 +3644,82 @@ mod tests {
             .await
             .unwrap();
         assert!(!next_publish(&mut session).await.retain);
+    }
+
+    /// Retained messages, recording the largest page looked up.
+    #[derive(Default)]
+    struct PagedRetained {
+        inner: MemoryStore,
+        largest: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RetainedMessageStore for PagedRetained {
+        async fn store_retained(
+            &self,
+            topic: &str,
+            message: Option<Message>,
+        ) -> mercurio_storage::Result<bool> {
+            self.inner.store_retained(topic, message).await
+        }
+
+        async fn get_retained_page(
+            &self,
+            topic_filter: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> mercurio_storage::Result<Vec<Message>> {
+            let page = self
+                .inner
+                .get_retained_page(topic_filter, after, limit)
+                .await?;
+            self.largest.fetch_max(page.len(), Ordering::Relaxed);
+            Ok(page)
+        }
+
+        async fn clear_all_retained(&self) -> mercurio_storage::Result<()> {
+            self.inner.clear_all_retained().await
+        }
+
+        async fn count_retained(&self) -> mercurio_storage::Result<usize> {
+            self.inner.count_retained().await
+        }
+    }
+
+    /// A subscription matching many retained messages gets them all, in
+    /// topic order, looked up a page at a time.
+    #[tokio::test]
+    async fn test_retained_messages_are_looked_up_a_page_at_a_time() {
+        let mut session = create_test_session();
+        let storage = Arc::new(PagedRetained::default());
+        let broker = crate::broker::Broker::new(Arc::clone(&storage));
+        let count = RETAINED_PAGE * 2 + 50;
+        for i in 0..count {
+            let topic = format!("r/{i:04}");
+            broker
+                .publish(&topic, message(&topic, QoS::AtMostOnce, None, true))
+                .await
+                .unwrap();
+        }
+        session
+            .handle_subscribe(
+                subscribe_packet("r/#", QoS::AtMostOnce),
+                &broker,
+                &no_plugins(),
+            )
+            .await
+            .unwrap();
+
+        let mut topics = Vec::new();
+        while session.owes_retained() {
+            session.feed_retained(&broker, &no_plugins()).await;
+            while session.shared.queue.len() > 0 {
+                topics.push(next_publish(&mut session).await.topic_name);
+            }
+        }
+        let expected: Vec<String> = (0..count).map(|i| format!("r/{i:04}")).collect();
+        assert_eq!(topics, expected);
+        assert_eq!(storage.largest.load(Ordering::Relaxed), RETAINED_PAGE);
     }
 
     #[test]

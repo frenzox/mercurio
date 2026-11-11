@@ -31,6 +31,7 @@ pub async fn conformance(store: &impl MqttStore) {
     batches(store).await;
     delete_cascades(store).await;
     retained(store).await;
+    retained_pages(store).await;
 }
 
 fn properties() -> MessageProperties {
@@ -705,6 +706,90 @@ async fn retained(store: &impl MqttStore) {
     store.clear_all_retained().await.unwrap();
     assert!(store.get_retained("#").await.unwrap().is_empty());
     assert_eq!(store.count_retained().await.unwrap(), 0);
+}
+
+/// Retained messages come a page at a time, in topic order, expired ones
+/// left out until they are removed, and storing tells whether the topic
+/// held one before.
+async fn retained_pages(store: &impl MqttStore) {
+    assert!(!store
+        .store_retained("p", Some(message("p", "p")))
+        .await
+        .unwrap());
+    assert!(store
+        .store_retained("p", Some(message("p", "again")))
+        .await
+        .unwrap());
+    let mut expected = vec!["p".to_string()];
+    for i in 0..250 {
+        let topic = format!("p/{i:03}");
+        store
+            .store_retained(&topic, Some(message(&topic, "")))
+            .await
+            .unwrap();
+        expected.push(topic);
+    }
+    for topic in ["q/x", "o/x", "$SYS/p"] {
+        store
+            .store_retained(topic, Some(message(topic, "")))
+            .await
+            .unwrap();
+    }
+    let mut expired = message("p/expired", "");
+    expired.expires_at = Some(1);
+    store
+        .store_retained("p/expired", Some(expired))
+        .await
+        .unwrap();
+
+    for (filter, wanted) in [
+        ("p/#", expected.clone()),
+        (
+            "+/+",
+            expected[1..]
+                .iter()
+                .cloned()
+                .chain(["q/x".into()])
+                .collect(),
+        ),
+    ] {
+        let mut wanted = wanted;
+        if filter == "+/+" {
+            wanted.insert(0, "o/x".into());
+        }
+        let mut found: Vec<String> = Vec::new();
+        loop {
+            let page = store
+                .get_retained_page(filter, found.last().map(String::as_str), 7)
+                .await
+                .unwrap();
+            assert!(page.len() <= 7);
+            let last = page.len() < 7;
+            found.extend(page.iter().map(|m| m.topic.to_string()));
+            if last {
+                break;
+            }
+        }
+        assert_eq!(found, wanted, "{filter}");
+    }
+    let exact = store.get_retained_page("p/007", None, 7).await.unwrap();
+    assert_eq!(exact.len(), 1);
+    assert!(store
+        .get_retained_page("p/007", Some("p/007"), 7)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The expired message counts until it is removed
+    let count = store.count_retained().await.unwrap();
+    assert_eq!(count, 255);
+    assert_eq!(store.remove_expired_retained().await.unwrap(), 1);
+    assert_eq!(store.count_retained().await.unwrap(), 254);
+    assert_eq!(store.remove_expired_retained().await.unwrap(), 0);
+
+    assert!(store.store_retained("p", None).await.unwrap());
+    assert!(!store.store_retained("p", None).await.unwrap());
+    store.clear_all_retained().await.unwrap();
 }
 
 pub fn ban(kind: &str, value: &str, prefix: bool) -> StoredBan {
