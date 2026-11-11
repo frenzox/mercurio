@@ -107,6 +107,7 @@ mercuriod -v</pre>
 
 <h2 id="systemd">Running as a systemd service</h2>
 <p>A unit file is provided in <code>mercuriod/contrib/mercuriod.service</code>; the packages install it for you. It runs the broker sandboxed as the <code>mercurio</code> user, with <code>/var/lib/mercurio</code>, which suits the SQLite database, and <code>/var/log/mercurio</code>, for a log <code>file</code>, as its only writable directories, and maps <code>systemctl reload</code> to <code>SIGHUP</code>. Files the broker creates are readable by its user only, and it may keep 65536 files open, as each client connection takes one. It also creates <code>/run/mercurio</code>, where the broker serves its <a href="admin.html#socket">admin socket</a>. Without a <code>mercurio</code> user on the system, systemd creates a temporary one for each run.</p>
+<p>The unit is <code>Type=notify</code>: the broker tells systemd it is ready once its listeners are bound and it serves, so <code>systemctl start</code> returns, and units ordered after <code>mercuriod</code> start, only then. A PostgreSQL <a href="operations.html#persistence">standby</a> becomes ready when it takes over; until then <code>systemctl status</code> shows it standing by, and as that may last indefinitely, the unit sets no start timeout. On <code>systemctl stop</code> the broker reports that it is stopping before it disconnects its clients.</p>
 <pre><span class="comment"># Binary, configuration and unit</span>
 sudo cp target/release/mercuriod /usr/bin/
 sudo mkdir -p /etc/mercurio

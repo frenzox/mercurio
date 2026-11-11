@@ -729,6 +729,13 @@ database) and `/var/log/mercurio` (for a log `file`) as its only writable
 directories. Files the broker creates are readable by its user only, and
 it may keep 65536 files open, as each client connection takes one.
 
+The unit is `Type=notify`: the broker sends `READY=1` to `$NOTIFY_SOCKET`
+once its listeners are bound and it serves, so `systemctl start` returns,
+and units ordered after it start, only then. A PostgreSQL standby sends it
+once it takes over, and until then reports `STATUS=Standing by: ...` in
+`systemctl status`; as that may take any time, the unit sets
+`TimeoutStartSec=infinity`. On shutdown the broker sends `STOPPING=1`.
+
 ```bash
 # Copy service file
 sudo cp mercuriod/contrib/mercuriod.service /etc/systemd/system/
