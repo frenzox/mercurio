@@ -34,7 +34,6 @@ mod config;
 mod credentials;
 mod dynsec;
 mod http_auth;
-#[allow(dead_code)] // used once the plugin is registered
 mod jwt_auth;
 mod logging;
 mod notify;
@@ -50,6 +49,7 @@ use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 use dynsec::DynamicSecurity;
 use http_auth::HttpAuth;
+use jwt_auth::JwtAuth;
 use reload::{Reload, Reloadable};
 
 const DEFAULT_CONFIG: &str = "/etc/mercurio/config.toml";
@@ -687,6 +687,7 @@ fn build_auth(
     let authenticating = [
         ("password_file", config.password_file.is_some()),
         ("dynamic_security", config.dynamic_security.is_some()),
+        ("jwt", config.jwt.is_some()),
         (
             "user_url",
             config.http.as_ref().is_some_and(|h| h.user_url.is_some()),
@@ -710,6 +711,13 @@ fn build_auth(
     }
 
     if let Some(path) = &config.dynamic_security {
+        if config.jwt.is_some() {
+            return Err(
+                "dynamic_security cannot be combined with [auth.jwt]: dynamic security owns \
+                 the users"
+                    .to_string(),
+            );
+        }
         if config.password_file.is_some() || config.acl_file.is_some() {
             return Err("dynamic_security replaces password_file and acl_file".to_string());
         }
@@ -744,6 +752,13 @@ fn build_auth(
     }
 
     let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if let Some(settings) = &config.jwt {
+        let auth = Arc::new(JwtAuth::from_config(settings)?);
+        if auth.has_key_file() {
+            reloadable.push(auth.clone());
+        }
+        plugins.push(auth);
+    }
     if let Some(path) = &config.password_file {
         let validator = Arc::new(Reloadable::load(path, load_credentials)?);
         info!("Loaded credentials from {}", path);

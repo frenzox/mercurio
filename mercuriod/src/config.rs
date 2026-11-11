@@ -1549,7 +1549,7 @@ pub struct HttpAuthConfig {
 
 /// Exactly one of `secret_file`, `public_key_file` and `jwks_url` gives the
 /// keys that tokens are signed with.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JwtAuthConfig {
     /// Shared secret of the HMAC algorithms

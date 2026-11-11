@@ -8,11 +8,15 @@ use base64::Engine;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{Jwk, PublicKeyUse};
 use jsonwebtoken::{decode, decode_header, Algorithm, AlgorithmFamily, DecodingKey, Validation};
+use mercurio_server::plugin::{
+    BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
+};
 use serde_json::{Map, Value};
 use tracing::warn;
 
 use crate::config::{redacted_http_url, JwtAuthConfig};
 use crate::http_auth::is_plaintext_to_remote;
+use crate::reload::Reload;
 
 /// Longest wait for the key set server, under the default 5 s
 /// `plugin_timeout` so a refresh usually ends before the CONNECT gives up.
@@ -347,6 +351,89 @@ fn reason(kind: &ErrorKind) -> &'static str {
         ErrorKind::InvalidAudience => "the token has the wrong audience",
         ErrorKind::MissingRequiredClaim(_) => "the token lacks a required claim",
         _ => "the token is malformed",
+    }
+}
+
+/// Lets in clients whose CONNECT password is a token for their user name.
+pub(crate) struct JwtAuth {
+    config: JwtAuthConfig,
+    verifier: RwLock<Arc<Verifier>>,
+}
+
+impl JwtAuth {
+    pub(crate) fn from_config(config: &JwtAuthConfig) -> Result<Self, String> {
+        Ok(Self {
+            verifier: RwLock::new(Arc::new(Verifier::from_config(config)?)),
+            config: config.clone(),
+        })
+    }
+
+    /// Whether its keys come from a file, which a reload rereads; a key set
+    /// is fetched again on its own.
+    pub(crate) fn has_key_file(&self) -> bool {
+        self.config.jwks_url.is_none()
+    }
+}
+
+impl Plugin for JwtAuth {
+    fn name(&self) -> &str {
+        "jwt"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new("jwt", PluginKind::Builtin).with_hooks(&["authenticate"])
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        credentials: &'a Credentials<'a>,
+    ) -> BoxFuture<'a, Decision> {
+        let verifier = Arc::clone(&self.verifier.read().unwrap());
+        Box::pin(async move {
+            let peer = client
+                .peer
+                .map_or_else(|| "-".to_string(), |peer| peer.to_string());
+            match verifier.check_async(credentials.password).await {
+                Checked::NotAToken => Decision::Defer,
+                Checked::Invalid(why) => {
+                    warn!(
+                        "Refusing the token of client `{}` from {}: {}",
+                        client.client_id, peer, why
+                    );
+                    Decision::Deny
+                }
+                Checked::Valid { username, .. } if username != credentials.username => {
+                    warn!(
+                        "Refusing the token of client `{}` from {}: it is for another user",
+                        client.client_id, peer
+                    );
+                    Decision::Deny
+                }
+                Checked::Valid { .. } => Decision::Allow,
+            }
+        })
+    }
+}
+
+impl Reload for JwtAuth {
+    fn reload(&self) -> Result<(), String> {
+        let verifier = Verifier::from_config(&self.config)?;
+        *self.verifier.write().unwrap() = Arc::new(verifier);
+        Ok(())
+    }
+
+    fn path(&self) -> &str {
+        let config = &self.config;
+        config
+            .secret_file
+            .as_deref()
+            .or(config.public_key_file.as_deref())
+            .unwrap_or_default()
+    }
+
+    fn item(&self) -> &str {
+        "jwt"
     }
 }
 
