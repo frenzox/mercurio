@@ -508,9 +508,11 @@ access at all; create a client of that name, without a password, to give
 it roles. A client has its own roles and those of its groups; clients without a user
 name get those of the anonymous group. ACLs of type `publishClientSend`
 decide publishing, `publishClientReceive` receiving, and
-`subscribePattern` and `subscribeLiteral` subscribing. The ACL with the
-highest `priority` wins, whichever role holds it; roles and groups have no
-priority of their own, and commands giving them one fail. Without a matching ACL, only receiving is allowed, unless
+`subscribePattern` and `subscribeLiteral` subscribing. As in mosquitto, a
+check walks the client's own roles, then its groups' roles, group by group,
+each list highest `priority` first (-1 when none is given), and within a
+role its ACLs by their `priority`; the first ACL that matches decides.
+Without a matching ACL, only receiving is allowed, unless
 `setDefaultACLAccess` changes it. Changes are saved to the file at once.
 As in mosquitto, a change that can take access away disconnects the
 connected clients it concerns, with Administrative Action (0x98), so they

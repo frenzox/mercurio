@@ -54,8 +54,14 @@ pub enum Dynsec {
     EnableClient { username: String },
     /// Stop a client from logging in, and take its access away at once
     DisableClient { username: String },
-    /// Give a client a role
-    AddClientRole { username: String, rolename: String },
+    /// Give a client a role, or change the role's priority
+    AddClientRole {
+        username: String,
+        rolename: String,
+        /// Its roles are checked highest priority first [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Take a role from a client
     RemoveClientRole { username: String, rolename: String },
     /// Show a client with its roles and groups
@@ -75,12 +81,25 @@ pub enum Dynsec {
     GetGroup { groupname: String },
     /// List the groups
     ListGroups,
-    /// Give a group a role
-    AddGroupRole { groupname: String, rolename: String },
+    /// Give a group a role, or change the role's priority
+    AddGroupRole {
+        groupname: String,
+        rolename: String,
+        /// Its roles are checked highest priority first [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Take a role from a group
     RemoveGroupRole { groupname: String, rolename: String },
-    /// Add a client to a group
-    AddGroupClient { groupname: String, username: String },
+    /// Add a client to a group, or change the group's priority for it
+    AddGroupClient {
+        groupname: String,
+        username: String,
+        /// The client's groups are checked highest priority first
+        /// [default: -1]
+        #[arg(allow_negative_numbers = true)]
+        priority: Option<i64>,
+    },
     /// Remove a client from a group
     RemoveGroupClient { groupname: String, username: String },
     /// Give clients without a user name the roles of this group
@@ -104,8 +123,8 @@ pub enum Dynsec {
         topic: String,
         #[arg(value_parser = ["allow", "deny"])]
         access: String,
-        /// The highest priority wins among a client's matching ACLs
-        /// [default: 0]
+        /// A role's ACLs are checked highest priority first [default: 0]
+        #[arg(allow_negative_numbers = true)]
         priority: Option<i64>,
     },
     /// Remove a role's ACL
@@ -236,9 +255,13 @@ pub fn command(
         Dynsec::DisableClient { username } => {
             named("disableClient", json!({ "username": username }))
         }
-        Dynsec::AddClientRole { username, rolename } => named(
+        Dynsec::AddClientRole {
+            username,
+            rolename,
+            priority,
+        } => named(
             "addClientRole",
-            json!({ "username": username, "rolename": rolename }),
+            json!({ "username": username, "rolename": rolename, "priority": priority }),
         ),
         Dynsec::RemoveClientRole { username, rolename } => named(
             "removeClientRole",
@@ -258,9 +281,10 @@ pub fn command(
         Dynsec::AddGroupRole {
             groupname,
             rolename,
+            priority,
         } => named(
             "addGroupRole",
-            json!({ "groupname": groupname, "rolename": rolename }),
+            json!({ "groupname": groupname, "rolename": rolename, "priority": priority }),
         ),
         Dynsec::RemoveGroupRole {
             groupname,
@@ -272,9 +296,10 @@ pub fn command(
         Dynsec::AddGroupClient {
             groupname,
             username,
+            priority,
         } => named(
             "addGroupClient",
-            json!({ "groupname": groupname, "username": username }),
+            json!({ "groupname": groupname, "username": username, "priority": priority }),
         ),
         Dynsec::RemoveGroupClient {
             groupname,
@@ -504,6 +529,37 @@ mod tests {
                 .chain(wrong.iter().copied());
             assert!(Cli::try_parse_from(argv).is_err(), "{wrong:?}");
         }
+    }
+
+    #[test]
+    fn roles_and_groups_take_a_priority() {
+        assert_eq!(
+            sent(&["add-client-role", "alice", "sensors", "5"]),
+            json!({
+                "command": "addClientRole", "username": "alice", "rolename": "sensors",
+                "priority": 5,
+            })
+        );
+        assert_eq!(
+            sent(&["add-group-role", "field", "sensors", "-2"]),
+            json!({
+                "command": "addGroupRole", "groupname": "field", "rolename": "sensors",
+                "priority": -2,
+            })
+        );
+        assert_eq!(
+            sent(&["add-group-client", "field", "alice", "3"]),
+            json!({
+                "command": "addGroupClient", "groupname": "field", "username": "alice",
+                "priority": 3,
+            })
+        );
+        assert_eq!(
+            sent(&["add-role-acl", "r", "subscribePattern", "t", "deny", "-1"])["priority"],
+            -1
+        );
+        let argv = ["mercurioctl", "dynsec", "add-client-role", "a", "r", "high"];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 
     #[test]

@@ -130,7 +130,7 @@ mercurioctl dynsec get-client s1</pre>
 <ul>
 <li><code>create-client</code> without <code>--password</code> asks for one twice. An empty one creates a client that can't log in until <code>set-client-password</code>.</li>
 <li>In scripts, <code>create-client</code> and <code>set-client-password</code> take the password from the first line of a file with <code>--password-file PATH</code>, or of standard input with <code>--password-stdin</code>, which keeps it out of <code>ps</code>: <code>pass show mqtt/s1 | mercurioctl dynsec set-client-password s1 --password-stdin</code>.</li>
-<li><code>add-role-acl</code> takes the ACL type, the topic, <code>allow</code> or <code>deny</code>, and an optional priority.</li>
+<li><code>add-role-acl</code> takes the ACL type, the topic, <code>allow</code> or <code>deny</code>, and an optional priority. <code>add-client-role</code>, <code>add-group-role</code> and <code>add-group-client</code> take an optional priority last too; run again on a role or group already held, they change its priority.</li>
 <li>mosquitto_ctrl's <code>modifyClient</code>, <code>modifyGroup</code> and <code>modifyRole</code> don't exist here; use the add, remove and set commands. Its <code>init</code> is <code>mercuriod dynsec-init</code>, which writes the file before the broker starts.</li>
 <li>When dynamic security isn't enabled, nothing answers: mercurioctl waits for <code>--timeout</code>, exits with status 2 and asks whether it is enabled.</li>
 </ul>
