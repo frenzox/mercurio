@@ -90,7 +90,10 @@ async fn health_and_metrics_are_served_without_http_dir() {
         "# TYPE mercurio_messages_dropped_total counter",
         "mercurio_messages_dropped_total{cause=\"queue_full\"} 0",
         "mercurio_messages_dropped_total{cause=\"no_share_member\"} 0",
+        "# TYPE mercurio_storage_batches_retried_total counter",
         "# TYPE mercurio_storage_batches_dropped_total counter",
+        "# TYPE mercurio_storage_dirty_clients gauge",
+        "mercurio_storage_dirty_clients 0",
         "# TYPE mercurio_connections_total counter",
         "# TYPE mercurio_uptime_seconds gauge",
     ] {

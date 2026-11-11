@@ -32,7 +32,7 @@ use crate::{
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
     sys::Stats,
-    writer::{Snapshots, Writers},
+    writer::{Snapshots, StorageHealth, Writers},
 };
 
 pub(crate) struct SessionManagerDropGuard<S: BatchStore> {
@@ -490,10 +490,11 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         }
     }
 
-    /// Batches of changes given up since the broker started, and clients
-    /// whose stored state is dirty until it is stored whole again.
-    pub(crate) fn storage_failures(&self) -> (u64, usize) {
-        self.writers.failures()
+    /// Batches of changes retried and given up since the broker started,
+    /// and clients whose stored state is dirty until it is stored whole
+    /// again.
+    pub(crate) fn storage_health(&self) -> StorageHealth {
+        self.writers.health()
     }
 
     /// Starts or resumes the session of the client in `connect_packet`,
@@ -1949,7 +1950,7 @@ mod tests {
             )
             .await;
         manager.flush().await;
-        assert_eq!(manager.storage_failures(), (1, 1));
+        assert_eq!(failures(&manager), (1, 1));
         let stored = storage.load_session("c").await.unwrap().unwrap();
         assert!(stored.subscriptions.is_empty());
 
@@ -1965,7 +1966,7 @@ mod tests {
         // Without a change or a flush, a later attempt stores it whole
         storage.fail(false);
         tokio::time::sleep(Duration::from_secs(120)).await;
-        assert_eq!(manager.storage_failures(), (1, 0));
+        assert_eq!(failures(&manager), (1, 0));
         let stored = storage.load_session("c").await.unwrap().unwrap();
         assert_eq!(stored.subscriptions, [subscription]);
         assert_eq!(stored.owner, owned_by("alice"));
@@ -1988,13 +1989,13 @@ mod tests {
         storage.fail(true);
         manager.delete_will("c");
         manager.flush().await;
-        assert_eq!(manager.storage_failures(), (1, 1));
+        assert_eq!(failures(&manager), (1, 1));
 
         storage.fail(false);
         started.session.restore_incoming_qos2(vec![7]).await;
         manager.store_incoming_qos2("c", 7).await;
         manager.flush().await;
-        assert_eq!(manager.storage_failures(), (1, 0));
+        assert_eq!(failures(&manager), (1, 0));
         assert_eq!(storage.get_incoming_qos2("c").await.unwrap(), [7]);
         manager.remove_incoming_qos2("c", 7).await;
         manager.flush().await;
@@ -2010,7 +2011,13 @@ mod tests {
         storage.fail(false);
         manager.flush().await;
         assert!(storage.load_session("c").await.unwrap().is_none());
-        assert_eq!(manager.storage_failures(), (2, 0));
+        assert_eq!(failures(&manager), (2, 0));
+    }
+
+    /// Batches given up and clients dirty, as `$SYS` reports them.
+    fn failures<S: BatchStore + 'static>(manager: &SessionManager<S>) -> (u64, usize) {
+        let health = manager.storage_health();
+        (health.dropped, health.dirty)
     }
 
     fn mark_persistent<S: BatchStore>(manager: &SessionManager<S>, client_id: &str) {

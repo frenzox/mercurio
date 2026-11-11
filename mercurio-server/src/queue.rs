@@ -472,7 +472,7 @@ mod tests {
 
     /// The `$SYS` value `name` of `stats`.
     fn stat(stats: &Stats, name: &str) -> u64 {
-        crate::sys::counters(stats, 0, 0, 0, 0, (0, 0))
+        crate::sys::counters(stats, 0, 0, 0, 0, Default::default())
             .into_iter()
             .find(|(n, _)| *n == name)
             .unwrap()

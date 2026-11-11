@@ -760,12 +760,12 @@ Every `sys_interval` seconds the broker publishes retained statistics under
 `publish/messages/dropped`, the messages lost before reaching a subscriber.
 Mercurio adds the dropped messages by cause under
 `publish/messages/dropped/` (`queue_full_qos0`, `queue_full`, `expired`,
-`too_large`, `not_authorized`, `no_share_member`) and the storage batches
-retried and given up on as `store/batches/retried` and
-`store/batches/dropped`. `storage/failed batches` counts the batches of
-changes given up since the broker started, and `storage/dirty clients`
-the clients whose stored state is to be written whole again because of
-them. Under `load/` come the 1, 5 and 15
+`too_large`, `not_authorized`, `no_share_member`) and, under `storage/`,
+the batches of session changes written again after a storage error
+(`storage/batches/retried`), those given up on since the broker started
+(`storage/batches/dropped`) and the clients whose stored state is to be
+written whole again because of them (`storage/clients/dirty`). Under
+`load/` come the 1, 5 and 15
 minute averages per minute of messages, bytes and connections, such as
 `load/messages/received/1min`. Clients
 may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`

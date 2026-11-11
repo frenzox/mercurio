@@ -17,14 +17,7 @@ use mercurio_storage::{MqttStore, Result as StorageResult, RetainedMessageStore}
 use tokio::time;
 use tracing::warn;
 
-use crate::{broker::Broker, session_manager::SessionManager};
-
-/// Storage batches the writers attempted again after a failure, for every
-/// broker of the process: the writers' retry loop has no broker to count in.
-pub(crate) static BATCHES_RETRIED: AtomicU64 = AtomicU64::new(0);
-
-/// Storage batches the writers gave up on, their changes lost.
-pub(crate) static BATCHES_DROPPED: AtomicU64 = AtomicU64::new(0);
+use crate::{broker::Broker, session_manager::SessionManager, writer::StorageHealth};
 
 /// Why the broker lost a message it had accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +251,7 @@ pub(crate) fn counters(
     expired: u64,
     retained: usize,
     subscriptions: usize,
-    storage_failures: (u64, usize),
+    storage: StorageHealth,
 ) -> Vec<(&'static str, u64)> {
     let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
     let connected = get(&stats.connected);
@@ -277,12 +270,11 @@ pub(crate) fn counters(
         ("retained messages/count", retained as u64),
         ("subscriptions/count", subscriptions as u64),
         ("publish/messages/dropped", dropped.iter().sum()),
-        ("storage/failed batches", storage_failures.0),
-        ("storage/dirty clients", storage_failures.1 as u64),
+        ("storage/batches/retried", storage.retried),
+        ("storage/batches/dropped", storage.dropped),
+        ("storage/clients/dirty", storage.dirty as u64),
     ];
     counters.extend(DROPPED_BY_CAUSE.into_iter().zip(dropped));
-    counters.push(("store/batches/retried", get(&BATCHES_RETRIED)));
-    counters.push(("store/batches/dropped", get(&BATCHES_DROPPED)));
     counters
 }
 
@@ -298,7 +290,7 @@ pub(crate) async fn current<St: MqttStore + 'static>(
         session_manager.expired_count(),
         broker.retained_count().await,
         broker.topics().subscription_count(),
-        session_manager.storage_failures(),
+        session_manager.storage_health(),
     )
 }
 
@@ -343,15 +335,20 @@ fn metric(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
             gauge,
         ),
         "subscriptions/count" => ("mercurio_subscriptions", "Subscriptions", gauge),
-        "store/batches/retried" => (
+        "storage/batches/retried" => (
             "mercurio_storage_batches_retried_total",
             "Batches of session changes written again after a storage error",
             counter,
         ),
-        "store/batches/dropped" => (
+        "storage/batches/dropped" => (
             "mercurio_storage_batches_dropped_total",
             "Batches of session changes given up on after storage errors",
             counter,
+        ),
+        "storage/clients/dirty" => (
+            "mercurio_storage_dirty_clients",
+            "Clients whose stored state differs from the broker's until it is stored whole again",
+            gauge,
         ),
         "connections" => (
             "mercurio_connections_total",
