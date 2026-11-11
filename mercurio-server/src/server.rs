@@ -654,13 +654,13 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         .any(|range| range.contains(peer.ip()))
                 });
             if !trusted {
-                warn!("{:?} may not send a PROXY header, closing", peer_addr);
+                warn!(target: CONNECTIONS, "{:?} may not send a PROXY header, closing", peer_addr);
                 return None;
             }
             let header = proxy::read_header(&mut socket);
             match connect_step(&mut self.shutdown, self.connect_deadline, header).await? {
                 Ok(Ok(source)) => {
-                    debug!("{:?} is proxying {:?}", peer_addr, source);
+                    debug!(target: CONNECTIONS, "{:?} is proxying {:?}", peer_addr, source);
                     peer_addr = source.or(peer_addr);
                     if let Some(peer) = peer_addr.filter(|p| self.bans.refuses_address(p.ip())) {
                         warn!("{} is banned, closing", peer.ip());
@@ -668,11 +668,11 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     }
                 }
                 Ok(Err(e)) => {
-                    warn!("Bad PROXY header from {:?}: {}", peer_addr, e);
+                    warn!(target: CONNECTIONS, "Bad PROXY header from {:?}: {}", peer_addr, e);
                     return None;
                 }
                 Err(_) => {
-                    warn!("No PROXY header from {:?} in time", peer_addr);
+                    debug!(target: CONNECTIONS, "No PROXY header from {:?} in time", peer_addr);
                     return None;
                 }
             }
@@ -691,25 +691,25 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let accept = acceptor.accept(socket);
         match connect_step(&mut self.shutdown, self.connect_deadline, accept).await? {
             Ok(Ok(tls_stream)) => {
-                debug!("TLS handshake completed for {:?}", peer_addr);
+                debug!(target: CONNECTIONS, "TLS handshake completed for {:?}", peer_addr);
                 if let Some(part) = settings.username_from_certificate {
                     let certs = tls_stream.get_ref().1.peer_certificates();
                     self.cert_identity = certs
                         .and_then(|c| c.first())
                         .and_then(|cert| certificate_name(cert, part));
                     if self.cert_identity.is_none() {
-                        warn!("No Common Name in the certificate of {:?}", peer_addr);
+                        warn!(target: CONNECTIONS, "No Common Name in the certificate of {:?}", peer_addr);
                         return None;
                     }
                 }
                 Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
             }
             Ok(Err(e)) => {
-                error!("TLS handshake failed for {:?}: {}", peer_addr, e);
+                debug!(target: CONNECTIONS, "TLS handshake failed for {:?}: {}", peer_addr, e);
                 None
             }
             Err(_) => {
-                warn!("TLS handshake timed out for {:?}", peer_addr);
+                debug!(target: CONNECTIONS, "TLS handshake timed out for {:?}", peer_addr);
                 None
             }
         }
@@ -742,18 +742,20 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                                 let response = connect_step(&mut self.shutdown, deadline, response);
                                 return match response.await {
                                     Some(Ok(Err(e))) => {
-                                        debug!("HTTP response to {:?} failed: {}", peer_addr, e)
+                                        debug!(target: CONNECTIONS, "HTTP response to {:?} failed: {}", peer_addr, e)
                                     }
                                     Some(Err(_)) => {
-                                        debug!("HTTP response to {:?} timed out", peer_addr)
+                                        debug!(target: CONNECTIONS, "HTTP response to {:?} timed out", peer_addr)
                                     }
                                     _ => {}
                                 };
                             }
                             Ok(Err(e)) => {
-                                return warn!("HTTP request from {:?} failed: {}", peer_addr, e)
+                                return debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e)
                             }
-                            Err(_) => return warn!("HTTP request from {:?} timed out", peer_addr),
+                            Err(_) => {
+                                return debug!(target: CONNECTIONS, "HTTP request from {:?} timed out", peer_addr)
+                            }
                         }
                     }
                     None => http::Rewind::new(stream, Vec::new()),
@@ -769,8 +771,12 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                     Ok(Ok(websocket)) => {
                         Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
                     }
-                    Ok(Err(e)) => warn!("WebSocket handshake failed for {:?}: {}", peer_addr, e),
-                    Err(_) => warn!("WebSocket handshake timed out for {:?}", peer_addr),
+                    Ok(Err(e)) => {
+                        debug!(target: CONNECTIONS, "WebSocket handshake failed for {:?}: {}", peer_addr, e)
+                    }
+                    Err(_) => {
+                        debug!(target: CONNECTIONS, "WebSocket handshake timed out for {:?}", peer_addr)
+                    }
                 }
             }
         }
@@ -1426,13 +1432,41 @@ impl<St: MqttStore + 'static> Listener<St> {
                     // Closed by the broker's own shutdown
                     Err(mercurio_core::error::Error::MQTTReasonCode(
                         ReasonCode::ServerShuttingDown,
-                    )) => debug!("Connection closed for shutdown"),
-                    Err(err) => error!(cause = ?err, "Connection error"),
+                    )) => debug!(target: CONNECTIONS, "Connection closed for shutdown"),
+                    // Only the broker's own storage failing is its error;
+                    // anything else a client can cause at will
+                    Err(Error::Storage(e)) => {
+                        error!("Storage failed serving {:?}: {}", handler.peer, e)
+                    }
+                    Err(Error::Io(e)) => {
+                        debug!(target: CONNECTIONS, "Connection of {:?} failed: {}", handler.peer, e)
+                    }
+                    Err(err) => warn!(
+                        target: CONNECTIONS,
+                        "Closing the connection of {:?}: {}", handler.peer, err
+                    ),
                     Ok(()) => {}
                 }
             }
-            Err(_) => warn!("No CONNECT received in time, closing connection"),
+            Err(_) => debug!(
+                target: CONNECTIONS,
+                "No CONNECT from {:?} in time, closing", handler.peer
+            ),
+            Ok(Ok(None)) => debug!(
+                target: CONNECTIONS,
+                "{:?} closed the connection before CONNECT", handler.peer
+            ),
+            Ok(Ok(Some(packet))) => warn!(
+                target: CONNECTIONS,
+                "{:?} sent {} before CONNECT, closing",
+                handler.peer,
+                describe(&packet)
+            ),
             Ok(Err(Error::MQTTReasonCode(ReasonCode::UnsupportedProtocolVersion))) => {
+                debug!(
+                    target: CONNECTIONS,
+                    "{:?} asked for an unsupported protocol version", handler.peer
+                );
                 // Answered in the MQTT 3.1.1 format, which every version can
                 // read [MQTT-3.1.2-2]
                 let connack = ConnAckPacket {
@@ -1453,7 +1487,10 @@ impl<St: MqttStore + 'static> Listener<St> {
             Ok(Err(Error::MQTTReasonCode(reason)))
                 if handler.connection.connect_version() == Some(ProtocolVersion::V5) =>
             {
-                warn!("Refusing invalid CONNECT: {:?}", reason);
+                warn!(
+                    target: CONNECTIONS,
+                    "Refusing invalid CONNECT from {:?}: {:?}", handler.peer, reason
+                );
                 let connack = ConnAckPacket {
                     protocol_version: ProtocolVersion::V5,
                     flags: ConnAckFlags {
@@ -1470,7 +1507,14 @@ impl<St: MqttStore + 'static> Listener<St> {
                     .write_packet(ControlPacket::ConnAck(connack))
                     .await;
             }
-            _ => error!("ConnectPacket expectation not met"),
+            Ok(Err(Error::Io(e))) => debug!(
+                target: CONNECTIONS,
+                "Connection of {:?} failed before CONNECT: {}", handler.peer, e
+            ),
+            Ok(Err(e)) => warn!(
+                target: CONNECTIONS,
+                "Refusing invalid CONNECT from {:?}: {}", handler.peer, e
+            ),
         }
         // Boxed: it runs once, at the end, but would take room in this
         // state for the whole connection
