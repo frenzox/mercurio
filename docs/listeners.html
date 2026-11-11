@@ -85,7 +85,7 @@ host = "0.0.0.0"
 port = 8080
 protocol = "websocket"
 http_dir = "/var/www/mercurio"</pre>
-<p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. Paths leaving the directory are refused. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
+<p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. A directory named without its trailing slash is redirected to the slash form, and paths leaving the directory are refused. Files are streamed; each response may take a minute, apart from the connect timeout, and a listener sends 32 at once, answering further requests with 503 Service Unavailable. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
 
 <h2 id="unix">Unix domain sockets</h2>
 <p>For clients on the same machine: no TCP overhead, and access restricted by file permissions.</p>

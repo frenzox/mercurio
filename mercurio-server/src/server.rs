@@ -297,7 +297,9 @@ pub struct ListenerConfig {
     /// being accepted, on top of the broker-wide limit.
     pub max_connections: Option<usize>,
     /// On WebSocket listeners, answer plain HTTP requests with the files of
-    /// this directory.
+    /// this directory. Each response may take a minute, apart from the
+    /// connect timeout, and a listener sends 32 at once at most; requests
+    /// beyond that get Service Unavailable.
     pub http_dir: Option<PathBuf>,
     /// Its clients skip authentication and access control, `$CONTROL` and
     /// every admin command included, as in-process connections do. They also
@@ -431,7 +433,7 @@ struct EndpointSettings {
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
     chain: Option<Chain>,
-    http_dir: Option<Arc<PathBuf>>,
+    http_files: Option<Arc<http::Files>>,
 }
 
 impl Endpoint {
@@ -522,7 +524,7 @@ impl Endpoint {
                     false => config.auth.map(Arc::new),
                 },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
-                http_dir: config.http_dir.map(Arc::new),
+                http_files: config.http_dir.map(|dir| Arc::new(http::Files::new(dir))),
             },
         })
     }
@@ -576,7 +578,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// user name
     cert_identity: Option<String>,
     mount_point: Option<String>,
-    http_dir: Option<Arc<PathBuf>>,
+    http_files: Option<Arc<http::Files>>,
     /// An in-process connection, from the local listener
     local: bool,
     /// When the PROXY header, the TLS and WebSocket handshakes and CONNECT
@@ -676,7 +678,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         self.mount_point = settings.mount_point;
-        self.http_dir = settings.http_dir;
+        self.http_files = settings.http_files;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
         }
@@ -722,17 +724,32 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match transport {
             Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
-                let stream = match self.http_dir.clone() {
-                    Some(dir) => {
-                        let request = Box::pin(http::serve_or_upgrade(stream, &dir));
+                let stream = match self.http_files.clone() {
+                    Some(files) => {
+                        let request = Box::pin(http::read_request(stream));
                         let request =
                             connect_step(&mut self.shutdown, self.connect_deadline, request);
                         let Some(request) = request.await else {
                             return;
                         };
                         match request {
-                            Ok(Ok(Some(upgrade))) => upgrade,
-                            Ok(Ok(None)) => return,
+                            Ok(Ok(http::Request::Upgrade(upgrade))) => upgrade,
+                            Ok(Ok(http::Request::Files(stream, head))) => {
+                                // Its own time: sending a file may take
+                                // longer than connecting does
+                                let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
+                                let response = Box::pin(http::respond(stream, &head, &files));
+                                let response = connect_step(&mut self.shutdown, deadline, response);
+                                return match response.await {
+                                    Some(Ok(Err(e))) => {
+                                        debug!("HTTP response to {:?} failed: {}", peer_addr, e)
+                                    }
+                                    Some(Err(_)) => {
+                                        debug!("HTTP response to {:?} timed out", peer_addr)
+                                    }
+                                    _ => {}
+                                };
+                            }
                             Ok(Err(e)) => {
                                 return warn!("HTTP request from {:?} failed: {}", peer_addr, e)
                             }
@@ -1309,7 +1326,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
-                http_dir: None,
+                http_files: None,
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,
                 address_slots: Arc::clone(&self.address_slots),
