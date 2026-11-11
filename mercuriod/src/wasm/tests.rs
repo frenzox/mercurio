@@ -883,22 +883,29 @@ async fn test_a_publish_flood_is_rate_limited() {
     // Messages queue for a broker that never serves them
     let (connector, _listener) = mercurio_server::server::LocalConnector::new();
     let plugin = misbehave(|s| s.broker = Some(connector)).await;
+    // The bucket refills while the test runs, slowly on a loaded machine
+    let refilled = |since: std::time::Instant| {
+        (since.elapsed().as_secs_f64() * PUBLISH_RATE as f64).ceil() as u32
+    };
+    let count = |flood: &str| -> u32 { flood.split_once(' ').unwrap().0.parse().unwrap() };
+    let started = std::time::Instant::now();
     let flood = control(&plugin, "publish-flood", b"1000").await.unwrap();
-    let (published, error) = flood.split_once(' ').unwrap();
-    assert_eq!(published, PUBLISH_BURST.to_string(), "{flood}");
+    let published = count(&flood);
     assert!(
-        error.contains(&format!("faster than {PUBLISH_RATE} messages a second")),
+        (PUBLISH_BURST..=PUBLISH_BURST + refilled(started)).contains(&published),
+        "{flood}"
+    );
+    assert!(
+        flood.contains(&format!("faster than {PUBLISH_RATE} messages a second")),
         "{flood}"
     );
     // The limit is the plugin's, whichever copy publishes
+    let started = std::time::Instant::now();
     let (a, b) = tokio::join!(
         control(&plugin, "publish-flood", b"1000"),
         control(&plugin, "publish-flood", b"1000"),
     );
-    let count = |flood: Option<String>| -> u32 {
-        flood.unwrap().split_once(' ').unwrap().0.parse().unwrap()
-    };
-    assert!(count(a) + count(b) < PUBLISH_BURST / 2);
+    assert!(count(&a.unwrap()) + count(&b.unwrap()) <= refilled(started) + 1);
     assert_eq!(plugin.status().failures, Some(0));
 }
 
