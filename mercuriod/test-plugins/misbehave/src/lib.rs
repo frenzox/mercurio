@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use mercurio_plugin::{export_plugin, host, AuthResult, ClientInfo, Hooks, Plugin, Registration};
+use mercurio_plugin::{
+    export_plugin, host, AuthResult, ClientInfo, Decision, Hooks, Plugin, Registration, Success,
+};
 use wasip2::{
     http::{
         outgoing_handler,
@@ -23,24 +25,36 @@ impl Plugin for Misbehave {
             std::thread::sleep(Duration::from_millis(ms));
         }
         Ok(Registration {
-            hooks: Hooks::ON_CONTROL,
+            hooks: Hooks::ON_CONTROL | Hooks::AUTHORIZE_CONTROL,
             auth_methods: vec!["WHO".into()],
         })
     }
 
-    /// Succeeds as the client it was asked about.
+    /// Succeeds as the client it was asked about, sending the data it got.
     fn auth_step(
         client: ClientInfo,
         _method: String,
         _state: Option<Vec<u8>>,
-        _data: Option<Vec<u8>>,
+        data: Option<Vec<u8>>,
     ) -> AuthResult {
-        AuthResult::Success(Some(format!("{} {:?}", client.client_id, client.username)))
+        AuthResult::Success(Success {
+            username: Some(format!("{} {:?}", client.client_id, client.username)),
+            data,
+        })
     }
 
-    fn on_control(_client: ClientInfo, path: String, payload: Vec<u8>) -> Option<Vec<u8>> {
+    /// Lets user `admin` administer, and leaves everyone else to the chain.
+    fn authorize_control(client: ClientInfo, _topic: String) -> Decision {
+        match client.username.as_deref() {
+            Some("admin") => Decision::Allow,
+            _ => Decision::Defer,
+        }
+    }
+
+    fn on_control(client: ClientInfo, path: String, payload: Vec<u8>) -> Option<Vec<u8>> {
         let text = String::from_utf8_lossy(&payload).into_owned();
         match path.as_str() {
+            "client" => Some(format!("{client:?}").into_bytes()),
             "panic" => panic!("misbehaving on purpose: {text}"),
             "spin" => loop {
                 std::hint::spin_loop()

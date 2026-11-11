@@ -367,6 +367,43 @@ fn loggable(message: String) -> String {
 
 impl super::runtime::bindings::mercurio::plugin::types::Host for State {}
 
+impl super::runtime::bindings_0_1::mercurio::plugin::types::Host for State {}
+
+/// Interface 0.1's host functions, the same as the current ones.
+impl super::runtime::bindings_0_1::mercurio::plugin::host::Host for State {
+    async fn log(
+        &mut self,
+        level: super::runtime::bindings_0_1::mercurio::plugin::types::Level,
+        message: String,
+    ) {
+        use super::runtime::bindings_0_1::mercurio::plugin::types::Level as Old;
+        let level = match level {
+            Old::Trace => Level::Trace,
+            Old::Debug => Level::Debug,
+            Old::Info => Level::Info,
+            Old::Warn => Level::Warn,
+            Old::Error => Level::Error,
+        };
+        host::Host::log(self, level, message).await;
+    }
+
+    async fn kv_get(&mut self, key: String) -> Option<Vec<u8>> {
+        self.kv.get(&key)
+    }
+
+    async fn kv_set(&mut self, key: String, value: Vec<u8>) -> Result<(), String> {
+        self.kv.set(key, value)
+    }
+
+    async fn kv_delete(&mut self, key: String) {
+        self.kv.delete(&key);
+    }
+
+    async fn kv_list(&mut self, prefix: String) -> Vec<String> {
+        self.kv.list(&prefix)
+    }
+}
+
 impl host::Host for State {
     async fn log(&mut self, level: Level, message: String) {
         let name = &self.name;

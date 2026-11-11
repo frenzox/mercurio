@@ -16,8 +16,8 @@ pub mod bindings {
 pub use bindings::exports::mercurio::plugin::guest::Guest;
 pub use bindings::mercurio::plugin::host;
 pub use bindings::mercurio::plugin::types::{
-    Access, AuthResult, Challenge, ClientInfo, Decision, Disconnected, Event, Hooks, Level,
-    Message, MessageAction, Qos, Registration, Subscribed, Unsubscribed,
+    Access, AuthResult, Challenge, ClientInfo, Connection, Decision, Disconnected, Event, Hooks,
+    Level, Message, MessageAction, Qos, Registration, Subscribed, Success, Unsubscribed,
 };
 
 /// A broker plugin. Every hook but `init` has a default that does nothing;
@@ -59,6 +59,11 @@ pub trait Plugin {
     /// to assign one. On re-authentication they are the client identifier
     /// and the verified user.
     ///
+    /// [`AuthResult::Success`] accepts the client as the user it names, if
+    /// any, and sends its `data`, if any, such as SCRAM's final server
+    /// message, to the client with the CONNACK or the AUTH that ends a
+    /// re-authentication.
+    ///
     /// The default fails with reason code 0x8C, Bad Authentication Method.
     fn auth_step(
         _client: ClientInfo,
@@ -77,8 +82,24 @@ pub trait Plugin {
     /// next plugin.
     ///
     /// Publishing to `$CONTROL/...`, which administers the broker, isn't
-    /// asked here: a WebAssembly plugin can't grant it.
+    /// asked here but in [`Plugin::authorize_control`].
     fn authorize(_client: ClientInfo, _topic: String, _access: Access) -> Decision {
+        Decision::Defer
+    }
+
+    /// Whether `client` may publish to `topic`, a `$CONTROL/...` topic,
+    /// which administers the broker or a plugin. Called when the plugin
+    /// registered [`Hooks::AUTHORIZE_CONTROL`]. A request to
+    /// `$CONTROL/broker/v1` is asked about twice: for that topic, then for
+    /// each of its commands as `$CONTROL/broker/v1/<command>`.
+    ///
+    /// The first plugin to answer [`Decision::Allow`] or [`Decision::Deny`]
+    /// decides. When every plugin answers [`Decision::Defer`], the default,
+    /// the client is refused, so a plugin that allows every topic in
+    /// [`Plugin::authorize`] doesn't make every client an administrator.
+    /// Receiving and subscribing to `$CONTROL` topics go through
+    /// `authorize`, as responses go only to the client that asked.
+    fn authorize_control(_client: ClientInfo, _topic: String) -> Decision {
         Decision::Defer
     }
 
@@ -173,6 +194,12 @@ macro_rules! export_plugin {
                     access: $crate::Access,
                 ) -> $crate::Decision {
                     <$plugin as $crate::Plugin>::authorize(client, topic, access)
+                }
+                fn authorize_control(
+                    client: $crate::ClientInfo,
+                    topic: ::std::string::String,
+                ) -> $crate::Decision {
+                    <$plugin as $crate::Plugin>::authorize_control(client, topic)
                 }
                 fn on_message(
                     client: $crate::ClientInfo,

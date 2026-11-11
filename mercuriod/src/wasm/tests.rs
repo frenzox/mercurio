@@ -505,7 +505,11 @@ async fn test_status_reports_hooks_copies_and_failures() {
     let status = plugin.status();
     assert_eq!(status.name, "misbehave");
     assert_eq!(status.kind, PluginKind::Wasm);
-    assert_eq!(status.hooks, ["begin_auth", "on_control"]);
+    assert_eq!(
+        status.hooks,
+        ["begin_auth", "authorize_control", "on_control"]
+    );
+    assert_eq!(status.interface.as_deref(), Some("0.2.0"));
     assert_eq!(status.instances, Some(1));
     assert_eq!(status.failures, Some(0));
     assert_eq!(status.last_error, None);
@@ -559,6 +563,7 @@ async fn test_list_plugins_shows_wasm_plugins() {
     let json = serde_json::to_value(status).unwrap();
     assert_eq!(json["kind"], "wasm");
     assert_eq!(json["instances"], 1);
+    assert_eq!(json["interface"], "0.2.0");
     assert!(json.get("lastError").is_none(), "{json}");
 }
 
@@ -575,4 +580,143 @@ async fn test_a_call_the_broker_cancels_counts_as_a_failure() {
     assert!(last_error.contains("on_control"), "{last_error}");
     assert!(last_error.contains("plugin_timeout"), "{last_error}");
     assert_eq!(control(&plugin, "kv-count", b"").await.unwrap(), "1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_plugin_built_for_0_1_still_loads() {
+    use mercurio_core::{message::MessageProperties, qos::QoS};
+    use mercurio_server::plugin::{AuthResult, MessageAction, PluginMessage};
+
+    let plugin = WasmPlugin::load(&Runtime::new().unwrap(), settings("interface-0-1", &[]))
+        .await
+        .unwrap();
+    let status = plugin.status();
+    assert_eq!(status.interface.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        status.hooks,
+        ["begin_auth", "authorize", "on_message", "on_control"]
+    );
+
+    let client = connected("old", None);
+    assert_eq!(
+        plugin.authorize(&client, "old/x", Access::Write).await,
+        Decision::Deny
+    );
+    assert_eq!(
+        plugin.authorize(&client, "old/x", Access::Read).await,
+        Decision::Defer
+    );
+    assert_eq!(
+        plugin.authorize_control(&client, "$CONTROL/broker/v1").await,
+        Decision::Defer
+    );
+
+    let mut exchange = plugin.begin_auth(&client, "OLD").unwrap();
+    assert_eq!(
+        exchange.step(None).await,
+        AuthResult::Success {
+            username: Some("old".into()),
+            data: None,
+        }
+    );
+
+    let mut message = PluginMessage::new(
+        "t",
+        bytes::Bytes::from_static(b"m"),
+        QoS::AtLeastOnce,
+        false,
+        MessageProperties::default(),
+    );
+    assert_eq!(
+        plugin.on_message(&client, &mut message).await,
+        MessageAction::Continue
+    );
+    let tag = &message.properties.user_property.unwrap()[0];
+    assert_eq!((tag.key.as_str(), tag.value.as_str()), ("seen-by", "old"));
+
+    assert_eq!(control(&plugin, "kv", b"stored").await.unwrap(), "stored");
+
+    // 0.1 knows nothing of the connection
+    let seen = control_as(&plugin, &client, "client").await.unwrap();
+    assert!(seen.contains(r#"client-id: "old""#), "{seen}");
+    assert!(!seen.contains("connection"), "{seen}");
+}
+
+/// A client on a TLS listener, as hooks see it once it connected.
+fn connected(client_id: &str, username: Option<&str>) -> ClientInfo {
+    use mercurio_core::protocol::ProtocolVersion;
+    use mercurio_server::plugin::ConnectionInfo;
+
+    let mut connection = ConnectionInfo::new("0.0.0.0:8883", ProtocolVersion::V3_1_1);
+    connection.tls = true;
+    connection.certificate = Some("device-7".into());
+    connection.mount_point = Some("tenant/".into());
+    let mut client = ClientInfo::new(client_id, username.map(Into::into));
+    client.peer = Some("10.0.0.1:5555".parse().unwrap());
+    client.connection = Some(std::sync::Arc::new(connection));
+    client
+}
+
+async fn control_as(plugin: &WasmPlugin, client: &ClientInfo, path: &str) -> Option<String> {
+    plugin
+        .on_control(client, path, bytes::Bytes::new())
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_plugins_see_the_connection() {
+    let plugin = misbehave(|_| ()).await;
+    let seen = control_as(&plugin, &connected("c", Some("u")), "client")
+        .await
+        .unwrap();
+    for part in [
+        r#"listener: "0.0.0.0:8883""#,
+        "protocol-version: 4",
+        "tls: true",
+        r#"certificate: Some("device-7")"#,
+        r#"mount-point: Some("tenant/")"#,
+        r#"peer: Some("10.0.0.1:5555")"#,
+    ] {
+        assert!(seen.contains(part), "{part} in {seen}");
+    }
+    let seen = control_as(&plugin, &ClientInfo::new("c", None), "client")
+        .await
+        .unwrap();
+    assert!(seen.contains("connection: None"), "{seen}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_plugins_can_grant_control() {
+    let plugin = misbehave(|_| ()).await;
+    let topic = "$CONTROL/broker/v1";
+    assert_eq!(
+        plugin
+            .authorize_control(&connected("c", Some("admin")), topic)
+            .await,
+        Decision::Allow
+    );
+    assert_eq!(
+        plugin
+            .authorize_control(&connected("c", Some("bob")), topic)
+            .await,
+        Decision::Defer
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_authentication_success_sends_final_data() {
+    use mercurio_server::plugin::AuthResult;
+
+    let plugin = misbehave(|_| ()).await;
+    let client = connected("c", None);
+    let mut exchange = plugin.begin_auth(&client, "WHO").unwrap();
+    let data = bytes::Bytes::from_static(b"server-final");
+    assert_eq!(
+        exchange.step(Some(&data)).await,
+        AuthResult::Success {
+            username: Some(r#"c None"#.into()),
+            data: Some(data),
+        }
+    );
 }

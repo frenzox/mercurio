@@ -2,6 +2,7 @@
 //! sandbox and adapted to the server's plugin chain.
 
 mod convert;
+mod guest;
 mod pool;
 mod runtime;
 mod sandbox;
@@ -25,9 +26,13 @@ use wasmtime::component::Component;
 
 use crate::reload::Reload;
 use pool::{Health, Pool};
-use runtime::bindings::{
-    self,
-    mercurio::plugin::types::{self as wit, Hooks},
+use guest::Pre;
+use runtime::{
+    bindings::{
+        self,
+        mercurio::plugin::types::{self as wit, Hooks},
+    },
+    bindings_0_1,
 };
 pub use runtime::Runtime;
 use sandbox::{Allowed, Kv, State};
@@ -35,9 +40,10 @@ use sandbox::{Allowed, Kv, State};
 /// The export a plugin implements, before its version.
 const INTERFACE: &str = "mercurio:plugin/guest@";
 
-/// The interface versions a plugin may be built for: wasmtime matches any
-/// patch release of a 0.x minor to the version the bindings name.
-const VERSION: &str = "0.1";
+/// The interface versions a plugin may be built for, oldest first:
+/// wasmtime matches any patch release of a 0.x minor to the version the
+/// bindings name.
+const VERSIONS: [&str; 2] = ["0.1", "0.2"];
 
 /// How to load and confine one plugin.
 pub struct PluginSettings {
@@ -70,6 +76,8 @@ pub struct WasmPlugin {
 
 struct Loaded {
     pool: Pool,
+    /// The interface version the plugin was built for, such as `0.2.0`
+    interface: String,
     hooks: Hooks,
     auth_methods: Vec<String>,
 }
@@ -171,11 +179,14 @@ impl Loaded {
         })
         .await??;
         let path = &settings.path;
-        check_version(runtime, &component, path)?;
+        let (interface, minor) = check_version(runtime, &component, path)?;
         let pre = runtime
             .linker
             .instantiate_pre(&component)
-            .and_then(bindings::PluginPre::new)
+            .and_then(|pre| match minor {
+                "0.1" => bindings_0_1::PluginPre::new(pre).map(Pre::V0_1),
+                _ => bindings::PluginPre::new(pre).map(Pre::V0_2),
+            })
             .map_err(anyhow::Error::from)
             .with_context(|| format!("linking {}", path.display()))?;
         let allowed = Allowed::parse(&settings.allow_http, &settings.allow_sockets)?;
@@ -198,6 +209,7 @@ impl Loaded {
         pool.put(instance);
         Ok(Loaded {
             pool,
+            interface,
             hooks: registration.hooks,
             auth_methods: registration.auth_methods,
         })
@@ -205,8 +217,13 @@ impl Loaded {
 }
 
 /// Refuses a component that doesn't export the plugin interface, or
-/// exports a version of it this broker can't call.
-fn check_version(runtime: &Runtime, component: &Component, path: &Path) -> anyhow::Result<()> {
+/// exports a version of it this broker can't call. Returns the version it
+/// exports and the one of [`VERSIONS`] that matches it.
+fn check_version(
+    runtime: &Runtime,
+    component: &Component,
+    path: &Path,
+) -> anyhow::Result<(String, &'static str)> {
     let names: Vec<String> = component
         .component_type()
         .exports(&runtime.engine)
@@ -223,21 +240,25 @@ fn check_version(runtime: &Runtime, component: &Component, path: &Path) -> anyho
             }
         );
     };
-    anyhow::ensure!(
-        compatible(version),
-        "{path}: built for {INTERFACE}{version}, this broker supports {VERSION}"
-    );
-    Ok(())
+    let Some(minor) = compatible(version) else {
+        anyhow::bail!(
+            "{path}: built for {INTERFACE}{version}, this broker supports {}",
+            VERSIONS.join(" and ")
+        );
+    };
+    Ok((version.to_string(), minor))
 }
 
-/// Whether wasmtime's export lookup matches `version` to the interface
-/// this broker was built with: any patch release of the same 0.x minor,
-/// with no pre-release or build suffix.
-fn compatible(version: &str) -> bool {
-    version
-        .strip_prefix(VERSION)
-        .and_then(|patch| patch.strip_prefix('.'))
-        .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
+/// The interface of [`VERSIONS`] wasmtime's export lookup matches
+/// `version` to: any patch release of the same 0.x minor, with no
+/// pre-release or build suffix.
+fn compatible(version: &str) -> Option<&'static str> {
+    VERSIONS.into_iter().find(|minor| {
+        version
+            .strip_prefix(minor)
+            .and_then(|patch| patch.strip_prefix('.'))
+            .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 impl Plugin for WasmPlugin {
@@ -252,6 +273,7 @@ impl Plugin for WasmPlugin {
             (has(Hooks::AUTHENTICATE), "authenticate"),
             (!loaded.auth_methods.is_empty(), "begin_auth"),
             (has(Hooks::AUTHORIZE), "authorize"),
+            (has(Hooks::AUTHORIZE_CONTROL), "authorize_control"),
             (has(Hooks::ON_MESSAGE), "on_message"),
             (has(Hooks::ON_EVENT), "on_event"),
             (has(Hooks::ON_TICK), "on_tick"),
@@ -264,6 +286,7 @@ impl Plugin for WasmPlugin {
         status.instances = Some(loaded.pool.live());
         status.failures = Some(self.health.failures());
         status.last_error = self.health.last_error();
+        status.interface = Some(loaded.interface.clone());
         status
     }
 
@@ -286,7 +309,7 @@ impl Plugin for WasmPlugin {
                 .call("authenticate", move |i| {
                     Box::pin(async move {
                         i.guest
-                            .call_authenticate(&mut i.store, &client, &username, &password)
+                            .authenticate(&mut i.store, &client, &username, &password)
                             .await
                     })
                 })
@@ -329,7 +352,32 @@ impl Plugin for WasmPlugin {
                 .call("authorize", move |i| {
                     Box::pin(async move {
                         i.guest
-                            .call_authorize(&mut i.store, &client, &topic, access)
+                            .authorize(&mut i.store, &client, &topic, access)
+                            .await
+                    })
+                })
+                .await
+                .map_or(Decision::Deny, convert::decision)
+        })
+    }
+
+    fn authorize_control<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        topic: &'a str,
+    ) -> BoxFuture<'a, Decision> {
+        let Some(loaded) = self.with(Hooks::AUTHORIZE_CONTROL) else {
+            return ready(Decision::Defer);
+        };
+        let client = convert::client(client);
+        let topic = topic.to_string();
+        Box::pin(async move {
+            loaded
+                .pool
+                .call("authorize_control", move |i| {
+                    Box::pin(async move {
+                        i.guest
+                            .authorize_control(&mut i.store, &client, &topic)
                             .await
                     })
                 })
@@ -354,7 +402,7 @@ impl Plugin for WasmPlugin {
                 .call("on_message", move |i| {
                     Box::pin(async move {
                         i.guest
-                            .call_on_message(&mut i.store, &client, &converted)
+                            .on_message(&mut i.store, &client, &converted)
                             .await
                     })
                 })
@@ -381,7 +429,7 @@ impl Plugin for WasmPlugin {
             loaded
                 .pool
                 .call("on_event", move |i| {
-                    Box::pin(async move { i.guest.call_on_event(&mut i.store, &event).await })
+                    Box::pin(async move { i.guest.on_event(&mut i.store, &event).await })
                 })
                 .await;
         })
@@ -395,7 +443,7 @@ impl Plugin for WasmPlugin {
             loaded
                 .pool
                 .call("on_tick", |i| {
-                    Box::pin(async move { i.guest.call_on_tick(&mut i.store).await })
+                    Box::pin(async move { i.guest.on_tick(&mut i.store).await })
                 })
                 .await;
         })
@@ -418,7 +466,7 @@ impl Plugin for WasmPlugin {
                 .call("on_control", move |i| {
                     Box::pin(async move {
                         i.guest
-                            .call_on_control(&mut i.store, &client, &path, &payload)
+                            .on_control(&mut i.store, &client, &path, &payload)
                             .await
                     })
                 })
@@ -451,7 +499,7 @@ impl AuthExchange for WasmAuth {
                 .call("enhanced authentication", move |i| {
                     Box::pin(async move {
                         i.guest
-                            .call_auth_step(
+                            .auth_step(
                                 &mut i.store,
                                 &client,
                                 &method,
@@ -477,12 +525,15 @@ mod version_tests {
     use super::compatible;
 
     #[test]
-    fn test_patch_releases_of_the_minor_are_compatible() {
-        assert!(compatible("0.1.0"));
-        assert!(compatible("0.1.7"));
-        assert!(!compatible("0.2.0"));
-        assert!(!compatible("0.10.0"));
-        assert!(!compatible("0.1.0-rc1"));
-        assert!(!compatible("0.1"));
+    fn test_patch_releases_of_a_known_minor_are_compatible() {
+        assert_eq!(compatible("0.1.0"), Some("0.1"));
+        assert_eq!(compatible("0.1.7"), Some("0.1"));
+        assert_eq!(compatible("0.2.0"), Some("0.2"));
+        assert_eq!(compatible("0.2.3"), Some("0.2"));
+        assert_eq!(compatible("0.3.0"), None);
+        assert_eq!(compatible("0.10.0"), None);
+        assert_eq!(compatible("0.1.0-rc1"), None);
+        assert_eq!(compatible("0.1"), None);
+        assert_eq!(compatible("0.20.0"), None);
     }
 }
