@@ -361,10 +361,10 @@ impl ConnectOptions {
     pub(crate) fn check(&self) -> crate::error::Result<()> {
         #[cfg(unix)]
         if self.unix_path.is_some() && self.tls.enabled {
-            return Err(ClientError::Tls(
+            return Err(ClientError::tls(
                 "TLS isn't supported over a Unix socket; a CA path, a client \
-                 certificate or skipping verification turns it on"
-                    .to_string(),
+                 certificate or skipping verification turns it on",
+                None,
             ));
         }
         if let Some(client_id) = &self.client_id {
@@ -720,12 +720,12 @@ mod tests {
     #[test]
     fn test_tls_is_refused_over_unix_sockets() {
         let options = ConnectOptions::unix("/run/mercurio/admin.sock").tls(true);
-        assert!(matches!(options.check(), Err(ClientError::Tls(_))));
+        assert!(matches!(options.check(), Err(ClientError::Tls { .. })));
         let options = ConnectOptions::unix("/run/mercurio/admin.sock").ca_path("ca.pem");
-        let Err(ClientError::Tls(message)) = options.check() else {
+        let Err(error @ ClientError::Tls { .. }) = options.check() else {
             panic!("a CA path over a Unix socket was accepted");
         };
-        assert!(message.contains("CA"), "{message}");
+        assert!(error.to_string().contains("CA"), "{error}");
         assert!(ConnectOptions::unix("/run/mercurio/admin.sock")
             .check()
             .is_ok());

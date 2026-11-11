@@ -9,9 +9,10 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
 
     /// The connection couldn't be opened, or the broker closed it before
-    /// answering CONNECT.
+    /// answering CONNECT. The I/O error says why, as its
+    /// [`kind`](std::io::Error::kind) does to a program.
     #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
+    ConnectionFailed(#[source] std::io::Error),
 
     /// The broker answered CONNECT with this failure, such as bad
     /// credentials. Reconnecting retries after Server Unavailable, Server
@@ -83,14 +84,152 @@ pub enum ClientError {
     #[error("Client disconnected")]
     Disconnected,
 
-    /// The client has stopped for good, so the request couldn't be sent.
-    #[error("Send error")]
-    SendError,
+    /// The client has stopped for good, after
+    /// [`disconnect`](crate::MqttClient::disconnect) or after giving up on
+    /// reconnecting, so the request couldn't be sent.
+    #[error("The client has stopped")]
+    Closed,
 
-    /// The TLS configuration couldn't be used, or the handshake failed.
-    #[error("TLS error: {0}")]
-    Tls(String),
+    /// The TLS configuration couldn't be used, or the broker's certificate
+    /// or TLS settings were refused during the handshake. `source` holds
+    /// the underlying error, such as the I/O error reading a file or the
+    /// [`rustls::Error`] of the handshake, when there is one.
+    #[error("TLS error: {context}{}", cause(.source))]
+    #[non_exhaustive]
+    Tls {
+        /// What the client was doing
+        context: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+}
+
+impl ClientError {
+    /// Whether trying again later may succeed: the connection failed or
+    /// ended, or the broker refused it for want of capacity (Server
+    /// Unavailable, Server Busy, Quota Exceeded, Connection Rate
+    /// Exceeded). Invalid requests, refused credentials, a redirection, TLS
+    /// configuration and certificate errors and a stopped client aren't
+    /// transient: repeating the same request meets the same answer.
+    ///
+    /// Reconnection uses the same classification for CONNACK refusals: it
+    /// keeps trying after a transient one and stops after any other.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ClientError::Io(_)
+            | ClientError::ConnectionFailed(_)
+            | ClientError::Timeout
+            | ClientError::Disconnected
+            | ClientError::BrokerViolation(_)
+            | ClientError::Protocol(_)
+            | ClientError::Packet(_) => true,
+            ClientError::ConnectionRefused(reason) => transient_refusal(*reason),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn tls(
+        context: impl Into<String>,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        ClientError::Tls {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+/// Whether a broker refusing CONNECT with `reason` may take the client
+/// later, the refusal being for want of capacity.
+pub(crate) fn transient_refusal(reason: ReasonCode) -> bool {
+    matches!(
+        reason,
+        ReasonCode::ServerUnavailable
+            | ReasonCode::ServerBusy
+            | ReasonCode::QuotaExceeded
+            | ReasonCode::ConnectionRateExceeded
+    )
+}
+
+fn cause(source: &Option<Box<dyn std::error::Error + Send + Sync>>) -> String {
+    source
+        .as_ref()
+        .map_or_else(String::new, |source| format!(": {source}"))
 }
 
 /// The client's result type.
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn failures_of_the_connection_are_transient() {
+        for error in [
+            ClientError::ConnectionFailed(io::ErrorKind::ConnectionRefused.into()),
+            ClientError::Io(io::ErrorKind::BrokenPipe.into()),
+            ClientError::Timeout,
+            ClientError::Disconnected,
+            ClientError::BrokerViolation(ReasonCode::ProtocolError),
+        ] {
+            assert!(error.is_transient(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn refusals_for_want_of_capacity_are_transient() {
+        for reason in [
+            ReasonCode::ServerUnavailable,
+            ReasonCode::ServerBusy,
+            ReasonCode::QuotaExceeded,
+            ReasonCode::ConnectionRateExceeded,
+        ] {
+            assert!(ClientError::ConnectionRefused(reason).is_transient());
+        }
+        for reason in [
+            ReasonCode::NotAuthorized,
+            ReasonCode::BadUserNameOrPassword,
+            ReasonCode::Banned,
+            ReasonCode::UnsupportedProtocolVersion,
+        ] {
+            assert!(!ClientError::ConnectionRefused(reason).is_transient());
+        }
+    }
+
+    #[test]
+    fn mistakes_and_refusals_for_good_are_not_transient() {
+        for error in [
+            ClientError::Closed,
+            ClientError::InvalidArgument("x".into()),
+            ClientError::TooLong("topic"),
+            ClientError::PacketTooLarge,
+            ClientError::NotSupported("retained messages"),
+            ClientError::PublishRefused(ReasonCode::NotAuthorized),
+            ClientError::AuthenticationFailed("bad proof".into()),
+            ClientError::Redirected {
+                reason: ReasonCode::ServerMoved,
+                server_reference: "other".into(),
+            },
+            ClientError::tls("no certificates", None),
+        ] {
+            assert!(!error.is_transient(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn tls_errors_keep_their_source() {
+        let error = ClientError::tls(
+            "reading the CA file",
+            Some(io::Error::from(io::ErrorKind::NotFound).into()),
+        );
+        let source = std::error::Error::source(&error).expect("a source");
+        assert_eq!(
+            source.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound)
+        );
+        assert!(error.to_string().contains("reading the CA file"), "{error}");
+    }
+}

@@ -37,7 +37,7 @@ use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::connection::Connection;
-use crate::error::{ClientError, Result};
+use crate::error::{transient_refusal, ClientError, Result};
 use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
 use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
@@ -105,8 +105,7 @@ impl MqttClient {
     /// Opens the transport and performs the CONNECT handshake.
     async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
         if let Some(connector) = &options.connector {
-            let stream =
-                (connector.0)().map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+            let stream = (connector.0)().map_err(ClientError::ConnectionFailed)?;
             let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
@@ -119,7 +118,7 @@ impl MqttClient {
             let stream = timeout(connect_timeout, tokio::net::UnixStream::connect(path))
                 .await
                 .map_err(|_| ClientError::Timeout)?
-                .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+                .map_err(ClientError::ConnectionFailed)?;
             let mut connection = Connection::new(stream, options);
             let session = Self::perform_connect(&mut connection, options).await?;
             return Ok((connection, session));
@@ -131,7 +130,7 @@ impl MqttClient {
         let stream = timeout(connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| ClientError::Timeout)?
-            .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+            .map_err(ClientError::ConnectionFailed)?;
 
         let mut connection = if options.tls.enabled {
             info!("Establishing TLS connection");
@@ -139,7 +138,7 @@ impl MqttClient {
             let tls_stream = timeout(connect_timeout, connector.connect(server_name, stream))
                 .await
                 .map_err(|_| ClientError::Timeout)?
-                .map_err(|e| ClientError::Tls(format!("TLS handshake failed: {}", e)))?;
+                .map_err(handshake_error)?;
             Connection::new(tls_stream, options)
         } else {
             Connection::new(stream, options)
@@ -164,7 +163,12 @@ impl MqttClient {
             let packet = timeout(options.connect_timeout, connection.read_packet())
                 .await
                 .map_err(|_| ClientError::Timeout)??
-                .ok_or_else(|| ClientError::ConnectionFailed("Connection closed".into()))?;
+                .ok_or_else(|| {
+                    ClientError::ConnectionFailed(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the broker closed the connection before answering CONNECT",
+                    ))
+                })?;
             let ControlPacket::Auth(auth) = packet else {
                 break packet;
             };
@@ -468,7 +472,7 @@ impl MqttClient {
                 response: response_tx,
             }))
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
         Ok(PendingPublish(response_rx))
     }
 
@@ -509,7 +513,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -525,7 +529,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -540,7 +544,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -555,7 +559,7 @@ impl MqttClient {
         self.command_tx
             .send(Command::Ack(token))
             .await
-            .map_err(|_| ClientError::SendError)
+            .map_err(|_| ClientError::Closed)
     }
 
     /// Disconnect from the broker gracefully.
@@ -566,7 +570,7 @@ impl MqttClient {
                 response: response_tx,
             })
             .await
-            .map_err(|_| ClientError::SendError)?;
+            .map_err(|_| ClientError::Closed)?;
 
         response_rx.await.map_err(|_| ClientError::Disconnected)?
     }
@@ -685,14 +689,18 @@ fn should_reconnect(reason: &DisconnectReason) -> bool {
 fn refused_for_good(error: &ClientError) -> bool {
     match error {
         ClientError::Redirected { .. } => true,
-        ClientError::ConnectionRefused(reason) => !matches!(
-            reason,
-            ReasonCode::ServerUnavailable
-                | ReasonCode::ServerBusy
-                | ReasonCode::QuotaExceeded
-                | ReasonCode::ConnectionRateExceeded
-        ),
+        ClientError::ConnectionRefused(reason) => !transient_refusal(*reason),
         _ => false,
+    }
+}
+
+/// A TLS handshake that failed over the certificate or the TLS settings,
+/// which rustls reports as invalid data, or over the connection itself.
+fn handshake_error(error: std::io::Error) -> ClientError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        ClientError::tls("TLS handshake failed", Some(error.into()))
+    } else {
+        ClientError::ConnectionFailed(error)
     }
 }
 
@@ -991,7 +999,7 @@ impl EventLoop {
     /// Starts re-authenticating [MQTT-4.12.1-1].
     async fn reauthenticate(&mut self, response: oneshot::Sender<Result<()>>) {
         let Some(authenticator) = &self.authenticator else {
-            let _ = response.send(Err(ClientError::Protocol(
+            let _ = response.send(Err(ClientError::InvalidArgument(
                 "no authenticator configured".into(),
             )));
             return;

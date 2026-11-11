@@ -16,7 +16,7 @@ pub fn build_tls_connector(
     host: &str,
 ) -> Result<(TlsConnector, ServerName<'static>), ClientError> {
     let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| ClientError::Tls(format!("Invalid server name: {}", host)))?;
+        .map_err(|e| ClientError::tls(format!("invalid server name `{host}`"), Some(e.into())))?;
 
     let builder = if options.danger_skip_verify {
         // WARNING: This disables all certificate verification - only for testing!
@@ -30,7 +30,7 @@ pub fn build_tls_connector(
         for cert in ca_certs {
             root_store
                 .add(cert)
-                .map_err(|e| ClientError::Tls(format!("Failed to add CA cert: {}", e)))?;
+                .map_err(|e| ClientError::tls("invalid CA certificate", Some(e.into())))?;
         }
         config_builder().with_root_certificates(root_store)
     } else {
@@ -43,16 +43,17 @@ pub fn build_tls_connector(
     let config = match (&options.cert_path, &options.key_path) {
         (Some(cert_path), Some(key_path)) => {
             let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {
-                ClientError::Tls(format!("Failed to read key from '{}': {}", key_path, e))
+                ClientError::tls(format!("reading the key in '{key_path}'"), Some(e.into()))
             })?;
             builder
                 .with_client_auth_cert(load_certs(cert_path)?, key)
-                .map_err(|e| ClientError::Tls(format!("Invalid client certificate: {}", e)))?
+                .map_err(|e| ClientError::tls("invalid client certificate", Some(e.into())))?
         }
         (None, None) => builder.with_no_client_auth(),
         _ => {
-            return Err(ClientError::Tls(
-                "A client certificate needs both a certificate and a key".to_string(),
+            return Err(ClientError::tls(
+                "a client certificate needs both a certificate and a key",
+                None,
             ))
         }
     };
@@ -72,13 +73,18 @@ fn config_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, ClientError> {
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| ClientError::Tls(format!("Failed to read certs from '{}': {}", path, e)))?;
+        .map_err(|e| {
+            ClientError::tls(
+                format!("reading the certificates in '{path}'"),
+                Some(e.into()),
+            )
+        })?;
 
     if certs.is_empty() {
-        return Err(ClientError::Tls(format!(
-            "No certificates found in '{}'",
-            path
-        )));
+        return Err(ClientError::tls(
+            format!("no certificates in '{path}'"),
+            None,
+        ));
     }
 
     Ok(certs)
