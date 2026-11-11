@@ -13,7 +13,7 @@ async fn start_broker(tls: Option<mercurio_server::tls::TlsConfig>) -> SocketAdd
     let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = websocket_listener.local_addr().unwrap();
     let mut websocket = ListenerConfig::new(websocket_listener, Transport::WebSocket);
-    websocket.tls = tls;
+    websocket.tls = tls.map(|tls| mercurio_server::tls::Tls::new(tls).unwrap());
     let mut config = ServerConfig::default();
     config.listeners = vec![websocket];
     tokio::spawn(mercurio_server::server::run_with_config(

@@ -111,7 +111,7 @@ impl TlsConfig {
         // Named rather than taken from the process default, which rustls
         // can't pick when other crates enable a second provider
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
+        let config = ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(versions)
             .map_err(|e| ServerError::Tls(format!("Unsupported TLS versions: {}", e)))?;
 
@@ -124,7 +124,10 @@ impl TlsConfig {
                     .add(cert)
                     .map_err(|e| ServerError::Tls(format!("Failed to add CA cert: {}", e)))?;
             }
-            let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+            let mut verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(root_store),
+                provider,
+            );
             if let Some(crl_path) = &self.crl_path {
                 verifier = verifier.with_crls(load_crls(crl_path)?);
             }
