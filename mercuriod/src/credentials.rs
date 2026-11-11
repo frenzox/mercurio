@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use mercurio_server::plugin::{BoxFuture, ClientInfo, Credentials, Decision, Plugin};
+use mercurio_server::plugin::{
+    BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
+};
 
 /// Credential validator that supports argon2 password hashes.
 ///
@@ -50,6 +52,10 @@ impl HashedCredentialValidator {
 impl Plugin for HashedCredentialValidator {
     fn name(&self) -> &str {
         "password-file"
+    }
+
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&["authenticate"])
     }
 
     fn authenticate<'a>(
@@ -197,5 +203,16 @@ mod tests {
         let validator = HashedCredentialValidator::new(creds);
 
         assert!(!validator.check("nobody", b"pass"));
+    }
+
+    #[test]
+    fn test_status_is_builtin() {
+        use mercurio_server::plugin::{Plugin, PluginKind, PluginStatus};
+
+        let validator = HashedCredentialValidator::new(HashMap::new());
+        assert_eq!(
+            validator.status(),
+            PluginStatus::new("password-file", PluginKind::Builtin).with_hooks(&["authenticate"])
+        );
     }
 }

@@ -2,7 +2,9 @@
 
 use std::sync::{Arc, OnceLock, RwLock};
 
-use mercurio_server::plugin::{Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin};
+use mercurio_server::plugin::{
+    Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginStatus,
+};
 
 type Loader<T> = fn(&str) -> Result<T, String>;
 
@@ -62,6 +64,10 @@ impl<T: Send + Sync> Reload for Reloadable<T> {
 impl<T: Plugin> Plugin for Reloadable<T> {
     fn name(&self) -> &str {
         self.name.get_or_init(|| self.get().name().to_string())
+    }
+
+    fn status(&self) -> PluginStatus {
+        self.get().status()
     }
 
     fn authenticate<'a>(
@@ -130,6 +136,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(Plugin::name(&acl), "acl-file");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_plugins_report_the_status_of_what_they_hold() {
+        use mercurio_server::plugin::{PluginKind, PluginStatus};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-reload-status-{}", std::process::id()));
+        std::fs::write(&path, "topic read public/#").unwrap();
+        let acl = Reloadable::load(path.to_str().unwrap(), |path| {
+            AclFile::parse(&std::fs::read_to_string(path).unwrap())
+        })
+        .unwrap();
+        assert_eq!(
+            Plugin::status(&acl),
+            PluginStatus::new("acl-file", PluginKind::Builtin).with_hooks(&["authorize"])
+        );
         std::fs::remove_file(&path).unwrap();
     }
 }

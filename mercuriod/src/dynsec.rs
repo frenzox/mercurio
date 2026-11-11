@@ -16,7 +16,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::topic_matches_filter;
 use mercurio_server::plugin::{
-    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin,
+    ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -648,6 +648,14 @@ impl Plugin for DynamicSecurity {
         "dynamic-security"
     }
 
+    fn status(&self) -> PluginStatus {
+        PluginStatus::new(self.name(), PluginKind::Builtin).with_hooks(&[
+            "authenticate",
+            "authorize",
+            "on_control",
+        ])
+    }
+
     fn on_control<'a>(
         &'a self,
         _: &'a ClientInfo,
@@ -956,6 +964,27 @@ mod tests {
         assert_eq!(
             security.authorize(&s1, "sensors/t1", Access::Write).await,
             Decision::Allow
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_status_is_builtin() {
+        use mercurio_server::plugin::{PluginKind, PluginStatus};
+
+        let path =
+            std::env::temp_dir().join(format!("mercuriod-dynsec-status-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        DynamicSecurity::init(path, "admin", "secret").unwrap();
+        let security = DynamicSecurity::load(path).unwrap();
+        assert_eq!(
+            security.status(),
+            PluginStatus::new("dynamic-security", PluginKind::Builtin).with_hooks(&[
+                "authenticate",
+                "authorize",
+                "on_control"
+            ])
         );
         std::fs::remove_file(path).unwrap();
     }
