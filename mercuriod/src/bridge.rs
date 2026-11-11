@@ -203,21 +203,22 @@ impl BridgeStatus {
     }
 }
 
-/// Starts the bridge in the background and returns the status it keeps up
-/// to date. Fails only on an invalid configuration; an unreachable remote
-/// broker is retried.
-pub fn spawn(config: BridgeConfig, local: LocalConnector) -> Result<Arc<BridgeStatus>, String> {
-    let bridge = prepare(config, local)?;
+/// Starts `bridge` in the background and returns the status it keeps up
+/// to date. An unreachable remote broker is retried.
+pub fn spawn(bridge: Bridge) -> Arc<BridgeStatus> {
     let status = Arc::clone(&bridge.status);
     tokio::spawn(bridge.run());
-    Ok(status)
+    status
 }
 
-/// The bridge, ready to run.
-fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String> {
-    let (outbound, inbound) = routes(&config)?;
+/// The bridge `config` describes, ready to run over `local`. Its routes,
+/// addresses and client options are checked, and its TLS files loaded,
+/// without connecting, so `--check` and a start refuse the same
+/// configurations.
+pub fn prepare(config: &BridgeConfig, local: LocalConnector) -> Result<Bridge, String> {
+    let (outbound, inbound) = routes(config)?;
     let client_id = config.client_id();
-    let addresses = addresses(&config)?;
+    let addresses = addresses(config)?;
 
     // Stays connected while the remote broker is unreachable, so messages
     // to forward wait in its queue meanwhile. The connector only fails
@@ -277,13 +278,16 @@ fn prepare(config: BridgeConfig, local: LocalConnector) -> Result<Bridge, String
             if let Some(password) = &config.password {
                 options = options.password(password.clone());
             }
-            (address, options)
+            options
+                .validate()
+                .map_err(|e| format!("Bridge {}: {address}: {e}", config.name))?;
+            Ok((address, options))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
 
     Ok(Bridge {
         status: Arc::new(BridgeStatus::new(&config.name, &client_id)),
-        name: config.name,
+        name: config.name.clone(),
         state_topic,
         remote_state_topic,
         echoes: (protocol_version == ProtocolVersion::V3_1_1).then(|| Mutex::new(VecDeque::new())),
@@ -322,7 +326,7 @@ fn addresses(config: &BridgeConfig) -> Result<Vec<(String, u16)>, String> {
         .collect()
 }
 
-struct Bridge {
+pub struct Bridge {
     status: Arc<BridgeStatus>,
     name: String,
     /// Where the bridge's state is published, `1` when connected
@@ -732,9 +736,13 @@ mod tests {
 
     #[test]
     fn test_a_ca_or_client_certificate_turns_tls_on() {
+        const FIXTURES: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../mercurio-server/tests/fixtures"
+        );
         for tls in [
-            "ca_path = \"ca.pem\"",
-            "cert_path = \"c.pem\"\nkey_path = \"k.pem\"",
+            format!("ca_path = \"{FIXTURES}/cert.pem\""),
+            format!("cert_path = \"{FIXTURES}/cert.pem\"\nkey_path = \"{FIXTURES}/key.pem\""),
         ] {
             let config: Config = toml::from_str(&format!(
                 "[[bridges]]\nname = \"cloud\"\nhost = \"h\"\ntopics = []\n\
@@ -743,7 +751,7 @@ mod tests {
             .unwrap();
             let config = config.bridges.into_iter().next().unwrap();
             let (connector, _) = mercurio_server::server::LocalConnector::new();
-            let bridge = super::prepare(config, connector).unwrap();
+            let bridge = super::prepare(&config, connector).unwrap();
             let options = format!("{:?}", bridge.remotes[0].1);
             assert!(options.contains("enabled: true"), "{tls}: {options}");
         }
@@ -757,7 +765,7 @@ mod tests {
         .unwrap();
         let config = config.bridges.into_iter().next().unwrap();
         let (connector, _) = mercurio_server::server::LocalConnector::new();
-        super::prepare(config, connector).unwrap()
+        super::prepare(&config, connector).unwrap()
     }
 
     #[test]
@@ -1011,7 +1019,7 @@ mod tests {
                  [[topics]]\npattern = \"a/#\"\nqos = 1\n"
             ))
             .unwrap();
-            let mut bridge = prepare(config, connector.clone()).unwrap();
+            let mut bridge = prepare(&config, connector.clone()).unwrap();
             bridge.retry = Backoff::new(Duration::from_millis(100), Duration::from_millis(400));
             bridge.local_options = bridge
                 .local_options

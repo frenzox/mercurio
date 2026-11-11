@@ -106,7 +106,7 @@ ca_path = "/etc/mercurio/cloud-ca.crt"
 <span class="comment"># Authenticate with a client certificate</span>
 cert_path = "/etc/mercurio/site1.crt"
 key_path = "/etc/mercurio/site1.key"</pre>
-<p><code>enabled = true</code> alone verifies the remote broker with the system's root certificates. A <code>ca_path</code> or a client certificate turns TLS on even without <code>enabled</code>, as <code>--cafile</code> does for recado and mercurioctl, so the password never crosses the network in the clear by mistake. <code>cert_path</code> and <code>key_path</code> go together; the broker refuses to start with only one.</p>
+<p><code>enabled = true</code> alone verifies the remote broker with the system's root certificates. A <code>ca_path</code> or a client certificate turns TLS on even without <code>enabled</code>, as <code>--cafile</code> does for recado and mercurioctl, so the password never crosses the network in the clear by mistake. <code>cert_path</code> and <code>key_path</code> go together; the broker refuses to start with only one. The files are loaded at startup and by <code>mercuriod --check</code>, and a file that can't be read or holds no certificate or key stops the broker from starting; each connection to the remote broker reads them again.</p>
 
 <h2>Monitoring</h2>
 <p>With <code>notifications</code> (on by default), the bridge publishes its state, retained, on this broker: <code>1</code> while forwarding, <code>0</code> at startup and whenever either connection is lost. It goes to <code>$SYS/broker/connection/&lt;client id&gt;/state</code>, or to <code>notification_topic</code> when set.</p>

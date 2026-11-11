@@ -543,6 +543,18 @@ impl ConnectOptions {
         self.will.as_ref().map_or(Ok(()), Will::check)
     }
 
+    /// Checks the options as connecting would, loading the TLS files they
+    /// name, without opening a connection, so a configuration can be
+    /// refused up front rather than at every attempt to connect.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        self.check()?;
+        #[cfg(feature = "tls")]
+        if self.tls.enabled && self.connector.is_none() {
+            crate::tls::build_tls_connector(&self.tls, &self.host)?;
+        }
+        Ok(())
+    }
+
     /// Create new connection options for the given host and port.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {

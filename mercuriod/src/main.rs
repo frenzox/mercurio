@@ -43,6 +43,7 @@ mod syslog;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+use bridge::Bridge;
 use config::{Config, StorageConfig};
 use credentials::HashedCredentialValidator;
 use dynsec::DynamicSecurity;
@@ -218,6 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dynsec,
         listeners: prepared_listeners,
         reloadable,
+        bridges,
     } = prepare(&config, &connector).await?;
 
     // Determine listen address (CLI overrides config)
@@ -353,12 +355,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let bridges = config
         .bridges
-        .into_iter()
-        .map(|bridge| {
-            info!("Starting bridge {}", bridge.name);
-            bridge::spawn(bridge, connector.clone())
+        .iter()
+        .zip(bridges)
+        .map(|(config, bridge)| {
+            info!("Starting bridge {}", config.name);
+            bridge::spawn(bridge)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     let reloadable: Arc<[Arc<dyn Reload>]> = reloadable.into();
     let commands = Arc::new(
@@ -456,6 +459,8 @@ struct Prepared {
     /// In the order of `[[listeners]]`
     listeners: Vec<PreparedListener>,
     reloadable: Vec<Arc<dyn Reload>>,
+    /// In the order of `[[bridges]]`
+    bridges: Vec<Bridge>,
 }
 
 struct PreparedListener {
@@ -467,8 +472,9 @@ struct PreparedListener {
 
 /// Checks the settings a start needs, loads the files of `[auth]` and of
 /// every listener, the TLS certificates and keys, and the WebAssembly
-/// plugins, binding nothing and leaving storage alone. Plugins publish
-/// through `broker`.
+/// plugins, and sets the bridges up, binding nothing, connecting nowhere
+/// and leaving storage alone. Plugins and bridges reach the broker through
+/// `broker`.
 async fn prepare(
     config: &Config,
     broker: &LocalConnector,
@@ -537,6 +543,11 @@ async fn prepare(
             plugins,
         });
     }
+    let bridges = config
+        .bridges
+        .iter()
+        .map(|bridge| bridge::prepare(bridge, broker.clone()))
+        .collect::<Result<_, _>>()?;
     Ok(Prepared {
         limits,
         policy,
@@ -546,6 +557,7 @@ async fn prepare(
         dynsec,
         listeners,
         reloadable,
+        bridges,
     })
 }
 
