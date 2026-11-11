@@ -2,18 +2,19 @@
 //! the server, with a reason (section 3.14).
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     reason::ReasonCode,
 };
 
-#[derive(Default, PartialEq, Eq, Debug)]
+use crate::PacketType;
+
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct DisconnectProperties {
     /// Replaces the session expiry from CONNECT. Sent by the client only
     /// [MQTT-3.14.2-2].
@@ -48,39 +49,24 @@ impl Decoder for DisconnectProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = DisconnectProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                ServerReference(v) => set_once(&mut properties.server_reference, v)?,
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v),
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            ServerReference(v) => set_once(&mut properties.server_reference, v),
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DisconnectPacket {
     /// Decodes as `NormalDisconnection` when left out or 0x00. Not encoded in
     /// MQTT 3.x, see [`Self::encode_v3`].
@@ -92,26 +78,30 @@ const PACKET_TYPE: u8 = 0x0e;
 
 impl Encoder for DisconnectPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut remaining_len = 0;
-
-        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
-
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += self.reason.encoded_size();
-        if self.properties.is_some() {
-            remaining_len += properties_len.encoded_size() + self.properties.encoded_size();
-        }
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.reason.encode(buffer);
         if self.properties.is_some() {
-            properties_len.encode(buffer);
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
             self.properties.encode(buffer);
         }
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
     }
 }
 
 impl DisconnectPacket {
+    fn remaining_len(&self) -> usize {
+        let mut len = self.reason.encoded_size();
+        if self.properties.is_some() {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
+
     /// Encodes a DISCONNECT packet in MQTT 3.x format, which has no
     /// variable header.
     pub fn encode_v3(&self, buffer: &mut BytesMut) {
@@ -122,32 +112,26 @@ impl DisconnectPacket {
 
 impl Decoder for DisconnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reserved = buffer.get_u8() & 0xF;
+        crate::decode_packet(buffer, PacketType::Disconnect, |_, buffer| {
+            // 0x00 is "Normal disconnection" in DISCONNECT, whether it is
+            // sent or left out
+            let reason = if buffer.has_remaining() {
+                match crate::decode_reason(buffer, PacketType::Disconnect)? {
+                    ReasonCode::Success => ReasonCode::NormalDisconnection,
+                    reason => reason,
+                }
+            } else {
+                ReasonCode::NormalDisconnection
+            };
 
-        if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
+            let properties = if buffer.has_remaining() {
+                crate::present(DisconnectProperties::decode(buffer)?)
+            } else {
+                None
+            };
 
-        let min_len_reason = 1;
-        let min_len_properties = 2;
-
-        let remaining_len = VariableByteInteger::decode(buffer)?; //Remaining length
-                                                                  // 0x00 is "Normal disconnection" in DISCONNECT, whether it is sent
-                                                                  // or left out
-        let reason = match remaining_len.0.cmp(&min_len_reason) {
-            core::cmp::Ordering::Less => ReasonCode::NormalDisconnection,
-            _ => match ReasonCode::decode(buffer)? {
-                ReasonCode::Success => ReasonCode::NormalDisconnection,
-                reason => reason,
-            },
-        };
-
-        let properties = match remaining_len.0.cmp(&min_len_properties) {
-            core::cmp::Ordering::Less => None,
-            _ => crate::present(DisconnectProperties::decode(buffer)?),
-        };
-
-        Ok(DisconnectPacket { reason, properties })
+            Ok(DisconnectPacket { reason, properties })
+        })
     }
 }
 

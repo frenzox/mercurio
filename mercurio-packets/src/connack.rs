@@ -3,19 +3,20 @@
 use core::mem;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BufMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+use crate::PacketType;
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct ConnAckFlags {
     /// Whether the server resumed a session it already held for this client.
     /// Always false after a CONNECT with clean start [MQTT-3.2.2-2].
@@ -47,7 +48,7 @@ impl Decoder for ConnAckFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct ConnAckProperties {
     /// Set when the server uses a session expiry other than the one the
@@ -138,52 +139,42 @@ impl Decoder for ConnAckProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = ConnAckProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
-                ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v)?,
-                MaximumQoS(v) => set_once(&mut properties.maximum_qos, v)?,
-                RetainAvailable(v) => set_once(&mut properties.retain_available, v)?,
-                MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v)?,
-                AssignedClientIdentifier(v) => set_once(&mut properties.assigned_client_id, v)?,
-                TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_max, v)?,
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                WildcardSubscriptionAvailable(v) => {
-                    set_once(&mut properties.wildcard_subscription_available, v)?
-                }
-                SubscriptionIdentifierAvailable(v) => {
-                    set_once(&mut properties.subscription_identifier_available, v)?
-                }
-                SharedSubscriptionAvailable(v) => {
-                    set_once(&mut properties.shared_subscription_available, v)?
-                }
-                ServerKeepAlive(v) => set_once(&mut properties.server_keepalive, v)?,
-                ResponseInformation(v) => set_once(&mut properties.response_information, v)?,
-                ServerReference(v) => set_once(&mut properties.server_reference, v)?,
-                AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v)?,
-                AuthenticationData(v) => set_once(&mut properties.authentication_data, v)?,
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v),
+            ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v),
+            MaximumQoS(v) => set_once(&mut properties.maximum_qos, v),
+            RetainAvailable(v) => set_once(&mut properties.retain_available, v),
+            MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v),
+            AssignedClientIdentifier(v) => set_once(&mut properties.assigned_client_id, v),
+            TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_max, v),
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            WildcardSubscriptionAvailable(v) => {
+                set_once(&mut properties.wildcard_subscription_available, v)
+            }
+            SubscriptionIdentifierAvailable(v) => {
+                set_once(&mut properties.subscription_identifier_available, v)
+            }
+            SharedSubscriptionAvailable(v) => {
+                set_once(&mut properties.shared_subscription_available, v)
+            }
+            ServerKeepAlive(v) => set_once(&mut properties.server_keepalive, v),
+            ResponseInformation(v) => set_once(&mut properties.response_information, v),
+            ServerReference(v) => set_once(&mut properties.server_reference, v),
+            AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v),
+            AuthenticationData(v) => set_once(&mut properties.authentication_data, v),
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
+
+        check_authentication(
+            &properties.authentication_method,
+            &properties.authentication_data,
+        )?;
 
         Ok(properties)
     }
@@ -238,7 +229,7 @@ impl From<ReasonCode> for ConnAckReturnCode {
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnAckPacket {
     /// Selects the wire format on encode: in MQTT 3.x a return code and no
     /// properties. `decode` sets `V5`, and `decode_v3` sets `V3_1_1` for both
@@ -254,24 +245,9 @@ const PACKET_TYPE: u8 = 0x02;
 
 impl Encoder for ConnAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut remaining_len = 0;
-
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += self.flags.encoded_size();
-
-        if self.protocol_version.supports_properties() {
-            // MQTT 5.0: reason code + properties
-            remaining_len += self.reason_code.encoded_size();
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        } else {
-            // MQTT 3.x: return code only, no properties
-            remaining_len += 1; // Return code byte
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         // Variable header
         self.flags.encode(buffer);
@@ -287,24 +263,40 @@ impl Encoder for ConnAckPacket {
             return_code.encode(buffer);
         }
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl ConnAckPacket {
+    fn remaining_len(&self) -> usize {
+        if self.protocol_version.supports_properties() {
+            self.flags.encoded_size()
+                + self.reason_code.encoded_size()
+                + crate::property_list_size(&self.properties)
+        } else {
+            // MQTT 3.x: a return code, no properties
+            self.flags.encoded_size() + 1
+        }
+    }
 }
 
 impl Decoder for ConnAckPacket {
     /// Decodes a CONNACK packet assuming MQTT 5.0 format.
     /// For MQTT 3.x decoding, use `decode_v3` instead.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
+            let flags = ConnAckFlags::decode(buffer)?;
+            let reason_code = crate::decode_reason(buffer, PacketType::ConnAck)?;
+            let properties = crate::present(ConnAckProperties::decode(buffer)?);
 
-        let flags = ConnAckFlags::decode(buffer)?;
-        let reason_code = ReasonCode::decode(buffer)?;
-        let properties = crate::present(ConnAckProperties::decode(buffer)?);
-
-        Ok(ConnAckPacket {
-            protocol_version: ProtocolVersion::V5,
-            flags,
-            reason_code,
-            properties,
+            Ok(ConnAckPacket {
+                protocol_version: ProtocolVersion::V5,
+                flags,
+                reason_code,
+                properties,
+            })
         })
     }
 }
@@ -312,9 +304,12 @@ impl Decoder for ConnAckPacket {
 impl ConnAckPacket {
     /// Decodes a CONNACK packet in MQTT 3.x format.
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::ConnAck, |_, buffer| {
+            Self::decode_v3_body(buffer)
+        })
+    }
 
+    fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let flags = ConnAckFlags::decode(buffer)?;
         let return_code = u8::decode(buffer)?;
 
@@ -341,6 +336,8 @@ impl ConnAckPacket {
 
 #[cfg(test)]
 mod tests {
+    use std::string::String;
+
     use crate::connack::*;
     use bytes::{Bytes, BytesMut};
 

@@ -2,18 +2,19 @@
 //! messages (section 3.10).
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::Buf;
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+use crate::PacketType;
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct UnsubscribeProperties {
     pub user_property: Option<Vec<UserProperty>>,
 }
@@ -36,36 +37,21 @@ impl Decoder for UnsubscribeProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = UnsubscribeProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubscribePayload {
     pub topic_filter: String,
 }
@@ -92,7 +78,7 @@ impl Decoder for UnsubscribePayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsubscribePacket {
     pub packet_id: u16,
     pub properties: Option<UnsubscribeProperties>,
@@ -104,6 +90,10 @@ const PACKET_TYPE: u8 = 0x0a;
 impl Encoder for UnsubscribePacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
         self.encode_inner(buffer, true);
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len(true))
     }
 }
 
@@ -124,23 +114,21 @@ impl UnsubscribePacket {
         Self::decode_inner(buffer, false)
     }
 
-    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
-        let mut remaining_len = 0;
+    fn remaining_len(&self, with_properties: bool) -> usize {
+        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
+        if with_properties {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
 
+    fn encode_inner(&self, buffer: &mut bytes::BytesMut, with_properties: bool) {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= 0b0000_0010;
         fixed_header.encode(buffer);
 
-        remaining_len += self.packet_id.encoded_size();
-        if with_properties {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-        remaining_len += self.payload.encoded_size();
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
         if with_properties {
@@ -151,11 +139,13 @@ impl UnsubscribePacket {
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; //Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::Unsubscribe, |_, body| {
+            Self::decode_body(body, with_properties)
+        })
+    }
 
-        let packet_id = u16::decode(buffer)?;
+    fn decode_body<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
+        let packet_id = crate::decode_packet_id(buffer)?;
         let properties = if with_properties {
             crate::present(UnsubscribeProperties::decode(buffer)?)
         } else {
@@ -166,10 +156,9 @@ impl UnsubscribePacket {
             return Err(ReasonCode::ProtocolError.into());
         }
 
-        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.remaining() > next_packet {
+        while buffer.has_remaining() {
             payload.push(UnsubscribePayload::decode(buffer)?);
         }
 
@@ -183,6 +172,8 @@ impl UnsubscribePacket {
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use bytes::{Bytes, BytesMut};
 
     use crate::unsubscribe::*;

@@ -2,16 +2,17 @@
 //! has no such packet.
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     reason::ReasonCode,
 };
+
+use crate::PacketType;
 
 #[derive(Default, PartialEq, Eq, Debug, Clone)]
 pub struct AuthProperties {
@@ -45,33 +46,20 @@ impl Decoder for AuthProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = AuthProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                AuthenticationMethod(v) => set_once(&mut properties.auth_method, v)?,
-                AuthenticationData(v) => set_once(&mut properties.auth_data, v)?,
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            AuthenticationMethod(v) => set_once(&mut properties.auth_method, v),
+            AuthenticationData(v) => set_once(&mut properties.auth_data, v),
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
+
+        check_authentication(&properties.auth_method, &properties.auth_data)?;
 
         Ok(properties)
     }
@@ -89,42 +77,42 @@ const PACKET_TYPE: u8 = 0x0f;
 
 impl Encoder for AuthPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let properties_len = VariableByteInteger(self.properties.encoded_size() as u32);
-        let remaining_len = self.reason.encoded_size()
-            + properties_len.encoded_size()
-            + self.properties.encoded_size();
-
         buffer.put_u8(PACKET_TYPE << 4);
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.reason.encode(buffer);
-        properties_len.encode(buffer);
+        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
         self.properties.encode(buffer);
+    }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl AuthPacket {
+    fn remaining_len(&self) -> usize {
+        self.reason.encoded_size() + crate::property_list_size(&self.properties)
     }
 }
 
 impl Decoder for AuthPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        let reserved = buffer.get_u8() & 0xF;
+        crate::decode_packet(buffer, PacketType::Auth, |_, buffer| {
+            // Both reason and properties may be omitted [MQTT-3.15.2-1]
+            let reason = if buffer.has_remaining() {
+                crate::decode_reason(buffer, PacketType::Auth)?
+            } else {
+                ReasonCode::Success
+            };
+            let properties = if buffer.has_remaining() {
+                AuthProperties::decode(buffer)?
+            } else {
+                AuthProperties::default()
+            };
 
-        if reserved != 0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let remaining_len = VariableByteInteger::decode(buffer)?;
-        // Both reason and properties may be omitted [MQTT-3.15.2-1]
-        let reason = if remaining_len.0 > 0 {
-            ReasonCode::decode(buffer)?
-        } else {
-            ReasonCode::Success
-        };
-        let properties = if remaining_len.0 > 1 {
-            AuthProperties::decode(buffer)?
-        } else {
-            AuthProperties::default()
-        };
-
-        Ok(AuthPacket { reason, properties })
+            Ok(AuthPacket { reason, properties })
+        })
     }
 }
 

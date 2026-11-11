@@ -3,7 +3,10 @@
 use bytes::Buf;
 use core::fmt;
 
-use crate::codec::{Decoder, Encoder};
+use crate::{
+    codec::{Decoder, Encoder},
+    protocol::PacketType,
+};
 
 /// MQTT reason code used in various packets to indicate success or failure.
 ///
@@ -15,7 +18,9 @@ use crate::codec::{Decoder, Encoder};
 /// [`Success`](ReasonCode::Success). The DISCONNECT decoder maps it to
 /// [`NormalDisconnection`](ReasonCode::NormalDisconnection), and the MQTT 3.x
 /// SUBACK decoder maps return codes itself. An unknown code is a
-/// [`MalformedPacket`](ReasonCode::MalformedPacket).
+/// [`MalformedPacket`](ReasonCode::MalformedPacket), and the packet
+/// decoders also refuse a known code their packet does not list; see
+/// [`is_valid_for`](ReasonCode::is_valid_for).
 ///
 /// It is also the error type of protocol failures, through
 /// [`Error::MQTTReasonCode`](crate::error::Error::MQTTReasonCode).
@@ -193,6 +198,55 @@ impl ReasonCode {
             WildcardSubscriptionsNotSupported => 0xa2,
         }
     }
+
+    /// Whether an MQTT 5 packet of `packet_type` may carry this reason code,
+    /// following the tables in sections 3.2.2.2 (CONNACK), 3.4.2.1 (PUBACK),
+    /// 3.5.2.1 (PUBREC), 3.6.2.1 (PUBREL), 3.7.2.1 (PUBCOMP), 3.9.3
+    /// (SUBACK), 3.11.3 (UNSUBACK), 3.14.2.1 (DISCONNECT) and 3.15.2.1
+    /// (AUTH). Packets without a reason code allow none.
+    ///
+    /// It compares the encoded byte, so [`Success`](ReasonCode::Success),
+    /// [`NormalDisconnection`](ReasonCode::NormalDisconnection) and
+    /// [`GrantedQoS0`](ReasonCode::GrantedQoS0) are valid wherever 0x00 is.
+    ///
+    /// ```
+    /// use mercurio_core::{protocol::PacketType, reason::ReasonCode};
+    ///
+    /// assert!(ReasonCode::PacketIdentifierNotFound.is_valid_for(PacketType::PubRel));
+    /// assert!(!ReasonCode::PacketIdentifierNotFound.is_valid_for(PacketType::PubAck));
+    /// ```
+    pub fn is_valid_for(&self, packet_type: PacketType) -> bool {
+        let code = self.get_code();
+        match packet_type {
+            PacketType::ConnAck => matches!(
+                code,
+                0x00 | 0x80..=0x8a | 0x8c | 0x90 | 0x95 | 0x97 | 0x99..=0x9d | 0x9f
+            ),
+            PacketType::PubAck | PacketType::PubRec => matches!(
+                code,
+                0x00 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
+            ),
+            PacketType::PubRel | PacketType::PubComp => matches!(code, 0x00 | 0x92),
+            PacketType::SubAck => matches!(
+                code,
+                0x00..=0x02 | 0x80 | 0x83 | 0x87 | 0x8f | 0x91 | 0x97 | 0x9e | 0xa1 | 0xa2
+            ),
+            PacketType::UnsubAck => {
+                matches!(code, 0x00 | 0x11 | 0x80 | 0x83 | 0x87 | 0x8f | 0x91)
+            }
+            PacketType::Disconnect => matches!(
+                code,
+                0x00 | 0x04 | 0x80..=0x83 | 0x87 | 0x89 | 0x8b | 0x8d..=0x90 | 0x93..=0xa2
+            ),
+            PacketType::Auth => matches!(code, 0x00 | 0x18 | 0x19),
+            PacketType::Connect
+            | PacketType::Publish
+            | PacketType::Subscribe
+            | PacketType::Unsubscribe
+            | PacketType::PingReq
+            | PacketType::PingResp => false,
+        }
+    }
 }
 
 impl Encoder for ReasonCode {
@@ -257,5 +311,56 @@ impl Decoder for ReasonCode {
         };
 
         Ok(reason)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec::Vec;
+
+    use super::*;
+
+    /// Every code the decoder knows, as the bytes 0x00 to 0xff decode.
+    fn known_codes() -> Vec<ReasonCode> {
+        (0..=u8::MAX)
+            .filter_map(|byte| ReasonCode::decode(&mut &[byte][..]).ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_reason_codes_per_packet_match_the_spec_tables() {
+        let expected = [
+            (PacketType::ConnAck, 22),
+            (PacketType::PubAck, 9),
+            (PacketType::PubRec, 9),
+            (PacketType::PubRel, 2),
+            (PacketType::PubComp, 2),
+            (PacketType::SubAck, 12),
+            (PacketType::UnsubAck, 7),
+            (PacketType::Disconnect, 29),
+            (PacketType::Auth, 3),
+            (PacketType::Publish, 0),
+            (PacketType::Connect, 0),
+        ];
+        for (packet_type, count) in expected {
+            let valid = known_codes()
+                .into_iter()
+                .filter(|code| code.is_valid_for(packet_type))
+                .count();
+            assert_eq!(valid, count, "{packet_type:?}");
+        }
+    }
+
+    #[test]
+    fn test_zero_is_valid_under_each_of_its_names() {
+        for code in [
+            ReasonCode::Success,
+            ReasonCode::NormalDisconnection,
+            ReasonCode::GrantedQoS0,
+        ] {
+            assert!(code.is_valid_for(PacketType::Disconnect));
+            assert!(code.is_valid_for(PacketType::SubAck));
+            assert!(code.is_valid_for(PacketType::PubAck));
+        }
     }
 }

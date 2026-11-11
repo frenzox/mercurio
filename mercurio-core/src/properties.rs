@@ -1,12 +1,13 @@
 //! MQTT 5.0 properties encoding and decoding.
 
 #[cfg(not(feature = "std"))]
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::{
     codec::{Decoder, Encoder, VariableByteInteger},
+    error::Error,
     reason::ReasonCode,
     topic::validate_publish_topic,
 };
@@ -202,7 +203,7 @@ def_prop!(SharedSubscriptionAvailable {
 /// a Topic Alias of 0) is a [`ReasonCode::ProtocolError`]. Decoding does
 /// not check that the packet type allows the property; the packet decoders
 /// do that.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 #[allow(clippy::enum_variant_names)] // Warns because of UserProperty
 #[non_exhaustive]
 pub enum Property {
@@ -366,6 +367,60 @@ pub fn set_once<T>(slot: &mut Option<T>, value: T) -> crate::Result<()> {
         return Err(ReasonCode::ProtocolError.into());
     }
     *slot = Some(value);
+    Ok(())
+}
+
+/// Authentication Data only means something with an Authentication Method;
+/// alone it is a protocol error (section 3.1.2.11.10).
+pub fn check_authentication(
+    method: &Option<AuthenticationMethod>,
+    data: &Option<AuthenticationData>,
+) -> crate::Result<()> {
+    if data.is_some() && method.is_none() {
+        return Err(ReasonCode::ProtocolError.into());
+    }
+    Ok(())
+}
+
+/// Appends a User Property, which may appear any number of times.
+pub fn push_user_property(slot: &mut Option<Vec<UserProperty>>, value: UserProperty) {
+    slot.get_or_insert_with(Vec::new).push(value);
+}
+
+/// Reads a property list (section 2.2.2): its Variable Byte Integer length,
+/// then each property in it, handed to `accept`.
+///
+/// A length that runs past the end of `buffer`, or a property cut short by
+/// the end of the list, is a [`ReasonCode::MalformedPacket`]. `accept`
+/// rejects the properties its packet does not allow.
+pub fn decode_property_list<T, F>(buffer: &mut T, accept: F) -> crate::Result<()>
+where
+    T: Buf,
+    F: FnMut(Property) -> crate::Result<()>,
+{
+    let len = VariableByteInteger::decode(buffer)?.0 as usize;
+    if buffer.remaining() < len {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+
+    decode_properties(&mut buffer.take(len), accept)
+}
+
+/// Reads properties until `buffer` is empty, for a list whose length is
+/// already known.
+pub(crate) fn decode_properties<T, F>(buffer: &mut T, mut accept: F) -> crate::Result<()>
+where
+    T: Buf,
+    F: FnMut(Property) -> crate::Result<()>,
+{
+    while buffer.has_remaining() {
+        let property = Property::decode(buffer).map_err(|e| match e {
+            Error::PacketIncomplete => ReasonCode::MalformedPacket.into(),
+            e => e,
+        })?;
+        accept(property)?;
+    }
+
     Ok(())
 }
 

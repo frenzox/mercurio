@@ -4,7 +4,7 @@
 use core::mem;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -17,7 +17,9 @@ use mercurio_core::{
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+use crate::PacketType;
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// The Connect Flags byte (section 3.1.2.3). The flags decide which
 /// optional fields of the payload are encoded and decoded.
 pub struct ConnectFlags {
@@ -108,7 +110,7 @@ impl Decoder for ConnectFlags {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// MQTT 5 only.
 pub struct ConnectProperties {
     /// Seconds the session outlives the connection. Absent means 0, the
@@ -169,48 +171,38 @@ impl Decoder for ConnectProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = ConnectProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v)?,
-                AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v)?,
-                AuthenticationData(v) => set_once(&mut properties.authentication_data, v)?,
-                RequestProblemInformation(v) => {
-                    set_once(&mut properties.request_problem_information, v)?
-                }
-                RequestResponseInformation(v) => {
-                    set_once(&mut properties.request_response_information, v)?
-                }
-                ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v)?,
-                TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_maximum, v)?,
-                MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            SessionExpiryInterval(v) => set_once(&mut properties.session_expiry_interval, v),
+            AuthenticationMethod(v) => set_once(&mut properties.authentication_method, v),
+            AuthenticationData(v) => set_once(&mut properties.authentication_data, v),
+            RequestProblemInformation(v) => {
+                set_once(&mut properties.request_problem_information, v)
             }
-        }
+            RequestResponseInformation(v) => {
+                set_once(&mut properties.request_response_information, v)
+            }
+            ReceiveMaximum(v) => set_once(&mut properties.receive_maximum, v),
+            TopicAliasMaximum(v) => set_once(&mut properties.topic_alias_maximum, v),
+            MaximumPacketSize(v) => set_once(&mut properties.maximum_packet_size, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
+            }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
+
+        check_authentication(
+            &properties.authentication_method,
+            &properties.authentication_data,
+        )?;
 
         Ok(properties)
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 /// Properties of the will message (section 3.1.3.2). MQTT 5 only.
 pub struct WillProperties {
     /// Seconds the server waits after the connection closes before it
@@ -255,43 +247,27 @@ impl Decoder for WillProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = WillProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                WillDelayInterval(v) => set_once(&mut properties.will_delay_interval, v)?,
-                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
-                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
-                ContentType(v) => set_once(&mut properties.content_type, v)?,
-                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
-                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            WillDelayInterval(v) => set_once(&mut properties.will_delay_interval, v),
+            PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v),
+            MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v),
+            ContentType(v) => set_once(&mut properties.content_type, v),
+            ResponseTopic(v) => set_once(&mut properties.response_topic, v),
+            CorrelationData(v) => set_once(&mut properties.correlation_data, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct ConnectPayload {
     /// May be empty, and the server then assigns one (section 3.1.3.1).
     pub client_id: String,
@@ -402,7 +378,7 @@ impl Decoder for ConnectPayload {
     }
 }
 
-#[derive(Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct ConnectPacket {
     /// Read from the protocol name and level. Selects the wire format on
     /// encode.
@@ -423,26 +399,9 @@ impl Encoder for ConnectPacket {
         let protocol_name = self.protocol_version.protocol_name();
         let protocol_level = self.protocol_version.protocol_level();
 
-        let mut remaining_len = 0;
-
         // Fixed header
         buffer.put_u8(PACKET_TYPE << 4);
-        remaining_len += protocol_name.encoded_size();
-        remaining_len += protocol_level.encoded_size();
-        remaining_len += self.flags.encoded_size();
-        remaining_len += self.keepalive.encoded_size();
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        remaining_len += self
-            .payload
-            .encoded_size_for_version(self.protocol_version, &self.flags);
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         // Variable header
         protocol_name.encode(buffer);
@@ -460,13 +419,40 @@ impl Encoder for ConnectPacket {
         self.payload
             .encode_for_version(buffer, self.protocol_version, &self.flags);
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl ConnectPacket {
+    fn remaining_len(&self) -> usize {
+        let mut len = self.protocol_version.protocol_name().encoded_size()
+            + self.protocol_version.protocol_level().encoded_size()
+            + self.flags.encoded_size()
+            + self.keepalive.encoded_size();
+
+        // Properties only for MQTT 5.0
+        if self.protocol_version.supports_properties() {
+            len += crate::property_list_size(&self.properties);
+        }
+
+        len + self
+            .payload
+            .encoded_size_for_version(self.protocol_version, &self.flags)
+    }
 }
 
 impl Decoder for ConnectPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let _ = VariableByteInteger::decode(buffer)?; // Remaining length
+        crate::decode_packet(buffer, PacketType::Connect, |_, body| {
+            Self::decode_body(body)
+        })
+    }
+}
 
+impl ConnectPacket {
+    fn decode_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // Parse protocol name and level to determine version
         let protocol_name = String::decode(buffer)?;
         let protocol_level = u8::decode(buffer)?;

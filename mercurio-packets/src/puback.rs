@@ -1,18 +1,19 @@
 //! PUBACK, the acknowledgement of a QoS 1 PUBLISH (section 3.4).
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+use crate::PacketType;
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PubAckProperties {
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
@@ -38,37 +39,22 @@ impl Decoder for PubAckProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = PubAckProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct PubAckPacket {
     pub packet_id: u16,
     /// Decodes as `Success` when left out. Left out on encode when `Success`
@@ -81,60 +67,61 @@ const PACKET_TYPE: u8 = 0x04;
 
 impl Encoder for PubAckPacket {
     fn encode(&self, buffer: &mut BytesMut) {
-        let mut remaining_len = 0;
-
         buffer.put_u8(PACKET_TYPE << 4);
-
-        remaining_len += self.packet_id.encoded_size();
-
-        if self.properties.is_some() || self.reason != ReasonCode::Success {
-            remaining_len += self.reason.encoded_size();
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
-        if remaining_len == 2 {
-            return;
+        if self.has_reason() {
+            self.reason.encode(buffer);
+            VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
+            self.properties.encode(buffer);
         }
+    }
 
-        self.reason.encode(buffer);
-        VariableByteInteger(self.properties.encoded_size() as u32).encode(buffer);
-        self.properties.encode(buffer);
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl PubAckPacket {
+    /// Whether the reason and properties are written: they are left out
+    /// when the reason is `Success` and there are no properties.
+    fn has_reason(&self) -> bool {
+        self.properties.is_some() || self.reason != ReasonCode::Success
+    }
+
+    fn remaining_len(&self) -> usize {
+        let mut len = self.packet_id.encoded_size();
+        if self.has_reason() {
+            len += self.reason.encoded_size() + crate::property_list_size(&self.properties);
+        }
+        len
     }
 }
 
 impl Decoder for PubAckPacket {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1);
+        crate::decode_packet(buffer, PacketType::PubAck, |_, buffer| {
+            let packet_id = crate::decode_packet_id(buffer)?;
 
-        let remaining_len = VariableByteInteger::decode(buffer)?;
-        let packet_id = u16::decode(buffer)?;
+            // Reason and properties may be left out (section 3.4.2.1)
+            let reason = if buffer.has_remaining() {
+                crate::decode_reason(buffer, PacketType::PubAck)?
+            } else {
+                ReasonCode::Success
+            };
+            let properties = if buffer.has_remaining() {
+                crate::present(PubAckProperties::decode(buffer)?)
+            } else {
+                None
+            };
 
-        if remaining_len.0 == 2 {
-            return Ok(PubAckPacket {
+            Ok(PubAckPacket {
                 packet_id,
-                reason: ReasonCode::Success,
-                properties: None,
-            });
-        }
-
-        let reason = ReasonCode::decode(buffer)?;
-        // The property length is omitted when there are none [MQTT-3.4.2.2]
-        let properties = if remaining_len.0 > 3 {
-            crate::present(PubAckProperties::decode(buffer)?)
-        } else {
-            None
-        };
-
-        Ok(PubAckPacket {
-            packet_id,
-            reason,
-            properties,
+                reason,
+                properties,
+            })
         })
     }
 }

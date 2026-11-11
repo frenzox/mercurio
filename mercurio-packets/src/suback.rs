@@ -2,19 +2,20 @@
 //! filter (section 3.9).
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use bytes::{Buf, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     protocol::ProtocolVersion,
     reason::ReasonCode,
 };
 
-#[derive(Default, Debug, PartialEq, Eq)]
+use crate::PacketType;
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct SubAckProperties {
     pub reason_string: Option<ReasonString>,
     pub user_property: Option<Vec<UserProperty>>,
@@ -40,37 +41,22 @@ impl Decoder for SubAckProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = SubAckProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                ReasonString(v) => set_once(&mut properties.reason_string, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            ReasonString(v) => set_once(&mut properties.reason_string, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubAckPayload {
     /// Result for the topic filter at the same position in the SUBSCRIBE. In
     /// MQTT 3.x every failure is encoded as 0x80, and decoded as
@@ -95,7 +81,7 @@ impl Encoder for SubAckPayload {
 impl Decoder for SubAckPayload {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         // 0x00 is "Granted QoS 0" in SUBACK
-        let reason_code = match ReasonCode::decode(buffer)? {
+        let reason_code = match crate::decode_reason(buffer, PacketType::SubAck)? {
             ReasonCode::Success => ReasonCode::GrantedQoS0,
             reason => reason,
         };
@@ -104,7 +90,7 @@ impl Decoder for SubAckPayload {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubAckPacket {
     /// Selects the wire format on encode. `decode` sets `V5`, and
     /// `decode_v3` sets `V3_1_1`.
@@ -120,24 +106,11 @@ const PACKET_TYPE: u8 = 0x09;
 
 impl Encoder for SubAckPacket {
     fn encode(&self, buffer: &mut bytes::BytesMut) {
-        let mut remaining_len = 0;
-
         // Fixed header
         let fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header.encode(buffer);
 
-        remaining_len += self.packet_id.encoded_size();
-
-        // Properties only for MQTT 5.0
-        if self.protocol_version.supports_properties() {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        remaining_len += self.payload.encoded_size();
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len() as u32).encode(buffer);
 
         self.packet_id.encode(buffer);
 
@@ -162,34 +135,45 @@ impl Encoder for SubAckPacket {
             }
         }
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len())
+    }
+}
+
+impl SubAckPacket {
+    fn remaining_len(&self) -> usize {
+        // Every return code is one byte, in MQTT 3.x as in MQTT 5
+        let mut len = self.packet_id.encoded_size() + self.payload.encoded_size();
+        if self.protocol_version.supports_properties() {
+            len += crate::property_list_size(&self.properties);
+        }
+        len
+    }
 }
 
 impl Decoder for SubAckPacket {
     /// Decodes a SUBACK packet assuming MQTT 5.0 format.
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize; // Remaining length
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
+            let packet_id = crate::decode_packet_id(buffer)?;
+            let properties = crate::present(SubAckProperties::decode(buffer)?);
 
-        let packet_id = u16::decode(buffer)?;
-        let properties = crate::present(SubAckProperties::decode(buffer)?);
+            if !buffer.has_remaining() {
+                return Err(ReasonCode::ProtocolError.into());
+            }
 
-        if !buffer.has_remaining() {
-            return Err(ReasonCode::ProtocolError.into());
-        }
+            let mut payload = Vec::new();
+            while buffer.has_remaining() {
+                payload.push(SubAckPayload::decode(buffer)?);
+            }
 
-        let next_packet = buffer_len - remaining_len;
-        let mut payload = Vec::new();
-
-        while buffer.remaining() > next_packet {
-            payload.push(SubAckPayload::decode(buffer)?);
-        }
-
-        Ok(SubAckPacket {
-            protocol_version: ProtocolVersion::V5,
-            packet_id,
-            properties,
-            payload,
+            Ok(SubAckPacket {
+                protocol_version: ProtocolVersion::V5,
+                packet_id,
+                properties,
+                payload,
+            })
         })
     }
 }
@@ -198,18 +182,25 @@ impl SubAckPacket {
     /// Decodes a SUBACK packet in MQTT 3.x format.
     /// MQTT 3.x SUBACK: packet_id + return codes (no properties)
     pub fn decode_v3<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
-        buffer.advance(1); // Packet type
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
-        let buffer_len = buffer.remaining();
+        crate::decode_packet(buffer, PacketType::SubAck, |_, buffer| {
+            Self::decode_v3_body(buffer)
+        })
+    }
 
-        let packet_id = u16::decode(buffer)?;
+    fn decode_v3_body<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
+        let packet_id = crate::decode_packet_id(buffer)?;
+
+        // One return code per filter of the SUBSCRIBE, which has at least
+        // one, as in MQTT 5
+        if !buffer.has_remaining() {
+            return Err(ReasonCode::ProtocolError.into());
+        }
 
         // No properties in MQTT 3.x
         // Return codes: 0x00=QoS0, 0x01=QoS1, 0x02=QoS2, 0x80=failure
-        let next_packet = buffer_len - remaining_len;
         let mut payload = Vec::new();
 
-        while buffer.remaining() > next_packet {
+        while buffer.has_remaining() {
             let return_code = u8::decode(buffer)?;
             let reason_code = match return_code {
                 0x00 => ReasonCode::GrantedQoS0,

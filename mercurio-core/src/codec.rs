@@ -29,12 +29,7 @@ pub trait Encoder {
     fn encode(&self, buffer: &mut BytesMut);
 
     /// Number of bytes [`encode`](Encoder::encode) writes.
-    ///
-    /// The default returns the in-memory size of the value. It is only
-    /// correct for fixed-size integers; every other type overrides it.
-    fn encoded_size(&self) -> usize {
-        mem::size_of_val(self)
-    }
+    fn encoded_size(&self) -> usize;
 }
 
 /// The longest packet MQTT can frame: the fixed header byte, a four-byte
@@ -82,6 +77,11 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
         value |= ((encoded_byte & 0b0111_1111) as u32) << shift;
 
         if (encoded_byte & 0b1000_0000) == 0 {
+            // A last byte of zero after the first adds nothing: the value
+            // fits in fewer bytes [MQTT-1.5.5-1]
+            if shift > 0 && encoded_byte == 0 {
+                return Err(ReasonCode::MalformedPacket.into());
+            }
             return Ok(VariableByteInteger(value));
         }
     }
@@ -98,7 +98,8 @@ fn decode_var_byte_integer<T: Buf>(encoded: &mut T) -> crate::Result<VariableByt
 ///
 /// Decoding fails with [`Error::PacketIncomplete`] when the buffer ends
 /// before the last byte, and with [`ReasonCode::MalformedPacket`] when a
-/// fourth byte still has its continuation bit set [MQTT-1.5.5-1].
+/// fourth byte still has its continuation bit set or the value uses more
+/// bytes than it needs [MQTT-1.5.5-1].
 /// Values above 268,435,455 encode to five bytes, which no peer accepts;
 /// packets that large are longer than [`MAX_PACKET_SIZE`].
 ///
@@ -187,6 +188,10 @@ impl Encoder for u8 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u8(*self);
     }
+
+    fn encoded_size(&self) -> usize {
+        1
+    }
 }
 
 impl Decoder for u8 {
@@ -202,6 +207,10 @@ impl Decoder for u8 {
 impl Encoder for u16 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u16(*self);
+    }
+
+    fn encoded_size(&self) -> usize {
+        2
     }
 }
 
@@ -219,6 +228,10 @@ impl Encoder for u32 {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u32(*self);
     }
+
+    fn encoded_size(&self) -> usize {
+        4
+    }
 }
 
 impl Decoder for u32 {
@@ -234,6 +247,10 @@ impl Decoder for u32 {
 impl Encoder for bool {
     fn encode(&self, buffer: &mut BytesMut) {
         buffer.put_u8(*self as u8);
+    }
+
+    fn encoded_size(&self) -> usize {
+        1
     }
 }
 
@@ -344,6 +361,24 @@ mod tests {
             Err(Error::MQTTReasonCode(e)) => assert_eq!(e, ReasonCode::MalformedPacket),
             _ => unreachable!(),
         };
+    }
+
+    #[test]
+    fn test_decoder_refuses_non_minimal_integers() {
+        for bytes in [&[0x80, 0x00][..], &[0xff, 0x00], &[0x80, 0x80, 0x80, 0x00]] {
+            assert!(
+                matches!(
+                    VariableByteInteger::decode(&mut Bytes::copy_from_slice(bytes)),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{bytes:02x?}"
+            );
+        }
+
+        let mut minimal = Bytes::from_static(&[0x80, 0x01]);
+        assert_eq!(VariableByteInteger::decode(&mut minimal).unwrap().0, 128);
+        let mut zero = Bytes::from_static(&[0x00]);
+        assert_eq!(VariableByteInteger::decode(&mut zero).unwrap().0, 0);
     }
 
     #[test]

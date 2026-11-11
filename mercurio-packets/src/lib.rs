@@ -4,6 +4,11 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+// Tests use std even when the library is built without it
+#[cfg(all(test, not(feature = "std")))]
+#[macro_use]
+extern crate std;
+
 pub mod auth;
 pub mod connack;
 pub mod connect;
@@ -20,9 +25,9 @@ pub mod subscribe;
 pub mod unsuback;
 pub mod unsubscribe;
 
-use core::convert::{TryFrom, TryInto};
+use core::convert::TryInto;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{buf::Take, Buf, BufMut, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
@@ -39,8 +44,10 @@ use crate::{
     subscribe::SubscribePacket, unsuback::UnsubAckPacket, unsubscribe::UnsubscribePacket,
 };
 
+pub use mercurio_core::protocol::PacketType;
+
 #[repr(u8)]
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 /// Any MQTT control packet, as decoded from or encoded to the wire.
 pub enum ControlPacket {
     Connect(ConnectPacket),
@@ -60,57 +67,30 @@ pub enum ControlPacket {
     Auth(AuthPacket),
 }
 
-#[repr(C)]
-/// The packet type, the high four bits of the first byte of the fixed
-/// header (section 2.1.2).
-pub enum PacketType {
-    Connect = 0x01,
-    ConnAck,
-    Publish,
-    PubAck,
-    PubRec,
-    PubRel,
-    PubComp,
-    Subscribe,
-    SubAck,
-    Unsubscribe,
-    UnsubAck,
-    PingReq,
-    PingResp,
-    Disconnect,
-    Auth,
-}
-
-impl TryFrom<u8> for PacketType {
-    type Error = ReasonCode;
-
-    fn try_from(value: u8) -> core::result::Result<Self, Self::Error> {
-        use PacketType::*;
-
-        let res = match value {
-            0x01 => Connect,
-            0x02 => ConnAck,
-            0x03 => Publish,
-            0x04 => PubAck,
-            0x05 => PubRec,
-            0x06 => PubRel,
-            0x07 => PubComp,
-            0x08 => Subscribe,
-            0x09 => SubAck,
-            0x0a => Unsubscribe,
-            0x0b => UnsubAck,
-            0x0c => PingReq,
-            0x0d => PingResp,
-            0x0e => Disconnect,
-            0x0f => Auth,
-            _ => return Err(ReasonCode::MalformedPacket),
-        };
-
-        Ok(res)
-    }
-}
-
 impl ControlPacket {
+    /// The type of this packet.
+    pub fn packet_type(&self) -> PacketType {
+        use ControlPacket::*;
+
+        match self {
+            Connect(_) => PacketType::Connect,
+            ConnAck(_) => PacketType::ConnAck,
+            Publish(_) => PacketType::Publish,
+            PubAck(_) => PacketType::PubAck,
+            PubRec(_) => PacketType::PubRec,
+            PubRel(_) => PacketType::PubRel,
+            PubComp(_) => PacketType::PubComp,
+            Subscribe(_) => PacketType::Subscribe,
+            SubAck(_) => PacketType::SubAck,
+            Unsubscribe(_) => PacketType::Unsubscribe,
+            UnsubAck(_) => PacketType::UnsubAck,
+            PingReq(_) => PacketType::PingReq,
+            PingResp(_) => PacketType::PingResp,
+            Disconnect(_) => PacketType::Disconnect,
+            Auth(_) => PacketType::Auth,
+        }
+    }
+
     /// Check if the buffer contains a complete MQTT packet.
     ///
     /// Returns `Ok(())` if the packet is complete, or `Err(Error::PacketIncomplete)`
@@ -192,7 +172,16 @@ impl ControlPacket {
         use ControlPacket::*;
 
         let packet_type: u8 = src[0] >> 4;
-        let flags = src[0] & 0x0f;
+
+        // MQTT 3.1 sets DUP when it resends a PUBREL, SUBSCRIBE or
+        // UNSUBSCRIBE (3.1 section 2.1); 3.1.1 reserved that bit. None of the
+        // three keeps the flag, so drop it before the decoders check it.
+        if version == ProtocolVersion::V3_1
+            && matches!(packet_type, 0x06 | 0x08 | 0x0a)
+            && src[0] & 0x0f == 0b1010
+        {
+            src[0] &= !0b1000;
+        }
 
         // In MQTT 3.x acknowledgements carry only a packet id, DISCONNECT and
         // the pings nothing, and AUTH doesn't exist; MQTT 5 extended them
@@ -208,17 +197,6 @@ impl ControlPacket {
             if body_len.is_some_and(|len| len != remaining_len) {
                 return Err(ReasonCode::MalformedPacket.into());
             }
-        }
-
-        // Fixed header flags are reserved except on PUBLISH, and must be
-        // 0b0010 on PUBREL, SUBSCRIBE and UNSUBSCRIBE [MQTT-2.1.3-1]
-        let expected_flags = match packet_type {
-            0x03 => flags,
-            0x06 | 0x08 | 0x0a => 0b0010,
-            _ => 0,
-        };
-        if flags != expected_flags {
-            return Err(ReasonCode::MalformedPacket.into());
         }
 
         let packet = match packet_type.try_into()? {
@@ -320,6 +298,88 @@ impl ControlPacket {
     }
 }
 
+/// Decodes one packet of `packet_type` from the front of `buffer`: reads
+/// the fixed header, then hands `decode_body` the flags and a reader over
+/// exactly the Remaining Length bytes.
+///
+/// Fails with [`Error::PacketIncomplete`] when `buffer` ends before the
+/// packet does, and with [`ReasonCode::MalformedPacket`] on another packet
+/// type, on reserved flags [MQTT-2.1.3-1], when the body runs short, or when
+/// `decode_body` leaves bytes of the packet unread.
+pub(crate) fn decode_packet<T, P, F>(
+    buffer: &mut T,
+    packet_type: PacketType,
+    decode_body: F,
+) -> Result<P>
+where
+    T: Buf,
+    F: FnOnce(u8, &mut Take<&mut T>) -> Result<P>,
+{
+    let first_byte = u8::decode(buffer)?;
+    if first_byte >> 4 != packet_type as u8 {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+
+    // Flags are free on PUBLISH, 0b0010 on PUBREL, SUBSCRIBE and
+    // UNSUBSCRIBE, and zero elsewhere
+    let flags = first_byte & 0x0f;
+    let expected_flags = match packet_type {
+        PacketType::Publish => flags,
+        PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => 0b0010,
+        _ => 0,
+    };
+    if flags != expected_flags {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+
+    let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+    if buffer.remaining() < remaining_len {
+        return Err(Error::PacketIncomplete);
+    }
+
+    // The whole packet is there, so running short inside it is malformed
+    let mut body = buffer.take(remaining_len);
+    let packet = decode_body(flags, &mut body).map_err(|e| match e {
+        Error::PacketIncomplete => ReasonCode::MalformedPacket.into(),
+        e => e,
+    })?;
+    if body.has_remaining() {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+
+    Ok(packet)
+}
+
+/// Reads an MQTT 5 reason code. A code that `packet_type` doesn't list is
+/// malformed, like a code no packet lists.
+pub(crate) fn decode_reason<T: Buf>(buffer: &mut T, packet_type: PacketType) -> Result<ReasonCode> {
+    let reason = ReasonCode::decode(buffer)?;
+    if !reason.is_valid_for(packet_type) {
+        return Err(ReasonCode::MalformedPacket.into());
+    }
+    Ok(reason)
+}
+
+/// Reads a Packet Identifier, which is never 0 [MQTT-2.2.1-3].
+pub(crate) fn decode_packet_id<T: Buf>(buffer: &mut T) -> Result<u16> {
+    match u16::decode(buffer)? {
+        0 => Err(ReasonCode::ProtocolError.into()),
+        packet_id => Ok(packet_id),
+    }
+}
+
+/// Size of a whole packet whose body is `remaining_len` bytes: the first
+/// byte, the Remaining Length and the body.
+pub(crate) fn packet_size(remaining_len: usize) -> usize {
+    1 + VariableByteInteger(remaining_len as u32).encoded_size() + remaining_len
+}
+
+/// Size of a property list with its length prefix.
+pub(crate) fn property_list_size<P: Encoder>(properties: &P) -> usize {
+    let len = properties.encoded_size();
+    VariableByteInteger(len as u32).encoded_size() + len
+}
+
 /// A property block that sets nothing reads as no block at all: the two
 /// mean the same, and senders use either.
 pub(crate) fn present<P: Default + PartialEq>(properties: P) -> Option<P> {
@@ -346,6 +406,28 @@ impl Encoder for ControlPacket {
             PingResp(p) => p.encode(buffer),
             Disconnect(p) => p.encode(buffer),
             Auth(p) => p.encode(buffer),
+        }
+    }
+
+    fn encoded_size(&self) -> usize {
+        use ControlPacket::*;
+
+        match self {
+            Connect(p) => p.encoded_size(),
+            ConnAck(p) => p.encoded_size(),
+            Publish(p) => p.encoded_size(),
+            PubAck(p) => p.encoded_size(),
+            PubRec(p) => p.encoded_size(),
+            PubRel(p) => p.encoded_size(),
+            PubComp(p) => p.encoded_size(),
+            Subscribe(p) => p.encoded_size(),
+            SubAck(p) => p.encoded_size(),
+            Unsubscribe(p) => p.encoded_size(),
+            UnsubAck(p) => p.encoded_size(),
+            PingReq(p) => p.encoded_size(),
+            PingResp(p) => p.encoded_size(),
+            Disconnect(p) => p.encoded_size(),
+            Auth(p) => p.encoded_size(),
         }
     }
 }
@@ -429,6 +511,28 @@ mod tests {
     }
 
     #[test]
+    fn test_dup_on_pubrel_subscribe_unsubscribe_only_in_mqtt_3_1() {
+        // PUBREL, SUBSCRIBE "a" at QoS 0 and UNSUBSCRIBE "a", DUP set
+        let resent: [&[u8]; 3] = [
+            &[0x6a, 0x02, 0x00, 0x01],
+            &[0x8a, 0x06, 0x00, 0x01, 0x00, 0x01, b'a', 0x00],
+            &[0xaa, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'],
+        ];
+        for bytes in resent {
+            let parse =
+                |version| ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
+            assert!(parse(ProtocolVersion::V3_1).is_ok(), "{bytes:02x?}");
+            assert!(
+                matches!(
+                    parse(ProtocolVersion::V3_1_1),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{bytes:02x?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_v3_1_acks_keep_their_version() {
         let mut buffer = BytesMut::from(&[0x90, 0x03, 0x00, 0x01, 0x01][..]);
         let ControlPacket::SubAck(suback) =
@@ -454,7 +558,12 @@ mod tests {
 
 #[cfg(test)]
 mod robustness_tests {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        vec::Vec,
+    };
+
+    use bytes::Bytes;
 
     use super::*;
 
@@ -525,8 +634,9 @@ mod robustness_tests {
         }
     }
 
-    #[test]
-    fn test_valid_packets_parse_completely() {
+    /// The samples with the protocol version each is valid in, and a few
+    /// more packets that leave out what the spec lets them.
+    fn versioned_samples() -> Vec<(Vec<u8>, ProtocolVersion)> {
         let v3 = [1, 4, 10, 13];
         let mut packets: Vec<(Vec<u8>, ProtocolVersion)> = samples()
             .into_iter()
@@ -540,15 +650,44 @@ mod robustness_tests {
                 (p, version)
             })
             .collect();
-        // Optional fields left out, as the spec allows
         packets.extend([
             (vec![0x40, 0x03, 0x00, 0x01, 0x10], ProtocolVersion::V5),
             (vec![0x62, 0x03, 0x00, 0x01, 0x92], ProtocolVersion::V5),
             (vec![0xe0, 0x00], ProtocolVersion::V5),
             (vec![0xf0, 0x00], ProtocolVersion::V5),
+            (vec![0x20, 0x02, 0x01, 0x00], ProtocolVersion::V3_1_1),
+            (vec![0x90, 0x03, 0x00, 0x01, 0x01], ProtocolVersion::V3_1_1),
+            (vec![0xb0, 0x02, 0x00, 0x01], ProtocolVersion::V3_1_1),
         ]);
+        packets
+    }
 
-        for (bytes, version) in packets {
+    #[test]
+    fn test_packet_type_is_the_first_nibble() {
+        for (bytes, version) in versioned_samples() {
+            let packet =
+                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
+                    .unwrap();
+            assert_eq!(packet.packet_type() as u8, bytes[0] >> 4, "{packet:?}");
+            assert_eq!(packet.clone(), packet);
+        }
+    }
+
+    #[test]
+    fn test_encoded_size_is_what_encode_writes() {
+        for (bytes, version) in versioned_samples() {
+            let packet =
+                ControlPacket::parse_with_version(&mut BytesMut::from(&bytes[..]), version)
+                    .unwrap();
+            let mut encoded = BytesMut::new();
+            packet.encode(&mut encoded);
+            assert_eq!(packet.encoded_size(), encoded.len(), "{packet:?}");
+        }
+    }
+
+    #[test]
+    fn test_valid_packets_parse_completely() {
+        for (bytes, version) in versioned_samples() {
             let mut buffer = BytesMut::from(&bytes[..]);
             // Followed by another packet that must stay untouched
             buffer.extend_from_slice(&[0xc0, 0x00]);
@@ -612,6 +751,109 @@ mod robustness_tests {
         );
         assert_eq!(ControlPacket::connect_version(&[0xc0, 0x00]), None);
         assert_eq!(ControlPacket::connect_version(&v5[..6]), None);
+    }
+
+    fn assert_protocol_error(packets: &[(&[u8], ProtocolVersion)]) {
+        for &(bytes, version) in packets {
+            let result = ControlPacket::parse_with_version(&mut BytesMut::from(bytes), version);
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                ),
+                "{bytes:02x?} ({version}): {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reason_codes_must_belong_to_their_packet() {
+        // Per packet: one code its table lists, then one it doesn't
+        let cases: [(&str, &[u8], &[u8]); 9] = [
+            (
+                "CONNACK",
+                &[0x20, 0x03, 0x00, 0x87, 0x00],
+                &[0x20, 0x03, 0x00, 0x10, 0x00],
+            ),
+            (
+                "PUBACK",
+                &[0x40, 0x03, 0x00, 0x01, 0x10],
+                &[0x40, 0x03, 0x00, 0x01, 0x92],
+            ),
+            (
+                "PUBREC",
+                &[0x50, 0x03, 0x00, 0x01, 0x91],
+                &[0x50, 0x03, 0x00, 0x01, 0x92],
+            ),
+            (
+                "PUBREL",
+                &[0x62, 0x03, 0x00, 0x01, 0x92],
+                &[0x62, 0x03, 0x00, 0x01, 0x10],
+            ),
+            (
+                "PUBCOMP",
+                &[0x70, 0x03, 0x00, 0x01, 0x92],
+                &[0x70, 0x03, 0x00, 0x01, 0x80],
+            ),
+            (
+                "SUBACK",
+                &[0x90, 0x04, 0x00, 0x01, 0x00, 0x9e],
+                &[0x90, 0x04, 0x00, 0x01, 0x00, 0x11],
+            ),
+            (
+                "UNSUBACK",
+                &[0xb0, 0x04, 0x00, 0x01, 0x00, 0x11],
+                &[0xb0, 0x04, 0x00, 0x01, 0x00, 0x01],
+            ),
+            ("DISCONNECT", &[0xe0, 0x01, 0x8e], &[0xe0, 0x01, 0x92]),
+            ("AUTH", &[0xf0, 0x01, 0x18], &[0xf0, 0x01, 0x87]),
+        ];
+
+        for (name, valid, invalid) in cases {
+            let parse = |bytes: &[u8]| {
+                ControlPacket::parse_with_version(&mut BytesMut::from(bytes), ProtocolVersion::V5)
+            };
+            assert!(parse(valid).is_ok(), "{name}: {:?}", parse(valid));
+            assert!(
+                matches!(
+                    parse(invalid),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{name}: {:?}",
+                parse(invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn test_suback_without_return_codes_is_a_protocol_error() {
+        assert_protocol_error(&[
+            (&[0x90, 0x02, 0x00, 0x01], ProtocolVersion::V3_1),
+            (&[0x90, 0x02, 0x00, 0x01], ProtocolVersion::V3_1_1),
+            (&[0x90, 0x03, 0x00, 0x01, 0x00], ProtocolVersion::V5),
+        ]);
+    }
+
+    #[test]
+    fn test_packet_identifier_zero_is_a_protocol_error() {
+        use ProtocolVersion::{V3_1_1, V5};
+
+        assert_protocol_error(&[
+            (&[0x32, 0x06, 0x00, 0x01, b't', 0x00, 0x00, 0x00], V5),
+            (&[0x32, 0x05, 0x00, 0x01, b't', 0x00, 0x00], V3_1_1),
+            (&[0x40, 0x02, 0x00, 0x00], V5),
+            (&[0x50, 0x02, 0x00, 0x00], V5),
+            (&[0x62, 0x02, 0x00, 0x00], V5),
+            (&[0x70, 0x02, 0x00, 0x00], V3_1_1),
+            (&[0x82, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01, b'a', 0x00], V5),
+            (&[0x82, 0x06, 0x00, 0x00, 0x00, 0x01, b'a', 0x00], V3_1_1),
+            (&[0x90, 0x04, 0x00, 0x00, 0x00, 0x00], V5),
+            (&[0x90, 0x03, 0x00, 0x00, 0x00], V3_1_1),
+            (&[0xa2, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, b'a'], V5),
+            (&[0xa2, 0x05, 0x00, 0x00, 0x00, 0x01, b'a'], V3_1_1),
+            (&[0xb0, 0x04, 0x00, 0x00, 0x00, 0x00], V5),
+            (&[0xb0, 0x02, 0x00, 0x00], V3_1_1),
+        ]);
     }
 
     #[test]
@@ -705,6 +947,214 @@ mod robustness_tests {
             // Keep the remaining length plausible so packets reach the decoders
             bytes[1] = (len - 2) as u8 & 0x7f;
             parse_all(&bytes);
+        }
+    }
+
+    type DirectDecoder = fn(&mut Bytes) -> Result<()>;
+
+    /// Every per-packet decoder, for both wire formats where they differ.
+    fn direct_decoders() -> Vec<(&'static str, DirectDecoder)> {
+        fn run<P: Decoder>(bytes: &mut Bytes) -> Result<()> {
+            P::decode(bytes).map(|_| ())
+        }
+        vec![
+            ("CONNECT", run::<ConnectPacket>),
+            ("CONNACK", run::<ConnAckPacket>),
+            ("CONNACK v3", |b| ConnAckPacket::decode_v3(b).map(|_| ())),
+            ("PUBLISH", run::<PublishPacket>),
+            ("PUBLISH v3", |b| PublishPacket::decode_v3(b).map(|_| ())),
+            ("PUBACK", run::<PubAckPacket>),
+            ("PUBREC", run::<PubRecPacket>),
+            ("PUBREL", run::<PubRelPacket>),
+            ("PUBCOMP", run::<PubCompPacket>),
+            ("SUBSCRIBE", run::<SubscribePacket>),
+            ("SUBSCRIBE v3", |b| {
+                SubscribePacket::decode_v3(b).map(|_| ())
+            }),
+            ("SUBACK", run::<SubAckPacket>),
+            ("SUBACK v3", |b| SubAckPacket::decode_v3(b).map(|_| ())),
+            ("UNSUBSCRIBE", run::<UnsubscribePacket>),
+            ("UNSUBSCRIBE v3", |b| {
+                UnsubscribePacket::decode_v3(b).map(|_| ())
+            }),
+            ("UNSUBACK", run::<UnsubAckPacket>),
+            ("UNSUBACK v3", |b| UnsubAckPacket::decode_v3(b).map(|_| ())),
+            ("PINGREQ", run::<PingReqPacket>),
+            ("PINGRESP", run::<PingRespPacket>),
+            ("DISCONNECT", run::<DisconnectPacket>),
+            ("AUTH", run::<AuthPacket>),
+        ]
+    }
+
+    fn decode_direct(name: &str, decode: DirectDecoder, bytes: &[u8]) -> Result<()> {
+        let mut buffer = Bytes::copy_from_slice(bytes);
+        catch_unwind(AssertUnwindSafe(|| decode(&mut buffer)))
+            .unwrap_or_else(|_| panic!("{name} decoder panicked on {bytes:02x?}"))
+    }
+
+    #[test]
+    fn test_direct_decoders_refuse_empty_and_truncated_input() {
+        for (name, decode) in direct_decoders() {
+            assert!(decode_direct(name, decode, &[]).is_err(), "{name}");
+            for sample in samples() {
+                for len in 1..sample.len() {
+                    assert!(
+                        decode_direct(name, decode, &sample[..len]).is_err(),
+                        "{name} accepted {:02x?}",
+                        &sample[..len]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_decoders_never_panic() {
+        for (name, decode) in direct_decoders() {
+            for sample in samples() {
+                for i in 0..sample.len() {
+                    for value in [0x00, 0x01, 0x7f, 0x80, 0xff, sample[i].wrapping_add(1)] {
+                        let mut mutated = sample.clone();
+                        mutated[i] = value;
+                        let _ = decode_direct(name, decode, &mutated);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_decoders_stop_at_the_packet_end() {
+        let pingreq = [0xc0, 0x00];
+        for (name, decode) in direct_decoders() {
+            for sample in samples() {
+                let mut bytes = Bytes::from([&sample[..], &pingreq].concat());
+                if decode(&mut bytes).is_ok() {
+                    assert_eq!(&bytes[..], &pingreq, "{name} on {sample:02x?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_decoders_check_the_packet_type() {
+        // A PUBREC is not a PUBACK, and a PINGRESP not a PINGREQ
+        let pubrec = [0x50, 0x02, 0x00, 0x01];
+        assert!(PubAckPacket::decode(&mut Bytes::copy_from_slice(&pubrec)).is_err());
+        assert!(PingReqPacket::decode(&mut Bytes::from_static(&[0xd0, 0x00])).is_err());
+    }
+
+    #[test]
+    fn test_direct_decoders_refuse_bytes_left_in_the_packet() {
+        let malformed: [(&str, DirectDecoder, &[u8]); 3] = [
+            (
+                "PINGREQ",
+                |b| PingReqPacket::decode(b).map(|_| ()),
+                &[0xc0, 0x01, 0x00],
+            ),
+            (
+                "CONNACK v3",
+                |b| ConnAckPacket::decode_v3(b).map(|_| ()),
+                &[0x20, 0x03, 0x00, 0x00, 0x00],
+            ),
+            (
+                "UNSUBACK v3",
+                |b| UnsubAckPacket::decode_v3(b).map(|_| ()),
+                &[0xb0, 0x03, 0x00, 0x01, 0x00],
+            ),
+        ];
+        for (name, decode, bytes) in malformed {
+            assert!(
+                matches!(
+                    decode_direct(name, decode, bytes),
+                    Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                ),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod property_list_tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    fn decode_all(bytes: &'static [u8]) -> [Result<()>; 14] {
+        fn run<P: Decoder>(bytes: &'static [u8]) -> Result<()> {
+            P::decode(&mut Bytes::from_static(bytes)).map(|_| ())
+        }
+        [
+            run::<connect::ConnectProperties>(bytes),
+            run::<connect::WillProperties>(bytes),
+            run::<connack::ConnAckProperties>(bytes),
+            run::<publish::PublishProperties>(bytes),
+            run::<puback::PubAckProperties>(bytes),
+            run::<pubrec::PubRecProperties>(bytes),
+            run::<pubrel::PubRelProperties>(bytes),
+            run::<pubcomp::PubCompProperties>(bytes),
+            run::<subscribe::SubscribeProperties>(bytes),
+            run::<suback::SubAckProperties>(bytes),
+            run::<unsubscribe::UnsubscribeProperties>(bytes),
+            run::<unsuback::UnsubAckProperties>(bytes),
+            run::<disconnect::DisconnectProperties>(bytes),
+            run::<auth::AuthProperties>(bytes),
+        ]
+    }
+
+    #[test]
+    fn test_property_list_past_the_packet_is_malformed() {
+        // A length of 5 with one byte after it, and a User Property cut
+        // short inside a list whose length fits
+        for bytes in [&[0x05, 0x26][..], &[0x02, 0x26, 0x00]] {
+            for (i, result) in decode_all(bytes).into_iter().enumerate() {
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::MQTTReasonCode(ReasonCode::MalformedPacket))
+                    ),
+                    "{bytes:02x?} in decoder {i}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_authentication_data_needs_a_method() {
+        fn run<P: Decoder>(bytes: &'static [u8]) -> Result<()> {
+            P::decode(&mut Bytes::from_static(bytes)).map(|_| ())
+        }
+        type Decode = fn(&'static [u8]) -> Result<()>;
+        let decoders: [Decode; 3] = [
+            run::<connect::ConnectProperties>,
+            run::<connack::ConnAckProperties>,
+            run::<auth::AuthProperties>,
+        ];
+
+        // Authentication Data alone, then with Authentication Method "m"
+        let data_only = &[0x03, 0x16, 0x00, 0x00][..];
+        let with_method = &[0x07, 0x16, 0x00, 0x00, 0x15, 0x00, 0x01, b'm'][..];
+        for (i, decode) in decoders.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    decode(data_only),
+                    Err(Error::MQTTReasonCode(ReasonCode::ProtocolError))
+                ),
+                "decoder {i}"
+            );
+            assert!(decode(with_method).is_ok(), "decoder {i}");
+        }
+    }
+
+    #[test]
+    fn test_every_property_list_takes_user_properties() {
+        // Two User Properties "k" = "" and "" = ""
+        let list = &[
+            0x0b, 0x26, 0x00, 0x01, b'k', 0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x00,
+        ][..];
+        for (i, result) in decode_all(list).into_iter().enumerate() {
+            assert!(result.is_ok(), "decoder {i}: {result:?}");
         }
     }
 }

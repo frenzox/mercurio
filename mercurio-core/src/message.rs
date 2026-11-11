@@ -1,7 +1,7 @@
 //! MQTT message types for internal routing.
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -118,24 +118,22 @@ impl Decoder for MessageProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         let mut properties = MessageProperties::default();
 
-        while buffer.has_remaining() {
-            match Property::decode(buffer)? {
-                Property::PayloadFormatIndicator(v) => {
-                    set_once(&mut properties.payload_format_indicator, v)?
-                }
-                Property::MessageExpiryInterval(v) => {
-                    set_once(&mut properties.message_expiry_interval, v)?
-                }
-                Property::ContentType(v) => set_once(&mut properties.content_type, v)?,
-                Property::ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
-                Property::CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
-                Property::UserProperty(v) => match &mut properties.user_property {
-                    Some(user_properties) => user_properties.push(v),
-                    None => properties.user_property = Some(vec![v]),
-                },
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_properties(buffer, |property| match property {
+            Property::PayloadFormatIndicator(v) => {
+                set_once(&mut properties.payload_format_indicator, v)
             }
-        }
+            Property::MessageExpiryInterval(v) => {
+                set_once(&mut properties.message_expiry_interval, v)
+            }
+            Property::ContentType(v) => set_once(&mut properties.content_type, v),
+            Property::ResponseTopic(v) => set_once(&mut properties.response_topic, v),
+            Property::CorrelationData(v) => set_once(&mut properties.correlation_data, v),
+            Property::UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
+            }
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }

@@ -1,17 +1,18 @@
 //! PUBLISH, an application message, in either direction (section 3.3).
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use mercurio_core::{
     codec::{Decoder, Encoder, VariableByteInteger},
-    error::Error,
     properties::*,
     qos::QoS,
     reason::ReasonCode,
 };
+
+use crate::PacketType;
 
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 /// MQTT 5 only.
@@ -63,37 +64,25 @@ impl Decoder for PublishProperties {
     fn decode<T: Buf>(buffer: &mut T) -> crate::Result<Self> {
         use Property::*;
 
-        let len = VariableByteInteger::decode(buffer)?;
         let mut properties = PublishProperties::default();
 
-        if len.0 == 0 {
-            return Ok(properties);
-        } else if (buffer.remaining() as u32) < len.0 {
-            return Err(Error::PacketIncomplete);
-        }
-
-        let mut encoded_properties = buffer.take(len.0 as usize);
-
-        while encoded_properties.has_remaining() {
-            match Property::decode(&mut encoded_properties)? {
-                PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v)?,
-                MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v)?,
-                TopicAlias(v) => set_once(&mut properties.topic_alias, v)?,
-                ResponseTopic(v) => set_once(&mut properties.response_topic, v)?,
-                CorrelationData(v) => set_once(&mut properties.correlation_data, v)?,
-                UserProperty(v) => {
-                    if let Some(vec) = &mut properties.user_property {
-                        vec.push(v);
-                    } else {
-                        let vec = vec![v];
-                        properties.user_property = Some(vec);
-                    }
-                }
-                SubscriptionIdentifier(v) => properties.subscription_identifiers.push(v),
-                ContentType(v) => set_once(&mut properties.content_type, v)?,
-                _ => return Err(ReasonCode::MalformedPacket.into()),
+        decode_property_list(buffer, |property| match property {
+            PayloadFormatIndicator(v) => set_once(&mut properties.payload_format_indicator, v),
+            MessageExpiryInterval(v) => set_once(&mut properties.message_expiry_interval, v),
+            TopicAlias(v) => set_once(&mut properties.topic_alias, v),
+            ResponseTopic(v) => set_once(&mut properties.response_topic, v),
+            CorrelationData(v) => set_once(&mut properties.correlation_data, v),
+            UserProperty(v) => {
+                push_user_property(&mut properties.user_property, v);
+                Ok(())
             }
-        }
+            SubscriptionIdentifier(v) => {
+                properties.subscription_identifiers.push(v);
+                Ok(())
+            }
+            ContentType(v) => set_once(&mut properties.content_type, v),
+            _ => Err(ReasonCode::MalformedPacket.into()),
+        })?;
 
         Ok(properties)
     }
@@ -124,6 +113,10 @@ impl Encoder for PublishPacket {
     fn encode(&self, buffer: &mut BytesMut) {
         self.encode_inner(buffer, true);
     }
+
+    fn encoded_size(&self) -> usize {
+        crate::packet_size(self.remaining_len(true))
+    }
 }
 
 impl Decoder for PublishPacket {
@@ -143,9 +136,15 @@ impl PublishPacket {
         Self::decode_inner(buffer, false)
     }
 
-    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
-        let mut remaining_len = 0;
+    fn remaining_len(&self, with_properties: bool) -> usize {
+        let mut len = self.topic_name.encoded_size() + self.packet_id.encoded_size();
+        if with_properties {
+            len += crate::property_list_size(&self.properties);
+        }
+        len + self.payload.as_ref().map_or(0, |payload| payload.len())
+    }
 
+    fn encode_inner(&self, buffer: &mut BytesMut, with_properties: bool) {
         // Fixed header
         let mut fixed_header: u8 = PACKET_TYPE << 4;
         fixed_header |= (self.dup as u8) << 3;
@@ -153,19 +152,7 @@ impl PublishPacket {
         fixed_header |= self.retain as u8;
         fixed_header.encode(buffer);
 
-        remaining_len += self.topic_name.encoded_size();
-        remaining_len += self.packet_id.encoded_size();
-        if with_properties {
-            remaining_len +=
-                VariableByteInteger(self.properties.encoded_size() as u32).encoded_size();
-            remaining_len += self.properties.encoded_size();
-        }
-
-        if let Some(payload) = &self.payload {
-            remaining_len += payload.len();
-        }
-
-        VariableByteInteger(remaining_len as u32).encode(buffer);
+        VariableByteInteger(self.remaining_len(with_properties) as u32).encode(buffer);
 
         // Variable header
         self.topic_name.encode(buffer);
@@ -182,45 +169,40 @@ impl PublishPacket {
     }
 
     fn decode_inner<T: Buf>(buffer: &mut T, with_properties: bool) -> crate::Result<Self> {
-        // Fixed header
-        let fixed_header = buffer.get_u8();
-        let dup = (fixed_header & 0b0000_1000) != 0;
-        let qos_level = QoS::from((fixed_header & 0b0000_0110) >> 1);
-        let retain = (fixed_header & 0b0000_0001) != 0;
-        let remaining_len = VariableByteInteger::decode(buffer)?.0 as usize;
+        crate::decode_packet(buffer, PacketType::Publish, |flags, body| {
+            Self::decode_body(flags, body, with_properties)
+        })
+    }
+
+    fn decode_body<T: Buf>(
+        flags: u8,
+        buffer: &mut T,
+        with_properties: bool,
+    ) -> crate::Result<Self> {
+        let dup = (flags & 0b0000_1000) != 0;
+        let qos_level = QoS::from((flags & 0b0000_0110) >> 1);
+        let retain = (flags & 0b0000_0001) != 0;
 
         // Variable header
         let topic_name = String::decode(buffer)?;
         let packet_id = match qos_level {
             QoS::AtMostOnce => None,
             QoS::Invalid => return Err(ReasonCode::MalformedPacket.into()),
-            _ => Some(u16::decode(buffer)?),
+            _ => Some(crate::decode_packet_id(buffer)?),
         };
         // A QoS 0 message is never retransmitted [MQTT-3.3.1-2]
         if dup && qos_level == QoS::AtMostOnce {
             return Err(ReasonCode::MalformedPacket.into());
         }
 
-        let mut header_len = topic_name.encoded_size() + packet_id.encoded_size();
         let properties = if with_properties {
-            let properties = PublishProperties::decode(buffer)?;
-            header_len += properties.encoded_size()
-                + VariableByteInteger(properties.encoded_size() as u32).encoded_size();
-            Some(properties)
+            Some(PublishProperties::decode(buffer)?)
         } else {
             None
         };
 
-        // Payload
-        let payload_len = remaining_len
-            .checked_sub(header_len)
-            .ok_or(ReasonCode::MalformedPacket)?;
-
-        if buffer.remaining() < payload_len {
-            return Err(ReasonCode::MalformedPacket.into());
-        }
-
-        let payload = Some(buffer.copy_to_bytes(payload_len));
+        // The payload is the rest of the packet
+        let payload = Some(buffer.copy_to_bytes(buffer.remaining()));
 
         Ok(PublishPacket {
             dup,
@@ -236,6 +218,8 @@ impl PublishPacket {
 
 #[cfg(test)]
 mod tests {
+    use std::{string::ToString, vec::Vec};
+
     use crate::publish::*;
 
     #[test]

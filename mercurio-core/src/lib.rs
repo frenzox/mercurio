@@ -4,6 +4,11 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+// Tests use std even when the library is built without it
+#[cfg(all(test, not(feature = "std")))]
+#[macro_use]
+extern crate std;
+
 pub mod codec;
 pub mod error;
 pub mod message;
