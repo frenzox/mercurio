@@ -121,6 +121,13 @@ max_inflight = 64
 # Connections one client address may hold at once, counting the address a
 # PROXY header gives (unbounded by default, as NAT puts many behind one)
 # max_connections_per_ip = 100
+# Seconds one call of a plugin hook may take, for built-in authentication
+# and access control as for [[plugins]]; a slower call denies, or drops the
+# message. [auth.http] timeout_seconds and a plugin's timeout_ms may not
+# exceed it
+# plugin_timeout = 5
+# Seconds between calls of the plugins' on_tick
+# plugin_tick_interval = 1
 
 # Send every client to another server instead of serving it. MQTT 5 clients
 # are told where to go; MQTT 3.x clients only learn this server is unavailable.
@@ -207,6 +214,7 @@ allow_anonymous = false
 # [auth.http]
 # user_url = "https://auth.internal/mqtt/user"
 # acl_url = "https://auth.internal/mqtt/acl"
+# No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
 
@@ -323,7 +331,8 @@ group = "mercurio"
 # allow_sockets = ["10.0.0.5:6379"]
 # Copies that run calls at once; the number of CPUs by default
 # instances = 4
-# Longest one call may run, in milliseconds
+# Longest one call may run, in milliseconds; plugin_timeout by default, and
+# no longer than it
 # timeout_ms = 5000
 # Memory each copy may use, in MiB
 # memory_mb = 64

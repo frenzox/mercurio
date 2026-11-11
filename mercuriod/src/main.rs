@@ -250,7 +250,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut reloadable: Vec<Arc<dyn Reload>> = Vec::new();
     let (auth_config, builtins, dynsec) = build_auth(&config.auth, &mut reloadable, true)?;
-    let wasm = load_plugins(&config.plugins, &mut reloadable).await?;
+    let wasm = load_plugins(
+        &config.plugins,
+        config.server.plugin_timeout(),
+        &mut reloadable,
+    )
+    .await?;
     // Listeners naming plugins share these copies of `[auth]`'s built-ins
     // and of the plugins with the broker's chain
     let chain = |builtins: &[Arc<dyn Plugin>], names: Option<&[String]>| {
@@ -339,6 +344,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     server_config.admin_extension = Some(extension);
     server_config.sys_interval =
         (config.server.sys_interval > 0).then(|| Duration::from_secs(config.server.sys_interval));
+    server_config.plugin_timeout = config.server.plugin_timeout();
+    server_config.plugin_tick_interval = config.server.plugin_tick_interval();
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(hangup, reloadable));
 
@@ -595,6 +602,7 @@ fn build_auth(
 #[cfg(feature = "wasm")]
 async fn load_plugins(
     plugins: &[config::PluginConfig],
+    plugin_timeout: Duration,
     reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {
@@ -613,10 +621,9 @@ async fn load_plugins(
             allow_http: plugin.allow_http.clone(),
             allow_sockets: plugin.allow_sockets.clone(),
             instances: plugin.instances.unwrap_or(cpus),
-            timeout: plugin.timeout_ms.map_or(
-                ServerConfig::default().plugin_timeout,
-                Duration::from_millis,
-            ),
+            timeout: plugin
+                .timeout_ms
+                .map_or(plugin_timeout, Duration::from_millis),
             memory: plugin.memory_mb << 20,
         };
         let loaded_plugin = wasm::WasmPlugin::load(&runtime, settings)
@@ -635,6 +642,7 @@ async fn load_plugins(
 #[cfg(not(feature = "wasm"))]
 async fn load_plugins(
     plugins: &[config::PluginConfig],
+    _plugin_timeout: Duration,
     _reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {

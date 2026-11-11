@@ -140,7 +140,7 @@ allow_http = ["audit.internal:80"]</pre>
 <li><code>allow_sockets</code> lists the <code>address:port</code> pairs it may open sockets to. A socket may bind only to the wildcard address with port 0, which is what a connect needs. DNS lookups are off, so use addresses. With an empty list the plugin can't create a socket at all.</li>
 <li>Each copy may hold at most 4096 host resources at once, such as sockets, streams and HTTP requests. A call that tries to hold more traps.</li>
 <li><code>memory_mb</code> caps the linear memory of each copy. The default is 64.</li>
-<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. The default is 5000. The broker's own limit per hook call is 5 seconds, so for hooks a larger value acts as 5 seconds. <code>init</code> when the plugin loads, or reloads, gets the full value.</li>
+<li><code>timeout_ms</code> bounds the CPU time (counted in epochs) and the wall-clock time of each call and of <code>init</code>. It defaults to <code>[server]</code> <code>plugin_timeout</code>, 5 seconds unless set, the broker's own limit per hook call, and may not be longer.</li>
 </ul>
 <p>A plugin that traps, runs out of memory or runs out of time fails that call as described above, and its copy is replaced. The broker logs the cause.</p>
 
