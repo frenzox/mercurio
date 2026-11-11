@@ -89,7 +89,8 @@ async fn test_auth_steps_see_the_client() {
     assert_eq!(
         exchange.step(None).await,
         AuthResult::Success {
-            username: Some(r#"who Some("claimed")"#.into())
+            username: Some(r#"who Some("claimed")"#.into()),
+            data: None,
         }
     );
     assert!(plugin.begin_auth(&client, "OTHER").is_none());

@@ -158,6 +158,7 @@ impl AuthExchange for SwitchExchange {
     fn step<'a>(&'a mut self, _: Option<&'a Bytes>) -> BoxFuture<'a, AuthResult> {
         ready(AuthResult::Success {
             username: Some(self.0.into()),
+            data: None,
         })
     }
 }

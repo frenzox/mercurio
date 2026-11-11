@@ -102,6 +102,7 @@ impl PlainExchange {
         match self.credentials.get(&username) {
             Some(stored_password) if stored_password == &password => AuthResult::Success {
                 username: Some(username),
+                data: None,
             },
             _ => AuthResult::Failed(ReasonCode::BadUserNameOrPassword),
         }
@@ -177,7 +178,8 @@ mod tests {
                 .step(Some(&data))
                 .await,
             AuthResult::Success {
-                username: Some("user".into())
+                username: Some("user".into()),
+                data: None,
             }
         );
     }

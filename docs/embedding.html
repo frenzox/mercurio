@@ -159,7 +159,7 @@ config.plugins = vec![Arc::new(OwnTopics)];</pre>
 </ul>
 
 <h3>Enhanced authentication</h3>
-<p>A plugin takes part in MQTT 5 enhanced authentication by returning an <code>AuthExchange</code> from <code>Plugin::begin_auth</code> for the methods it knows. <code>begin_auth</code> gets the client: during CONNECT its user name is the one the client claims, if any; on re-authentication it is the verified user. The broker calls <code>step</code> once per message from the client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username }</code> or <code>Failed(reason)</code>. <code>auth::PlainAuth</code> is a complete example: add it to <code>ServerConfig::plugins</code> to accept the <code>PLAIN</code> method.</p>
+<p>A plugin takes part in MQTT 5 enhanced authentication by returning an <code>AuthExchange</code> from <code>Plugin::begin_auth</code> for the methods it knows. <code>begin_auth</code> gets the client: during CONNECT its user name is the one the client claims, if any; on re-authentication it is the verified user. The broker calls <code>step</code> once per message from the client; each step returns <code>AuthResult::Continue(challenge)</code>, <code>Success { username, data }</code> or <code>Failed(reason)</code>. <code>data</code>, such as SCRAM's final server message, goes to the client as Authentication Data in the CONNACK, or in the AUTH that ends a re-authentication. <code>auth::PlainAuth</code> is a complete example: add it to <code>ServerConfig::plugins</code> to accept the <code>PLAIN</code> method.</p>
 
 <h2>Storage</h2>
 <pre>use std::sync::Arc;

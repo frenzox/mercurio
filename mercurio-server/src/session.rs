@@ -579,6 +579,7 @@ impl Session {
         connection: &mut Connection<S>,
         resume: bool,
         assigned_client_id: bool,
+        auth_data: Option<Bytes>,
         limits: &Limits,
         policy: &ConnectPolicy,
     ) -> Result<()>
@@ -626,6 +627,7 @@ impl Session {
                         .properties
                         .as_ref()
                         .and_then(|p| p.authentication_method.clone()),
+                    authentication_data: auth_data.map(AuthenticationData::new),
                     receive_maximum: Some(ReceiveMaximum::new(limits.receive_maximum)),
                     response_information: policy
                         .response_information
@@ -1470,12 +1472,17 @@ impl Session {
         };
 
         match result {
-            AuthResult::Success { username } => {
+            AuthResult::Success { username, data } => {
                 session.auth_exchange = None;
                 session.verified_user = username;
+                // An AUTH with properties names its method [MQTT-3.15.2-1]
                 Ok(Some(ControlPacket::Auth(AuthPacket {
                     reason: ReasonCode::Success,
-                    properties: AuthProperties::default(),
+                    properties: AuthProperties {
+                        auth_method: Some(AuthenticationMethod::new(method)),
+                        auth_data: data.map(AuthenticationData::new),
+                        ..Default::default()
+                    },
                 })))
             }
             AuthResult::Continue(challenge) => Ok(Some(ControlPacket::Auth(AuthPacket {

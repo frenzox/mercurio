@@ -231,8 +231,13 @@ impl Event {
 #[non_exhaustive]
 pub enum AuthResult {
     /// The client is authenticated, as `username` if the method identifies
-    /// users.
-    Success { username: Option<String> },
+    /// users. `data`, such as SCRAM's final server message, goes to the
+    /// client as Authentication Data, in the CONNACK or in the AUTH that
+    /// ends a re-authentication.
+    Success {
+        username: Option<String>,
+        data: Option<Bytes>,
+    },
     /// Authentication requires another round - send this challenge to client.
     Continue(Bytes),
     /// Authentication failed with the given reason.
