@@ -22,7 +22,10 @@ pub enum ClientError {
     ConnectionRefused(ReasonCode),
 
     /// The broker refused the connection and named another server to use
-    /// instead, `reason` saying whether the move is for good.
+    /// instead, `reason` saying whether the move is for good. With
+    /// [`follow_redirects`](crate::ConnectOptions::follow_redirects), the
+    /// last redirection when the hop limit was reached or no server it
+    /// named could be read.
     #[error("Connection refused ({reason:?}), use {server_reference} instead")]
     #[non_exhaustive]
     Redirected {

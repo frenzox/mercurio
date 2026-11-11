@@ -376,6 +376,7 @@ pub struct ConnectOptions {
     pub(crate) write_timeout: Option<Duration>,
     pub(crate) manual_acks: bool,
     pub(crate) resubscribe: bool,
+    pub(crate) max_redirects: u8,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
@@ -413,6 +414,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("write_timeout", &self.write_timeout)
             .field("manual_acks", &self.manual_acks)
             .field("resubscribe", &self.resubscribe)
+            .field("max_redirects", &self.max_redirects)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
@@ -509,6 +511,7 @@ impl ConnectOptions {
             write_timeout: None,
             manual_acks: false,
             resubscribe: false,
+            max_redirects: 0,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
@@ -668,6 +671,23 @@ impl ConnectOptions {
     /// forgets a subscription. Off unless set.
     pub fn resubscribe(mut self, resubscribe: bool) -> Self {
         self.resubscribe = resubscribe;
+        self
+    }
+
+    /// Follow up to `hops` redirections in a row to the servers a broker
+    /// names when it refuses CONNECT, or closes the connection, with Use
+    /// Another Server or Server Moved and a Server Reference: a list of
+    /// `host[:port]` entries tried in order, each with this client's TLS
+    /// settings and, without a port, the current one. An entry with a
+    /// scheme that would turn TLS off, or on, is skipped. After Server
+    /// Moved the server reached replaces the host and port for the rest of
+    /// the client's life; Use Another Server only applies to that attempt,
+    /// and reconnecting later goes back to the configured broker. Off (0)
+    /// unless set, in which case redirections fail with
+    /// [`ClientError::Redirected`] or end the client. Not with a
+    /// [`connector`](Self::connector) or a Unix socket.
+    pub fn follow_redirects(mut self, hops: u8) -> Self {
+        self.max_redirects = hops;
         self
     }
 

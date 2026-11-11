@@ -19,6 +19,7 @@ mod connection;
 mod error;
 mod event;
 mod options;
+mod redirect;
 #[cfg(feature = "tls")]
 mod tls;
 #[cfg(feature = "websocket")]

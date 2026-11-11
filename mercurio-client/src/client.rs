@@ -91,7 +91,7 @@ impl MqttClient {
     /// Connect to an MQTT broker with the given options.
     pub async fn connect(mut options: ConnectOptions) -> Result<Self> {
         options.check()?;
-        let (connection, session) = Self::open(&options).await?;
+        let (connection, session) = Self::open(&mut options).await?;
         // Reconnecting must present the same identity to find the session
         options.client_id = Some(session.client_id.clone());
         let client_id = session.client_id.clone();
@@ -120,8 +120,87 @@ impl MqttClient {
         })
     }
 
+    /// Opens the connection, following redirections as far as the options
+    /// allow. A server that moved for good replaces the host and port in
+    /// `options`.
+    async fn open(options: &mut ConnectOptions) -> Result<(Connection, Session)> {
+        match Self::open_once(options).await {
+            Err(ClientError::Redirected {
+                reason,
+                server_reference,
+            }) if options.max_redirects > 0 => {
+                Self::follow(options, reason, server_reference).await
+            }
+            opened => opened,
+        }
+    }
+
+    /// Connects to the servers `reference` names, in order, until one
+    /// takes the client, following further redirections up to the hop
+    /// limit. After Server Moved the server reached replaces the one in
+    /// `options`; Use Another Server only applies to this attempt. The TLS
+    /// settings stay as they are.
+    async fn follow(
+        options: &mut ConnectOptions,
+        mut reason: ReasonCode,
+        mut reference: String,
+    ) -> Result<(Connection, Session)> {
+        let redirected = |reason, server_reference| ClientError::Redirected {
+            reason,
+            server_reference,
+        };
+        // A connector or a Unix socket names no host to replace
+        #[cfg(unix)]
+        let fixed = options.connector.is_some() || options.unix_path.is_some();
+        #[cfg(not(unix))]
+        let fixed = options.connector.is_some();
+        if fixed {
+            return Err(redirected(reason, reference));
+        }
+        for _ in 0..options.max_redirects {
+            let mut failure = None;
+            let mut next = None;
+            for server in crate::redirect::servers(&reference, options.tls.enabled) {
+                let mut attempt = options.clone();
+                attempt.port = server.port.unwrap_or(options.port);
+                attempt.host = server.host;
+                info!(
+                    "Redirected ({:?}) to {}:{}",
+                    reason, attempt.host, attempt.port
+                );
+                let opened = Self::open_once(&attempt).await;
+                // A server that answered CONNECT was reached, even to
+                // send the client on
+                let reached = matches!(opened, Ok(_) | Err(ClientError::Redirected { .. }));
+                if reached && reason == ReasonCode::ServerMoved {
+                    options.host = attempt.host;
+                    options.port = attempt.port;
+                }
+                match opened {
+                    Ok(opened) => return Ok(opened),
+                    Err(ClientError::Redirected {
+                        reason,
+                        server_reference,
+                    }) => {
+                        next = Some((reason, server_reference));
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Following the redirection failed: {}", e);
+                        failure = Some(e);
+                    }
+                }
+            }
+            match next {
+                Some((again, to)) => (reason, reference) = (again, to),
+                None => return Err(failure.unwrap_or(redirected(reason, reference))),
+            }
+        }
+        Err(redirected(reason, reference))
+    }
+
     /// Opens the transport and performs the CONNECT handshake.
-    async fn open(options: &ConnectOptions) -> Result<(Connection, Session)> {
+    async fn open_once(options: &ConnectOptions) -> Result<(Connection, Session)> {
         let mut connection = Connection::new(Self::open_stream(options).await?, options);
         let session = Self::perform_connect(&mut connection, options).await?;
         Ok((connection, session))
@@ -360,7 +439,7 @@ impl MqttClient {
         session: Session,
         mut command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
-        options: ConnectOptions,
+        mut options: ConnectOptions,
         connack: Arc<RwLock<ConnAckInfo>>,
     ) {
         let mut state = EventLoop {
@@ -393,9 +472,19 @@ impl MqttClient {
 
         let mut reason = state.run(&mut command_rx, keep_alive).await;
         loop {
-            let reconnect = backoff.as_mut().filter(|_| should_reconnect(&reason));
+            let redirect = match &reason {
+                DisconnectReason::ServerInitiated {
+                    reason: code @ (ReasonCode::UseAnotherServer | ReasonCode::ServerMoved),
+                    server_reference: Some(reference),
+                    ..
+                } if options.max_redirects > 0 => Some((*code, reference.clone())),
+                _ => None,
+            };
+            let reconnect = backoff.is_some() && should_reconnect(&reason);
             state.deliver(Event::Disconnected { reason });
-            let Some(backoff) = reconnect else { break };
+            if redirect.is_none() && !reconnect {
+                break;
+            }
 
             // Their acknowledgements can't go out any more; the broker
             // sends the messages again if it kept the session
@@ -406,17 +495,38 @@ impl MqttClient {
             if let Some(response) = state.reauthentication.take() {
                 let _ = response.send(Err(ClientError::Disconnected));
             }
-            let (connection, session) =
-                match state.reconnect(&mut command_rx, &options, backoff).await {
-                    Ok(opened) => opened,
-                    Err(Some(error)) => {
-                        state.deliver(Event::Stopped {
-                            error: Arc::new(error),
-                        });
-                        break;
+            let opened = match redirect {
+                Some((code, reference)) => {
+                    match MqttClient::follow(&mut options, code, reference).await {
+                        Err(e) if !refused_for_good(&e) => match backoff.as_mut() {
+                            Some(backoff) => {
+                                warn!("Following the redirection failed: {}", e);
+                                state
+                                    .reconnect(&mut command_rx, &mut options, backoff)
+                                    .await
+                            }
+                            None => Err(Some(e)),
+                        },
+                        followed => followed.map_err(Some),
                     }
-                    Err(None) => break,
-                };
+                }
+                None => {
+                    let backoff = backoff.as_mut().expect("reconnecting");
+                    state
+                        .reconnect(&mut command_rx, &mut options, backoff)
+                        .await
+                }
+            };
+            let (connection, session) = match opened {
+                Ok(opened) => opened,
+                Err(Some(error)) => {
+                    state.deliver(Event::Stopped {
+                        error: Arc::new(error),
+                    });
+                    break;
+                }
+                Err(None) => break,
+            };
             state.connection = connection;
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
@@ -1346,7 +1456,7 @@ impl EventLoop {
     async fn reconnect(
         &mut self,
         command_rx: &mut mpsc::Receiver<Command>,
-        options: &ConnectOptions,
+        options: &mut ConnectOptions,
         backoff: &mut Backoff,
     ) -> std::result::Result<(Connection, Session), Option<ClientError>> {
         let event_tx = self.event_tx.clone();
