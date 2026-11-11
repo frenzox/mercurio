@@ -1335,6 +1335,7 @@ impl<St: MqttStore + 'static> Listener<St> {
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
+                    crate::connection::configure_tcp(&socket);
                     let parts = HandlerParts {
                         listener: Arc::clone(&self.endpoints[endpoint].state.name),
                         ..parts

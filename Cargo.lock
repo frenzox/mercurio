@@ -1448,6 +1448,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",

@@ -44,6 +44,35 @@ const LINGER: Duration = Duration::from_secs(1);
 /// How long writing one packet may take unless configured otherwise.
 pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an accepted TCP connection may be silent before the kernel
+/// probes whether the client is still there, which also keeps NAT and
+/// firewall state alive for clients with a long MQTT keep-alive or none.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const KEEPALIVE_PROBES: u32 = 5;
+
+/// Sets up an accepted TCP socket: packets go out at once rather than
+/// waiting for Nagle's algorithm to batch them, and a client that vanished
+/// is noticed by the kernel within about two minutes, whether the
+/// connection is idle (keepalive) or has data the client never acknowledges
+/// (`TCP_USER_TIMEOUT`, on Linux, matching the keepalive probes' time).
+/// A socket that refuses an option is served without it.
+pub(crate) fn configure_tcp(socket: &TcpStream) {
+    let socket = socket2::SockRef::from(socket);
+    let _ = socket.set_tcp_nodelay(true);
+    let keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let keepalive = keepalive
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_PROBES);
+    let _ = socket.set_tcp_keepalive(&keepalive);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ =
+        socket.set_tcp_user_timeout(Some(KEEPALIVE_IDLE + KEEPALIVE_INTERVAL * KEEPALIVE_PROBES));
+}
+
 /// A connection that can be either plain TCP or TLS-encrypted.
 pub struct Connection<S = TcpStream>
 where
@@ -313,6 +342,44 @@ where
             Err(Error::PacketIncomplete) => Ok(None),
             // An actual error
             Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use socket2::SockRef;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn test_accepted_sockets_send_at_once_and_notice_dead_peers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        super::configure_tcp(&socket);
+
+        let socket = SockRef::from(&socket);
+        assert!(socket.tcp_nodelay().unwrap());
+        assert!(socket.keepalive().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(socket.tcp_keepalive_time().unwrap(), super::KEEPALIVE_IDLE);
+            assert_eq!(
+                socket.tcp_keepalive_interval().unwrap(),
+                super::KEEPALIVE_INTERVAL
+            );
+            assert_eq!(
+                socket.tcp_keepalive_retries().unwrap(),
+                super::KEEPALIVE_PROBES
+            );
+            assert_eq!(
+                socket.tcp_user_timeout().unwrap(),
+                Some(Duration::from_secs(110))
+            );
         }
     }
 }

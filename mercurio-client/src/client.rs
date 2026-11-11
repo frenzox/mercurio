@@ -132,6 +132,8 @@ impl MqttClient {
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+        // Each packet is written whole, so Nagle would only delay it
+        let _ = stream.set_nodelay(true);
 
         let mut connection = if options.tls.enabled {
             info!("Establishing TLS connection");
