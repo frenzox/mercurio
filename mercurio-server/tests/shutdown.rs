@@ -34,6 +34,9 @@ async fn handshaking_connections_end_with_the_server() {
         started.push((listener.local_addr().unwrap(), start));
         let mut listener = ListenerConfig::new(listener, transport);
         listener.proxy_protocol = proxy_protocol;
+        if proxy_protocol {
+            listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
+        }
         config.listeners.push(listener);
     }
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

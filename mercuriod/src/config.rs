@@ -191,7 +191,8 @@ pub struct ListenerConfig {
     pub proxy_protocol: bool,
 
     /// Addresses or CIDR blocks of the proxies allowed to send the header;
-    /// any when empty
+    /// required with `proxy_protocol` on TCP, `["0.0.0.0/0", "::/0"]` for
+    /// any peer
     #[serde(default)]
     pub proxy_from: Vec<String>,
 

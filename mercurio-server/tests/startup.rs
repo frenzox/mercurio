@@ -79,6 +79,22 @@ async fn trusted_tcp_listeners_fail_startup() {
     assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
 }
 
+/// A PROXY header can claim any address, so trusting every peer to send
+/// one has to be asked for by name.
+#[tokio::test]
+async fn proxy_protocol_without_proxy_from_fails_startup() {
+    let mut value = ListenerConfig::new(
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        Transport::Mqtt,
+    );
+    value.proxy_protocol = true;
+    let result = start_with(value).await;
+    let Err(ServerError::Config(message)) = result else {
+        panic!("{result:?}");
+    };
+    assert!(message.contains(r#"["0.0.0.0/0", "::/0"]"#), "{message}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn peer_filters_on_tcp_listeners_fail_startup() {

@@ -39,6 +39,7 @@ async fn every_handshake_step_shares_one_deadline() {
     let addr = proxied.local_addr().unwrap();
     let mut listener = ListenerConfig::new(proxied, Transport::Mqtt);
     listener.proxy_protocol = true;
+    listener.proxy_from = vec!["127.0.0.1".parse().unwrap()];
     let mut config = ServerConfig::default();
     config.listeners.push(listener);
     config.limits.connect_timeout = Duration::from_millis(1000);

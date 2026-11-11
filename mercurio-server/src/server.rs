@@ -282,7 +282,9 @@ pub struct ListenerConfig {
     pub proxy_protocol: bool,
     /// With `proxy_protocol`, the proxies allowed to send the header; other
     /// connections are closed, as their header could claim any address.
-    /// Any connection may send one when empty.
+    /// Required on TCP listeners with `proxy_protocol`: `0.0.0.0/0` and
+    /// `::/0` let any peer send one. Unix socket listeners take none, as
+    /// their clients have no address.
     pub proxy_from: Vec<AddressRange>,
     /// Prefixed to every topic the listener's clients use, so they only see
     /// their own part of the topic tree.
@@ -467,6 +469,22 @@ impl Endpoint {
             return Err(ServerError::Config(
                 "a trusted listener can't sit behind a proxy: the kernel reports the proxy's \
                  credentials, so every remote client would be trusted"
+                    .into(),
+            ));
+        }
+        // A Unix socket's file permissions decide who may send the header
+        if config.proxy_protocol && config.proxy_from.is_empty() && !unix {
+            return Err(ServerError::Config(
+                "a PROXY header can claim any address, so proxy_protocol needs proxy_from to \
+                 name the proxies that may send it; to let any peer send one, set proxy_from \
+                 to [\"0.0.0.0/0\", \"::/0\"]"
+                    .into(),
+            ));
+        }
+        if !config.proxy_from.is_empty() && unix {
+            return Err(ServerError::Config(
+                "a Unix socket's clients have no address for proxy_from to match; its file \
+                 permissions decide who may connect"
                     .into(),
             ));
         }

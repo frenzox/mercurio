@@ -112,7 +112,7 @@ backend mqtt
     mode tcp
     server mercurio 10.0.0.5:1884 send-proxy-v2</pre>
 <p>Connections without a valid header are closed. TLS, when enabled on the listener, starts after the header.</p>
-<p>A header can claim any address, so name the balancers in <code>proxy_from</code>: connections from other addresses are closed. That matters most with <code>max_connections_per_ip</code>, which counts the address the header gives.</p>
+<p>A header can claim any address, so <code>proxy_from</code> is required and names the balancers: connections from other addresses are closed. That matters most with <code>max_connections_per_ip</code>, which counts the address the header gives. When every peer that reaches the port is a proxy, say so with <code>proxy_from = ["0.0.0.0/0", "::/0"]</code>. A Unix socket listener takes no <code>proxy_from</code>: its file permissions decide who may connect. Version 2 headers with a command other than LOCAL or PROXY are refused.</p>
 
 <h2 id="mount-points">Mount points</h2>
 <p>A mount point gives a listener's clients their own part of the topic tree, for example one per tenant:</p>

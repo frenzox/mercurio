@@ -314,7 +314,8 @@ group = "mercurio"
 # port = 1884
 # proxy_protocol = true
 # Proxies allowed to send the header, as addresses or CIDR blocks; others
-# are closed, as their header could claim any address (any when empty)
+# are closed, as their header could claim any address. Required with
+# proxy_protocol; ["0.0.0.0/0", "::/0"] lets any peer send one
 # proxy_from = ["10.0.0.0/8"]
 #
 # A tenant's listener: its clients only see topics under the mount point
