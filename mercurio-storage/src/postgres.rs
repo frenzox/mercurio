@@ -60,7 +60,8 @@ const LOCK_KEY: i64 = 0x6d65_7263_7572_696f;
 const SCHEMA_LOCK_KEY: i64 = LOCK_KEY - 1;
 
 /// Schema changes, applied in order; the database records how many it has.
-/// Released entries never change: a new schema change is a new entry.
+/// Released entries never change: a new schema change is a new entry, written
+/// so that applying it again is harmless.
 const MIGRATIONS: &[&str] = &[
     "
     CREATE TABLE sessions (
@@ -196,6 +197,10 @@ const MIGRATIONS: &[&str] = &[
         RETURN NULL;
     END
     $$;
+",
+    "
+    ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS retain BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE inflight_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT;
 ",
 ];
 
@@ -824,15 +829,16 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
         statements.push((
             "INSERT INTO inflight_messages
              (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-              subscription_identifiers)
+              subscription_identifiers, retain, expires_at)
              SELECT $1, * FROM unnest($2::INTEGER[], $3::TEXT[], $4::BYTEA[], $5::INTEGER[],
                                       $6::BOOLEAN[], $7::BIGINT[], $8::BOOLEAN[], $9::BYTEA[],
-                                      $10::TEXT[])
+                                      $10::TEXT[], $11::BOOLEAN[], $12::BIGINT[])
              ON CONFLICT (client_id, packet_id) DO UPDATE SET
              topic = EXCLUDED.topic, payload = EXCLUDED.payload, qos = EXCLUDED.qos,
              dup = EXCLUDED.dup, sequence = EXCLUDED.sequence, released = EXCLUDED.released,
              properties = EXCLUDED.properties,
-             subscription_identifiers = EXCLUDED.subscription_identifiers",
+             subscription_identifiers = EXCLUDED.subscription_identifiers,
+             retain = EXCLUDED.retain, expires_at = EXCLUDED.expires_at",
             vec![
                 id(),
                 column(&stored, |(m, _)| i32::from(m.packet_id)),
@@ -846,6 +852,8 @@ fn bulk_statements(client_id: &str, run: &[&Write]) -> Vec<(&'static str, Params
                 column(&stored, |(m, released)| m.released || *released),
                 column(&stored, |(m, _)| encode_properties(&m.properties)),
                 column(&stored, |(m, _)| identifiers(&m.subscription_identifiers)),
+                column(&stored, |(m, _)| m.retain),
+                column(&stored, |(m, _)| m.expires_at.map(|t| t as i64)),
             ],
         ));
     }
@@ -1020,6 +1028,11 @@ fn inflight_from_row(row: &Row) -> Result<InflightMessage> {
         subscription_identifiers: decode_identifiers(
             row.try_get("subscription_identifiers").db()?,
         )?,
+        retain: row.try_get("retain").db()?,
+        expires_at: row
+            .try_get::<_, Option<i64>>("expires_at")
+            .db()?
+            .map(|t| t as u64),
     })
 }
 
@@ -1458,6 +1471,8 @@ mod tests {
             payload: Some(Bytes::from_static(b"p")),
             qos: QoS::ExactlyOnce,
             dup: false,
+            retain: true,
+            expires_at: Some(u64::MAX >> 1),
             sequence: u64::MAX,
             released: false,
             properties: Default::default(),
@@ -1513,6 +1528,52 @@ mod tests {
         assert_eq!(version as usize, MIGRATIONS.len());
         let old = store.load_session("old").await.unwrap().unwrap();
         assert_eq!(old.owner, SessionOwner::default());
+    }
+
+    /// A store on a database whose schema is at `version`, as a release
+    /// that had only the first `version` migrations left it, after `setup`.
+    async fn database_at(url: &str, version: usize, setup: &str) {
+        let store = PostgresStore::connect(url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        store
+            .client()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+                 SET client_min_messages = warning;
+                 {}
+                 CREATE TABLE mercurio_schema (version INTEGER NOT NULL);
+                 INSERT INTO mercurio_schema VALUES ({version});
+                 {setup}",
+                MIGRATIONS[..version].concat()
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// In-flight messages stored before they kept their RETAIN flag and
+    /// expiry load without either.
+    #[tokio::test]
+    async fn test_migrates_in_flight_messages_without_retain_or_expiry() {
+        let Some(url) = database_url() else { return };
+        let _database = DATABASE.lock().await;
+        database_at(
+            &url,
+            4,
+            "INSERT INTO inflight_messages VALUES ('c', 4, 't', 'p', 1, FALSE, 9, FALSE, '', NULL);",
+        )
+        .await;
+
+        let store = PostgresStore::connect(&url, &ConnectOptions::default())
+            .await
+            .unwrap();
+        let loaded = store.get_all_inflight("c").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
+        assert!(!loaded[0].retain);
+        assert_eq!(loaded[0].expires_at, None);
     }
 
     #[tokio::test]
@@ -1595,6 +1656,8 @@ mod tests {
         assert!(loaded.released && loaded.payload.is_none());
         assert_eq!(loaded.sequence, u64::MAX);
         assert_eq!(loaded.subscription_identifiers, vec![1, u32::MAX]);
+        assert!(loaded.retain);
+        assert_eq!(loaded.expires_at, Some(u64::MAX >> 1));
         assert_eq!(store.get_all_inflight("c").await.unwrap().len(), 1);
         store.remove_inflight("c", u16::MAX).await.unwrap();
         assert!(store.get_all_inflight("c").await.unwrap().is_empty());

@@ -304,9 +304,8 @@ struct State {
     topics: Option<TopicTree<Subscriber>>,
     /// Retained messages owed to new subscriptions, in subscription order
     retained: VecDeque<RetainedDelivery>,
-    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id, with
-    /// the sequence they were sent in
-    unacknowledged_messages: HashMap<u16, (u64, PublishPacket)>,
+    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
+    unacknowledged_messages: HashMap<u16, Unacknowledged>,
     /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
     /// sequence they were sent in
     pubrecs: HashMap<u16, u64>,
@@ -1170,7 +1169,7 @@ impl Session {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
         let sequence = match session.unacknowledged_messages.remove(&packet_id) {
-            Some((sequence, _)) => Some(sequence),
+            Some(sent) => Some(sent.sequence),
             None => session.pubrecs.get(&packet_id).copied(),
         };
         session.unsent.retain(|id| *id != packet_id);
@@ -1646,8 +1645,8 @@ impl Session {
             return None;
         }
         while let Some(packet_id) = session.unsent.pop_front() {
-            if let Some((_, publish)) = session.unacknowledged_messages.get(&packet_id) {
-                let mut publish = publish.clone();
+            if let Some(sent) = session.unacknowledged_messages.get(&packet_id) {
+                let mut publish = sent.publish.clone();
                 publish.dup = true;
                 return Some(ControlPacket::Publish(publish));
             }
@@ -1722,15 +1721,22 @@ impl Session {
             let inflight = packet_id.map(|packet_id| {
                 let sequence = session.next_sequence;
                 session.next_sequence += 1;
-                session
-                    .unacknowledged_messages
-                    .insert(packet_id, (sequence, publish.clone()));
+                session.unacknowledged_messages.insert(
+                    packet_id,
+                    Unacknowledged {
+                        sequence,
+                        publish: publish.clone(),
+                        expires_at: message.expires_at,
+                    },
+                );
                 InflightMessage {
                     packet_id,
                     topic: publish.topic_name.clone(),
                     payload: publish.payload.clone(),
                     qos: publish.qos_level,
                     dup: false,
+                    retain: publish.retain,
+                    expires_at: message.expires_at,
                     sequence,
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
@@ -1757,7 +1763,7 @@ impl Session {
                 let publish = PublishPacket {
                     dup: false,
                     qos_level: message.qos,
-                    retain: false,
+                    retain: message.retain,
                     topic_name: message.topic,
                     packet_id: Some(message.packet_id),
                     properties: publish_properties(
@@ -1766,9 +1772,14 @@ impl Session {
                     ),
                     payload: message.payload,
                 };
-                session
-                    .unacknowledged_messages
-                    .insert(message.packet_id, (message.sequence, publish));
+                session.unacknowledged_messages.insert(
+                    message.packet_id,
+                    Unacknowledged {
+                        sequence: message.sequence,
+                        publish,
+                        expires_at: message.expires_at,
+                    },
+                );
             }
         }
     }
@@ -1778,18 +1789,42 @@ impl Session {
     /// were first sent [MQTT-4.4.0-1]. Only as many PUBLISH packets as the
     /// client's Receive Maximum allows are returned [MQTT-3.3.4-9]; the
     /// rest wait for `next_retransmission`. Those larger than the client's
-    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25].
+    /// Maximum Packet Size are discarded as if delivered [MQTT-3.1.2-25],
+    /// and those past their expiry are discarded too [MQTT-3.3.2-5]; the
+    /// others carry the time they have left.
     pub(crate) async fn pending_retransmissions(&self) -> Retransmissions {
         let mut session = self.shared.state.lock().await;
         let session = &mut *session;
+        let now = unix_millis();
 
+        let mut resend = Retransmissions::default();
+        session.unacknowledged_messages.retain(|packet_id, sent| {
+            let expired = sent.expires_at.is_some_and(|deadline| now >= deadline);
+            if expired {
+                resend.dropped.push(*packet_id);
+            }
+            !expired
+        });
         let mut pending: Vec<(u64, Option<u16>, ControlPacket)> = session
             .unacknowledged_messages
-            .iter()
-            .map(|(packet_id, (sequence, publish))| {
-                let mut publish = publish.clone();
+            .iter_mut()
+            .map(|(packet_id, sent)| {
+                if let Some(deadline) = sent.expires_at {
+                    let remaining_secs = (deadline - now).div_ceil(1000);
+                    sent.publish
+                        .properties
+                        .get_or_insert_with(Default::default)
+                        .message_expiry_interval = Some(MessageExpiryInterval::new(
+                        remaining_secs.try_into().unwrap_or(u32::MAX),
+                    ));
+                }
+                let mut publish = sent.publish.clone();
                 publish.dup = true;
-                (*sequence, Some(*packet_id), ControlPacket::Publish(publish))
+                (
+                    sent.sequence,
+                    Some(*packet_id),
+                    ControlPacket::Publish(publish),
+                )
             })
             .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
                 let pubrel = PubRelPacket {
@@ -1802,7 +1837,6 @@ impl Session {
             .collect();
         pending.sort_by_key(|(sequence, _, _)| *sequence);
 
-        let mut resend = Retransmissions::default();
         session.unsent.clear();
         let mut room = session.window().saturating_sub(session.pubrecs.len());
         for (_, packet_id, packet) in pending {
@@ -1828,12 +1862,21 @@ impl Session {
     }
 }
 
+/// An outgoing QoS 1 or 2 message the client has yet to acknowledge.
+struct Unacknowledged {
+    /// Position in the order messages were sent
+    sequence: u64,
+    publish: PublishPacket,
+    /// Unix time in milliseconds when the message expires, if it does
+    expires_at: Option<u64>,
+}
+
 /// What a resumed session resends at once.
 #[derive(Default)]
 pub(crate) struct Retransmissions {
     pub packets: Vec<ControlPacket>,
     /// Packet ids of unacknowledged messages discarded as too large for
-    /// the client
+    /// the client or expired
     pub dropped: Vec<u16>,
 }
 
@@ -2316,12 +2359,16 @@ mod tests {
         let state = Arc::get_mut(&mut session.shared).unwrap().state.get_mut();
 
         state.last_packet_id = u16::MAX - 1;
-        state
-            .unacknowledged_messages
-            .insert(u16::MAX, (0, PublishPacket::default()));
-        state
-            .unacknowledged_messages
-            .insert(1, (1, PublishPacket::default()));
+        for (packet_id, sequence) in [(u16::MAX, 0), (1, 1)] {
+            state.unacknowledged_messages.insert(
+                packet_id,
+                Unacknowledged {
+                    sequence,
+                    publish: PublishPacket::default(),
+                    expires_at: None,
+                },
+            );
+        }
 
         assert_eq!(state.next_packet_id(), Some(2));
     }
@@ -3026,7 +3073,7 @@ mod tests {
         assert!(state
             .unacknowledged_messages
             .values()
-            .all(|(_, p)| !p.topic_name.is_empty()));
+            .all(|sent| !sent.publish.topic_name.is_empty()));
     }
 
     fn encoded_len(packet: &ControlPacket) -> usize {

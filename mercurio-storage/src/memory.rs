@@ -421,6 +421,8 @@ mod tests {
             payload: Some(Bytes::from("data")),
             qos: QoS::ExactlyOnce,
             dup: false,
+            retain: true,
+            expires_at: Some(1_700_000_000_000),
             sequence: 7,
             released: false,
             properties: Default::default(),
@@ -432,6 +434,8 @@ mod tests {
         let loaded = store.get_inflight("client1", 1).await.unwrap().unwrap();
         assert_eq!(loaded.sequence, 7);
         assert!(!loaded.released);
+        assert!(loaded.retain);
+        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
 
         store.release_inflight("client1", 1).await.unwrap();
         let all = store.get_all_inflight("client1").await.unwrap();

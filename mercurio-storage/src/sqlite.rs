@@ -141,6 +141,8 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
                 released INTEGER NOT NULL,
                 properties BLOB NOT NULL,
                 subscription_identifiers TEXT,
+                retain INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER,
                 PRIMARY KEY (client_id, packet_id)
             );
 
@@ -194,6 +196,18 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
 
+    // Databases created before in-flight messages kept their RETAIN flag
+    // and expiry
+    let has_inflight_retain = conn
+        .prepare("SELECT retain FROM inflight_messages LIMIT 0")
+        .is_ok();
+    if !has_inflight_retain {
+        conn.execute_batch(
+            "ALTER TABLE inflight_messages ADD COLUMN retain INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE inflight_messages ADD COLUMN expires_at INTEGER;",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -231,6 +245,28 @@ impl FromSql for Identifiers {
             _ => Err(FromSqlError::InvalidType),
         }
     }
+}
+
+/// Selects the columns `inflight_from_row` reads.
+const INFLIGHT_COLUMNS: &str = "SELECT packet_id, topic, payload, qos, dup, sequence, released,
+    properties, subscription_identifiers, retain, expires_at FROM inflight_messages";
+
+fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
+    let payload: Option<Vec<u8>> = row.get(2)?;
+    Ok(InflightMessage {
+        packet_id: row.get(0)?,
+        topic: row.get(1)?,
+        payload: payload.map(Bytes::from),
+        qos: int_to_qos(row.get(3)?),
+        dup: row.get(4)?,
+        // SQLite integers are signed; the bit pattern round-trips
+        sequence: row.get::<_, i64>(5)? as u64,
+        released: row.get(6)?,
+        properties: decode_properties(row.get(7)?)?,
+        subscription_identifiers: row.get::<_, Identifiers>(8)?.0,
+        retain: row.get(9)?,
+        expires_at: row.get::<_, Option<i64>>(10)?.map(|t| t as u64),
+    })
 }
 
 /// Applies one change; the caller holds the transaction.
@@ -297,8 +333,8 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
                  (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-                  subscription_identifiers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  subscription_identifiers, retain, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     client_id,
                     message.packet_id,
@@ -310,7 +346,9 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                     message.sequence as i64,
                     message.released,
                     encode_properties(&message.properties),
-                    Identifiers(message.subscription_identifiers.clone())
+                    Identifiers(message.subscription_identifiers.clone()),
+                    message.retain,
+                    message.expires_at.map(|t| t as i64)
                 ],
             )?;
         }
@@ -701,37 +739,12 @@ impl InflightStore for SqliteStore {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT topic, payload, qos, dup, sequence, released, properties,
-                 subscription_identifiers
-                 FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
-            )?;
-
-            let result = stmt
-                .query_row(params![client_id, packet_id], |row| {
-                    let topic: String = row.get(0)?;
-                    let payload: Option<Vec<u8>> = row.get(1)?;
-                    let qos: i32 = row.get(2)?;
-                    let dup: bool = row.get(3)?;
-                    let sequence: i64 = row.get(4)?;
-                    let released: bool = row.get(5)?;
-                    let properties: Vec<u8> = row.get(6)?;
-                    let Identifiers(subscription_identifiers) = row.get(7)?;
-                    Ok(InflightMessage {
-                        packet_id,
-                        topic,
-                        payload: payload.map(Bytes::from),
-                        qos: int_to_qos(qos),
-                        dup,
-                        sequence: sequence as u64,
-                        released,
-                        properties: decode_properties(properties)?,
-                        subscription_identifiers,
-                    })
-                })
-                .optional()?;
-
-            Ok(result)
+            conn.query_row(
+                &format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1 AND packet_id = ?2"),
+                params![client_id, packet_id],
+                inflight_from_row,
+            )
+            .optional()
         })
         .await
     }
@@ -750,40 +763,9 @@ impl InflightStore for SqliteStore {
         let client_id = client_id.to_string();
 
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT packet_id, topic, payload, qos, dup, sequence, released, properties,
-                 subscription_identifiers
-                 FROM inflight_messages WHERE client_id = ?1",
-            )?;
-
-            let rows = stmt.query_map(params![client_id], |row| {
-                let packet_id: u16 = row.get(0)?;
-                let topic: String = row.get(1)?;
-                let payload: Option<Vec<u8>> = row.get(2)?;
-                let qos: i32 = row.get(3)?;
-                let dup: bool = row.get(4)?;
-                let sequence: i64 = row.get(5)?;
-                let released: bool = row.get(6)?;
-                let properties: Vec<u8> = row.get(7)?;
-                let Identifiers(subscription_identifiers) = row.get(8)?;
-                Ok(InflightMessage {
-                    packet_id,
-                    topic,
-                    payload: payload.map(Bytes::from),
-                    qos: int_to_qos(qos),
-                    dup,
-                    sequence: sequence as u64,
-                    released,
-                    properties: decode_properties(properties)?,
-                    subscription_identifiers,
-                })
-            })?;
-
-            let mut messages = Vec::new();
-            for row in rows {
-                messages.push(row?);
-            }
-            Ok(messages)
+            let mut stmt = conn.prepare(&format!("{INFLIGHT_COLUMNS} WHERE client_id = ?1"))?;
+            let rows = stmt.query_map(params![client_id], inflight_from_row)?;
+            rows.collect()
         })
         .await
     }
@@ -935,6 +917,35 @@ mod tests {
             .unwrap();
         // Sessions from before owners were kept count as anonymous ones
         assert_eq!(loaded.owner, SessionOwner::default());
+        drop(store);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_older_in_flight_messages_load_without_retain_or_expiry() {
+        let path =
+            std::env::temp_dir().join(format!("mercurio-inflight-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE inflight_messages (
+                    client_id TEXT NOT NULL, packet_id INTEGER NOT NULL, topic TEXT NOT NULL,
+                    payload BLOB, qos INTEGER NOT NULL, dup INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL, released INTEGER NOT NULL,
+                    properties BLOB NOT NULL, subscription_identifiers TEXT,
+                    PRIMARY KEY (client_id, packet_id)
+                );
+                INSERT INTO inflight_messages VALUES ('c', 4, 't', x'70', 1, 0, 9, 0, x'', NULL);",
+            )
+            .unwrap();
+
+        let store = SqliteStore::new(&path).unwrap();
+        let loaded = store.get_all_inflight("c").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
+        assert!(!loaded[0].retain);
+        assert_eq!(loaded[0].expires_at, None);
         drop(store);
         std::fs::remove_file(&path).unwrap();
     }
@@ -1132,6 +1143,8 @@ mod tests {
             payload: Some(Bytes::from("data")),
             qos: QoS::ExactlyOnce,
             dup: false,
+            retain: true,
+            expires_at: Some(1_700_000_000_000),
             sequence: 7,
             released: false,
             properties: Default::default(),
@@ -1144,6 +1157,8 @@ mod tests {
         assert_eq!(loaded.sequence, 7);
         assert_eq!(loaded.subscription_identifiers, [3]);
         assert!(!loaded.released);
+        assert!(loaded.retain);
+        assert_eq!(loaded.expires_at, Some(1_700_000_000_000));
 
         store.release_inflight("client1", 1).await.unwrap();
         let all = store.get_all_inflight("client1").await.unwrap();

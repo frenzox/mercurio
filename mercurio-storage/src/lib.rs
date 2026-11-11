@@ -187,6 +187,10 @@ pub struct InflightMessage {
     pub payload: Option<Bytes>,
     pub qos: QoS,
     pub dup: bool,
+    /// The RETAIN flag the message was sent with, which a resend keeps
+    pub retain: bool,
+    /// Unix time in milliseconds when the message expires, if it does
+    pub expires_at: Option<u64>,
     /// Position in the order messages were sent, for resending in order
     pub sequence: u64,
     /// The client acknowledged a QoS 2 message with PUBREC, so PUBREL is

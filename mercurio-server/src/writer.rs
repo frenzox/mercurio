@@ -360,6 +360,8 @@ mod tests {
             payload: None,
             qos: mercurio_core::qos::QoS::AtLeastOnce,
             dup: false,
+            retain: false,
+            expires_at: None,
             sequence: 0,
             released: false,
             properties: Default::default(),
