@@ -51,7 +51,7 @@ use crate::{
     topic_tree::TopicTree,
 };
 use mercurio_storage::{
-    InflightMessage, RetainedMessageStore, SessionOwner, SessionState, StoredSubscription, Write,
+    RetainedMessageStore, SessionOwner, SessionState, StoredSubscription, Write,
 };
 
 mod inbound;
@@ -61,7 +61,7 @@ mod retained;
 mod subscriptions;
 mod will;
 
-use outbound::Unacknowledged;
+use outbound::Inflight;
 pub(crate) use outbound::{Held, Outgoing};
 use presence::Presence;
 pub(crate) use presence::SessionSnapshot;
@@ -244,20 +244,10 @@ struct State {
     topics: Option<TopicTree<Subscriber>>,
     /// Retained messages owed to new subscriptions, in subscription order
     retained: VecDeque<RetainedDelivery>,
-    /// Outgoing QoS 1/2 messages awaiting PUBACK/PUBREC, by packet_id
-    unacknowledged_messages: HashMap<u16, Unacknowledged>,
-    /// Outgoing QoS 2 messages awaiting PUBCOMP, by packet_id, with the
-    /// sequence they were sent in
-    pubrecs: HashMap<u16, u64>,
-    /// Unacknowledged messages a resumed session has yet to resend on this
-    /// connection, in order, held back by the client's Receive Maximum
-    unsent: VecDeque<u16>,
-    /// Sequence number of the next outgoing QoS 1/2 message
-    next_sequence: u64,
+    /// Outgoing QoS 1 and 2 messages until their exchange ends
+    inflight: Inflight,
     /// Incoming QoS 2 packet ids already delivered and awaiting PUBREL
     incoming_qos2: HashSet<u16>,
-    /// Last packet identifier assigned to an outgoing QoS > 0 PUBLISH
-    last_packet_id: u16,
     /// Topic names the client registered under an alias on this connection
     topic_aliases: HashMap<u16, String>,
     /// Highest alias the client may use, as advertised in CONNACK
@@ -376,12 +366,8 @@ impl Session {
                     subscriptions: HashMap::new(),
                     topics: None,
                     retained: VecDeque::new(),
-                    unacknowledged_messages: HashMap::new(),
-                    pubrecs: HashMap::new(),
-                    unsent: VecDeque::new(),
-                    next_sequence: 0,
+                    inflight: Inflight::default(),
                     incoming_qos2: HashSet::new(),
-                    last_packet_id: 0,
                     topic_aliases: HashMap::new(),
                     topic_alias_maximum: 0,
                     outgoing_aliases: HashMap::new(),
@@ -590,46 +576,7 @@ impl Session {
         if !persistent {
             return writes;
         }
-        for (packet_id, sent) in &state.unacknowledged_messages {
-            let properties = sent.publish.properties.as_ref();
-            writes.push(Write::StoreInflight(InflightMessage {
-                packet_id: *packet_id,
-                topic: sent.publish.topic_name.clone(),
-                payload: sent.publish.payload.clone(),
-                qos: sent.publish.qos_level,
-                dup: false,
-                retain: sent.publish.retain,
-                expires_at: sent.expires_at,
-                sequence: sent.sequence,
-                released: false,
-                properties: message_properties(properties),
-                subscription_identifiers: properties
-                    .map(|p| {
-                        p.subscription_identifiers
-                            .iter()
-                            .map(|id| id.value())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                share_group: sent.share_group.as_deref().map(str::to_string),
-            }));
-        }
-        for (packet_id, sequence) in &state.pubrecs {
-            writes.push(Write::StoreInflight(InflightMessage {
-                packet_id: *packet_id,
-                topic: String::new(),
-                payload: None,
-                qos: QoS::ExactlyOnce,
-                dup: false,
-                retain: false,
-                expires_at: None,
-                sequence: *sequence,
-                released: true,
-                properties: MessageProperties::default(),
-                subscription_identifiers: Vec::new(),
-                share_group: None,
-            }));
-        }
+        writes.extend(state.inflight.stored());
         writes.extend(
             state
                 .incoming_qos2

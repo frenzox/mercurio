@@ -397,27 +397,6 @@ async fn test_outgoing_packet_ids_are_allocated_per_session() {
     assert_ne!(second, 0);
 }
 
-#[test]
-fn test_next_packet_id_skips_in_flight_and_wraps() {
-    let mut session = create_test_session();
-    let state = Arc::get_mut(&mut session.shared).unwrap().state.get_mut();
-
-    state.last_packet_id = u16::MAX - 1;
-    for (packet_id, sequence) in [(u16::MAX, 0), (1, 1)] {
-        state.unacknowledged_messages.insert(
-            packet_id,
-            Unacknowledged {
-                sequence,
-                publish: PublishPacket::default(),
-                expires_at: None,
-                share_group: None,
-            },
-        );
-    }
-
-    assert_eq!(state.next_packet_id(), Some(2));
-}
-
 fn qos2_publish(topic: &str, packet_id: u16, dup: bool) -> ControlPacket {
     ControlPacket::Publish(PublishPacket {
         dup,
@@ -619,6 +598,7 @@ async fn test_incoming_pubrel_leaves_outgoing_qos2_state_alone() {
         .state
         .lock()
         .await
+        .inflight
         .pubrecs
         .contains_key(&packet_id));
 }
@@ -678,7 +658,14 @@ async fn test_unknown_packet_ids_are_reported() {
         pubrel,
         Some(ControlPacket::PubRel(ref p)) if p.reason == ReasonCode::PacketIdentifierNotFound
     ));
-    assert!(session.shared.state.lock().await.pubrecs.is_empty());
+    assert!(session
+        .shared
+        .state
+        .lock()
+        .await
+        .inflight
+        .pubrecs
+        .is_empty());
 }
 
 #[tokio::test]
@@ -698,8 +685,8 @@ async fn test_failed_pubrec_ends_the_exchange() {
 
     assert!(response.is_none());
     let state = session.shared.state.lock().await;
-    assert!(state.pubrecs.is_empty());
-    assert!(state.unacknowledged_messages.is_empty());
+    assert!(state.inflight.pubrecs.is_empty());
+    assert!(state.inflight.unacknowledged_messages.is_empty());
 }
 
 #[tokio::test]
@@ -1048,6 +1035,7 @@ async fn test_messages_beyond_client_maximum_packet_size_are_dropped() {
             .state
             .lock()
             .await
+            .inflight
             .unacknowledged_messages
             .len(),
         1
@@ -1214,6 +1202,7 @@ async fn test_outgoing_topics_are_aliased_up_to_the_client_maximum() {
     // What would be resent after a reconnect keeps the full topic
     let state = session.shared.state.lock().await;
     assert!(state
+        .inflight
         .unacknowledged_messages
         .values()
         .all(|sent| !sent.publish.topic_name.is_empty()));

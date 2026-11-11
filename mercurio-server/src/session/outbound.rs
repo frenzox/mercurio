@@ -2,7 +2,10 @@
 //! acknowledged, their packet identifiers and order, retransmission on resume,
 //! and the messages a share group may take back.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use mercurio_core::{
     message::{unix_millis, Message, MessageProperties},
@@ -18,7 +21,7 @@ use mercurio_packets::{
     pubrel::PubRelPacket,
     ControlPacket, Packet,
 };
-use mercurio_storage::InflightMessage;
+use mercurio_storage::{InflightMessage, Write};
 use tracing::warn;
 
 use super::{message_properties, Session, State};
@@ -55,6 +58,206 @@ pub(super) struct Unacknowledged {
     pub(super) expires_at: Option<u64>,
     /// The shared subscription it came through, if it did
     pub(super) share_group: Option<Arc<str>>,
+}
+
+/// The QoS 1 and 2 messages sent to the client whose exchange hasn't
+/// ended, with the order they were sent in and the packet identifiers they
+/// hold.
+#[derive(Default)]
+pub(super) struct Inflight {
+    /// Awaiting PUBACK or PUBREC, by packet id
+    pub(super) unacknowledged_messages: HashMap<u16, Unacknowledged>,
+    /// QoS 2 messages awaiting PUBCOMP, by packet id, with the sequence
+    /// they were sent in
+    pub(super) pubrecs: HashMap<u16, u64>,
+    /// Unacknowledged messages a resumed session has yet to resend on this
+    /// connection, in order, held back by the client's Receive Maximum
+    unsent: VecDeque<u16>,
+    /// Sequence number of the next message sent
+    next_sequence: u64,
+    /// Last packet identifier assigned
+    last_packet_id: u16,
+}
+
+impl Inflight {
+    /// Messages sent and not acknowledged, released QoS 2 ones included.
+    pub(super) fn len(&self) -> usize {
+        self.unacknowledged_messages.len() + self.pubrecs.len()
+    }
+
+    /// QoS 1 and 2 messages sent on this connection or an earlier one and
+    /// not yet acknowledged, leaving out those still to be resent.
+    fn in_flight(&self) -> usize {
+        self.unacknowledged_messages
+            .len()
+            .saturating_sub(self.unsent.len())
+            + self.pubrecs.len()
+    }
+
+    /// Allocates the next packet identifier not currently in flight.
+    /// Identifiers are per session, so they can't be copied from the publisher.
+    fn next_packet_id(&mut self) -> Option<u16> {
+        for _ in 0..u16::MAX {
+            self.last_packet_id = self.last_packet_id.checked_add(1).unwrap_or(1);
+            let id = self.last_packet_id;
+            if !self.unacknowledged_messages.contains_key(&id) && !self.pubrecs.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Tracks `publish`, sent with `packet_id`, until it is acknowledged,
+    /// and returns the sequence it was sent in.
+    fn send(
+        &mut self,
+        packet_id: u16,
+        publish: PublishPacket,
+        expires_at: Option<u64>,
+        share_group: Option<Arc<str>>,
+    ) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.unacknowledged_messages.insert(
+            packet_id,
+            Unacknowledged {
+                sequence,
+                publish,
+                expires_at,
+                share_group,
+            },
+        );
+        sequence
+    }
+
+    /// PUBACK: the client took the QoS 1 message.
+    fn acknowledge(&mut self, packet_id: u16) {
+        self.unacknowledged_messages.remove(&packet_id);
+        self.unsent.retain(|id| *id != packet_id);
+    }
+
+    /// PUBREC: the client took the QoS 2 message, which awaits PUBCOMP
+    /// from now on. False if `packet_id` had no exchange in progress.
+    fn release(&mut self, packet_id: u16) -> bool {
+        let sequence = match self.unacknowledged_messages.remove(&packet_id) {
+            Some(sent) => Some(sent.sequence),
+            None => self.pubrecs.get(&packet_id).copied(),
+        };
+        self.unsent.retain(|id| *id != packet_id);
+        match sequence {
+            Some(sequence) => {
+                self.pubrecs.insert(packet_id, sequence);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A PUBREC with a failure reason: the client won't take the message,
+    /// which ends its exchange.
+    fn refuse(&mut self, packet_id: u16) {
+        self.unacknowledged_messages.remove(&packet_id);
+        self.unsent.retain(|id| *id != packet_id);
+        self.pubrecs.remove(&packet_id);
+    }
+
+    /// PUBCOMP: the QoS 2 exchange is over.
+    fn complete(&mut self, packet_id: u16) {
+        self.pubrecs.remove(&packet_id);
+    }
+
+    /// Lets go of an unacknowledged message. False if it wasn't held.
+    fn give_up(&mut self, packet_id: u16) -> bool {
+        self.unsent.retain(|id| *id != packet_id);
+        self.unacknowledged_messages.remove(&packet_id).is_some()
+    }
+
+    /// The next message held back to resend, flagged as a duplicate.
+    fn next_unsent(&mut self) -> Option<PublishPacket> {
+        while let Some(packet_id) = self.unsent.pop_front() {
+            if let Some(sent) = self.unacknowledged_messages.get(&packet_id) {
+                let mut publish = sent.publish.clone();
+                publish.dup = true;
+                return Some(publish);
+            }
+        }
+        None
+    }
+
+    /// Adds a message loaded from storage.
+    fn restore(&mut self, message: InflightMessage) {
+        self.next_sequence = self.next_sequence.max(message.sequence + 1);
+        if message.released {
+            self.pubrecs.insert(message.packet_id, message.sequence);
+            return;
+        }
+        let publish = PublishPacket {
+            dup: false,
+            qos_level: message.qos,
+            retain: message.retain,
+            topic_name: message.topic,
+            packet_id: Some(message.packet_id),
+            properties: publish_properties(&message.properties, &message.subscription_identifiers),
+            payload: message.payload,
+        };
+        self.unacknowledged_messages.insert(
+            message.packet_id,
+            Unacknowledged {
+                sequence: message.sequence,
+                publish,
+                expires_at: message.expires_at,
+                share_group: message.share_group.map(Arc::from),
+            },
+        );
+    }
+
+    /// The writes that store every message in flight.
+    pub(super) fn stored(&self) -> impl Iterator<Item = Write> + '_ {
+        let unacknowledged = self
+            .unacknowledged_messages
+            .iter()
+            .map(|(packet_id, sent)| {
+                let properties = sent.publish.properties.as_ref();
+                Write::StoreInflight(InflightMessage {
+                    packet_id: *packet_id,
+                    topic: sent.publish.topic_name.clone(),
+                    payload: sent.publish.payload.clone(),
+                    qos: sent.publish.qos_level,
+                    dup: false,
+                    retain: sent.publish.retain,
+                    expires_at: sent.expires_at,
+                    sequence: sent.sequence,
+                    released: false,
+                    properties: message_properties(properties),
+                    subscription_identifiers: properties
+                        .map(|p| {
+                            p.subscription_identifiers
+                                .iter()
+                                .map(|id| id.value())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    share_group: sent.share_group.as_deref().map(str::to_string),
+                })
+            });
+        let released = self.pubrecs.iter().map(|(packet_id, sequence)| {
+            Write::StoreInflight(InflightMessage {
+                packet_id: *packet_id,
+                topic: String::new(),
+                payload: None,
+                qos: QoS::ExactlyOnce,
+                dup: false,
+                retain: false,
+                expires_at: None,
+                sequence: *sequence,
+                released: true,
+                properties: MessageProperties::default(),
+                subscription_identifiers: Vec::new(),
+                share_group: None,
+            })
+        });
+        unacknowledged.chain(released)
+    }
 }
 
 /// A message that reached a session through a shared subscription and may
@@ -97,8 +300,7 @@ impl Session {
         packet: PubAckPacket,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        session.unacknowledged_messages.remove(&packet.packet_id);
-        session.unsent.retain(|id| *id != packet.packet_id);
+        session.inflight.acknowledge(packet.packet_id);
         Ok(None)
     }
 
@@ -108,20 +310,14 @@ impl Session {
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
         let packet_id = packet.packet_id;
-        let sequence = match session.unacknowledged_messages.remove(&packet_id) {
-            Some(sent) => Some(sent.sequence),
-            None => session.pubrecs.get(&packet_id).copied(),
-        };
-        session.unsent.retain(|id| *id != packet_id);
 
         // A failure reason ends the exchange: the client won't take the message
         if packet.reason.code() >= 0x80 {
-            session.pubrecs.remove(&packet_id);
+            session.inflight.refuse(packet_id);
             return Ok(None);
         }
 
-        let reason = if let Some(sequence) = sequence {
-            session.pubrecs.insert(packet_id, sequence);
+        let reason = if session.inflight.release(packet_id) {
             ReasonCode::Success
         } else {
             session.unknown_packet_id_reason()
@@ -139,8 +335,7 @@ impl Session {
         packet: PubCompPacket,
     ) -> Result<Option<ControlPacket>> {
         let mut session = self.shared.state.lock().await;
-        // O(1) removal
-        session.pubrecs.remove(&packet.packet_id);
+        session.inflight.complete(packet.packet_id);
         Ok(None)
     }
 
@@ -153,6 +348,7 @@ impl Session {
         let mut unacknowledged: Vec<(u64, Handback)> = {
             let state = self.shared.state.lock().await;
             state
+                .inflight
                 .unacknowledged_messages
                 .iter()
                 .filter(|(_, sent)| sent.publish.qos_level == QoS::AtLeastOnce)
@@ -211,8 +407,7 @@ impl Session {
             Held::Queued(sequence) => self.shared.queue.remove(sequence),
             Held::Unacknowledged(packet_id) => {
                 let mut state = self.shared.state.lock().await;
-                state.unsent.retain(|id| *id != packet_id);
-                state.unacknowledged_messages.remove(&packet_id).is_some()
+                state.inflight.give_up(packet_id)
             }
         }
     }
@@ -222,7 +417,7 @@ impl Session {
     /// limit.
     pub(crate) async fn can_send_more(&self) -> bool {
         let session = self.shared.state.lock().await;
-        session.in_flight() < session.window()
+        session.inflight.in_flight() < session.window()
     }
 
     /// The next unacknowledged message a resumed session holds back, once
@@ -230,17 +425,10 @@ impl Session {
     /// the order messages were first sent in [MQTT-4.6.0-1].
     pub(crate) async fn next_retransmission(&self) -> Option<ControlPacket> {
         let mut session = self.shared.state.lock().await;
-        if session.in_flight() >= session.window() {
+        if session.inflight.in_flight() >= session.window() {
             return None;
         }
-        while let Some(packet_id) = session.unsent.pop_front() {
-            if let Some(sent) = session.unacknowledged_messages.get(&packet_id) {
-                let mut publish = sent.publish.clone();
-                publish.dup = true;
-                return Some(ControlPacket::Publish(publish));
-            }
-        }
-        None
+        session.inflight.next_unsent().map(ControlPacket::Publish)
     }
 
     /// Waits for the next message to send to the client. Cancel safe, and
@@ -273,7 +461,7 @@ impl Session {
         {
             let packet_id = match message.qos {
                 QoS::AtMostOnce => None,
-                _ => match session.next_packet_id() {
+                _ => match session.inflight.next_packet_id() {
                     Some(id) => Some(id),
                     None => {
                         // Only reachable when the client's Receive Maximum allows
@@ -312,16 +500,11 @@ impl Session {
             };
 
             let inflight = packet_id.map(|packet_id| {
-                let sequence = session.next_sequence;
-                session.next_sequence += 1;
-                session.unacknowledged_messages.insert(
+                let sequence = session.inflight.send(
                     packet_id,
-                    Unacknowledged {
-                        sequence,
-                        publish: publish.clone(),
-                        expires_at: message.expires_at,
-                        share_group: message.share_group.clone(),
-                    },
+                    publish.clone(),
+                    message.expires_at,
+                    message.share_group.clone(),
                 );
                 InflightMessage {
                     packet_id,
@@ -349,34 +532,8 @@ impl Session {
     /// Adds in-flight messages loaded from storage to a restored session.
     pub(crate) async fn restore_inflight(&self, inflight: Vec<InflightMessage>) {
         let mut session = self.shared.state.lock().await;
-
         for message in inflight {
-            session.next_sequence = session.next_sequence.max(message.sequence + 1);
-            if message.released {
-                session.pubrecs.insert(message.packet_id, message.sequence);
-            } else {
-                let publish = PublishPacket {
-                    dup: false,
-                    qos_level: message.qos,
-                    retain: message.retain,
-                    topic_name: message.topic,
-                    packet_id: Some(message.packet_id),
-                    properties: publish_properties(
-                        &message.properties,
-                        &message.subscription_identifiers,
-                    ),
-                    payload: message.payload,
-                };
-                session.unacknowledged_messages.insert(
-                    message.packet_id,
-                    Unacknowledged {
-                        sequence: message.sequence,
-                        publish,
-                        expires_at: message.expires_at,
-                        share_group: message.share_group.map(Arc::from),
-                    },
-                );
-            }
+            session.inflight.restore(message);
         }
     }
 
@@ -394,14 +551,18 @@ impl Session {
         let now = unix_millis();
 
         let mut resend = Retransmissions::default();
-        session.unacknowledged_messages.retain(|packet_id, sent| {
-            let expired = sent.expires_at.is_some_and(|deadline| now >= deadline);
-            if expired {
-                resend.dropped.push(*packet_id);
-            }
-            !expired
-        });
+        session
+            .inflight
+            .unacknowledged_messages
+            .retain(|packet_id, sent| {
+                let expired = sent.expires_at.is_some_and(|deadline| now >= deadline);
+                if expired {
+                    resend.dropped.push(*packet_id);
+                }
+                !expired
+            });
         let mut pending: Vec<(u64, Option<u16>, ControlPacket)> = session
+            .inflight
             .unacknowledged_messages
             .iter_mut()
             .map(|(packet_id, sent)| {
@@ -422,19 +583,27 @@ impl Session {
                     ControlPacket::Publish(publish),
                 )
             })
-            .chain(session.pubrecs.iter().map(|(packet_id, sequence)| {
-                let pubrel = PubRelPacket {
-                    packet_id: *packet_id,
-                    reason: ReasonCode::Success,
-                    properties: None,
-                };
-                (*sequence, None, ControlPacket::PubRel(pubrel))
-            }))
+            .chain(
+                session
+                    .inflight
+                    .pubrecs
+                    .iter()
+                    .map(|(packet_id, sequence)| {
+                        let pubrel = PubRelPacket {
+                            packet_id: *packet_id,
+                            reason: ReasonCode::Success,
+                            properties: None,
+                        };
+                        (*sequence, None, ControlPacket::PubRel(pubrel))
+                    }),
+            )
             .collect();
         pending.sort_by_key(|(sequence, _, _)| *sequence);
 
-        session.unsent.clear();
-        let mut room = session.window().saturating_sub(session.pubrecs.len());
+        session.inflight.unsent.clear();
+        let mut room = session
+            .window()
+            .saturating_sub(session.inflight.pubrecs.len());
         for (_, packet_id, packet) in pending {
             let (Some(packet_id), ControlPacket::Publish(publish)) = (packet_id, &packet) else {
                 resend.packets.push(packet);
@@ -446,13 +615,13 @@ impl Session {
                     "Message on `{}` exceeds the maximum packet size of client `{}`, dropping it",
                     publish.topic_name, session.client_id
                 );
-                session.unacknowledged_messages.remove(&packet_id);
+                session.inflight.unacknowledged_messages.remove(&packet_id);
                 resend.dropped.push(packet_id);
             } else if room > 0 {
                 room -= 1;
                 resend.packets.push(packet);
             } else {
-                session.unsent.push_back(packet_id);
+                session.inflight.unsent.push_back(packet_id);
             }
         }
         resend
@@ -513,31 +682,105 @@ impl State {
         usize::from(receive_maximum.min(self.max_inflight))
     }
 
-    /// QoS 1 and 2 messages sent on this connection or an earlier one and
-    /// not yet acknowledged, leaving out those still to be resent.
-    fn in_flight(&self) -> usize {
-        self.unacknowledged_messages
-            .len()
-            .saturating_sub(self.unsent.len())
-            + self.pubrecs.len()
-    }
-
     /// Whether `publish` is larger than the client accepts.
     fn too_big(&self, publish: &PublishPacket) -> bool {
         self.client_maximum_packet_size()
             .is_some_and(|maximum| publish.encoded_size(self.client.protocol_version) > maximum)
     }
+}
 
-    /// Allocates the next packet identifier not currently in flight.
-    /// Identifiers are per session, so they can't be copied from the publisher.
-    pub(super) fn next_packet_id(&mut self) -> Option<u16> {
-        for _ in 0..u16::MAX {
-            self.last_packet_id = self.last_packet_id.checked_add(1).unwrap_or(1);
-            let id = self.last_packet_id;
-            if !self.unacknowledged_messages.contains_key(&id) && !self.pubrecs.contains_key(&id) {
-                return Some(id);
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn publish(packet_id: u16) -> PublishPacket {
+        PublishPacket {
+            qos_level: QoS::ExactlyOnce,
+            topic_name: "t".into(),
+            packet_id: Some(packet_id),
+            ..Default::default()
         }
-        None
+    }
+
+    fn sent(inflight: &mut Inflight) -> u16 {
+        let packet_id = inflight.next_packet_id().unwrap();
+        inflight.send(packet_id, publish(packet_id), None, None);
+        packet_id
+    }
+
+    #[test]
+    fn test_next_packet_id_skips_in_flight_and_wraps() {
+        let mut inflight = Inflight {
+            last_packet_id: u16::MAX - 1,
+            ..Default::default()
+        };
+        for packet_id in [u16::MAX, 1] {
+            inflight.send(packet_id, publish(packet_id), None, None);
+        }
+
+        assert_eq!(inflight.next_packet_id(), Some(2));
+    }
+
+    #[test]
+    fn test_released_messages_keep_their_packet_id_until_pubcomp() {
+        let mut inflight = Inflight::default();
+        let packet_id = sent(&mut inflight);
+
+        assert!(inflight.release(packet_id));
+        assert_eq!(inflight.len(), 1);
+        assert_ne!(inflight.next_packet_id(), Some(packet_id));
+        // PUBREC again, as after a reconnect, keeps the exchange going
+        assert!(inflight.release(packet_id));
+
+        inflight.complete(packet_id);
+        assert_eq!(inflight.len(), 0);
+        assert!(!inflight.release(packet_id));
+    }
+
+    #[test]
+    fn test_acknowledgements_and_refusals_end_the_exchange() {
+        let mut inflight = Inflight::default();
+        let acknowledged = sent(&mut inflight);
+        let refused = sent(&mut inflight);
+        let released = sent(&mut inflight);
+        assert!(inflight.release(released));
+
+        inflight.acknowledge(acknowledged);
+        inflight.refuse(refused);
+        inflight.refuse(released);
+        assert_eq!(inflight.len(), 0);
+        assert_eq!(inflight.in_flight(), 0);
+    }
+
+    #[test]
+    fn test_stored_messages_come_back_in_their_order() {
+        let mut inflight = Inflight::default();
+        let first = sent(&mut inflight);
+        let second = sent(&mut inflight);
+        assert!(inflight.release(first));
+
+        let mut restored = Inflight::default();
+        for write in inflight.stored() {
+            let Write::StoreInflight(message) = write else {
+                panic!("expected StoreInflight");
+            };
+            restored.restore(message);
+        }
+        assert_eq!(restored.pubrecs.get(&first), Some(&0));
+        assert_eq!(restored.unacknowledged_messages[&second].sequence, 1);
+        // Messages sent from now on come after them
+        let third = sent(&mut restored);
+        assert_eq!(restored.unacknowledged_messages[&third].sequence, 2);
+    }
+
+    #[test]
+    fn test_given_up_messages_are_not_resent() {
+        let mut inflight = Inflight::default();
+        let packet_id = sent(&mut inflight);
+        inflight.unsent.push_back(packet_id);
+
+        assert!(inflight.give_up(packet_id));
+        assert!(!inflight.give_up(packet_id));
+        assert!(inflight.next_unsent().is_none());
     }
 }

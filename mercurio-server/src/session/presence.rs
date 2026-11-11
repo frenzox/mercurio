@@ -121,7 +121,7 @@ impl Session {
             expires_at: presence.expires_at,
             subscriptions: state.subscriptions.values().cloned().collect(),
             queued: self.shared.queue.len(),
-            inflight: state.unacknowledged_messages.len() + state.pubrecs.len(),
+            inflight: state.inflight.len(),
             will_pending: state.will_message.is_some() || state.pending_will.is_some(),
             counters: Arc::clone(&presence.counters),
         }
