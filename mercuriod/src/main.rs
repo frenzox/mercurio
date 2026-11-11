@@ -859,7 +859,7 @@ async fn load_plugins(
     }
 }
 
-/// Rereads the ACL, password and dynamic security files, the TLS
+/// Rereads the ACL, password, dynamic security and JWT key files, the TLS
 /// certificates, keys and CRLs and the WebAssembly plugins on SIGHUP, as
 /// the `reload` command does. ACL and plugin changes apply to every later
 /// check or call; password and TLS changes apply to later connections.

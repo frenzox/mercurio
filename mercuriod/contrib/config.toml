@@ -244,9 +244,10 @@ backend = "memory"
 # pool_timeout = 5
 
 [auth]
-# Require clients to authenticate. password_file, dynamic_security and
-# user_url authenticate clients, so the broker refuses to start when one is
-# set while this is false; acl_file and acl_url work either way
+# Require clients to authenticate. password_file, dynamic_security,
+# user_url and [auth.jwt] authenticate clients, so the broker refuses to
+# start when one is set while this is false; acl_file and acl_url work
+# either way
 enabled = false
 
 # Allow clients that send no user name (when auth is enabled)
@@ -284,6 +285,27 @@ allow_anonymous = false
 # ca_path = "/etc/mercurio/auth-ca.pem"
 # cert_path = "/etc/mercurio/auth-client.pem"
 # key_path = "/etc/mercurio/auth-client-key.pem"
+
+# Or let clients log in with a JSON Web Token as their password, for the
+# user name in its user claim. Passwords that are not tokens go on to
+# password_file or user_url. Topic access still comes from acl_file or
+# acl_url. Not with dynamic_security.
+# [auth.jwt]
+# Exactly one of these three. A secret file loses one trailing newline; a
+# JWKS URL must be https:// with a publicly trusted certificate
+# secret_file = "/etc/mercurio/jwt.secret"
+# public_key_file = "/etc/mercurio/jwt.pem"
+# jwks_url = "https://issuer.example/.well-known/jwks.json"
+# Required; the token's header never chooses the algorithm
+# algorithms = ["RS256"]
+# issuer = "https://issuer.example"
+# audience = "mercurio"
+# username_claim = "sub"
+# leeway_seconds = 30
+# Disconnect clients whose token expired, with Not Authorized
+# disconnect_on_expiry = true
+# Least seconds between two fetches of jwks_url, at least 10
+# jwks_refresh_seconds = 300
 
 [admin]
 # Unix socket for administering the broker from this machine, as mercurioctl

@@ -45,6 +45,7 @@
 <tr><td>A fixed list of users</td><td><a href="#passwords">password file</a> and <a href="#acl">ACL file</a></td></tr>
 <tr><td>Users and access managed while the broker runs</td><td><a href="#dynamic-security">dynamic security</a></td></tr>
 <tr><td>Users kept in your own database or identity service</td><td><a href="#http">HTTP authentication</a></td></tr>
+<tr><td>Clients holding tokens from an identity provider</td><td><a href="#jwt">JSON Web Tokens</a>, with an ACL file or HTTP topic checks</td></tr>
 <tr><td>Devices identified by certificates</td><td><a href="#tls">client certificates</a>, with an ACL file</td></tr>
 <tr><td>Custom logic in Rust</td><td><a href="embedding.html#auth">the server library's traits</a></td></tr>
 </table>
@@ -234,6 +235,42 @@ class Auth(BaseHTTPRequestHandler):
 
 HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 
+<h2 id="jwt">JSON Web Tokens</h2>
+<p>Clients can log in with a JSON Web Token (JWT) issued by your identity provider. The client sends the token as its CONNECT <strong>password</strong>, and the CONNECT <strong>user name</strong> must equal the token's user claim, <code>sub</code> unless <code>username_claim</code> names another. Access control is keyed by user name, so ACL files, <code>acl_url</code> and the rest work for these clients as for any other.</p>
+<pre>[auth]
+enabled = true
+acl_file = "/etc/mercurio/acl"
+
+[auth.jwt]
+public_key_file = "/etc/mercurio/jwt.pem"
+algorithms = ["RS256"]
+issuer = "https://issuer.example"
+audience = "mercurio"</pre>
+<p>A password that does not look like a JWT, three base64url parts separated by dots whose first part is a JSON object with an <code>alg</code>, is left to the next check, so a <code>password_file</code> or <code>user_url</code> can keep serving other clients. With nothing else configured, such a client is refused as for a wrong password. A password that looks like a JWT and fails any check is refused with Bad User Name or Password (return code 4 in MQTT 3.1.1), counts as a failed login, and is logged at warn level with the client id, its address and the reason, never the token.</p>
+<p>The broker checks:</p>
+<ul>
+<li>the signature, with an algorithm from <code>algorithms</code>. The token's own <code>alg</code> header never picks the key or its type, and unsigned tokens (<code>alg: none</code>) are always refused;</li>
+<li><code>exp</code>, which the token must have, and <code>nbf</code> when present, each with <code>leeway_seconds</code> of clock skew allowed;</li>
+<li><code>iss</code> and <code>aud</code>, when <code>issuer</code> and <code>audience</code> are set: the token must then carry them;</li>
+<li>the user claim, which must be a string equal to the CONNECT user name.</li>
+</ul>
+<p>Keys come from exactly one of:</p>
+<ul>
+<li><code>secret_file</code>, a shared secret of at least 32 bytes for HS256, HS384 and HS512. One trailing newline is removed, so a file written by <code>echo</code> works.</li>
+<li><code>public_key_file</code>, a PEM public key for RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384 or EdDSA.</li>
+<li><code>jwks_url</code>, the issuer's JSON Web Key Set, fetched at startup; the broker does not start without it. A token naming a <code>kid</code> the set lacks makes the broker fetch it again, at most once every <code>jwks_refresh_seconds</code>, and a failed fetch keeps the previous keys. The URL must be <code>https://</code> with a certificate from a publicly trusted CA, or <code>http://</code> to a loopback address for testing; there is no <code>ca_path</code> for it, and redirects are not followed. HMAC algorithms can't be used with it, as their keys are secret.</li>
+</ul>
+<p>All algorithms listed must take the same kind of key. A <a href="#reloading">reload</a> rereads <code>secret_file</code> and <code>public_key_file</code>, so keys can be rotated without a restart.</p>
+<p>By default a client is disconnected once its token expires, with Not Authorized (MQTT 3.x clients are just disconnected); without that, a token valid for five minutes would buy a connection that lasts for ever. The broker checks expiries every <code>[server]</code> <code>plugin_tick_interval</code>, one second by default, so a client may stay up to that long after <code>exp</code> plus <code>leeway_seconds</code>, or up to 30 seconds after logging in when the broker is too busy to report the connection to the check. A client renews its token by reconnecting with a new one, which replaces the old expiry; re-authenticating a live connection with a token is not supported. The client's will is published, as for a lost connection. <code>disconnect_on_expiry = false</code> lets clients stay until they leave.</p>
+<p>Tokens carry no access rules: give topic access with an <a href="#acl">ACL file</a> or <a href="#http"><code>acl_url</code></a>. JWT authentication needs <code>enabled = true</code>, and can't be combined with <a href="#dynamic-security">dynamic security</a>, which owns its users.</p>
+<p>To try it, make a token for <code>alice</code>, valid for five minutes, signed with the secret in <code>/etc/mercurio/jwt.secret</code>, and connect with it:</p>
+<pre>b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+header=$(printf '{"alg":"HS256","typ":"JWT"}' | b64)
+payload=$(printf '{"sub":"alice","exp":%d}' $(($(date +%s) + 300)) | b64)
+signature=$(printf '%s.%s' "$header" "$payload" \
+  | openssl dgst -sha256 -hmac "$(cat /etc/mercurio/jwt.secret)" -binary | b64)
+RECADO_PASSWORD="$header.$payload.$signature" recado sub -u alice -t '#'</pre>
+
 <h2 id="enhanced">MQTT 5 enhanced authentication</h2>
 <p>MQTT 5 clients can authenticate with a method through the AUTH packet, and re-authenticate during a connection. The daemon offers <a href="#scram">SCRAM-SHA-256</a> with a password file or dynamic security. Applications embedding the broker register other methods through the server library. See <a href="embedding.html#auth">Embedding</a>.</p>
 
@@ -253,10 +290,10 @@ HTTPServer(("127.0.0.1", 8000), Auth).serve_forever()</pre>
 <p>A session left by a previous owner blocks the id until it expires. To give the id to someone else sooner, delete the session with <code>mercurioctl client delete-session &lt;clientid&gt;</code>, adding <code>--mount-point</code> when the id is on more than one. A <a href="admin.html#bans">ban</a> on a client id holds on every mount point.</p>
 
 <h2 id="reloading">Reloading</h2>
-<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, the TLS certificate, key, CA and CRL files, those of listeners included, and the CA and client certificate files of <code>[auth.http]</code>, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
+<p>Send <code>SIGHUP</code>, or run <code>systemctl reload mercuriod</code>, to reread every password file, ACL file and dynamic security file, the TLS certificate, key, CA and CRL files, those of listeners included, the CA and client certificate files of <code>[auth.http]</code>, and the key files of <code>[auth.jwt]</code>, without dropping connections. <code>mercurioctl broker reload</code> does the same and reports how each file went.</p>
 <ul>
 <li>New ACL rules apply to every later publish, subscribe and delivery, connected clients included.</li>
-<li>Password changes apply to later logins.</li>
+<li>Password and JWT key changes apply to later logins.</li>
 <li>TLS changes apply to later connections, so a renewed certificate takes over without a restart. Connected clients keep the session they started with. A certificate whose key does not match, or a file that is missing, keeps the previous certificate, key, CA and CRLs of that listener.</li>
 <li>If a file fails to load, the broker logs the error and keeps the previous version, so a typo never locks everyone out.</li>
 <li>Other settings need a restart.</li>
