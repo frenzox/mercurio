@@ -36,6 +36,7 @@ cargo build --release --package mercuriod
 mercuriod [OPTIONS]
 mercuriod passwd -f <FILE> -u <USER> [-d]
 mercuriod dynsec-init -f <FILE> [-u <USER>]
+mercuriod dynsec-import <MOSQUITTO FILE> <FILE>
 ```
 
 | Option | Description | Default |
@@ -482,6 +483,20 @@ command gives the file to that directory's owner and group, so the service
 can read it. systemd creates that directory when the service first starts:
 start it once before, with `systemctl start mercuriod`, if it has never
 run.
+
+Coming from mosquitto, create it from the plugin's file instead:
+
+```bash
+sudo mercuriod dynsec-import /var/lib/mosquitto/dynamic-security.json \
+    /var/lib/mercurio/dynamic-security.json
+```
+
+It carries over clients, groups, roles, ACLs, priorities, the default
+access and the anonymous group, gives the file to its directory's owner as
+`dynsec-init` does, and never overwrites a file. Passwords keep working:
+mosquitto's PBKDF2-SHA512 hashes are checked as they are, and stored as
+Argon2 once set again. What it leaves out, such as unsubscribe ACLs, it
+lists.
 
 The administrator manages it with `mercurioctl`, which names mosquitto's
 commands in kebab-case, as `mosquitto_ctrl` does:

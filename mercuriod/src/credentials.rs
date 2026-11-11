@@ -30,15 +30,21 @@ impl HashedCredentialValidator {
             return false;
         };
 
-        match Hash::parse(stored) {
-            Ok(Hash::Argon2(hash)) => Argon2::default().verify_password(password, &hash).is_ok(),
-            Ok(Hash::Mosquitto {
-                iterations,
-                salt,
-                hash,
-            }) => mosquitto_hash_matches(iterations, &salt, &hash, password),
-            Err(_) => false,
-        }
+        verify(stored, password)
+    }
+}
+
+/// Whether `password` matches `stored`, a hash of one of the forms
+/// [`check_hash`] accepts; never for any other.
+pub(crate) fn verify(stored: &str, password: &[u8]) -> bool {
+    match Hash::parse(stored) {
+        Ok(Hash::Argon2(hash)) => Argon2::default().verify_password(password, &hash).is_ok(),
+        Ok(Hash::Mosquitto {
+            iterations,
+            salt,
+            hash,
+        }) => mosquitto_hash_matches(iterations, &salt, &hash, password),
+        Err(_) => false,
     }
 }
 

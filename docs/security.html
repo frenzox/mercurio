@@ -135,6 +135,9 @@ pattern read devices/%u/commands</pre>
 <pre><span class="comment"># Create the state file with an administrator (prompts for the password)</span>
 sudo mercuriod dynsec-init -f /var/lib/mercurio/dynamic-security.json -u admin</pre>
 <p>The file is created with mode 0600. Run as root in a directory owned by another user, as the service's state directory <code>/var/lib/mercurio</code> is, <code>dynsec-init</code> gives the file to that directory's owner and group, so the service can read it. systemd creates that directory when the service first starts: start it once before, with <code>systemctl start mercuriod</code>, if it has never run.</p>
+<p>Coming from mosquitto, create it from mosquitto's file instead:</p>
+<pre>sudo mercuriod dynsec-import /var/lib/mosquitto/dynamic-security.json /var/lib/mercurio/dynamic-security.json</pre>
+<p><code>dynsec-import</code> carries over clients, groups, roles, ACLs, priorities, the default access and the anonymous group, and gives the file to the directory's owner as <code>dynsec-init</code> does. It never overwrites an existing file. Clients keep their passwords: mosquitto's PBKDF2-SHA512 hashes are checked as they are, and a password set again with <code>setClientPassword</code> or <code>modifyClient</code> is stored as Argon2. A PBKDF2 check is faster than an Argon2 one, so until then the time a login takes can tell an imported client from an unknown user name; set those passwords again to close that. What can't be carried over is listed and left out: <code>unsubscribeLiteral</code> and <code>unsubscribePattern</code> ACLs and a default that denies unsubscribing (Mercurio lets every client unsubscribe), passwords in another form (those clients can't log in until they get one), and names a client, group or role refers to that the file does not define.</p>
 <pre>[auth]
 enabled = true
 allow_anonymous = false

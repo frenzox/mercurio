@@ -14,7 +14,7 @@ use std::{
 };
 
 use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
 use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::error;
 
-use crate::credentials::unknown_user_hash;
+use crate::credentials::{self, unknown_user_hash};
 use crate::reload::Reload;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -80,7 +80,8 @@ struct Client {
     username: String,
     #[serde(flatten)]
     description: Description,
-    /// Argon2 hash; a client without one can't log in
+    /// Argon2 hash, or the `$7$` PBKDF2 hash of a client imported from
+    /// mosquitto; a client without one can't log in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
     /// The only client id it may connect with, when set
@@ -957,11 +958,30 @@ impl DynamicSecurity {
             }],
             ..Default::default()
         };
-        write(path, &data)?;
-        #[cfg(unix)]
-        give_to_directory_owner(path)
-            .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
-        Ok(())
+        create(path, &data)
+    }
+
+    /// Writes a new state file from `source`, the `dynamic-security.json`
+    /// of mosquitto's plugin, with its clients, groups, roles, default
+    /// access and anonymous group, owned as [`Self::init`] owns its file.
+    /// Returns what could not be carried over, one line each.
+    pub fn import(source: &str, path: &str) -> Result<Vec<String>, String> {
+        if Path::new(path).exists() {
+            return Err(format!("{path} already exists"));
+        }
+        let contents =
+            std::fs::read_to_string(source).map_err(|e| format!("Failed to read {source}: {e}"))?;
+        // serde_json's errors quote values, which can be hashes
+        let file: Value = serde_json::from_str(&contents).map_err(|e| {
+            format!(
+                "{source} is not JSON: error at line {} column {}",
+                e.line(),
+                e.column()
+            )
+        })?;
+        let (data, notes) = from_mosquitto(&file).map_err(|e| format!("{source}: {e}"))?;
+        create(path, &data)?;
+        Ok(notes)
     }
 
     /// Runs a batch of commands, `{"commands": [...]}`, and returns the
@@ -1108,6 +1128,266 @@ fn write(path: &str, data: &Data) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {path}: {e}"))
 }
 
+/// Writes `data` to a new file at `path`, given to the owner of its
+/// directory when [`adopted_owner`] says so.
+fn create(path: &str, data: &Data) -> Result<(), String> {
+    write(path, data)?;
+    #[cfg(unix)]
+    give_to_directory_owner(path)
+        .map_err(|e| format!("Failed to give {path} to its directory's owner: {e}"))?;
+    Ok(())
+}
+
+/// The state a mosquitto `dynamic-security.json` describes, with what
+/// could not be carried over. Names a client, group or role refers to that
+/// the file does not define are left out, as are ACL types Mercurio does
+/// not check. Errors name where the file is wrong without quoting it.
+fn from_mosquitto(file: &Value) -> Result<(Data, Vec<String>), String> {
+    let mut notes = Vec::new();
+    let mut data = Data::default();
+    let list = |value: &Value, key: &str, context: &str| -> Result<Vec<Value>, String> {
+        match value.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(entries)) => Ok(entries.clone()),
+            Some(_) => Err(format!("{context}`{key}` is not a list")),
+        }
+    };
+    let name = |entry: &Value, key: &str, context: &str| -> Result<String, String> {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("{context}: `{key}` is missing or not text"))
+    };
+
+    for (n, entry) in list(file, "roles", "")?.iter().enumerate() {
+        let rolename = name(entry, "rolename", &format!("roles[{n}]"))?;
+        if data.roles.iter().any(|r| r.rolename == rolename) {
+            notes.push(format!("role {rolename}: defined twice; the first is kept"));
+            continue;
+        }
+        let context = format!("role {rolename}");
+        let mut acls = Vec::new();
+        for (n, acl) in list(entry, "acls", &format!("{context}: "))?
+            .iter()
+            .enumerate()
+        {
+            let at = format!("{context}, acls[{n}]");
+            let acltype = name(acl, "acltype", &at)?;
+            let topic = name(acl, "topic", &at)?;
+            let Ok(parsed) = serde_json::from_value::<AclType>(json!(acltype)) else {
+                notes.push(format!(
+                    "{context}: ACL {acltype} on {topic} left out, as Mercurio has no such check"
+                ));
+                continue;
+            };
+            let allow = match acl.get("allow") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(allow)) => *allow,
+                Some(_) => return Err(format!("{at}: `allow` is not true or false")),
+            };
+            let priority = match acl.get("priority") {
+                None | Some(Value::Null) => 0,
+                Some(priority) => priority
+                    .as_i64()
+                    .ok_or_else(|| format!("{at}: `priority` is not a whole number"))?,
+            };
+            acls.retain(|a: &Acl| !(a.acltype == parsed && a.topic == topic));
+            acls.push(Acl {
+                acltype: parsed,
+                topic,
+                priority,
+                allow,
+            });
+        }
+        data.roles.push(Role {
+            rolename,
+            description: mosquitto_description(entry),
+            acls,
+        });
+    }
+
+    let known = |names: Vec<Ranked>,
+                 kind: &str,
+                 exists: &dyn Fn(&str) -> bool,
+                 notes: &mut Vec<String>,
+                 context: &str| {
+        names
+            .into_iter()
+            .filter(|ranked| {
+                let found = exists(&ranked.name);
+                if !found {
+                    notes.push(format!(
+                        "{context}: {kind} {} is not defined, so it is left out",
+                        ranked.name
+                    ));
+                }
+                found
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut members = Vec::new();
+    for (n, entry) in list(file, "groups", "")?.iter().enumerate() {
+        let groupname = name(entry, "groupname", &format!("groups[{n}]"))?;
+        if data.groups.iter().any(|g| g.groupname == groupname) {
+            notes.push(format!(
+                "group {groupname}: defined twice; the first is kept"
+            ));
+            continue;
+        }
+        let context = format!("group {groupname}");
+        let roles =
+            ranked(entry.get("roles"), "rolename").map_err(|e| format!("{context}: {e}"))?;
+        let roles = known(
+            roles,
+            "role",
+            &|name| data.roles.iter().any(|r| r.rolename == name),
+            &mut notes,
+            &context,
+        );
+        let clients =
+            ranked(entry.get("clients"), "username").map_err(|e| format!("{context}: {e}"))?;
+        members.push((groupname.clone(), clients));
+        data.groups.push(Group {
+            groupname,
+            description: mosquitto_description(entry),
+            roles,
+        });
+    }
+
+    for (n, entry) in list(file, "clients", "")?.iter().enumerate() {
+        let username = name(entry, "username", &format!("clients[{n}]"))?;
+        if data.clients.iter().any(|c| c.username == username) {
+            notes.push(format!(
+                "client {username}: defined twice; the first is kept"
+            ));
+            continue;
+        }
+        let context = format!("client {username}");
+        let roles =
+            ranked(entry.get("roles"), "rolename").map_err(|e| format!("{context}: {e}"))?;
+        let roles = known(
+            roles,
+            "role",
+            &|name| data.roles.iter().any(|r| r.rolename == name),
+            &mut notes,
+            &context,
+        );
+        // Mosquitto keeps memberships with the groups; taken here too
+        let groups =
+            ranked(entry.get("groups"), "groupname").map_err(|e| format!("{context}: {e}"))?;
+        let groups = known(
+            groups,
+            "group",
+            &|name| data.groups.iter().any(|g| g.groupname == name),
+            &mut notes,
+            &context,
+        );
+        let clientid = match entry.get("clientid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => (!id.is_empty()).then(|| id.clone()),
+            Some(_) => return Err(format!("{context}: `clientid` is not text")),
+        };
+        let disabled = match entry.get("disabled") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(disabled)) => *disabled,
+            Some(_) => return Err(format!("{context}: `disabled` is not true or false")),
+        };
+        let password = mosquitto_password(entry);
+        if password.is_none() && entry.get("password").is_some_and(|p| !p.is_null()) {
+            notes.push(format!(
+                "{context}: its password is in a form Mercurio cannot check, so it has none \
+                 and cannot log in until one is set"
+            ));
+        }
+        data.clients.push(Client {
+            username,
+            description: mosquitto_description(entry),
+            password,
+            clientid,
+            disabled,
+            roles,
+            groups,
+        });
+    }
+
+    for (groupname, clients) in members {
+        for member in clients {
+            match data.clients.iter_mut().find(|c| c.username == member.name) {
+                Some(client) => rank(&mut client.groups, groupname.clone(), member.priority),
+                None => notes.push(format!(
+                    "group {groupname}: client {} is not defined, so it is left out",
+                    member.name
+                )),
+            }
+        }
+    }
+
+    match file.get("anonymousGroup") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(group)) if data.groups.iter().any(|g| &g.groupname == group) => {
+            data.anonymous_group = Some(group.clone());
+        }
+        Some(Value::String(group)) => notes.push(format!(
+            "anonymous group {group} is not defined, so none is set"
+        )),
+        Some(_) => return Err("`anonymousGroup` is not text".to_string()),
+    }
+
+    if let Some(access) = file.get("defaultACLAccess").filter(|a| !a.is_null()) {
+        let flag = |key: &str, default: bool| match access.get(key) {
+            None | Some(Value::Null) => Ok(default),
+            Some(Value::Bool(allow)) => Ok(*allow),
+            Some(_) => Err(format!("defaultACLAccess: `{key}` is not true or false")),
+        };
+        let defaults = DefaultAccess::default();
+        data.default_acl_access = DefaultAccess {
+            publish_client_send: flag("publishClientSend", defaults.publish_client_send)?,
+            publish_client_receive: flag("publishClientReceive", defaults.publish_client_receive)?,
+            subscribe: flag("subscribe", defaults.subscribe)?,
+        };
+        if !flag("unsubscribe", true)? {
+            notes.push(
+                "defaultACLAccess: unsubscribe is denied, but Mercurio lets every client \
+                 unsubscribe"
+                    .to_string(),
+            );
+        }
+    }
+
+    data.order();
+    Ok((data, notes))
+}
+
+/// The text of a client, group or role of mosquitto, which spells it
+/// `textname` and, in the file `mosquitto_ctrl dynsec init` writes,
+/// `textName`.
+fn mosquitto_description(entry: &Value) -> Description {
+    let text = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|key| entry.get(*key).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    Description {
+        textname: text(["textname", "textName"]),
+        textdescription: text(["textdescription", "textDescription"]),
+    }
+}
+
+/// The password of a mosquitto client as a `$7$` hash: mosquitto stores
+/// the PBKDF2-SHA512 hash and its salt in base64 with the iteration count
+/// beside them, the form `mosquitto_passwd` writes in one string. None
+/// when it has none or it is in another form.
+fn mosquitto_password(entry: &Value) -> Option<String> {
+    let hash = entry.get("password")?.as_str()?;
+    let salt = entry.get("salt")?.as_str()?;
+    let iterations = entry.get("iterations")?.as_u64()?;
+    let stored = format!("$7${iterations}${salt}${hash}");
+    credentials::check_hash(&stored).ok().map(|()| stored)
+}
+
 /// The directory holding `path`.
 #[cfg(unix)]
 fn directory_of(path: &str) -> &Path {
@@ -1170,13 +1450,11 @@ impl DynamicSecurity {
                 _ => (None, None),
             }
         };
-        match hash
-            .as_deref()
-            .and_then(|hash| PasswordHash::new(hash).ok())
-        {
+        match hash {
+            // Argon2, or the PBKDF2 of a client imported from mosquitto
+            // that has not set its password since
             Some(hash) => {
-                let valid = Argon2::default().verify_password(password, &hash).is_ok();
-                valid && bound.is_none_or(|bound| bound == client_id)
+                credentials::verify(&hash, password) && bound.is_none_or(|bound| bound == client_id)
             }
             None => {
                 // As slow as a wrong password, so timing doesn't tell which
@@ -2399,6 +2677,196 @@ mod tests {
             json!([{ "username": "out", "priority": 4 }])
         );
         assert!(fixture.publishes("out", "t/1"));
+    }
+
+    /// A file as mosquitto's plugin writes it. `admin`'s password is
+    /// "secret", hashed by mosquitto_passwd 2.0.18 as in `credentials.rs`.
+    const MOSQUITTO_FILE: &str = r##"{
+      "defaultACLAccess": {
+        "publishClientSend": true, "publishClientReceive": true,
+        "subscribe": false, "unsubscribe": false
+      },
+      "clients": [{
+        "username": "admin", "textName": "Dynsec admin user",
+        "roles": [{ "rolename": "admin" }],
+        "password": "1FhG/H49+FnZ9qx8YFDOUZOiE+Yd+yOKjQ9AzfsTHwepsiXOTbzCSojC7kA3U/VicSJdksyipSowQpvFhpo0iQ==",
+        "salt": "lT8RRynk8Dr5uL1b", "iterations": 101
+      }, {
+        "username": "sensor", "clientid": "dev1", "textname": "Sensor",
+        "textdescription": "On the roof", "disabled": true,
+        "roles": [{ "rolename": "reader", "priority": 3 }, { "rolename": "gone" }]
+      }, {
+        "username": "legacy", "password": "c2VjcmV0"
+      }],
+      "groups": [{
+        "groupname": "field", "textname": "Field devices",
+        "roles": [{ "rolename": "writer", "priority": 2 }],
+        "clients": [{ "username": "sensor", "priority": 5 }, { "username": "nobody" }]
+      }, {
+        "groupname": "guests", "roles": [{ "rolename": "reader" }]
+      }],
+      "roles": [{
+        "rolename": "admin",
+        "acls": [
+          { "acltype": "publishClientSend", "topic": "$CONTROL/dynamic-security/#",
+            "allow": true },
+          { "acltype": "unsubscribePattern", "topic": "#", "allow": true }
+        ]
+      }, {
+        "rolename": "reader", "textdescription": "Reads news",
+        "acls": [{ "acltype": "subscribePattern", "topic": "news/#", "priority": 1,
+                   "allow": true }]
+      }, {
+        "rolename": "writer",
+        "acls": [{ "acltype": "publishClientSend", "topic": "news/#", "allow": false }]
+      }],
+      "anonymousGroup": "guests"
+    }"##;
+
+    /// Paths for a mosquitto file holding `contents` and a target beside it.
+    fn import_paths(name: &str, contents: &str) -> (String, String) {
+        let dir = std::env::temp_dir();
+        let source = dir.join(format!(
+            "mercuriod-import-{name}-{}.json",
+            std::process::id()
+        ));
+        let target = dir.join(format!("mercuriod-imported-{name}-{}", std::process::id()));
+        std::fs::write(&source, contents).unwrap();
+        let _ = std::fs::remove_file(&target);
+        (
+            source.to_str().unwrap().to_string(),
+            target.to_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_import_converts_a_mosquitto_file() {
+        let (source, target) = import_paths("full", MOSQUITTO_FILE);
+        let notes = DynamicSecurity::import(&source, &target).unwrap();
+        let security = DynamicSecurity::load(&target).unwrap();
+
+        // Mosquitto's PBKDF2 hashes keep working
+        assert!(security.check_password("admin", b"secret", "any"));
+        assert!(!security.check_password("admin", b"wrong", "any"));
+        assert_eq!(
+            security
+                .authorize_control(&identity("admin"), COMMAND_TOPIC)
+                .await,
+            Decision::Allow
+        );
+
+        let shown = run(
+            &security,
+            json!([
+                { "command": "getClient", "username": "sensor" },
+                { "command": "getGroup", "groupname": "field" },
+                { "command": "getRole", "rolename": "reader" },
+                { "command": "getAnonymousGroup" },
+                { "command": "getDefaultACLAccess" },
+                { "command": "getClient", "username": "admin" },
+            ]),
+        );
+        let sensor = &shown[0]["data"]["client"];
+        assert_eq!(sensor["clientid"], "dev1");
+        assert_eq!(sensor["textname"], "Sensor");
+        assert_eq!(sensor["textdescription"], "On the roof");
+        assert_eq!(sensor["disabled"], true);
+        assert_eq!(
+            sensor["roles"],
+            json!([{ "rolename": "reader", "priority": 3 }])
+        );
+        assert_eq!(
+            sensor["groups"],
+            json!([{ "groupname": "field", "priority": 5 }])
+        );
+        let field = &shown[1]["data"]["group"];
+        assert_eq!(field["textname"], "Field devices");
+        assert_eq!(
+            field["roles"],
+            json!([{ "rolename": "writer", "priority": 2 }])
+        );
+        let reader = &shown[2]["data"]["role"];
+        assert_eq!(reader["textdescription"], "Reads news");
+        assert_eq!(reader["acls"][0]["priority"], 1);
+        assert_eq!(shown[3]["data"]["group"]["groupname"], "guests");
+        assert_eq!(
+            shown[4]["data"]["acls"],
+            json!([
+                { "acltype": "publishClientSend", "allow": true },
+                { "acltype": "publishClientReceive", "allow": true },
+                { "acltype": "subscribe", "allow": false },
+            ])
+        );
+        assert_eq!(shown[5]["data"]["client"]["textname"], "Dynsec admin user");
+
+        // Anonymous clients get the anonymous group's roles
+        let anonymous = ClientInfo::new("a", None);
+        assert_eq!(
+            security
+                .authorize(&anonymous, "news/today", Access::Subscribe)
+                .await,
+            Decision::Allow
+        );
+
+        // What could not come along is reported
+        for expected in [
+            "unsubscribe",
+            "unsubscribePattern",
+            "gone",
+            "nobody",
+            "legacy",
+        ] {
+            assert!(
+                notes.iter().any(|note| note.contains(expected)),
+                "{expected}: {notes:?}"
+            );
+        }
+        assert!(!security.check_password("legacy", b"secret", "any"));
+
+        // A password set again is hashed with Argon2
+        run(
+            &security,
+            json!([{ "command": "setClientPassword", "username": "admin", "password": "n3w" }]),
+        );
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        let admin = saved["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["username"] == "admin")
+            .unwrap();
+        assert!(admin["password"].as_str().unwrap().starts_with("$argon2"));
+        assert!(security.check_password("admin", b"n3w", "any"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_file(&source).unwrap();
+        std::fs::remove_file(&target).unwrap();
+    }
+
+    #[test]
+    fn test_import_refuses_to_overwrite_and_does_not_quote_the_file() {
+        let (source, target) = import_paths("exists", MOSQUITTO_FILE);
+        std::fs::write(&target, "keep").unwrap();
+        let error = DynamicSecurity::import(&source, &target).unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        std::fs::remove_file(&target).unwrap();
+
+        std::fs::write(
+            &source,
+            r#"{"clients": [{"username": 5, "password": "SECRET"}]}"#,
+        )
+        .unwrap();
+        let error = DynamicSecurity::import(&source, &target).unwrap_err();
+        assert!(!error.contains("SECRET"), "{error}");
+        assert!(!Path::new(&target).exists());
+        std::fs::remove_file(&source).unwrap();
     }
 
     #[test]

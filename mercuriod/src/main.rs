@@ -103,6 +103,13 @@ enum Commands {
         #[arg(short = 'u', long, default_value = "admin")]
         username: String,
     },
+    /// Create a dynamic security file from mosquitto's dynamic-security.json
+    DynsecImport {
+        /// The file of mosquitto's dynamic security plugin
+        mosquitto: String,
+        /// Path of the file to create
+        file: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -154,6 +161,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let password = prompt_new_password(&username)?;
             DynamicSecurity::init(&file, &username, &password)?;
             eprintln!("Created `{}` with administrator `{}`", file, username);
+            return Ok(());
+        }
+        Some(Commands::DynsecImport { mosquitto, file }) => {
+            for note in DynamicSecurity::import(&mosquitto, &file)? {
+                eprintln!("Not imported: {note}");
+            }
+            eprintln!("Created `{file}` from `{mosquitto}`");
             return Ok(());
         }
         None => {}

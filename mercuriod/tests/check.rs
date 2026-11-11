@@ -254,3 +254,48 @@ fn a_start_validates_authentication_before_binding() {
     assert!(message.contains("`enabled`"), "{message}");
     assert!(!message.contains("listen"), "{message}");
 }
+
+#[test]
+fn an_imported_mosquitto_file_passes_and_is_not_overwritten() {
+    let dir = TempDir::new("import");
+    let mosquitto = dir.write(
+        "dynamic-security.json",
+        r#"{"clients": [{"username": "u", "roles": [{"rolename": "r"}]}],
+            "roles": [{"rolename": "r", "acls": [
+                {"acltype": "unsubscribeLiteral", "topic": "t", "allow": true}]}]}"#,
+    );
+    let imported = dir.0.join("imported.json");
+    let import = || {
+        Command::new(env!("CARGO_BIN_EXE_mercuriod"))
+            .arg("dynsec-import")
+            .arg(&mosquitto)
+            .arg(&imported)
+            .output()
+            .unwrap()
+    };
+    let output = import();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unsubscribeLiteral"),
+        "{}",
+        stderr(&output)
+    );
+
+    let config = dir.write(
+        "config.toml",
+        &format!(
+            "[admin]\nsocket = \"\"\n[auth]\nenabled = true\ndynamic_security = \"{}\"\n",
+            imported.display()
+        ),
+    );
+    let checked = mercuriod(&config, true);
+    assert!(checked.status.success(), "{}", stderr(&checked));
+
+    let again = import();
+    assert!(!again.status.success());
+    assert!(
+        stderr(&again).contains("already exists"),
+        "{}",
+        stderr(&again)
+    );
+}
