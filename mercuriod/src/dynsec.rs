@@ -13,11 +13,11 @@ use std::{
     sync::{Mutex, OnceLock, RwLock},
 };
 
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordVerifier};
 use bytes::Bytes;
 use mercurio_core::topic::{filter_covers, topic_matches_filter};
 use mercurio_server::admin::{Admin, ClientQuery, DisconnectOptions, Paging, MAX_PAGE};
+use mercurio_server::auth::{ScramCredentialStore, StoredCredentials};
 use mercurio_server::plugin::{
     ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin, PluginKind, PluginStatus,
 };
@@ -84,6 +84,12 @@ struct Client {
     /// mosquitto; a client without one can't log in
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
+    /// SCRAM-SHA-256 credentials set with the password, see
+    /// [`credentials::scram_entry`]; only for clients whose password was
+    /// set since SCRAM support, and ignored once the password changes
+    /// without them
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scram: Option<String>,
     /// The only client id it may connect with, when set
     #[serde(default, skip_serializing_if = "Option::is_none")]
     clientid: Option<String>,
@@ -444,15 +450,19 @@ impl Data {
                     Some(Value::String(id)) => Some(id.clone()),
                     Some(_) => return Err("Invalid clientid".to_string()),
                 };
-                let password = match args.get("password").and_then(Value::as_str) {
-                    Some(password) => Some(hash_password(password)?),
-                    None => None,
+                let (password, scram) = match args.get("password").and_then(Value::as_str) {
+                    Some(password) => {
+                        let (hash, scram) = hash_password(password)?;
+                        (Some(hash), Some(scram))
+                    }
+                    None => (None, None),
                 };
                 let description = Description::default().modified(args)?;
                 self.clients.push(Client {
                     username,
                     description,
                     password,
+                    scram,
                     clientid,
                     disabled: false,
                     roles,
@@ -467,8 +477,10 @@ impl Data {
                 Ok((None, true))
             }
             "setClientPassword" => {
-                let hash = hash_password(&text("password")?)?;
-                self.client(&text("username")?)?.password = Some(hash);
+                let (hash, scram) = hash_password(&text("password")?)?;
+                let client = self.client(&text("username")?)?;
+                client.password = Some(hash);
+                client.scram = Some(scram);
                 Ok((None, true))
             }
             "modifyClient" => {
@@ -504,8 +516,9 @@ impl Data {
                 if let Some(clientid) = clientid {
                     client.clientid = clientid;
                 }
-                if password.is_some() {
-                    client.password = password;
+                if let Some((hash, scram)) = password {
+                    client.password = Some(hash);
+                    client.scram = Some(scram);
                 }
                 Ok((None, true))
             }
@@ -867,12 +880,9 @@ fn priority(args: &Value) -> Result<i64, String> {
     }
 }
 
-fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|e| format!("Failed to hash password: {e}"))
+/// The Argon2 hash of `password` and its SCRAM-SHA-256 credentials.
+fn hash_password(password: &str) -> Result<(String, String), String> {
+    credentials::hash_new_password(password)
 }
 
 /// Connected clients a change of the state concerns.
@@ -932,11 +942,13 @@ impl DynamicSecurity {
             priority: 0,
             allow: true,
         };
+        let (hash, scram) = hash_password(password)?;
         let data = Data {
             clients: vec![Client {
                 username: admin.to_string(),
                 description: Description::default(),
-                password: Some(hash_password(password)?),
+                password: Some(hash),
+                scram: Some(scram),
                 clientid: None,
                 disabled: false,
                 roles: vec![Ranked::new("admin")],
@@ -1305,6 +1317,7 @@ fn from_mosquitto(file: &Value) -> Result<(Data, Vec<String>), String> {
             username,
             description: mosquitto_description(entry),
             password,
+            scram: None,
             clientid,
             disabled,
             roles,
@@ -1463,6 +1476,30 @@ impl DynamicSecurity {
                 false
             }
         }
+    }
+}
+
+impl ScramCredentialStore for DynamicSecurity {
+    /// The SCRAM credentials of an enabled client, set with its current
+    /// password, that may connect as `client`.
+    fn scram_credentials<'a>(
+        &'a self,
+        client: &'a ClientInfo,
+        username: &'a str,
+    ) -> BoxFuture<'a, Option<StoredCredentials>> {
+        let data = self.data.read().unwrap();
+        let credentials = data
+            .clients
+            .iter()
+            .find(|c| c.username == username && !c.disabled)
+            .filter(|c| c.clientid.as_ref().is_none_or(|id| *id == client.client_id))
+            .and_then(|c| match (&c.password, &c.scram) {
+                (Some(hash), Some(scram)) => {
+                    credentials::scram_credentials(hash, scram).ok().flatten()
+                }
+                _ => None,
+            });
+        ready(credentials)
     }
 }
 
@@ -2502,6 +2539,63 @@ mod tests {
         }
         let listed = fixture.run_ok(json!([{ "command": "listClients" }]));
         assert_eq!(listed[0]["data"]["clients"], json!(["admin", "c"]));
+    }
+
+    #[tokio::test]
+    async fn test_setting_a_password_sets_scram_credentials() {
+        let fixture = Fixture::new("scram");
+        let scram = |username: &'static str, client_id: &'static str| {
+            let security = &fixture.security;
+            async move {
+                security
+                    .scram_credentials(&ClientInfo::new(client_id, None), username)
+                    .await
+            }
+        };
+        assert!(scram("admin", "any").await.is_some());
+
+        fixture.run_ok(json!([
+            { "command": "createClient", "username": "c", "password": "pw", "clientid": "dev1" },
+            { "command": "createClient", "username": "nopassword" },
+        ]));
+        let first = scram("c", "dev1").await.unwrap();
+        assert_eq!(scram("c", "other").await, None, "bound to its client id");
+        assert_eq!(scram("nopassword", "any").await, None);
+        assert_eq!(scram("nobody", "any").await, None);
+
+        fixture.run_ok(json!([
+            { "command": "setClientPassword", "username": "c", "password": "pw2" },
+        ]));
+        let second = scram("c", "dev1").await.unwrap();
+        assert_ne!(first, second);
+        fixture.run_ok(json!([
+            { "command": "modifyClient", "username": "c", "password": "pw3" },
+        ]));
+        assert_ne!(scram("c", "dev1").await.unwrap(), second);
+
+        fixture.run_ok(json!([{ "command": "disableClient", "username": "c" }]));
+        assert_eq!(scram("c", "dev1").await, None);
+
+        // A password changed by a release that knows nothing of SCRAM
+        // leaves keys that no longer hold
+        {
+            let mut data = fixture.security.data.write().unwrap();
+            let admin = data
+                .clients
+                .iter_mut()
+                .find(|c| c.username == "admin")
+                .unwrap();
+            admin.password = Some(hash_password("changed").unwrap().0);
+        }
+        assert_eq!(scram("admin", "any").await, None);
+
+        // The keys survive saving and loading
+        fixture.run_ok(json!([{ "command": "enableClient", "username": "c" }]));
+        let reloaded = DynamicSecurity::load(&fixture.path).unwrap();
+        assert!(reloaded
+            .scram_credentials(&ClientInfo::new("dev1", None), "c")
+            .await
+            .is_some());
     }
 
     #[test]

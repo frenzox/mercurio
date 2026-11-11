@@ -1,24 +1,95 @@
 //! Reading and writing the `username:hash` password file.
+//!
+//! A user's SCRAM-SHA-256 credentials go on a line of their own after the
+//! user's, `#scram-sha-256:<username>:<credentials>`, see
+//! [`crate::credentials::scram_entry`]. It starts with `#`, so mosquitto and
+//! older `mercuriod` releases take it for a comment and still read the
+//! file, and the credentials are bound to the hash on the user's line, so
+//! a tool that changes the hash and not them leaves them unused.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
+use mercurio_server::auth::StoredCredentials;
+
+use crate::credentials::{check_hash, scram_credentials};
+
+/// Starts the line holding a user's SCRAM credentials.
+const SCRAM_PREFIX: &str = "#scram-sha-256:";
+
+/// A user of the password file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    pub hash: String,
+    /// SCRAM-SHA-256 credentials set with the hash's password, in the form
+    /// of [`crate::credentials::scram_entry`]
+    pub scram: Option<String>,
+}
+
+impl User {
+    pub fn new(hash: impl Into<String>) -> Self {
+        Self {
+            hash: hash.into(),
+            scram: None,
+        }
+    }
+}
+
+/// The users of a password file and the SCRAM credentials of those that
+/// have them.
+#[derive(Debug)]
+pub struct Loaded {
+    pub hashes: HashMap<String, String>,
+    pub scram: HashMap<String, StoredCredentials>,
+}
+
 /// Load a password file with format: `username:hash` per line.
-/// Lines starting with `#` and empty lines are ignored.
-pub fn load(path: &str) -> Result<HashMap<String, String>, String> {
+/// Lines starting with `#` and empty lines are ignored, except for the
+/// SCRAM credentials of the users.
+pub fn load(path: &str) -> Result<Loaded, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read password file `{}`: {}", path, e))?;
-    parse(path, &content, true)
+    let users = parse(path, &content, true)?;
+    let mut loaded = Loaded {
+        hashes: HashMap::with_capacity(users.len()),
+        scram: HashMap::new(),
+    };
+    for (username, user) in users {
+        if let Some(Ok(Some(credentials))) = user
+            .scram
+            .as_deref()
+            .map(|entry| scram_credentials(&user.hash, entry))
+        {
+            loaded.scram.insert(username.clone(), credentials);
+        }
+        loaded.hashes.insert(username, user.hash);
+    }
+    Ok(loaded)
 }
 
 /// The file's users; with `check_hashes`, a hash no password can match,
-/// such as a plain-text password, is an error naming its line.
-fn parse(path: &str, content: &str, check_hashes: bool) -> Result<HashMap<String, String>, String> {
-    let mut credentials = HashMap::new();
+/// such as a plain-text password, or malformed SCRAM credentials, is an
+/// error naming its line. SCRAM credentials set with another password
+/// than the user's hash, or of no user, are left out.
+fn parse(path: &str, content: &str, check_hashes: bool) -> Result<HashMap<String, User>, String> {
+    let invalid = |line_num: usize, e: &str| {
+        format!(
+            "Invalid hash in password file `{}` at line {}: {}",
+            path,
+            line_num + 1,
+            e
+        )
+    };
+    let mut users = HashMap::new();
+    let mut scram = Vec::new();
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
+        if let Some(entry) = line.strip_prefix(SCRAM_PREFIX) {
+            scram.push((line_num, entry));
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -30,24 +101,29 @@ fn parse(path: &str, content: &str, check_hashes: bool) -> Result<HashMap<String
             ));
         };
         if check_hashes {
-            crate::credentials::check_hash(password_hash).map_err(|e| {
-                format!(
-                    "Invalid hash in password file `{}` at line {}: {}",
-                    path,
-                    line_num + 1,
-                    e
-                )
-            })?;
+            check_hash(password_hash).map_err(|e| invalid(line_num, e))?;
         }
-        credentials.insert(username.to_string(), password_hash.to_string());
+        users.insert(username.to_string(), User::new(password_hash));
     }
-    Ok(credentials)
+    for (line_num, entry) in scram {
+        let (username, entry) = entry.split_once(':').unwrap_or((entry, ""));
+        let Some(user) = users.get_mut(username) else {
+            continue;
+        };
+        match scram_credentials(&user.hash, entry) {
+            Ok(Some(_)) => user.scram = Some(entry.to_string()),
+            Ok(None) => {}
+            Err(e) if check_hashes => return Err(invalid(line_num, &e)),
+            Err(_) => {}
+        }
+    }
+    Ok(users)
 }
 
 /// The users of the password file at `path`, for `mercuriod passwd` to
 /// change; none when the file doesn't exist. Any other failure is an error,
 /// so a file that can't be read is never rewritten with one user.
-pub fn read_users(path: &str) -> Result<BTreeMap<String, String>, String> {
+pub fn read_users(path: &str) -> Result<BTreeMap<String, User>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -88,7 +164,7 @@ pub fn check_username(username: &str) -> Result<(), String> {
 /// Replaces the password file at `path` with `users`. The new file is
 /// written beside it and renamed over it, so the broker never reads half a
 /// file; it keeps the old file's owner and mode, at most 0640, or gets 0600.
-pub fn write_users(path: &str, users: &BTreeMap<String, String>) -> Result<(), String> {
+pub fn write_users(path: &str, users: &BTreeMap<String, User>) -> Result<(), String> {
     let failed = |e: std::io::Error| format!("Failed to write password file `{path}`: {e}");
     let existing = match std::fs::metadata(path) {
         Ok(metadata) => Some(metadata),
@@ -114,10 +190,14 @@ pub fn write_users(path: &str, users: &BTreeMap<String, String>) -> Result<(), S
     ));
 
     let mut content = String::from(
-        "# Mercurio password file\n# Managed by `mercuriod passwd`. Do not edit manually.\n",
+        "# Mercurio password file\n# Managed by `mercuriod passwd`. Do not edit manually.\n\
+         # `#scram-sha-256:` lines hold the SCRAM-SHA-256 keys of the user above.\n",
     );
-    for (username, hash) in users {
-        content.push_str(&format!("{username}:{hash}\n"));
+    for (username, user) in users {
+        content.push_str(&format!("{username}:{}\n", user.hash));
+        if let Some(scram) = &user.scram {
+            content.push_str(&format!("{SCRAM_PREFIX}{username}:{scram}\n"));
+        }
     }
     let result = replace(&target, dir, &temp, existing.as_ref(), content.as_bytes());
     if result.is_err() {
@@ -212,10 +292,10 @@ mod tests {
         }
     }
 
-    fn users(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn users(entries: &[(&str, &str)]) -> BTreeMap<String, User> {
         entries
             .iter()
-            .map(|(u, h)| (u.to_string(), h.to_string()))
+            .map(|(u, h)| (u.to_string(), User::new(*h)))
             .collect()
     }
 
@@ -231,7 +311,7 @@ mod tests {
              sha512:$6$pZufTypp2a6RmJv0$0E3Uw01KVS5L6/s+8dWtsoMjdF9mnjUcloZJLTWqsIQbvp1b3crPcunceFO+VmiVpj+Wde8NRnyJs4ZAFgaQUA==\n",
         )
         .unwrap();
-        assert_eq!(load(&good).unwrap().len(), 3);
+        assert_eq!(load(&good).unwrap().hashes.len(), 3);
 
         for (line, hash) in [
             (2, ""),
@@ -251,6 +331,65 @@ mod tests {
                 "{hash:?} shown: {error}"
             );
         }
+    }
+
+    #[test]
+    fn test_scram_credentials_ride_along_in_comment_lines() {
+        let dir = TempDir::new("scram");
+        let path = dir.file("passwd");
+        let (hash, scram) = crate::credentials::hash_new_password("secret").unwrap();
+        let mut users = users(&[("bob", "$6$c2FsdA==$aGFzaA==")]);
+        users.insert(
+            "alice".into(),
+            User {
+                hash: hash.clone(),
+                scram: Some(scram),
+            },
+        );
+        write_users(&path, &users).unwrap();
+        assert_eq!(read_users(&path).unwrap(), users);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.hashes.len(), 2);
+        assert_eq!(loaded.scram.keys().collect::<Vec<_>>(), ["alice"]);
+
+        // Every other line is still a `username:hash` one, as older
+        // releases and mosquitto read them
+        let content = std::fs::read_to_string(&path).unwrap();
+        let plain: Vec<&str> = content.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            plain,
+            [format!("alice:{hash}").as_str(), "bob:$6$c2FsdA==$aGFzaA=="]
+        );
+    }
+
+    #[test]
+    fn test_scram_credentials_of_another_password_are_left_out() {
+        let dir = TempDir::new("scram-stale");
+        let path = dir.file("passwd");
+        let (_, scram) = crate::credentials::hash_new_password("old").unwrap();
+        // As mosquitto_passwd leaves it, having changed alice's password
+        std::fs::write(
+            &path,
+            format!(
+                "alice:$6$c2FsdA==$aGFzaA==\n#scram-sha-256:alice:{scram}\n\
+                 #scram-sha-256:nobody:{scram}\n"
+            ),
+        )
+        .unwrap();
+        assert!(load(&path).unwrap().scram.is_empty());
+        assert_eq!(read_users(&path).unwrap()["alice"].scram, None);
+
+        std::fs::write(
+            &path,
+            "alice:$6$c2FsdA==$aGFzaA==\n#scram-sha-256:alice:x:SCRAM-SHA-256$1:c2FsdA==\n",
+        )
+        .unwrap();
+        let error = load(&path).unwrap_err();
+        assert!(
+            error.contains("line 2") && !error.contains("c2FsdA"),
+            "{error}"
+        );
+        assert_eq!(read_users(&path).unwrap()["alice"].scram, None);
     }
 
     #[test]

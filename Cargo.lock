@@ -1538,6 +1538,7 @@ dependencies = [
  "libc",
  "mercurio-client",
  "mercurio-core",
+ "mercurio-scram",
  "mercurio-server",
  "mercurio-storage",
  "pbkdf2",
