@@ -59,7 +59,10 @@ use crate::{
     broker::Broker,
     connection::Connection,
     http,
-    plugin::{guarded, AuthResult, Chain, ClientInfo, Credentials, Decision, Event, Plugin},
+    plugin::{
+        guarded, AuthResult, Chain, ClientInfo, ConnectionInfo, Credentials, Decision, Event,
+        Plugin,
+    },
     proxy,
     session::{
         cap_expiry_interval, cap_session_expiry, effective_keepalive, Outgoing, Session,
@@ -614,6 +617,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// The client certificate's Common Name, when it stands in for the
     /// user name
     cert_identity: Option<String>,
+    /// Whether the connection is TLS
+    tls: bool,
     mount_point: Option<String>,
     http_files: Option<Arc<http::Files>>,
     allowed_origins: Option<Arc<[String]>>,
@@ -747,6 +752,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                         return None;
                     }
                 }
+                self.tls = true;
                 Some((*self, Secured::Tls(Box::new(tls_stream)), peer_addr))
             }
             Ok(Err(e)) => {
@@ -852,7 +858,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        connection.set_mount_point(self.mount_point);
+        connection.set_mount_point(self.mount_point.clone());
         connection.set_stats(Arc::clone(&self.stats));
         connection.set_write_timeout(self.limits.write_timeout);
         let mut handler = Handler {
@@ -867,6 +873,9 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             limits: self.limits,
             stats: self.stats,
             cert_identity: self.cert_identity,
+            tls: self.tls,
+            mount_point: self.mount_point,
+            connection_info: None,
             local: self.local,
             connect_deadline: self.connect_deadline,
             listener: self.listener,
@@ -959,6 +968,10 @@ where
     stats: Arc<Stats>,
     limits: Limits,
     cert_identity: Option<String>,
+    tls: bool,
+    mount_point: Option<String>,
+    /// What plugins are told about the connection, once CONNECT is read
+    connection_info: Option<Arc<ConnectionInfo>>,
     /// An in-process connection, from the local listener
     local: bool,
     connect_deadline: Instant,
@@ -1401,6 +1414,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 limits: self.limits,
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
+                tls: false,
                 mount_point: None,
                 http_files: None,
                 allowed_origins: None,
@@ -1649,6 +1663,12 @@ where
     async fn run(&mut self, mut connect_packet: Box<ConnectPacket>) -> Result<()> {
         self.connection
             .set_protocol_version(connect_packet.protocol_version);
+        let mut connection_info =
+            ConnectionInfo::new(Arc::clone(&self.listener), connect_packet.protocol_version);
+        connection_info.tls = self.tls;
+        connection_info.certificate = self.cert_identity.clone();
+        connection_info.mount_point = self.mount_point.clone();
+        self.connection_info = Some(Arc::new(connection_info));
 
         if let Some(redirect) = self.policy.redirect.clone() {
             return self.redirect(&connect_packet, &redirect).await;
@@ -1691,11 +1711,8 @@ where
                 &connect_packet.payload.password,
             ) {
                 (Some(username), Some(password)) => {
-                    let client = ClientInfo {
-                        client_id: connect_packet.payload.client_id.clone(),
-                        username: Some(username.clone()),
-                        peer: self.peer,
-                    };
+                    let client =
+                        self.client_info(&connect_packet.payload.client_id, Some(username.clone()));
                     let credentials = Credentials::new(username, password);
                     let checked = validate_credentials(&self.chain, &client, &credentials);
                     let checked = connect_step(&mut self.shutdown, self.connect_deadline, checked);
@@ -1793,11 +1810,8 @@ where
         // A will is published on the client's behalf, so it needs the same
         // permission as a PUBLISH, checked once the client id is final
         if let Some(will_topic) = &connect_packet.payload.will_topic {
-            let identity = ClientInfo {
-                client_id: connect_packet.payload.client_id.clone(),
-                username: verified_user.clone(),
-                peer: self.peer,
-            };
+            let identity =
+                self.client_info(&connect_packet.payload.client_id, verified_user.clone());
             if !self.chain.may(&identity, will_topic, Access::Write).await {
                 return self
                     .reject_connect(&connect_packet, ReasonCode::NotAuthorized)
@@ -1871,7 +1885,9 @@ where
         }
 
         session.set_verified_user(verified_user.clone()).await;
-        session.set_peer(self.peer).await;
+        session
+            .set_peer(self.peer, self.connection_info.clone())
+            .await;
         // A ban added after the check above, while this client had yet to
         // claim its id, also missed it in addBan's walk of the connected
         // clients. Checked again now that the id is held and the session
@@ -2035,6 +2051,15 @@ where
         result
     }
 
+    /// The client of this connection as plugins see it, before it has a
+    /// session.
+    fn client_info(&self, client_id: &str, username: Option<String>) -> ClientInfo {
+        let mut client = ClientInfo::new(client_id, username);
+        client.peer = self.peer;
+        client.connection = self.connection_info.clone();
+        client
+    }
+
     /// Runs the AUTH exchange of MQTT 5 enhanced authentication during
     /// CONNECT. Returns the user name the method verified, if any, and the
     /// data for the CONNACK, or None having refused the connection.
@@ -2043,11 +2068,10 @@ where
         connect_packet: &ConnectPacket,
         method: &str,
     ) -> Result<Option<(Option<String>, Option<bytes::Bytes>)>> {
-        let client = ClientInfo {
-            client_id: connect_packet.payload.client_id.clone(),
-            username: connect_packet.payload.user_name.clone(),
-            peer: self.peer,
-        };
+        let client = self.client_info(
+            &connect_packet.payload.client_id,
+            connect_packet.payload.user_name.clone(),
+        );
         let exchange = self.chain.begin_auth(&client, method);
         let Some(mut exchange) = exchange else {
             self.reject_connect(connect_packet, ReasonCode::BadAuthenticationMethod)

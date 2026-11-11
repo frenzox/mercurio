@@ -55,7 +55,8 @@ use crate::{
     broker::Broker,
     connection::Connection,
     plugin::{
-        is_control, AuthResult, Chain, ClientInfo, Event, Exchange, MessageAction, PluginMessage,
+        is_control, AuthResult, Chain, ClientInfo, ConnectionInfo, Event, Exchange, MessageAction,
+        PluginMessage,
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
@@ -349,6 +350,8 @@ struct State {
     verified_user: Option<String>,
     /// The client's address, None for in-process clients
     peer: Option<SocketAddr>,
+    /// The connection plugins are told about; None until a client connects
+    connection_info: Option<Arc<ConnectionInfo>>,
     /// Who may resume the session
     owner: SessionOwner,
     max_subscriptions: Option<usize>,
@@ -449,6 +452,7 @@ impl Session {
                     auth_exchange: None,
                     verified_user: None,
                     peer: None,
+                    connection_info: None,
                     owner: SessionOwner::default(),
                     max_subscriptions: None,
                     max_retained_messages: None,
@@ -1037,12 +1041,7 @@ impl Session {
 
     /// Who the client of this session is, for access control.
     pub(crate) async fn identity(&self) -> ClientInfo {
-        let session = self.shared.state.lock().await;
-        ClientInfo {
-            client_id: session.client_id.clone(),
-            username: session.verified_user.clone(),
-            peer: session.peer,
-        }
+        self.shared.state.lock().await.client_info()
     }
 
     /// Identifies this session's subscriptions in the topic tree.
@@ -1144,9 +1143,16 @@ impl Session {
         self.shared.state.lock().await.verified_user = username;
     }
 
-    /// Records the address of the client now connected to this session.
-    pub(crate) async fn set_peer(&self, peer: Option<SocketAddr>) {
-        self.shared.state.lock().await.peer = peer;
+    /// Records the address and connection of the client now connected to
+    /// this session.
+    pub(crate) async fn set_peer(
+        &self,
+        peer: Option<SocketAddr>,
+        connection_info: Option<Arc<ConnectionInfo>>,
+    ) {
+        let mut state = self.shared.state.lock().await;
+        state.peer = peer;
+        state.connection_info = connection_info;
     }
 
     pub(crate) async fn owner(&self) -> SessionOwner {
@@ -1327,11 +1333,7 @@ impl Session {
             );
             if !chain.is_empty() {
                 chain.emit(Event::Subscribed {
-                    client: ClientInfo {
-                        client_id: session.client_id.clone(),
-                        username: session.verified_user.clone(),
-                        peer: session.peer,
-                    },
+                    client: session.client_info(),
                     filter: sub.topic_filter.clone(),
                     qos: granted_qos,
                 });
@@ -1411,11 +1413,7 @@ impl Session {
             };
             if reason_code == ReasonCode::Success && !chain.is_empty() {
                 chain.emit(Event::Unsubscribed {
-                    client: ClientInfo {
-                        client_id: session.client_id.clone(),
-                        username: session.verified_user.clone(),
-                        peer: session.peer,
-                    },
+                    client: session.client_info(),
                     filter: unsub.topic_filter.clone(),
                 });
             }
@@ -1449,11 +1447,7 @@ impl Session {
 
         let result = match packet.reason {
             ReasonCode::ReAuthenticate => {
-                let client = ClientInfo {
-                    client_id: session.client_id.clone(),
-                    username: session.verified_user.clone(),
-                    peer: session.peer,
-                };
+                let client = session.client_info();
                 let Some(mut exchange) = chain.begin_auth(&client, &method) else {
                     return Err(ReasonCode::BadAuthenticationMethod.into());
                 };
@@ -1854,6 +1848,14 @@ pub(crate) struct Outgoing {
 }
 
 impl State {
+    /// Who the client of this session is, for plugins.
+    fn client_info(&self) -> ClientInfo {
+        let mut client = ClientInfo::new(self.client_id.clone(), self.verified_user.clone());
+        client.peer = self.peer;
+        client.connection = self.connection_info.clone();
+        client
+    }
+
     /// Replaces the topic of an outgoing PUBLISH with an alias where the
     /// client accepts them, assigning new aliases until its maximum is
     /// reached. Only the copy sent is aliased: aliases end with the
