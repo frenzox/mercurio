@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use mercurio_client::{
@@ -9,11 +11,7 @@ use tokio::{net::TcpListener, time::timeout};
 async fn start_broker(config: ServerConfig) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     port
 }
 

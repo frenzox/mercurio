@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
@@ -13,10 +15,7 @@ use tokio::{
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     addr
 }
 

@@ -158,9 +158,8 @@ mod tests {
     use mercurio_client::{ConnectOptions, Event, MqttClient, QoS};
     use mercurio_server::{
         admin::{AdminExtension, ErrorCode},
-        server::{LocalConnector, LocalListener, Server, ServerConfig},
+        server::{ListenerConfig, LocalConnector, LocalListener, Server, ServerConfig, Transport},
     };
-    use mercurio_storage::memory::MemoryStore;
     use serde_json::{json, Value};
     use tokio::net::TcpListener;
 
@@ -173,11 +172,14 @@ mod tests {
     /// Serves a broker with `commands` and an in-process listener.
     async fn start(commands: Arc<DaemonCommands>, local_listener: LocalListener) {
         let mut config = ServerConfig::default();
-        config.local_listener = Some(local_listener);
         let extension: Arc<dyn AdminExtension> = commands.clone();
         config.admin_extension = Some(extension);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = Server::new(listener, config, Arc::new(MemoryStore::new()))
+        let server = Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .local_listener(local_listener)
+            .build()
             .await
             .unwrap();
         commands.set_admin(server.admin());
@@ -386,9 +388,14 @@ mod tests {
         let remote = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = remote.local_addr().unwrap().port();
         let (stop_remote, stopped) = tokio::sync::oneshot::channel::<()>();
-        let remote = tokio::spawn(mercurio_server::server::run(remote, async move {
-            let _ = stopped.await;
-        }));
+        let remote = tokio::spawn(
+            Server::builder()
+                .config(Default::default())
+                .listener(ListenerConfig::new(remote, Transport::Mqtt))
+                .run(async move {
+                    let _ = stopped.await;
+                }),
+        );
 
         let config: BridgeConfig = toml::from_str(&format!(
             "name = \"cloud\"\nhost = \"127.0.0.1\"\nport = {port}\n[[topics]]\npattern = \"a/#\"\n"

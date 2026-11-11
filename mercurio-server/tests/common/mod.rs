@@ -1,8 +1,23 @@
 use std::time::Duration;
 
-use tokio::{io::AsyncReadExt, net::TcpStream, time::timeout};
+use mercurio_server::server::{ListenerConfig, Server, ServerBuilder, ServerConfig, Transport};
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
+
+/// A broker with `config`, serving `listener` as plain MQTT, ready to
+/// take other listeners and storage.
+#[allow(dead_code)]
+pub fn broker(listener: TcpListener, config: ServerConfig) -> ServerBuilder {
+    Server::builder()
+        .config(config)
+        .listener(ListenerConfig::new(listener, Transport::Mqtt))
+}
 
 /// Reads a whole CONNACK, whatever properties it carries.
+#[allow(dead_code)]
 pub async fn read_connack(stream: &mut TcpStream) -> Vec<u8> {
     timeout(Duration::from_secs(2), async {
         let mut connack = vec![0u8; 2];

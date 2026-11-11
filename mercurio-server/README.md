@@ -6,13 +6,16 @@ access control and storage. The
 [`mercuriod`](https://crates.io/crates/mercuriod) daemon is built on it.
 
 ```rust,no_run
-use mercurio_server::server::{run_with_config, ServerConfig};
+use mercurio_server::server::{ListenerConfig, Server, Transport};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:1883").await?;
-    run_with_config(listener, ServerConfig::default(), tokio::signal::ctrl_c()).await?;
+    Server::builder()
+        .listener(ListenerConfig::new(listener, Transport::Mqtt))
+        .run(tokio::signal::ctrl_c())
+        .await?;
     Ok(())
 }
 ```

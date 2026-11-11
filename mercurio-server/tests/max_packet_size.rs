@@ -15,10 +15,7 @@ use tokio::{
 async fn connect() -> (TcpStream, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
@@ -86,10 +83,7 @@ async fn oversized_packet_is_refused_from_its_header() {
 async fn oversized_connect_is_refused_from_its_header() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     // MQTT 5 CONNECT announcing 100,000 bytes, under the packet size limit
     // but over the one for CONNECT, without sending the rest

@@ -1,6 +1,8 @@
 //! What a broker on a durable store keeps across a restart, including one
 //! that stops at once, as a crash would.
 
+mod common;
+
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -80,14 +82,13 @@ impl Broker {
         let (stop, stopped) = oneshot::channel::<()>();
         let _entered = runtime.enter();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-        runtime.spawn(mercurio_server::server::run_with_storage(
-            listener,
-            config,
-            storage,
-            async {
-                let _ = stopped.await;
-            },
-        ));
+        runtime.spawn(
+            common::broker(listener, config)
+                .storage(storage)
+                .run(async {
+                    let _ = stopped.await;
+                }),
+        );
         Broker {
             addr,
             runtime,

@@ -43,10 +43,7 @@ async fn next_packet(stream: &mut TcpStream, buffer: &mut BytesMut) -> ControlPa
 async fn unacknowledged_messages_are_resent_in_order_on_resume() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut subscriber = connect(addr, b'r', true).await;
     let mut buffer = BytesMut::new();
@@ -171,10 +168,7 @@ async fn leave_unacknowledged(addr: SocketAddr, payloads: &[&[u8]]) {
 async fn resent_messages_respect_the_new_receive_maximum() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     leave_unacknowledged(addr, &[b"1", b"2", b"3", b"4"]).await;
 
     let mut resumed = connect_with(addr, b'r', false, 2, None).await;
@@ -210,10 +204,7 @@ async fn resent_messages_respect_the_new_receive_maximum() {
 async fn resent_messages_respect_the_new_maximum_packet_size() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     let large = [b'x'; 64];
     leave_unacknowledged(addr, &[b"1", &large, b"3"]).await;
 

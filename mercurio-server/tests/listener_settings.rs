@@ -22,13 +22,13 @@ async fn start_broker(
     let main = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let extra = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addrs = (main.local_addr().unwrap(), extra.local_addr().unwrap());
-    let mut config = ServerConfig::default();
-    config.listeners = vec![settings(ListenerConfig::new(extra, Transport::Mqtt))];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        main,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let config = ServerConfig::default();
+    let listeners = vec![settings(ListenerConfig::new(extra, Transport::Mqtt))];
+    tokio::spawn(
+        common::broker(main, config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     addrs
 }
 

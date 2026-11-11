@@ -8,7 +8,7 @@ use mercurio_client::{ConnectOptions, MqttClient, QoS};
 use mercurio_server::{
     admin::{AdminError, AdminExtension},
     plugin::{ready, BoxFuture},
-    server::{run_with_config, ListenerConfig, ServerConfig, Transport},
+    server::{ListenerConfig, Server, ServerConfig, Transport},
 };
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, UnixListener};
@@ -68,16 +68,18 @@ async fn start(name: &str) -> Broker {
     admin_socket.trusted = true;
     let extension: Arc<dyn AdminExtension> = Arc::new(Daemon);
     let mut config = ServerConfig::default();
-    config.listeners = vec![admin_socket];
+    let listeners = vec![admin_socket];
     config.sys_interval = None;
     config.admin_extension = Some(extension);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        Server::builder()
+            .config(config)
+            .listener(ListenerConfig::new(listener, Transport::Mqtt))
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
     Broker { socket, port }
 }
 

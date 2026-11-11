@@ -11,10 +11,7 @@ use tokio::{
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     addr
 }
 
@@ -132,7 +129,7 @@ async fn shutdown_is_announced_to_connected_clients() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(mercurio_server::server::run(listener, async {
+    let server = tokio::spawn(common::broker(listener, Default::default()).run(async {
         let _ = stopped.await;
     }));
 

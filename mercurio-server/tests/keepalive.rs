@@ -15,10 +15,7 @@ const PINGRESP: [u8; 2] = [0xd0, 0x00];
 async fn keepalive_zero_keeps_connection_alive() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
@@ -51,10 +48,7 @@ async fn keepalive_zero_keeps_connection_alive() {
 async fn packets_waiting_when_a_late_task_runs_count_before_the_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut clients = Vec::new();
     for i in 0..16 {

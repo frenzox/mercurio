@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::time::Duration;
 
 use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS};
@@ -13,16 +15,16 @@ use tokio::{
 async fn clients_connect_through_unix_sockets() {
     let path = std::env::temp_dir().join(format!("mercurio-client-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let mut config = ServerConfig::default();
-    config.listeners = vec![ListenerConfig::new(
+    let config = ServerConfig::default();
+    let listeners = vec![ListenerConfig::new(
         UnixListener::bind(&path).unwrap(),
         Transport::Mqtt,
     )];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(TcpListener::bind("127.0.0.1:0").await.unwrap(), config)
+            .listeners(listeners)
+            .run(std::future::pending::<()>()),
+    );
 
     let client = MqttClient::connect(ConnectOptions::unix(&path))
         .await

@@ -190,11 +190,7 @@ async fn requests_reach_a_responder_through_the_broker() {
     let port = listener.local_addr().unwrap().port();
     let mut config = ServerConfig::default();
     config.sys_interval = None;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
 
     let responder = MqttClient::connect(ConnectOptions::new("127.0.0.1", port))
         .await

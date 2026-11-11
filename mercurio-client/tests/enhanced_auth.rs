@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -88,11 +90,7 @@ async fn start_broker() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.plugins = vec![Arc::new(ChallengeMethod)];
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

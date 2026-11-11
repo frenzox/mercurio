@@ -1,4 +1,38 @@
 #![doc = include_str!("../README.md")]
+
+/// Chainable `with_*` setters for the public fields of configuration
+/// structs, which `#[non_exhaustive]` keeps code outside the crate from
+/// building with a struct expression. `name => field: Some(Type)` sets an
+/// optional field to the value given.
+macro_rules! setters {
+    ($ty:ty { $($body:tt)* }) => {
+        impl $ty {
+            setters!(@each $($body)*);
+        }
+    };
+    (@each) => {};
+    (@each $(#[$attr:meta])* $name:ident => $field:ident: Some($t:ty), $($rest:tt)*) => {
+        $(#[$attr])*
+        #[doc = concat!("Sets [`", stringify!($field), "`](Self::", stringify!($field), ").")]
+        #[must_use]
+        pub fn $name(mut self, value: $t) -> Self {
+            self.$field = Some(value);
+            self
+        }
+        setters!(@each $($rest)*);
+    };
+    (@each $(#[$attr:meta])* $name:ident => $field:ident: $t:ty, $($rest:tt)*) => {
+        $(#[$attr])*
+        #[doc = concat!("Sets [`", stringify!($field), "`](Self::", stringify!($field), ").")]
+        #[must_use]
+        pub fn $name(mut self, value: $t) -> Self {
+            self.$field = value;
+            self
+        }
+        setters!(@each $($rest)*);
+    };
+}
+
 pub mod acl;
 pub mod admin;
 pub mod auth;

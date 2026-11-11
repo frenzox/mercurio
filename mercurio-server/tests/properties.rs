@@ -77,10 +77,7 @@ fn application_properties() -> PublishProperties {
 async fn application_properties_are_forwarded() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut v5 = connect(addr, b'5', 5).await;
     subscribe(&mut v5, 5).await;

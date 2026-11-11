@@ -17,11 +17,7 @@ async fn start_broker(limits: Limits) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits = limits;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

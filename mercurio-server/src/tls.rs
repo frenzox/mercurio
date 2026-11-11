@@ -7,7 +7,7 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKey
 use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-use crate::error::ServerError;
+use crate::error::TlsError;
 
 /// TLS configuration for the server.
 #[derive(Debug, Clone)]
@@ -62,6 +62,15 @@ pub enum TlsVersion {
     Tls13,
 }
 
+setters!(TlsConfig {
+    with_require_certificate => require_certificate: bool,
+    with_crl_path => crl_path: Some(String),
+    with_crl_end_entity_only => crl_end_entity_only: bool,
+    with_crl_allow_unknown => crl_allow_unknown: bool,
+    with_min_version => min_version: TlsVersion,
+    with_username_from_certificate => username_from_certificate: Some(CertificateName),
+});
+
 impl TlsConfig {
     /// Create a new TLS configuration.
     pub fn new(cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
@@ -85,21 +94,15 @@ impl TlsConfig {
     }
 
     /// Reads the files and builds the rustls configuration they describe.
-    pub fn server_config(&self) -> Result<Arc<ServerConfig>, ServerError> {
+    pub fn server_config(&self) -> Result<Arc<ServerConfig>, TlsError> {
         let certificate_options = self.crl_path.is_some()
             || self.username_from_certificate.is_some()
             || !self.require_certificate;
         if self.ca_path.is_none() && certificate_options {
-            return Err(ServerError::Tls(
-                "Revocation lists, optional client certificates and certificate identities \
-                 need a CA to verify clients with"
-                    .to_string(),
-            ));
+            return Err(TlsError::NeedsCa);
         }
         if self.crl_path.is_none() && (self.crl_end_entity_only || self.crl_allow_unknown) {
-            return Err(ServerError::Tls(
-                "How revocation lists are checked needs revocation lists to check".to_string(),
-            ));
+            return Err(TlsError::NeedsRevocationLists);
         }
         let certs = load_certs(&self.cert_path)?;
         let key = load_private_key(&self.key_path)?;
@@ -113,16 +116,14 @@ impl TlsConfig {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(versions)
-            .map_err(|e| ServerError::Tls(format!("Unsupported TLS versions: {}", e)))?;
+            .map_err(TlsError::Versions)?;
 
         let config = if let Some(ref ca_path) = self.ca_path {
             // Enable client certificate authentication
             let ca_certs = load_certs(ca_path)?;
             let mut root_store = rustls::RootCertStore::empty();
             for cert in ca_certs {
-                root_store
-                    .add(cert)
-                    .map_err(|e| ServerError::Tls(format!("Failed to add CA cert: {}", e)))?;
+                root_store.add(cert).map_err(TlsError::CaCertificate)?;
             }
             let mut verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(root_store),
@@ -140,9 +141,7 @@ impl TlsConfig {
             if !self.require_certificate {
                 verifier = verifier.allow_unauthenticated();
             }
-            let verifier = verifier
-                .build()
-                .map_err(|e| ServerError::Tls(format!("Failed to build client verifier: {}", e)))?;
+            let verifier = verifier.build().map_err(TlsError::ClientVerifier)?;
             config.with_client_cert_verifier(verifier)
         } else {
             // No client authentication
@@ -151,7 +150,7 @@ impl TlsConfig {
 
         let config = config
             .with_single_cert(certs, key)
-            .map_err(|e| ServerError::Tls(format!("Failed to configure TLS: {}", e)))?;
+            .map_err(TlsError::Configure)?;
 
         Ok(Arc::new(config))
     }
@@ -179,7 +178,7 @@ impl std::fmt::Debug for Tls {
 
 impl Tls {
     /// Reads the files of `config`, failing if they can't be used.
-    pub fn new(config: TlsConfig) -> Result<Self, ServerError> {
+    pub fn new(config: TlsConfig) -> Result<Self, TlsError> {
         Ok(Self {
             current: Arc::new(RwLock::new(config.server_config()?)),
             username_from_certificate: config.username_from_certificate,
@@ -206,11 +205,9 @@ impl Tls {
 
     /// Reads the files again, for connections from now on. On error the
     /// settings in use are kept.
-    pub fn reload(&self) -> Result<(), ServerError> {
+    pub fn reload(&self) -> Result<(), TlsError> {
         let Some(files) = &self.files else {
-            return Err(ServerError::Tls(
-                "the TLS configuration was not read from files".to_string(),
-            ));
+            return Err(TlsError::NotFromFiles);
         };
         self.set_server_config(files.server_config()?);
         Ok(())
@@ -237,26 +234,31 @@ impl Tls {
 }
 
 /// Load certificates from a PEM file.
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, ServerError> {
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let certs = CertificateDer::pem_file_iter(path)
         .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| ServerError::Tls(format!("Failed to read certs from '{}': {}", path, e)))?;
+        .map_err(|source| TlsError::ReadCertificates {
+            path: path.to_string(),
+            source,
+        })?;
 
     if certs.is_empty() {
-        return Err(ServerError::Tls(format!(
-            "No certificates found in '{}'",
-            path
-        )));
+        return Err(TlsError::NoCertificates {
+            path: path.to_string(),
+        });
     }
 
     Ok(certs)
 }
 
 /// Load certificate revocation lists from a PEM file.
-fn load_crls(path: &str) -> Result<Vec<CertificateRevocationListDer<'static>>, ServerError> {
+fn load_crls(path: &str) -> Result<Vec<CertificateRevocationListDer<'static>>, TlsError> {
     CertificateRevocationListDer::pem_file_iter(path)
         .and_then(|crls| crls.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| ServerError::Tls(format!("Failed to read CRLs from '{}': {}", path, e)))
+        .map_err(|source| TlsError::ReadRevocationLists {
+            path: path.to_string(),
+            source,
+        })
 }
 
 /// The name `part` of a DER certificate gives.
@@ -306,9 +308,11 @@ fn escape(value: &str) -> String {
 
 /// Load the first private key, in PKCS#1, PKCS#8 or SEC1 format, from a PEM
 /// file.
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, ServerError> {
-    PrivateKeyDer::from_pem_file(path)
-        .map_err(|e| ServerError::Tls(format!("Failed to read key from '{}': {}", path, e)))
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
+    PrivateKeyDer::from_pem_file(path).map_err(|source| TlsError::ReadKey {
+        path: path.to_string(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -335,10 +339,11 @@ mod tests {
     fn test_client_certificate_options_need_a_ca() {
         let mut config = TlsConfig::new("/path/to/cert.pem", "/path/to/key.pem");
         config.username_from_certificate = Some(CertificateName::CommonName);
-        let Err(ServerError::Tls(message)) = Tls::new(config) else {
+        let Err(error) = Tls::new(config) else {
             panic!("accepted identity_as_username without a CA");
         };
-        assert!(message.contains("need a CA"), "{message}");
+        assert!(matches!(error, TlsError::NeedsCa), "{error}");
+        assert!(error.to_string().contains("need a CA"), "{error}");
     }
 
     #[test]

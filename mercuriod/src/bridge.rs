@@ -932,7 +932,9 @@ mod tests {
         };
 
         use mercurio_client::{Backoff, ConnectOptions, Event, MqttClient, QoS};
-        use mercurio_server::server::{LocalConnector, ServerConfig};
+        use mercurio_server::server::{
+            ListenerConfig, LocalConnector, Server, ServerConfig, Transport,
+        };
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::{TcpListener, TcpStream},
@@ -949,22 +951,27 @@ mod tests {
         async fn start_remote() -> SocketAddr {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            tokio::spawn(mercurio_server::server::run(
-                listener,
-                std::future::pending::<()>(),
-            ));
+            tokio::spawn(
+                Server::builder()
+                    .config(Default::default())
+                    .listener(ListenerConfig::new(listener, Transport::Mqtt))
+                    .run(std::future::pending::<()>()),
+            );
             addr
         }
 
         /// This broker, reached in process, until `shutdown` completes.
         async fn start_local(shutdown: impl Future + Send + 'static) -> LocalConnector {
             let (connector, local_listener) = LocalConnector::new();
-            let mut config = ServerConfig::default();
-            config.local_listener = Some(local_listener);
+            let config = ServerConfig::default();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            tokio::spawn(mercurio_server::server::run_with_config(
-                listener, config, shutdown,
-            ));
+            tokio::spawn(
+                Server::builder()
+                    .config(config)
+                    .listener(ListenerConfig::new(listener, Transport::Mqtt))
+                    .local_listener(local_listener)
+                    .run(shutdown),
+            );
             connector
         }
 

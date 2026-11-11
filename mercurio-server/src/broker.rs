@@ -5,7 +5,9 @@ use crate::{
     sys::{is_sys, DropCause, Stats, SysOverlay},
     topic_tree::TopicTree,
 };
-use mercurio_core::{message::Message, Result};
+use mercurio_core::message::Message;
+
+use crate::error::{Error, Result};
 use mercurio_storage::RetainedMessageStore;
 use tracing::warn;
 
@@ -208,10 +210,7 @@ impl<S: RetainedMessageStore> Broker<S> {
     /// The retained messages matching a topic filter.
     #[cfg(test)]
     pub(crate) async fn retained(&self, filter: &str) -> Result<Vec<Message>> {
-        self.storage
-            .get_retained(filter)
-            .await
-            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+        self.storage.get_retained(filter).await.map_err(Error::from)
     }
 
     /// At most `limit` of the retained messages matching a topic filter, in
@@ -227,7 +226,7 @@ impl<S: RetainedMessageStore> Broker<S> {
         self.storage
             .get_retained_page(filter, after, limit)
             .await
-            .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))
+            .map_err(Error::from)
     }
 
     /// Whether `max` topics hold retained messages already, `topic` not one
@@ -237,8 +236,7 @@ impl<S: RetainedMessageStore> Broker<S> {
         if is_sys(topic) {
             return Ok(false);
         }
-        let storage_error =
-            |e: mercurio_storage::StorageError| mercurio_core::error::Error::Storage(e.to_string());
+        let storage_error = Error::from;
         if self.storage.count_retained().await.map_err(storage_error)? < max {
             return Ok(false);
         }
@@ -296,7 +294,7 @@ impl<S: RetainedMessageStore> Broker<S> {
                 self.storage
                     .store_retained(topic, None)
                     .await
-                    .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))?;
+                    .map_err(Error::from)?;
             } else {
                 // Store the retained message (with retain flag set to false for storage)
                 let mut retained_msg = message.clone();
@@ -304,7 +302,7 @@ impl<S: RetainedMessageStore> Broker<S> {
                 self.storage
                     .store_retained(topic, Some(retained_msg))
                     .await
-                    .map_err(|e| mercurio_core::error::Error::Storage(e.to_string()))?;
+                    .map_err(Error::from)?;
             }
         }
 

@@ -5,7 +5,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use mercurio_core::{message::Message, protocol::ProtocolVersion, qos::QoS};
 use mercurio_packets::ControlPacket;
-use mercurio_server::server::{Server, ServerConfig};
+use mercurio_server::server::ServerConfig;
 use mercurio_storage::{memory::MemoryStore, RetainedMessageStore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,11 +18,7 @@ async fn start_broker() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.sys_interval = Some(Duration::from_millis(100));
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 
@@ -137,7 +133,9 @@ async fn statistics_stay_out_of_the_retained_store() {
         .unwrap();
     let mut config = ServerConfig::default();
     config.sys_interval = Some(Duration::from_millis(50));
-    let server = Server::new(listener, config, Arc::clone(&storage))
+    let server = common::broker(listener, config)
+        .storage(Arc::clone(&storage))
+        .build()
         .await
         .unwrap();
     tokio::spawn(server.run(std::future::pending::<()>()));

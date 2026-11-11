@@ -172,11 +172,9 @@ async fn aliases_start_over_on_each_connection_and_never_reach_resent_messages()
 async fn aliased_messages_reach_subscribers_with_their_topics() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        ServerConfig::default(),
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(
+        common::broker(listener, ServerConfig::default()).run(std::future::pending::<()>()),
+    );
     let subscriber = MqttClient::connect(ConnectOptions::new("127.0.0.1", port))
         .await
         .unwrap();

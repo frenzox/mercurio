@@ -38,14 +38,13 @@ async fn start_broker_with(db: &PathBuf, config: ServerConfig) -> (SocketAddr, B
     let addr = listener.local_addr().unwrap();
     let storage = Arc::new(SqliteStore::new(db).unwrap());
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(mercurio_server::server::run_with_storage(
-        listener,
-        config,
-        storage,
-        async {
-            let _ = stopped.await;
-        },
-    ));
+    let task = tokio::spawn(
+        common::broker(listener, config)
+            .storage(storage)
+            .run(async {
+                let _ = stopped.await;
+            }),
+    );
     (addr, Broker { stop, task })
 }
 

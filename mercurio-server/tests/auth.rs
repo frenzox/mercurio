@@ -36,11 +36,7 @@ async fn start_broker_with(
     config.auth.allow_anonymous = false;
     config.plugins = plugins;
     settings(&mut config);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 
@@ -151,15 +147,18 @@ async fn authentication_panicking_refuses_and_the_broker_keeps_serving() {
 async fn listener_plugins_replace_the_brokers() {
     let extra = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let extra_addr = extra.local_addr().unwrap();
-    let main = start_broker_with(
-        vec![authenticator(Behaviour::Decide(Decision::Deny))],
-        |config| {
-            let mut listener = ListenerConfig::new(extra, Transport::Mqtt);
-            listener.plugins = Some(vec![authenticator(Behaviour::Decide(Decision::Allow))]);
-            config.listeners = vec![listener];
-        },
-    )
-    .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let main = listener.local_addr().unwrap();
+    let config = ServerConfig::default()
+        .with_auth(AuthConfig::default().with_require_auth(true))
+        .with_plugins(vec![authenticator(Behaviour::Decide(Decision::Deny))]);
+    let extra = ListenerConfig::new(extra, Transport::Mqtt)
+        .with_plugins(vec![authenticator(Behaviour::Decide(Decision::Allow))]);
+    tokio::spawn(
+        common::broker(listener, config)
+            .listener(extra)
+            .run(std::future::pending::<()>()),
+    );
 
     assert_eq!(connect(main, Some(("user", "secret"))).await, REFUSED);
     assert_eq!(connect(extra_addr, Some(("user", "secret"))).await, 0x00);

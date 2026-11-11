@@ -47,58 +47,67 @@ mercurio-storage = { version = "0.3", features = ["sqlite"] }
 tokio = { version = "1", features = ["full"] }</pre>
 
 <h2>Running a broker</h2>
-<pre>use mercurio_server::server::{run_with_config, ServerConfig};
+<pre>use mercurio_server::server::{ListenerConfig, Server, Transport};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
     let listener = TcpListener::bind("0.0.0.0:1883").await?;
-    run_with_config(listener, ServerConfig::default(), tokio::signal::ctrl_c()).await?;
+    Server::builder()
+        .listener(ListenerConfig::new(listener, Transport::Mqtt))
+        .run(tokio::signal::ctrl_c())
+        .await?;
     Ok(())
 }</pre>
-<p>The broker runs until the future given last completes, then shuts down gracefully. Three entry points exist:</p>
+<p>The broker runs until the future given to <code>run</code> completes, then shuts down gracefully. <code>Server::builder()</code> starts a <code>ServerBuilder</code> with no listener, its state in memory and the default settings:</p>
 <table>
-<tr><th>Function</th><th>Use</th></tr>
-<tr><td><code>run(listener, shutdown)</code></td><td>Defaults, state in memory</td></tr>
-<tr><td><code>run_with_config(listener, config, shutdown)</code></td><td>Your configuration, state in memory</td></tr>
-<tr><td><code>run_with_storage(listener, config, storage, shutdown)</code></td><td>Your configuration and storage</td></tr>
+<tr><th>Method</th><th>Sets</th></tr>
+<tr><td><code>listener(ListenerConfig)</code>, <code>listeners(...)</code></td><td>The sockets to serve, any number, none of them special: TCP or Unix, MQTT or WebSocket, each with its own TLS, mount point, auth, plugins and limits</td></tr>
+<tr><td><code>local_listener(LocalListener)</code></td><td>In-process connections made before the broker is built, see <a href="#local">below</a></td></tr>
+<tr><td><code>storage(Arc&lt;St&gt;)</code></td><td>Where sessions, retained messages, wills and bans are kept, see <a href="#storage">below</a></td></tr>
+<tr><td><code>config(ServerConfig)</code></td><td>Every broker-wide setting at once</td></tr>
+<tr><td><code>with_auth</code>, <code>with_plugins</code>, <code>with_limits</code>, <code>with_policy</code>, ...</td><td>One broker-wide setting, as listed under <a href="#configuration">Configuration</a></td></tr>
 </table>
-<p>They fail without serving anyone if the configuration can't be used, such as a mount point with a wildcard.</p>
-<p>When they return, every task the broker started has ended: connections still open after a few seconds, session expiry timers, wills waiting for their delay and the <code>$SYS</code> publisher are stopped, and what they were waiting for is taken up from storage by the next broker. The broker no longer holds its storage, so the same SQLite file can be opened again in the same process. An <code>Admin</code> handle kept from <code>Server::admin</code> still holds it until dropped.</p>
+<p><code>build()</code> checks the configuration and restores what storage holds, and returns a <code>Server</code> that serves nobody yet; <code>run(shutdown)</code> on the builder builds and serves at once. A broker needs no network listener: with none, it serves the in-process clients of <code>Server::local_connector</code>.</p>
+<p>A configuration that can't be used fails <code>build()</code> before anyone is served, with <code>ServerError::Config</code>. Its <code>ConfigError</code> names the listener, by its position among those given and its address, and its <code>kind</code> says which setting is wrong, such as <code>ConfigErrorKind::MountPointWildcard</code> for a mount point with a wildcard. Certificates and keys that can't be read are a <code>TlsError</code>, from <code>Tls::new</code>.</p>
+<p>When <code>run</code> returns, every task the broker started has ended: connections still open after a few seconds, session expiry timers, wills waiting for their delay and the <code>$SYS</code> publisher are stopped, and what they were waiting for is taken up from storage by the next broker. The broker no longer holds its storage, so the same SQLite file can be opened again in the same process. An <code>Admin</code> handle kept from <code>Server::admin</code> still holds it until dropped.</p>
 
-<h2>Configuration</h2>
-<p><code>ServerConfig</code> mirrors the daemon's configuration file:</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>ServerConfig</code> holds the broker-wide settings, which listeners use unless they have their own:</p>
 <table>
 <tr><th>Field</th><th>Holds</th></tr>
-<tr><td><code>tls</code></td><td><code>Option&lt;Tls&gt;</code> for the main listener, see <a href="#tls">below</a></td></tr>
 <tr><td><code>auth</code></td><td><code>AuthConfig</code>: whether authentication is required and anonymous clients are allowed</td></tr>
 <tr><td><code>plugins</code></td><td><code>Vec&lt;Arc&lt;dyn Plugin&gt;&gt;</code>: the plugin chain, see <a href="#auth">below</a></td></tr>
 <tr><td><code>plugin_timeout</code></td><td>Longest a plugin hook may take, 5 seconds by default</td></tr>
 <tr><td><code>plugin_tick_interval</code></td><td>How often <code>Plugin::on_tick</code> runs, 1 second by default</td></tr>
 <tr><td><code>limits</code></td><td><code>Limits</code>: connection, packet, queue and QoS limits</td></tr>
 <tr><td><code>policy</code></td><td><code>ConnectPolicy</code>: client id rules, redirection, response information</td></tr>
-<tr><td><code>listeners</code></td><td>Extra <code>ListenerConfig</code>s: TCP or Unix sockets, MQTT or WebSocket, with their own TLS, mount point, auth, plugins and limits</td></tr>
-<tr><td><code>local_listener</code></td><td>In-process connections, see <a href="#local">below</a></td></tr>
 <tr><td><code>admin_extension</code></td><td>Serves the <code>$CONTROL/broker/v1</code> commands the broker doesn't know, see <a href="#admin">below</a></td></tr>
 <tr><td><code>sys_interval</code></td><td>How often <code>$SYS</code> statistics are published</td></tr>
 </table>
 <pre>use mercurio_server::{
-    server::{ListenerConfig, ServerConfig, Transport},
+    server::{Limits, ListenerConfig, Server, ServerConfig, Transport},
     tls::{Tls, TlsConfig},
 };
 use tokio::net::TcpListener;
 
 let tls = Tls::new(TlsConfig::new("server.crt", "server.key"))?;
-let mut tls_listener =
-    ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt);
-tls_listener.tls = Some(tls.clone());
+let plain = ListenerConfig::new(TcpListener::bind("0.0.0.0:1883").await?, Transport::Mqtt);
+let secure = ListenerConfig::new(TcpListener::bind("0.0.0.0:8883").await?, Transport::Mqtt)
+    .with_tls(tls.clone());
 
-let mut config = ServerConfig::default();
-config.listeners.push(tls_listener);</pre>
+let config = ServerConfig::default()
+    .with_limits(Limits::default().with_max_connections(10_000));
+let server = Server::builder()
+    .config(config)
+    .listener(plain)
+    .listener(secure)
+    .build()
+    .await?;</pre>
 <h3 id="tls">TLS</h3>
 <p><code>Tls::new</code> reads the certificate, key, CA and CRL files a <code>TlsConfig</code> names, and fails if they can't be used. <code>Tls::reload</code> reads them again, for example after a certificate is renewed: connections from then on get the new files, and those already up keep theirs. A reload that fails returns the error and keeps the previous files. Clones of a <code>Tls</code> share it, so one reload reaches every listener given a clone.</p>
 <p>For settings <code>TlsConfig</code> has no field for, such as ALPN, session resumption, a certificate resolver or a client verifier of your own, build a <code>rustls::ServerConfig</code> and serve it with <code>Tls::from_rustls(config, username_from_certificate)</code>. Reloading is then up to you: <code>Tls::reload</code> returns an error, and <code>Tls::set_server_config</code> swaps in a new configuration for later connections. With a <code>CertificateName</code>, clients that present a certificate are named by it; whether they must present one is up to your client verifier.</p>
-<p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
+<p>Configuration types are built from their default, or from a constructor such as <code>ListenerConfig::new</code>, then changed with their <code>with_*</code> methods, one per field, or field by field: new fields may appear in minor releases, so they can't be written out as struct literals.</p>
 
 <h2 id="auth">Plugins</h2>
 <p>One <code>Plugin</code> trait covers authentication, MQTT 5 enhanced authentication, topic access control, message hooks, lifecycle events, periodic work and <code>$CONTROL</code> commands. A plugin implements the hooks it needs; every other one does nothing. The broker runs its plugins as a chain, in the order configured:</p>
@@ -113,7 +122,7 @@ config.listeners.push(tls_listener);</pre>
 
 use mercurio_server::{
     plugin::{ready, Access, BoxFuture, ClientInfo, Credentials, Decision, Plugin},
-    server::ServerConfig,
+    server::{AuthConfig, ServerConfig},
 };
 
 /// Lets each user use the topics under their own name.
@@ -151,9 +160,9 @@ impl Plugin for OwnTopics {
     }
 }
 
-let mut config = ServerConfig::default();
-config.auth.require_auth = true;
-config.plugins = vec![Arc::new(OwnTopics)];</pre>
+let config = ServerConfig::default()
+    .with_auth(AuthConfig::default().with_require_auth(true))
+    .with_plugins(vec![Arc::new(OwnTopics)]);</pre>
 <ul>
 <li><code>Access</code> is <code>Write</code> to publish, <code>Subscribe</code> to subscribe, with the topic filter, and <code>Read</code> to receive a message.</li>
 <li><code>ClientInfo::username</code> is only set for users the broker verified. <code>client_id</code> is empty in <code>authenticate</code> when the client asked the server to assign one.</li>
@@ -177,40 +186,47 @@ users.insert(
 config.plugins.push(Arc::new(ScramAuth::new(Arc::new(users))));</pre>
 <p>A <code>HashMap&lt;String, StoredCredentials&gt;</code> is a store, for tests and demos; implement <code>ScramCredentialStore</code> on your own type for anything else. The <code>mercurio-scram</code> crate holds the messages and key derivation the broker and the client share.</p>
 
-<h2>Storage</h2>
+<h2 id="storage">Storage</h2>
 <pre>use std::sync::Arc;
 
-use mercurio_server::server::{run_with_storage, ServerConfig};
+use mercurio_server::server::{ListenerConfig, Server, Transport};
 use mercurio_storage::sqlite::SqliteStore;
 
 let storage = Arc::new(SqliteStore::new("/var/lib/myapp/mqtt.db")?);
-run_with_storage(listener, ServerConfig::default(), storage, shutdown).await?;</pre>
+Server::builder()
+    .storage(storage)
+    .listener(ListenerConfig::new(listener, Transport::Mqtt))
+    .run(shutdown)
+    .await?;</pre>
 <p>Any type implementing the storage traits of <code>mercurio-storage</code> (sessions, retained messages, wills, in-flight messages and queues) can replace SQLite; <code>postgres::PostgresStore::connect_exclusive(url, &amp;options, wait)</code>, behind the <code>postgres</code> feature, keeps it in PostgreSQL; <code>postgres::ConnectOptions</code> sets the CA certificate and the size of its connection pool. It returns a <code>DatabaseLock</code> along with the store: only its holder may write to the database, and its <code>lost()</code> completes when another broker may have taken over, the moment to stop serving.</p>
 
 <h2 id="local">In-process clients</h2>
 <p>A <code>LocalConnector</code> opens connections to the broker in memory, without TCP. Combined with <code>mercurio-client</code>'s <code>connector</code> option, it lets your program publish and subscribe on its own broker. These connections are trusted: authentication and access control don't apply to them.</p>
 <pre>use mercurio_client::{ConnectOptions, MqttClient, QoS};
-use mercurio_server::server::{run_with_config, LocalConnector, ServerConfig};
+use mercurio_server::server::Server;
 
-let (connector, local_listener) = LocalConnector::new();
-let mut config = ServerConfig::default();
-config.local_listener = Some(local_listener);
-tokio::spawn(run_with_config(listener, config, std::future::pending::&lt;()&gt;()));
+let server = Server::builder().build().await?;
+let connector = server.local_connector();
+tokio::spawn(server.run(std::future::pending::&lt;()&gt;()));
 
 let options = ConnectOptions::new("localhost", 0)
     .client_id("internal")
     .connector(move || std::future::ready(connector.connect()));
 let client = MqttClient::connect(options).await?;
 client.publish("app/started", "1", QoS::AtLeastOnce).await?;</pre>
-<p>The daemon's bridges and dynamic security work this way.</p>
+<p>Code that must hold a connector before the broker is built, as the daemon's plugins and bridges do, creates the pair with <code>LocalConnector::new()</code> and gives the <code>LocalListener</code> to <code>ServerBuilder::local_listener</code>. The daemon's bridges and dynamic security work this way.</p>
 
 <h2 id="admin">Administering it</h2>
-<p><code>Server</code> separates setting a broker up from serving it. In between it hands out an <code>Admin</code>, which runs the commands of the <a href="admin.html">admin API</a> as <code>async</code> methods, before and while the broker serves. The <code>run*</code> functions above are shortcuts for <code>Server::new</code> followed by <code>Server::run</code>.</p>
-<pre>use std::sync::Arc;
-use mercurio_server::{admin::ClientQuery, server::{Server, ServerConfig}};
-use mercurio_storage::memory::MemoryStore;
+<p><code>Server</code> separates setting a broker up from serving it. In between it hands out an <code>Admin</code>, which runs the commands of the <a href="admin.html">admin API</a> as <code>async</code> methods, before and while the broker serves. <code>ServerBuilder::run</code> is a shortcut for <code>ServerBuilder::build</code> followed by <code>Server::run</code>.</p>
+<pre>use mercurio_server::{
+    admin::ClientQuery,
+    server::{ListenerConfig, Server, Transport},
+};
 
-let server = Server::new(listener, ServerConfig::default(), Arc::new(MemoryStore::new())).await?;
+let server = Server::builder()
+    .listener(ListenerConfig::new(listener, Transport::Mqtt))
+    .build()
+    .await?;
 let admin = server.admin();
 tokio::spawn(server.run(tokio::signal::ctrl_c()));
 
@@ -223,7 +239,7 @@ for client in admin.clients(&amp;query).await.items {
 <li>Methods return plain structs. Failures are an <code>AdminError</code>, whose <code>code</code> is the protocol's.</li>
 <li>Each mount point has its own client ids, so the methods acting on one client, <code>client</code>, <code>disconnect</code> and <code>delete_session</code>, take a <code>SessionKey</code>: the client id and the mount point, <code>None</code> for a listener without one. <code>Admin::session_key</code> finds it from a client id as the protocol's <code>mountpoint</code> argument does, and <code>ClientSummary</code> carries both.</li>
 <li>The broker serves the same commands over MQTT on <code>$CONTROL/broker/v1</code>, to clients access control allows. <code>ServerConfig::admin_extension</code> takes an <code>AdminExtension</code> for commands the broker doesn't know: mercuriod adds its bridge, configuration, log level and reload commands this way. Without one, those answer <code>unavailable</code>.</li>
-<li>A <code>ListenerConfig</code> on a Unix socket can be <code>trusted</code>: its clients skip authentication and access control, and run every command. Give it a <code>peer_filter</code> to choose clients by their user and group ids, as mercuriod's admin socket does, or keep the socket's permissions tight. <code>Server::new</code> refuses a trusted listener on TCP, with its own authentication or plugins, with <code>proxy_protocol</code> or serving WebSocket.</li>
+<li>A <code>ListenerConfig</code> on a Unix socket can be <code>trusted</code>: its clients skip authentication and access control, and run every command. Give it a <code>peer_filter</code> to choose clients by their user and group ids, as mercuriod's admin socket does, or keep the socket's permissions tight. <code>ServerBuilder::build</code> refuses a trusted listener on TCP, with its own authentication or plugins, with <code>proxy_protocol</code> or serving WebSocket.</li>
 </ul>
 
 <h2>Logs</h2>

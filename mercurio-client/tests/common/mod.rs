@@ -12,9 +12,18 @@ use mercurio_packets::connack::{ConnAckFlags, ConnAckPacket, ConnAckProperties};
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::suback::{SubAckPacket, SubAckPayload};
 use mercurio_packets::ControlPacket;
+use mercurio_server::server::{ListenerConfig, Server, ServerBuilder, ServerConfig, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
+
+/// The real broker with `config`, serving `listener` as plain MQTT, ready
+/// to take other listeners and storage.
+pub fn broker(listener: TcpListener, config: ServerConfig) -> ServerBuilder {
+    Server::builder()
+        .config(config)
+        .listener(ListenerConfig::new(listener, Transport::Mqtt))
+}
 
 /// One connection of the client, seen from the broker.
 pub struct Peer {

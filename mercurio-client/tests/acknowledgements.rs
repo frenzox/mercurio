@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use mercurio_client::{ClientError, ConnectOptions, Event, MqttClient, QoS, ReasonCode};
@@ -7,10 +9,7 @@ use tokio::{net::TcpListener, time::timeout};
 async fn start_broker() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
     addr
 }
 
@@ -64,11 +63,7 @@ async fn subscribe_reports_what_the_broker_granted() {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.limits.max_subscriptions = Some(1);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     let subscriber = client(addr, "sub").await;
 
     let results = subscriber

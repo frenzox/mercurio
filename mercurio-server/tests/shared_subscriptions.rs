@@ -1,6 +1,8 @@
 //! What becomes of the messages a member of a share group was given when
 //! it leaves the group.
 
+mod common;
+
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -29,11 +31,7 @@ async fn start_broker(redelivery: ShareRedelivery) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let mut config = ServerConfig::default();
     config.share_redelivery = redelivery;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 

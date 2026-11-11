@@ -1,3 +1,5 @@
+mod common;
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
@@ -31,11 +33,7 @@ async fn start_broker(plugins: Vec<Arc<dyn Plugin>>) -> SocketAddr {
     let mut config = ServerConfig::default();
     config.plugins = plugins;
     config.sys_interval = None;
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     addr
 }
 
@@ -398,11 +396,7 @@ async fn plugins_tick() {
     let mut config = ServerConfig::default();
     config.plugins = vec![echo.clone()];
     config.plugin_tick_interval = Duration::from_millis(20);
-    tokio::spawn(mercurio_server::server::run_with_config(
-        listener,
-        config,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, config).run(std::future::pending::<()>()));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(echo.0.load(std::sync::atomic::Ordering::Relaxed) >= 3);
 }

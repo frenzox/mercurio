@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use tokio::{
@@ -31,10 +33,7 @@ async fn connect_v311(addr: std::net::SocketAddr, client_id: u8) -> TcpStream {
 async fn mqtt311_clients_exchange_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(mercurio_server::server::run(
-        listener,
-        std::future::pending::<()>(),
-    ));
+    tokio::spawn(common::broker(listener, Default::default()).run(std::future::pending::<()>()));
 
     let mut subscriber = connect_v311(addr, b's').await;
     // SUBSCRIBE packet id 1, "t" at QoS 1
