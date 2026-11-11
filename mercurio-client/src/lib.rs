@@ -25,7 +25,9 @@ mod websocket;
 
 pub use client::{MqttClient, PendingPublish};
 pub use error::{ClientError, Result};
-pub use event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
+pub use event::{
+    AckToken, ConnAckInfo, DisconnectReason, Event, SubscribeResult, UnsubscribeResult,
+};
 pub use mercurio_packets::subscribe::{RetainHandling, SubscriptionOptions};
 pub use options::{Authenticator, Backoff, ConnectOptions, MessageProperties, Will};
 

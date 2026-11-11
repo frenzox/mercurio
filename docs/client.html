@@ -106,7 +106,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>connect_timeout(Duration)</code></td><td>Longest wait for the connection, CONNACK included, 30 seconds by default</td></tr>
 <tr><td><code>write_timeout(duration)</code></td><td>Longest a packet may take to write before the connection counts as lost; the keep-alive by default, or 30 seconds with a keep-alive of 0</td></tr>
 </table>
-<p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own.</p>
+<p>The client follows the limits the broker announces in CONNACK, such as Maximum QoS, Receive Maximum, Maximum Packet Size and Retain Available, and holds the broker to the client's own. <code>client.connack()</code> returns them as a <code>ConnAckInfo</code>: the keep-alive in effect, Maximum QoS, Retain Available, Receive Maximum, Maximum Packet Size, Topic Alias Maximum, the session expiry, the response information and the subscription features, each with its MQTT default when the broker left it out. It is replaced on every reconnection, before <code>Event::Reconnected</code> arrives. <code>client.client_id()</code> returns the client id in use, the one the broker assigned when the options had none.</p>
 <p>The optional <code>clap</code> feature adds <code>cli::ConnectArgs</code>: the connection options recado and mercurioctl share, to flatten into your own <code>clap</code> command, and turned into <code>ConnectOptions</code> by <code>to_connect_options()</code>.</p>
 
 <h2>Persistent sessions and reconnection</h2>

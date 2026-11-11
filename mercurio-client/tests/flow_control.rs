@@ -91,7 +91,7 @@ async fn response_information_is_requested_on_demand() {
     let asking = MqttClient::connect(options(addr, "a").request_response_information(true))
         .await
         .unwrap();
-    assert_eq!(asking.response_information(), Some("replies/a/"));
+    assert_eq!(asking.response_information().as_deref(), Some("replies/a/"));
 
     let not_asking = MqttClient::connect(options(addr, "b")).await.unwrap();
     assert_eq!(not_asking.response_information(), None);

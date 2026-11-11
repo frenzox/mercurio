@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,7 +38,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::connection::{Connection, Stream};
 use crate::error::{transient_refusal, ClientError, Result};
-use crate::event::{AckToken, DisconnectReason, Event, SubscribeResult, UnsubscribeResult};
+use crate::event::{
+    AckToken, ConnAckInfo, DisconnectReason, Event, SubscribeResult, UnsubscribeResult,
+};
 use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
 };
@@ -72,9 +74,9 @@ enum Command {
 pub struct MqttClient {
     command_tx: mpsc::Sender<Command>,
     event_rx: Mutex<mpsc::Receiver<Event>>,
-    #[allow(dead_code)]
     client_id: String,
-    response_information: Option<String>,
+    /// What the latest CONNACK settled, replaced on reconnecting
+    connack: Arc<RwLock<ConnAckInfo>>,
 }
 
 impl MqttClient {
@@ -85,19 +87,24 @@ impl MqttClient {
         // Reconnecting must present the same identity to find the session
         options.client_id = Some(session.client_id.clone());
         let client_id = session.client_id.clone();
-        let response_information = session.response_information.clone();
+        let connack = Arc::new(RwLock::new(session.connack.clone()));
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(256);
         tokio::spawn(Self::event_loop(
-            connection, session, command_rx, event_tx, options,
+            connection,
+            session,
+            command_rx,
+            event_tx,
+            options,
+            Arc::clone(&connack),
         ));
 
         Ok(MqttClient {
             command_tx,
             event_rx: Mutex::new(event_rx),
             client_id,
-            response_information,
+            connack,
         })
     }
 
@@ -187,8 +194,7 @@ impl MqttClient {
             connection.write_packet(answer).await?;
         };
 
-        let response_information;
-        let (session_present, client_id, keep_alive, limits) = match connack {
+        let (client_id, limits, connack) = match connack {
             ControlPacket::ConnAck(ack) => {
                 if ack.reason_code != ReasonCode::Success {
                     // A refusal may name the server to use instead
@@ -240,29 +246,44 @@ impl MqttClient {
                         .map_err(ClientError::AuthenticationFailed)?;
                 }
                 let limits = BrokerLimits::from_connack(ack.properties.as_ref());
-                response_information = ack
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.response_information.as_ref())
-                    .map(|r| r.value.clone());
-                (ack.flags.session_present, client_id, keep_alive, limits)
+                let p = ack.properties.as_ref();
+                let connack = ConnAckInfo {
+                    session_present: ack.flags.session_present,
+                    keep_alive,
+                    maximum_qos: limits.maximum_qos,
+                    retain_available: limits.retain_available,
+                    receive_maximum: limits.receive_maximum,
+                    maximum_packet_size: limits.maximum_packet_size,
+                    topic_alias_maximum: p
+                        .and_then(|p| p.topic_alias_max.as_ref())
+                        .map_or(0, |t| t.value),
+                    // The broker says so only when it overrides the request
+                    session_expiry: p
+                        .and_then(|p| p.session_expiry_interval.as_ref())
+                        .map_or(options.session_expiry, |s| s.value),
+                    response_information: p
+                        .and_then(|p| p.response_information.as_ref())
+                        .map(|r| r.value.clone()),
+                    wildcard_subscriptions: limits.wildcard_subscriptions,
+                    shared_subscriptions: limits.shared_subscriptions,
+                    subscription_identifiers: limits.subscription_identifiers,
+                };
+                (client_id, limits, connack)
             }
             _ => return Err(ClientError::Protocol("Expected CONNACK packet".to_string())),
         };
 
         info!(
             "Connected to MQTT broker, client_id: {}, session_present: {}",
-            client_id, session_present
+            client_id, connack.session_present
         );
 
         connection.set_max_packet_size(limits.maximum_packet_size);
-        connection.set_write_timeout(options.write_timeout_for(keep_alive));
+        connection.set_write_timeout(options.write_timeout_for(connack.keep_alive));
         Ok(Session {
             client_id,
-            keep_alive,
             limits,
-            session_present,
-            response_information,
+            connack,
         })
     }
 
@@ -328,6 +349,7 @@ impl MqttClient {
         mut command_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
         options: ConnectOptions,
+        connack: Arc<RwLock<ConnAckInfo>>,
     ) {
         let mut state = EventLoop {
             connection,
@@ -351,7 +373,7 @@ impl MqttClient {
             unacknowledged: VecDeque::new(),
             next_delivery: 0,
         };
-        let mut keep_alive = session.keep_alive;
+        let mut keep_alive = session.connack.keep_alive;
         let mut backoff = options.reconnect_backoff();
 
         loop {
@@ -384,11 +406,11 @@ impl MqttClient {
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
             state.topic_aliases.clear();
-            keep_alive = session.keep_alive;
-            state.deliver(Event::Reconnected {
-                session_present: session.session_present,
-            });
-            state.resume(session.session_present).await;
+            keep_alive = session.connack.keep_alive;
+            let session_present = session.connack.session_present;
+            *connack.write().unwrap_or_else(|e| e.into_inner()) = session.connack;
+            state.deliver(Event::Reconnected { session_present });
+            state.resume(session_present).await;
         }
 
         // Fail every request still waiting for the broker, and refuse new
@@ -582,8 +604,25 @@ impl MqttClient {
 
     /// What the broker answered to `request_response_information`, often a
     /// topic prefix this client may use for response topics.
-    pub fn response_information(&self) -> Option<&str> {
-        self.response_information.as_deref()
+    pub fn response_information(&self) -> Option<String> {
+        self.connack().response_information
+    }
+
+    /// The client id in use: the one given in the options, or the one the
+    /// broker assigned when none was. Reconnecting presents the same id.
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// What the broker settled in its latest CONNACK, such as the
+    /// keep-alive in effect and the limits it announced, updated when the
+    /// client reconnects. Read it after `Event::Reconnected` for the
+    /// values of the new connection.
+    pub fn connack(&self) -> ConnAckInfo {
+        self.connack
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Receive the next event from the broker.
@@ -668,10 +707,8 @@ impl Future for PendingPublish {
 /// What CONNACK settled for a connection.
 struct Session {
     client_id: String,
-    keep_alive: u16,
     limits: BrokerLimits,
-    session_present: bool,
-    response_information: Option<String>,
+    connack: ConnAckInfo,
 }
 
 /// Whether a connection that ended this way is worth reopening. A broker
