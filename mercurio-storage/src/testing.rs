@@ -59,6 +59,7 @@ pub fn message(topic: &str, payload: &str) -> Message {
         expires_at: None,
         subscription_identifiers: Vec::new(),
         origin: None,
+        share_group: None,
     }
 }
 
@@ -76,6 +77,7 @@ pub fn inflight_message(packet_id: u16) -> InflightMessage {
         released: false,
         properties: properties(),
         subscription_identifiers: vec![1, 268_435_455],
+        share_group: Some("$share/g/t".into()),
     }
 }
 
@@ -323,6 +325,7 @@ async fn inflight(store: &impl MqttStore) {
         sequence: 0,
         properties: Default::default(),
         subscription_identifiers: Vec::new(),
+        share_group: None,
         ..inflight_message(1)
     };
     apply(
@@ -422,6 +425,7 @@ async fn queue(store: &impl MqttStore) {
     detailed.properties = properties();
     detailed.expires_at = Some(u64::MAX >> 1);
     detailed.subscription_identifiers = vec![4, 268_435_455];
+    detailed.share_group = Some(Arc::from("$share/g/q"));
     apply(
         store,
         &key("c"),
@@ -440,7 +444,8 @@ async fn queue(store: &impl MqttStore) {
             loaded.retain,
             &loaded.properties,
             loaded.expires_at,
-            &loaded.subscription_identifiers
+            &loaded.subscription_identifiers,
+            &loaded.share_group
         ),
         (
             "q",
@@ -449,9 +454,11 @@ async fn queue(store: &impl MqttStore) {
             true,
             &detailed.properties,
             detailed.expires_at,
-            &detailed.subscription_identifiers
+            &detailed.subscription_identifiers,
+            &detailed.share_group
         )
     );
+
     apply(store, &key("c"), &[Write::ClearQueue]).await;
     assert!(store.load_queue(&key("c")).await.unwrap().is_empty());
 

@@ -27,10 +27,10 @@ use mercurio_storage::{
 use tracing::{error, warn};
 
 use crate::{
-    broker::Broker,
+    broker::{Broker, Reoffer},
     plugin::{BoxFuture, Chain, Event},
     queue::QueueLimits,
-    session::{Session, SessionDropGuard, WillMessage},
+    session::{Held, Session, SessionDropGuard, WillMessage},
     shutdown::Tasks,
     sys::Stats,
     writer::{Snapshots, StorageHealth, Writers},
@@ -84,6 +84,8 @@ struct Shared {
     expired: std::sync::atomic::AtomicU64,
     /// Who hears about expired sessions, which belong to no connection
     expiry_chain: std::sync::OnceLock<Chain>,
+    /// Takes the messages of a departing member of a share group
+    share_groups: std::sync::OnceLock<Arc<dyn Reoffer>>,
 }
 
 struct State {
@@ -523,6 +525,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             local: Default::default(),
             expired: Default::default(),
             expiry_chain: Default::default(),
+            share_groups: Default::default(),
         });
 
         let writers = Writers::new(Arc::clone(&storage), tasks.clone());
@@ -697,6 +700,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         if let Some(discarded) = discarded {
             discarded.session().stop_queue_journal();
             discarded.session().unsubscribe_all().await;
+            self.hand_back(&key, &discarded.session(), true).await;
         }
         if clean_start {
             self.writers.write(&key, Write::DeleteSession);
@@ -1180,6 +1184,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             session.set_generation(generation).await;
             session.stop_queue_journal();
             session.unsubscribe_all().await;
+            self.hand_back(key, &session, true).await;
         }
         let removed = removed.is_some() || was_restored;
         if removed {
@@ -1523,8 +1528,43 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         if let Some(ended) = ended {
             ended.session().stop_queue_journal();
             ended.session().unsubscribe_all().await;
+            self.hand_back(key, &ended.session(), true).await;
         }
         true
+    }
+
+    /// Where the messages of a departing member of a share group go.
+    pub(crate) fn set_share_groups(&self, groups: Arc<dyn Reoffer>) {
+        let _ = self.shared.share_groups.set(groups);
+    }
+
+    /// Gives what reached `session`, of `key`, through shared subscriptions
+    /// and may go to another member back to the groups. Once the session
+    /// has `ended`, any other member may take it, and what none takes is
+    /// lost. Otherwise, as the client has only lost its connection, only
+    /// a connected member may, and what one takes leaves the session, in
+    /// storage too; the rest waits for the client.
+    async fn hand_back(&self, key: &SessionKey, session: &Session, ended: bool) {
+        let Some(groups) = self.shared.share_groups.get() else {
+            return;
+        };
+        for handback in session.handbacks().await {
+            let except = session.subscriber_id();
+            if !groups.reoffer(&handback.group, handback.message, except, ended) || ended {
+                continue;
+            }
+            if session.give_up(handback.held).await {
+                if let Held::Unacknowledged(packet_id) = handback.held {
+                    self.remove_inflight(key, packet_id).await;
+                }
+            }
+        }
+    }
+
+    /// Gives the messages a client that lost its connection holds through
+    /// shared subscriptions to the members connected; see `hand_back`.
+    pub(crate) async fn hand_back_on_disconnect(&self, key: &SessionKey, session: &Session) {
+        self.hand_back(key, session, false).await;
     }
 
     pub(crate) fn hold_locally(&self, key: &SessionKey) {
@@ -1954,6 +1994,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 
@@ -2154,6 +2195,7 @@ mod tests {
                     released: false,
                     properties: Default::default(),
                     subscription_identifiers: Vec::new(),
+                    share_group: None,
                 },
             )
             .await
@@ -2377,6 +2419,7 @@ mod tests {
                         released,
                         properties: Default::default(),
                         subscription_identifiers: Vec::new(),
+                        share_group: None,
                     },
                 )
                 .await
@@ -2767,6 +2810,7 @@ mod tests {
             released: false,
             properties: Default::default(),
             subscription_identifiers: Vec::new(),
+            share_group: None,
         };
 
         // Store inflight message
@@ -2828,6 +2872,7 @@ mod tests {
             released: false,
             properties: Default::default(),
             subscription_identifiers: Vec::new(),
+            share_group: None,
         };
         let inflight2 = InflightMessage {
             packet_id: 2,
@@ -2841,6 +2886,7 @@ mod tests {
             released: false,
             properties: Default::default(),
             subscription_identifiers: Vec::new(),
+            share_group: None,
         };
         storage
             .store_inflight(&key("client1"), &inflight1)
@@ -2894,6 +2940,7 @@ mod tests {
             released: false,
             properties: Default::default(),
             subscription_identifiers: Vec::new(),
+            share_group: None,
         };
         storage
             .store_inflight(&key("client1"), &inflight)
@@ -2937,6 +2984,7 @@ mod tests {
                     released: false,
                     properties: Default::default(),
                     subscription_identifiers: Vec::new(),
+                    share_group: None,
                 },
                 None,
             )
@@ -3905,6 +3953,7 @@ mod tests {
                 released: false,
                 properties: Default::default(),
                 subscription_identifiers: Vec::new(),
+                share_group: None,
             };
             manager
                 .store_inflight(&key("client1"), &inflight, None)

@@ -1076,6 +1076,7 @@ impl Session {
                         expires_at: None,
                         subscription_identifiers: Vec::new(),
                         origin: None,
+                        share_group: None,
                     };
                     broker.publish_to(&topic, reply, self.shared.subscriber_id);
                 }
@@ -1110,6 +1111,7 @@ impl Session {
             properties,
             subscription_identifiers: Vec::new(),
             origin,
+            share_group: None,
         };
 
         let subscribers = broker
@@ -1330,6 +1332,7 @@ impl Session {
                             .collect()
                     })
                     .unwrap_or_default(),
+                share_group: sent.share_group.as_deref().map(str::to_string),
             }));
         }
         for (packet_id, sequence) in &state.pubrecs {
@@ -1345,6 +1348,7 @@ impl Session {
                 released: true,
                 properties: MessageProperties::default(),
                 subscription_identifiers: Vec::new(),
+                share_group: None,
             }));
         }
         writes.extend(
@@ -1809,6 +1813,82 @@ impl Session {
             no_local: subscription.no_local,
             retain_as_published: subscription.retain_as_published,
             subscription_identifier: subscription.subscription_identifier,
+            share: parse_shared_subscription(&subscription.topic_filter)
+                .is_some()
+                .then(|| Arc::from(subscription.topic_filter.as_str())),
+        }
+    }
+
+    /// The messages that reached this session through a shared
+    /// subscription and may go to another member of the group: the QoS 1
+    /// messages sent and not acknowledged, in the order they were sent,
+    /// then those queued. QoS 2 messages sent stay with the session
+    /// [MQTT-4.8.2-5].
+    pub(crate) async fn handbacks(&self) -> Vec<Handback> {
+        let mut unacknowledged: Vec<(u64, Handback)> = {
+            let state = self.shared.state.lock().await;
+            state
+                .unacknowledged_messages
+                .iter()
+                .filter(|(_, sent)| sent.publish.qos_level == QoS::AtLeastOnce)
+                .filter_map(|(packet_id, sent)| {
+                    let group = sent.share_group.clone()?;
+                    let publish = &sent.publish;
+                    let message = Message {
+                        packet_id: None,
+                        topic: Arc::from(publish.topic_name.as_str()),
+                        dup: false,
+                        qos: publish.qos_level,
+                        retain: publish.retain,
+                        payload: publish.payload.clone(),
+                        properties: message_properties(publish.properties.as_ref()),
+                        expires_at: sent.expires_at,
+                        subscription_identifiers: Vec::new(),
+                        origin: None,
+                        share_group: None,
+                    };
+                    let held = Held::Unacknowledged(*packet_id);
+                    Some((
+                        sent.sequence,
+                        Handback {
+                            message,
+                            group,
+                            held,
+                        },
+                    ))
+                })
+                .collect()
+        };
+        unacknowledged.sort_by_key(|(sequence, _)| *sequence);
+        let queued = self
+            .shared
+            .queue
+            .shared()
+            .into_iter()
+            .filter_map(|(sequence, message)| {
+                Some(Handback {
+                    group: message.share_group.clone()?,
+                    message,
+                    held: Held::Queued(sequence),
+                })
+            });
+        unacknowledged
+            .into_iter()
+            .map(|(_, handback)| handback)
+            .chain(queued)
+            .collect()
+    }
+
+    /// Lets go of a message another member of its group took. False if the
+    /// session no longer held it.
+    pub(crate) async fn give_up(&self, held: Held) -> bool {
+        match held {
+            Held::Queued(sequence) => self.shared.queue.remove(sequence),
+            Held::Unacknowledged(packet_id) => {
+                let mut state = self.shared.state.lock().await;
+                state.unsent.retain(|id| *id != packet_id);
+                state.unacknowledged_messages.remove(&packet_id).is_some()
+            }
         }
     }
 
@@ -2012,6 +2092,7 @@ impl Session {
                         sequence,
                         publish: publish.clone(),
                         expires_at: message.expires_at,
+                        share_group: message.share_group.clone(),
                     },
                 );
                 InflightMessage {
@@ -2026,6 +2107,7 @@ impl Session {
                     released: false,
                     properties: message_properties(publish.properties.as_ref()),
                     subscription_identifiers: message.subscription_identifiers.clone(),
+                    share_group: message.share_group.as_deref().map(str::to_string),
                 }
             });
 
@@ -2074,6 +2156,7 @@ impl Session {
                         sequence: message.sequence,
                         publish,
                         expires_at: message.expires_at,
+                        share_group: message.share_group.map(Arc::from),
                     },
                 );
             }
@@ -2166,6 +2249,26 @@ struct Unacknowledged {
     publish: PublishPacket,
     /// Unix time in milliseconds when the message expires, if it does
     expires_at: Option<u64>,
+    /// The shared subscription it came through, if it did
+    share_group: Option<Arc<str>>,
+}
+
+/// A message that reached a session through a shared subscription and may
+/// go to another member of the group.
+pub(crate) struct Handback {
+    pub message: Message,
+    /// The shared subscription, `$share/{name}/{filter}`
+    pub group: Arc<str>,
+    pub held: Held,
+}
+
+/// Where a session holds a message it may hand back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// Queued, at this sequence of the queue
+    Queued(u64),
+    /// Sent at QoS 1 with this packet id, not acknowledged
+    Unacknowledged(u16),
 }
 
 /// What a resumed session resends at once.
@@ -2584,6 +2687,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 
@@ -2710,6 +2814,7 @@ mod tests {
                     sequence,
                     publish: PublishPacket::default(),
                     expires_at: None,
+                    share_group: None,
                 },
             );
         }

@@ -45,6 +45,10 @@ pub struct Message {
     pub subscription_identifiers: Vec<u32>,
     /// The client that published it, when it came from a client
     pub origin: Option<Arc<MessageOrigin>>,
+    /// Set per delivery: the shared subscription, `$share/{name}/{filter}`,
+    /// the message reached the session through, so it can go to another
+    /// member of the group when it can't reach this one
+    pub share_group: Option<Arc<str>>,
 }
 
 /// Who published a message.

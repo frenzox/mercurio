@@ -127,6 +127,14 @@ max_queued_qos0_messages = 1000
 # each publisher's messages stay in order). Connected members whose queue
 # has room always come first
 # shared_subscription_strategy = "round_robin"
+# When the messages a member was given and hasn't processed go to another
+# member: those still queued for it and those at QoS 1 it hasn't
+# acknowledged. "session_end" when the member's session ends; "disconnect"
+# also as soon as it loses its connection, to the members connected then.
+# QoS 2 messages already sent stay with the member. A QoS 1 message the
+# member processed without acknowledging reaches the application twice
+# shared_subscription_redelivery = "session_end"
+
 
 # Send messages at the QoS of the subscription even when they were published
 # with a lower one; goes beyond the MQTT specification

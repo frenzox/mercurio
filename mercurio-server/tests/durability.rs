@@ -123,6 +123,8 @@ struct Client {
 struct Connect {
     clean_start: bool,
     receive_maximum: u16,
+    /// Seconds the session outlives the connection
+    session_expiry: u32,
     protocol_version: ProtocolVersion,
 }
 
@@ -131,14 +133,15 @@ impl Default for Connect {
         Connect {
             clean_start: true,
             receive_maximum: 100,
+            session_expiry: 3600,
             protocol_version: ProtocolVersion::V5,
         }
     }
 }
 
 impl Client {
-    /// Connects with a one hour session expiry; returns the client and
-    /// whether its session was resumed.
+    /// Connects as `options` say; returns the client and whether its
+    /// session was resumed.
     async fn connect(addr: SocketAddr, client_id: &str, options: Connect) -> (Self, bool) {
         let v5 = options.protocol_version == ProtocolVersion::V5;
         let connect = ConnectPacket {
@@ -147,7 +150,7 @@ impl Client {
             keepalive: 60,
             properties: v5.then(|| ConnectProperties {
                 session_expiry_interval: Some(
-                    mercurio_core::properties::SessionExpiryInterval::new(3600),
+                    mercurio_core::properties::SessionExpiryInterval::new(options.session_expiry),
                 ),
                 receive_maximum: Some(mercurio_core::properties::ReceiveMaximum::new(
                     options.receive_maximum,
@@ -583,5 +586,40 @@ async fn persistent_client_expiration_holds_across_a_crash() {
     sleep(Duration::from_millis(1500)).await;
     let (_client, resumed) = connect_v311(broker.addr, b'c').await;
     assert!(!resumed, "the session outlived its expiry");
+    broker.stop().await;
+}
+
+/// A member of a share group leaves a message unacknowledged and another
+/// queued, and the broker crashes. Restarted, it still knows they came
+/// through the share, so when the member's session ends they go to
+/// another member.
+#[tokio::test]
+async fn shared_messages_go_to_another_member_after_a_crash() {
+    let db = database("shared");
+    let broker = Broker::start(&db);
+    let member = Connect {
+        receive_maximum: 1,
+        session_expiry: 2,
+        ..Default::default()
+    };
+    let (mut leaving, _) = Client::connect(broker.addr, "leaving", member).await;
+    leaving.subscribe("$share/g/jobs", QoS::AtLeastOnce).await;
+    let (mut publisher, _) = Client::connect(broker.addr, "p", Connect::default()).await;
+    publisher.publish(message("jobs", "one")).await;
+    publisher.publish(message("jobs", "two")).await;
+    let sent = leaving.next_publish().await.unwrap();
+    assert_eq!(sent.payload.unwrap(), "one");
+    drop(leaving);
+    broker.crash().await;
+
+    let broker = Broker::start(&db);
+    let (mut staying, _) = Client::connect(broker.addr, "staying", Connect::default()).await;
+    staying.subscribe("$share/g/jobs", QoS::AtLeastOnce).await;
+    sleep(Duration::from_secs(2)).await;
+    let received = drain(&mut staying).await;
+    assert_eq!(
+        received,
+        [("one".to_string(), false), ("two".to_string(), false)]
+    );
     broker.stop().await;
 }

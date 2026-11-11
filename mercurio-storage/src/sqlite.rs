@@ -133,8 +133,21 @@ fn create_private(path: &Path) -> Result<()> {
 /// Schema changes, applied in order, each in a transaction of its own; the
 /// database records how many it has in `user_version`. Released entries
 /// never change: a new schema change is a new entry.
-const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] =
-    &[create_schema, index_retained_expiry, key_by_mount_point];
+const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] = &[
+    create_schema,
+    index_retained_expiry,
+    key_by_mount_point,
+    mark_share_groups,
+];
+
+/// Records which shared subscription a queued or in-flight message came
+/// through, so it can go to another member of the group.
+fn mark_share_groups(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE queued_messages ADD COLUMN share_group TEXT;
+         ALTER TABLE inflight_messages ADD COLUMN share_group TEXT;",
+    )
+}
 
 /// Lets the removal of expired retained messages find them without
 /// reading the table.
@@ -585,8 +598,8 @@ fn will_from_row(row: &rusqlite::Row) -> rusqlite::Result<StoredWillMessage> {
 }
 
 /// The columns `queued_from_row` reads.
-const QUEUED_COLUMNS: &str =
-    "sequence, topic, payload, qos, retain, properties, expires_at, subscription_identifiers";
+const QUEUED_COLUMNS: &str = "sequence, topic, payload, qos, retain, properties, expires_at,
+    subscription_identifiers, share_group";
 
 fn queued_from_row(row: &rusqlite::Row) -> rusqlite::Result<(u64, Message)> {
     let topic: String = row.get(1)?;
@@ -602,6 +615,7 @@ fn queued_from_row(row: &rusqlite::Row) -> rusqlite::Result<(u64, Message)> {
         expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
         subscription_identifiers: row.get::<_, Identifiers>(7)?.0,
         origin: None,
+        share_group: row.get::<_, Option<String>>(8)?.map(Arc::from),
     };
     // SQLite integers are signed; the bit pattern round-trips
     Ok((row.get::<_, i64>(0)? as u64, message))
@@ -609,7 +623,7 @@ fn queued_from_row(row: &rusqlite::Row) -> rusqlite::Result<(u64, Message)> {
 
 /// The columns `inflight_from_row` reads.
 const INFLIGHT_COLUMNS: &str = "packet_id, topic, payload, qos, dup, sequence, released,
-    properties, subscription_identifiers, retain, expires_at";
+    properties, subscription_identifiers, retain, expires_at, share_group";
 
 fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
     let payload: Option<Vec<u8>> = row.get(2)?;
@@ -626,6 +640,7 @@ fn inflight_from_row(row: &rusqlite::Row) -> rusqlite::Result<InflightMessage> {
         subscription_identifiers: row.get::<_, Identifiers>(8)?.0,
         retain: row.get(9)?,
         expires_at: row.get::<_, Option<i64>>(10)?.map(|t| t as u64),
+        share_group: row.get(11)?,
     })
 }
 
@@ -704,6 +719,7 @@ fn retained_page(
                         }))
                     })
                     .transpose()?,
+                share_group: None,
             });
             if messages.len() == limit {
                 return Ok(messages);
@@ -799,8 +815,8 @@ fn apply_write(conn: &Connection, key: &SessionKey, write: &Write) -> rusqlite::
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
                  (mount_point, client_id, packet_id, topic, payload, qos, dup, sequence, released,
-                  properties, subscription_identifiers, retain, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  properties, subscription_identifiers, retain, expires_at, share_group)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     mount_point,
                     client_id,
@@ -815,7 +831,8 @@ fn apply_write(conn: &Connection, key: &SessionKey, write: &Write) -> rusqlite::
                     encode_properties(&message.properties),
                     Identifiers(message.subscription_identifiers.clone()),
                     message.retain,
-                    message.expires_at.map(|t| t as i64)
+                    message.expires_at.map(|t| t as i64),
+                    message.share_group
                 ],
             )?;
         }
@@ -851,8 +868,8 @@ fn apply_write(conn: &Connection, key: &SessionKey, write: &Write) -> rusqlite::
             conn.execute(
                 "INSERT OR REPLACE INTO queued_messages
                  (mount_point, client_id, sequence, topic, payload, qos, retain, properties,
-                  expires_at, subscription_identifiers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  expires_at, subscription_identifiers, share_group)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     mount_point,
                     client_id,
@@ -863,7 +880,8 @@ fn apply_write(conn: &Connection, key: &SessionKey, write: &Write) -> rusqlite::
                     message.retain,
                     encode_properties(&message.properties),
                     message.expires_at.map(|t| t as i64),
-                    Identifiers(message.subscription_identifiers.clone())
+                    Identifiers(message.subscription_identifiers.clone()),
+                    message.share_group.as_deref()
                 ],
             )?;
         }

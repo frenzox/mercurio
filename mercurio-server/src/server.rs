@@ -94,7 +94,7 @@ pub struct AuthConfig {
 
 pub use crate::{
     bans::LoginFailures,
-    broker::ShareStrategy,
+    broker::{ShareRedelivery, ShareStrategy},
     connection::{DEFAULT_MAX_CONNECT_PACKET_SIZE, DEFAULT_MAX_PACKET_SIZE},
     queue::{Overflow, QueueLimits},
 };
@@ -397,6 +397,8 @@ pub struct ServerConfig {
     pub admin_extension: Option<Arc<dyn AdminExtension>>,
     /// How shared subscriptions pick the member a message goes to.
     pub share_strategy: ShareStrategy,
+    /// When a member's messages go to the rest of its share group.
+    pub share_redelivery: ShareRedelivery,
 }
 
 impl Default for ServerConfig {
@@ -414,6 +416,7 @@ impl Default for ServerConfig {
             plugin_tick_interval: Duration::from_secs(1),
             admin_extension: None,
             share_strategy: ShareStrategy::default(),
+            share_redelivery: ShareRedelivery::default(),
         }
     }
 }
@@ -1447,6 +1450,7 @@ impl<St: MqttStore + 'static> Server<St> {
             plugin_tick_interval,
             admin_extension,
             share_strategy,
+            share_redelivery,
         } = config;
         let stats = Arc::new(Stats::default());
         let policy = Arc::new(policy);
@@ -1469,7 +1473,8 @@ impl<St: MqttStore + 'static> Server<St> {
         let tasks = Tasks::default();
         let broker = Broker::new(Arc::clone(&storage))
             .counted_in(Arc::clone(&stats))
-            .with_share_strategy(share_strategy);
+            .with_share_strategy(share_strategy)
+            .with_share_redelivery(share_redelivery);
         let session_manager_holder = SessionManagerDropGuard::new(
             Arc::clone(&storage),
             limits.queue,
@@ -1479,6 +1484,7 @@ impl<St: MqttStore + 'static> Server<St> {
             tasks.clone(),
         );
         let session_manager = session_manager_holder.session_manager();
+        session_manager.set_share_groups(Arc::new(broker.clone()));
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
         let bans = Arc::new(Bans::load(Arc::clone(&storage).ban_store()).await?);
@@ -2423,6 +2429,19 @@ where
         }
 
         session.detach(lease.generation, expiry).await;
+
+        // A member of a share group that only lost its connection gives
+        // its messages to the members connected, when asked to; a session
+        // ending with its connection gives them as it ends, and one taken
+        // over keeps them for its client
+        if self.broker.share_redelivery() == ShareRedelivery::OnDisconnect
+            && expiry != Some(Duration::ZERO)
+            && session.generation() == lease.generation
+        {
+            self.session_manager
+                .hand_back_on_disconnect(&key, &session)
+                .await;
+        }
 
         // A close that drops the will can lose the race against a read error,
         // an EOF or a DISCONNECT with a will
@@ -3437,6 +3456,7 @@ async fn publish_will<St: MqttStore>(broker: &Broker<St>, will: WillMessage, key
         properties: will.properties,
         subscription_identifiers: Vec::new(),
         origin: None,
+        share_group: None,
     };
 
     if let Err(e) = broker.publish(&topic, message).await {

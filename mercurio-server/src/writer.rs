@@ -553,6 +553,7 @@ mod tests {
             released: false,
             properties: Default::default(),
             subscription_identifiers: Vec::new(),
+            share_group: None,
         })
     }
 
@@ -616,6 +617,7 @@ mod tests {
                     expires_at: None,
                     subscription_identifiers: Vec::new(),
                     origin: None,
+                    share_group: None,
                 },
             )
         };

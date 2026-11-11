@@ -538,6 +538,7 @@ async fn publish<St: MqttStore>(broker: &Broker<St>, name: &str, value: String) 
         expires_at: None,
         subscription_identifiers: Vec::new(),
         origin: None,
+        share_group: None,
     };
     if let Err(e) = broker.publish(&topic, message).await {
         warn!("Failed to publish `{}`: {}", topic, e);
@@ -560,6 +561,7 @@ mod tests {
             expires_at: None,
             subscription_identifiers: Vec::new(),
             origin: None,
+            share_group: None,
         }
     }
 

@@ -9,7 +9,10 @@ use std::{
 
 use mercurio_core::qos::QoS;
 use mercurio_server::{
-    server::{Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareStrategy, Transport},
+    server::{
+        Limits, LoginFailures, Overflow, QueueLimits, Rate, ShareRedelivery, ShareStrategy,
+        Transport,
+    },
     tls::{CertificateName, TlsConfig, TlsVersion},
 };
 use mercurio_storage::postgres::ConnectOptions;
@@ -806,6 +809,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub shared_subscription_strategy: SharedStrategy,
 
+    /// When the messages a member of a shared subscription holds go to
+    /// another member: as its session ends, or already as it disconnects
+    #[serde(default)]
+    pub shared_subscription_redelivery: SharedRedelivery,
+
     /// Send messages at the QoS of the subscription even when published
     /// with a lower one
     #[serde(default)]
@@ -970,6 +978,7 @@ impl Default for ServerConfig {
             max_queued_bytes: default_max_queued_bytes(),
             queue_overflow: QueueOverflow::default(),
             shared_subscription_strategy: SharedStrategy::default(),
+            shared_subscription_redelivery: SharedRedelivery::default(),
             upgrade_outgoing_qos: false,
             check_retain_source: false,
             max_subscriptions: default_max_subscriptions(),
@@ -1079,6 +1088,15 @@ pub enum SharedStrategy {
     Random,
     Sticky,
     Hash,
+}
+
+/// When a member's messages go to the rest of its shared subscription.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRedelivery {
+    #[default]
+    SessionEnd,
+    Disconnect,
 }
 
 /// Which message a full queue drops.
@@ -1320,6 +1338,13 @@ impl ServerConfig {
             SharedStrategy::Random => ShareStrategy::Random,
             SharedStrategy::Sticky => ShareStrategy::Sticky,
             SharedStrategy::Hash => ShareStrategy::Hash,
+        }
+    }
+
+    pub fn share_redelivery(&self) -> ShareRedelivery {
+        match self.shared_subscription_redelivery {
+            SharedRedelivery::SessionEnd => ShareRedelivery::OnSessionEnd,
+            SharedRedelivery::Disconnect => ShareRedelivery::OnDisconnect,
         }
     }
 
@@ -1890,6 +1915,24 @@ mod tests {
         assert!(toml::from_str::<Config>("[server]\nmax_session_expiry = \"forever\"\n").is_err());
         assert_eq!(limits("").max_sessions, None);
         assert_eq!(limits("[server]\nmax_sessions = 5\n").max_sessions, Some(5));
+    }
+
+    #[test]
+    fn test_shared_subscription_redelivery_is_read() {
+        let redelivery = |toml: &str| {
+            let config: Config = toml::from_str(toml).unwrap();
+            config.server.share_redelivery()
+        };
+        use mercurio_server::server::ShareRedelivery;
+        assert_eq!(redelivery(""), ShareRedelivery::OnSessionEnd);
+        assert_eq!(
+            redelivery("[server]\nshared_subscription_redelivery = \"disconnect\"\n"),
+            ShareRedelivery::OnDisconnect
+        );
+        assert!(
+            toml::from_str::<Config>("[server]\nshared_subscription_redelivery = \"never\"\n")
+                .is_err()
+        );
     }
 
     #[test]
