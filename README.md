@@ -16,8 +16,7 @@ top of Tokio. It speaks MQTT 3.1, 3.1.1 and 5.0.
 - **Complete MQTT 5.** Shared subscriptions, subscription options, topic
   aliases, message expiry, request/response, enhanced authentication and
   server redirection in the broker. The client supports the same, except
-  that it only accepts topic aliases from the broker and reports a
-  redirection to the application without following it.
+  that it reports a redirection to the application without following it.
 - **Durable.** Sessions, retained messages and queued messages are kept in
   SQLite or PostgreSQL, and a standby broker takes over a PostgreSQL
   database when the serving one stops.

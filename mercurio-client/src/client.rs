@@ -10,7 +10,7 @@ use mercurio_core::codec::VariableByteInteger;
 use mercurio_core::properties::{
     AuthenticationData, AuthenticationMethod, MaximumPacketSize, ReceiveMaximum,
     RequestProblemInformation, RequestResponseInformation, SessionExpiryInterval,
-    SubscriptionIdentifier, TopicAliasMaximum,
+    SubscriptionIdentifier, TopicAlias, TopicAliasMaximum,
 };
 use mercurio_core::qos::QoS;
 use mercurio_core::reason::ReasonCode;
@@ -265,9 +265,7 @@ impl MqttClient {
                     retain_available: limits.retain_available,
                     receive_maximum: limits.receive_maximum,
                     maximum_packet_size: limits.maximum_packet_size,
-                    topic_alias_maximum: p
-                        .and_then(|p| p.topic_alias_max.as_ref())
-                        .map_or(0, |t| t.value),
+                    topic_alias_maximum: limits.topic_alias_maximum,
                     // The broker says so only when it overrides the request
                     session_expiry: p
                         .and_then(|p| p.session_expiry_interval.as_ref())
@@ -376,6 +374,7 @@ impl MqttClient {
             waiting: VecDeque::new(),
             topic_aliases: HashMap::new(),
             topic_alias_maximum: options.topic_alias_maximum,
+            outbound_aliases: OutboundAliases::new(options.outbound_topic_aliases),
             receive_maximum: options.receive_maximum.unwrap_or(u16::MAX),
             authenticator: options.authenticator.clone(),
             reauthentication: None,
@@ -417,6 +416,7 @@ impl MqttClient {
             state.limits = session.limits;
             // Aliases only last as long as the connection [MQTT-3.3.2-7]
             state.topic_aliases.clear();
+            state.outbound_aliases.clear();
             keep_alive = session.connack.keep_alive;
             let session_present = session.connack.session_present;
             *connack.write().unwrap_or_else(|e| e.into_inner()) = session.connack;
@@ -830,6 +830,8 @@ struct EventLoop {
     /// Topics the broker gave aliases on this connection
     topic_aliases: HashMap<u16, String>,
     topic_alias_maximum: u16,
+    /// Topics this client gave aliases on this connection
+    outbound_aliases: OutboundAliases,
     /// Most QoS 2 messages the broker may have in flight to this client
     receive_maximum: u16,
     authenticator: Option<SharedAuthenticator>,
@@ -876,6 +878,7 @@ pub(crate) struct BrokerLimits {
     wildcard_subscriptions: bool,
     shared_subscriptions: bool,
     subscription_identifiers: bool,
+    topic_alias_maximum: u16,
 }
 
 impl BrokerLimits {
@@ -904,7 +907,65 @@ impl BrokerLimits {
             subscription_identifiers: p
                 .and_then(|p| p.subscription_identifier_available.as_ref())
                 .is_none_or(|s| s.value),
+            topic_alias_maximum: p
+                .and_then(|p| p.topic_alias_max.as_ref())
+                .map_or(0, |t| t.value),
         }
+    }
+}
+
+/// The aliases this client gave topics it publishes to on the current
+/// connection. Aliases are handed out from 1 up; once the limit is reached
+/// a new topic takes over the alias of the topic used least recently.
+struct OutboundAliases {
+    /// The most the application allows
+    maximum: u16,
+    /// Each topic's alias and when it was last used
+    topics: HashMap<String, (u16, u64)>,
+    clock: u64,
+}
+
+impl OutboundAliases {
+    fn new(maximum: u16) -> Self {
+        OutboundAliases {
+            maximum,
+            topics: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.topics.clear();
+    }
+
+    /// The alias to send `topic` with, and whether the topic must go along
+    /// to set it, within the broker's `limit`; `None` without aliases.
+    fn plan(&self, topic: &str, limit: u16) -> Option<(u16, bool)> {
+        let limit = self.maximum.min(limit);
+        if limit == 0 {
+            return None;
+        }
+        if let Some((alias, _)) = self.topics.get(topic) {
+            return Some((*alias, false));
+        }
+        if self.topics.len() < usize::from(limit) {
+            return Some((self.topics.len() as u16 + 1, true));
+        }
+        self.topics
+            .values()
+            .min_by_key(|(_, used)| *used)
+            .map(|(alias, _)| (*alias, true))
+    }
+
+    /// Records that `topic` went out with `alias`, as `plan` said.
+    fn commit(&mut self, topic: &str, alias: u16) {
+        self.clock += 1;
+        if let Some(entry) = self.topics.get_mut(topic) {
+            entry.1 = self.clock;
+            return;
+        }
+        self.topics.retain(|_, (taken, _)| *taken != alias);
+        self.topics.insert(topic.to_string(), (alias, self.clock));
     }
 }
 
@@ -1392,13 +1453,30 @@ impl EventLoop {
             properties: properties.to_publish(),
             payload: Some(payload),
         };
+        // Only this send may use the alias: a message sent again goes out
+        // on another connection, where the alias means nothing yet
+        let alias = self
+            .outbound_aliases
+            .plan(&publish.topic_name, self.limits.topic_alias_maximum);
+        let mut wire = publish.clone();
+        if let Some((alias, new)) = alias {
+            wire.properties
+                .get_or_insert_with(Default::default)
+                .topic_alias = Some(TopicAlias::new(alias));
+            if !new {
+                wire.topic_name.clear();
+            }
+        }
         if let Err(e) = self
             .connection
-            .write_packet(ControlPacket::Publish(publish.clone()))
+            .write_packet(ControlPacket::Publish(wire))
             .await
         {
             let _ = response.send(Err(e));
             return;
+        }
+        if let Some((alias, _)) = alias {
+            self.outbound_aliases.commit(&publish.topic_name, alias);
         }
 
         match packet_id {

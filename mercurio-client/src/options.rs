@@ -378,6 +378,7 @@ pub struct ConnectOptions {
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
+    pub(crate) outbound_topic_aliases: u16,
     pub(crate) request_response_information: bool,
     pub(crate) request_problem_information: bool,
     pub(crate) authenticator: Option<SharedAuthenticator>,
@@ -413,6 +414,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
+            .field("outbound_topic_aliases", &self.outbound_topic_aliases)
             .field(
                 "request_response_information",
                 &self.request_response_information,
@@ -507,6 +509,7 @@ impl ConnectOptions {
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
+            outbound_topic_aliases: 0,
             request_response_information: false,
             request_problem_information: true,
             authenticator: None,
@@ -716,6 +719,19 @@ impl ConnectOptions {
     /// saving bandwidth on repeated topics. MQTT 5 only.
     pub fn topic_alias_maximum(mut self, maximum: u16) -> Self {
         self.topic_alias_maximum = maximum;
+        self
+    }
+
+    /// Replace the topics of published messages with aliases, up to this
+    /// many at once and no more than the broker's Topic Alias Maximum; off
+    /// (0) unless set, and only with MQTT 5 brokers that announce a
+    /// maximum. The first publish to a topic sends it with a new alias, and
+    /// later ones send the alias alone. Once every alias is taken, a new
+    /// topic takes over the alias of the topic published to least
+    /// recently. Aliases start over on each connection, and messages sent
+    /// again after reconnecting carry their whole topic.
+    pub fn outbound_topic_aliases(mut self, maximum: u16) -> Self {
+        self.outbound_topic_aliases = maximum;
         self
     }
 

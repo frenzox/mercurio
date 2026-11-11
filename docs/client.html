@@ -98,6 +98,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>tls_config(Arc&lt;rustls::ClientConfig&gt;)</code></td><td>A rustls configuration of your own, replacing the other TLS settings; turns TLS on</td></tr>
 <tr><td><code>client_cert(cert, key)</code></td><td>Authenticate with a client certificate; turns TLS on</td></tr>
 <tr><td><code>receive_maximum(n)</code>, <code>maximum_packet_size(n)</code>, <code>topic_alias_maximum(n)</code></td><td>Limits announced to the broker; packets over <code>maximum_packet_size</code>, 1 MiB by default as on the broker, are refused from their header</td></tr>
+<tr><td><code>outbound_topic_aliases(n)</code></td><td>Send repeated topics as aliases, up to <code>n</code> and the broker's Topic Alias Maximum; off by default. A new topic takes the next free alias, or once all are taken the alias of the topic published to least recently. Aliases start over on each connection, and messages sent again after reconnecting carry their whole topic</td></tr>
 <tr><td><code>request_response_information(bool)</code></td><td>Ask the broker for a response topic prefix, read with <code>response_information()</code></td></tr>
 <tr><td><code>manual_acks(bool)</code></td><td>Acknowledge QoS 1 and 2 messages when the application calls <code>ack</code>, not on receipt</td></tr>
 <tr><td><code>authenticator(a)</code></td><td>MQTT 5 enhanced authentication</td></tr>
