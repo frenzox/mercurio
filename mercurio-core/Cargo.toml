@@ -1,12 +1,12 @@
 [package]
 name = "mercurio-core"
 version = "0.2.0"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "Core types and traits for the Mercurio MQTT implementation"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "iot", "no-std"]
 categories = ["network-programming", "no-std"]
 

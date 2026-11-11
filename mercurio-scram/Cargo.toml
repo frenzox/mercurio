@@ -1,12 +1,12 @@
 [package]
 name = "mercurio-scram"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.89"
+edition.workspace = true
+rust-version.workspace = true
 description = "SCRAM-SHA-256 message handling and key derivation for the Mercurio MQTT implementation"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "scram", "sasl", "authentication"]
 categories = ["authentication", "cryptography"]
 

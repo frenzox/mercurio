@@ -13,6 +13,14 @@ members = [
     "mercurioctl",
 ]
 
+# mercuriod sets its own rust-version, as wasmtime needs a newer Rust
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frenzox/mercurio"
+homepage = "https://frenzox.github.io/mercurio/"
+
 # Third-party crates more than one member uses. Members add their own
 # features; default features stay off where a no_std or library crate needs
 # them off, so those crates opt back in with "std" or the features they use.

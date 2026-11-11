@@ -1,12 +1,12 @@
 [package]
 name = "mercuriod"
 version = "0.4.5"
-edition = "2021"
+edition.workspace = true
 rust-version = "1.97"
 description = "Mercurio MQTT broker daemon"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/frenzox/mercurio"
-homepage = "https://frenzox.github.io/mercurio/"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 keywords = ["mqtt", "mqtt5", "broker", "iot", "mosquitto"]
 categories = ["network-programming", "command-line-utilities"]
 
