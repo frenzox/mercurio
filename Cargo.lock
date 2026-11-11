@@ -1416,6 +1416,7 @@ dependencies = [
  "futures-util",
  "mercurio-core",
  "mercurio-packets",
+ "mercurio-scram",
  "mercurio-server",
  "rpassword",
  "rustls",
