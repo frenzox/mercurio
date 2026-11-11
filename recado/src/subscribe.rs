@@ -191,7 +191,7 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                     }
                     Some(Event::Disconnected { reason }) => {
                         // With reconnection on, the client says when it
-                        // gives up by closing the event stream
+                        // gives up with Event::Stopped
                         if reconnect.is_none() {
                             return Err(Failure::disconnected(&reason));
                         }
@@ -206,6 +206,11 @@ pub async fn run(mut args: SubArgs) -> Result<(), Failure> {
                         if !session_present {
                             subscribe().await?;
                         }
+                    }
+                    Some(Event::Stopped { error, .. }) => {
+                        return Err(Failure::Connection(format!(
+                            "gave up reconnecting: {error}"
+                        )));
                     }
                     // Events added in later versions of the client
                     Some(_) => {}

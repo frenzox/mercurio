@@ -77,7 +77,8 @@ Connection options, for both commands:
 
 Exit status: 0 on success, 1 when the broker refused a subscription or a
 message, 2 when it couldn't be reached, refused the login or closed the
-connection, 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
+connection (with `--reconnect`, when it refuses the reconnection for good,
+saying why), 3 on wrong usage, 4 when `sub -W` ran out of time. Messages
 go to standard error.
 
 `recado completions <shell>` prints a completion script for bash, zsh,
