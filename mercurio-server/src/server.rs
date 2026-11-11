@@ -1464,7 +1464,9 @@ impl<St: MqttStore + 'static> Server<St> {
             limits,
             stats,
             bans,
-            failed_logins: limits.login_failures.map(|l| Arc::new(FailedLogins::new(l))),
+            failed_logins: limits
+                .login_failures
+                .map(|l| Arc::new(FailedLogins::new(l))),
         };
 
         session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
@@ -1624,7 +1626,11 @@ impl<St: MqttStore + 'static> Listener<St> {
 
             if let Some(i) = endpoint.filter(|_| !trusted) {
                 let endpoint = &mut self.endpoints[i];
-                if endpoint.connection_rate.as_mut().is_some_and(|b| !b.try_take()) {
+                if endpoint
+                    .connection_rate
+                    .as_mut()
+                    .is_some_and(|b| !b.try_take())
+                {
                     warn!(
                         "Connection rate of {} exceeded, refusing {:?}",
                         endpoint.state.name, peer_addr
@@ -3316,9 +3322,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_pacing_waits_for_the_slower_of_messages_and_bytes() {
-        let mut limits = Limits::default();
-        limits.max_publish_rate = Some(Rate::new(100, 1));
-        limits.max_publish_bytes_rate = Some(Rate::new(1000, 1000));
+        let limits = Limits {
+            max_publish_rate: Some(Rate::new(100, 1)),
+            max_publish_bytes_rate: Some(Rate::new(1000, 1000)),
+            ..Default::default()
+        };
         let mut pacing = Pacing::new(&limits);
         assert_eq!(pacing.publish(500), None);
         // One message too many, and 1000 bytes too many

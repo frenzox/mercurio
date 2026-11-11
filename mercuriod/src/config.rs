@@ -1028,7 +1028,11 @@ impl ExpiryBound {
 
 /// The rate `per_second`, `name` in the configuration, with `burst`,
 /// one second's worth by default.
-pub fn rate(name: &str, per_second: Option<u32>, burst: Option<u32>) -> Result<Option<Rate>, String> {
+pub fn rate(
+    name: &str,
+    per_second: Option<u32>,
+    burst: Option<u32>,
+) -> Result<Option<Rate>, String> {
     let Some(per_second) = per_second else {
         return match burst {
             Some(_) => Err(format!("a burst for {name} needs {name}")),

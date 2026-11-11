@@ -106,7 +106,10 @@ async fn failed_logins_ban_the_address_for_a_while() {
     // Banned now, even with the right password
     assert_eq!(login(proxied, attacker, b"secret").await, None);
     // Others are not, loopback never is
-    assert_eq!(login(proxied, Some("192.0.2.8"), b"secret").await, Some(0x00));
+    assert_eq!(
+        login(proxied, Some("192.0.2.8"), b"secret").await,
+        Some(0x00)
+    );
     for _ in 0..3 {
         assert_eq!(login(main, None, b"guess").await, Some(0x86));
     }

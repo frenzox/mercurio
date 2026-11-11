@@ -503,7 +503,11 @@ mod tests {
         let listed = bans.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].value, "192.0.2.7");
-        assert!(listed[0].reason.as_deref().unwrap().starts_with("automatic"));
+        assert!(listed[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("automatic"));
         let expires_in = listed[0].expires_at.unwrap() - unix_secs();
         assert!((299..=300).contains(&expires_in), "{expires_in}");
         assert_eq!(logins.tracked(), 0);
@@ -513,8 +517,12 @@ mod tests {
     async fn test_failed_logins_count_by_block_and_spare_loopback() {
         let bans = Bans::load(None).await.unwrap();
         let logins = throttle(2);
-        logins.failed("2001:db8:0:1::1".parse().unwrap(), &bans).await;
-        logins.failed("2001:db8:0:1::2".parse().unwrap(), &bans).await;
+        logins
+            .failed("2001:db8:0:1::1".parse().unwrap(), &bans)
+            .await;
+        logins
+            .failed("2001:db8:0:1::2".parse().unwrap(), &bans)
+            .await;
         assert!(bans.refuses_address("2001:db8:0:1:ffff::9".parse().unwrap()));
         assert!(!bans.refuses_address("2001:db8:0:2::1".parse().unwrap()));
         assert_eq!(bans.list()[0].value, "2001:db8:0:1::/64");

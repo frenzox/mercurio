@@ -326,7 +326,12 @@ impl QueueState {
     /// The positions of the oldest messages of `message`'s kind, QoS 0 or
     /// QoS 1 and 2, to drop for it to fit within `limit` messages and
     /// `max_bytes`; None if dropping all of them would not be enough.
-    fn room_for(&self, message: &Message, limit: usize, max_bytes: Option<usize>) -> Option<Vec<usize>> {
+    fn room_for(
+        &self,
+        message: &Message,
+        limit: usize,
+        max_bytes: Option<usize>,
+    ) -> Option<Vec<usize>> {
         let qos0 = message.qos == QoS::AtMostOnce;
         let size = payload_size(message);
         let (mut count, mut bytes) = (self.messages.len(), self.bytes);
@@ -355,7 +360,11 @@ impl QueueState {
                 continue;
             };
             self.bytes -= payload_size(&message);
-            if let Some(journal) = self.journal.as_ref().filter(|_| message.qos != QoS::AtMostOnce) {
+            if let Some(journal) = self
+                .journal
+                .as_ref()
+                .filter(|_| message.qos != QoS::AtMostOnce)
+            {
                 journal.write(Write::Dequeue(sequence));
             }
         }

@@ -249,7 +249,11 @@ struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.armed {
-            self.shared.persistent.lock().unwrap().remove(&self.client_id);
+            self.shared
+                .persistent
+                .lock()
+                .unwrap()
+                .remove(&self.client_id);
         }
     }
 }
@@ -3348,7 +3352,10 @@ mod tests {
             .unwrap();
         started
             .session
-            .restore_subscriptions(vec![StoredSubscription::new("a", QoS::AtLeastOnce)], &broker)
+            .restore_subscriptions(
+                vec![StoredSubscription::new("a", QoS::AtLeastOnce)],
+                &broker,
+            )
             .await
             .unwrap();
         manager
