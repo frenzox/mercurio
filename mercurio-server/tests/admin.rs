@@ -756,6 +756,10 @@ impl Plugin for HideSecret {
         "hide-secret"
     }
 
+    fn authorize_control<'a>(&'a self, _: &'a ClientInfo, _: &'a str) -> BoxFuture<'a, Decision> {
+        ready(Decision::Allow)
+    }
+
     fn authorize<'a>(
         &'a self,
         _: &'a ClientInfo,
