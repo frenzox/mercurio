@@ -160,3 +160,72 @@ async fn trusted_listeners_take_no_auth() {
     let _ = std::fs::remove_file(&path);
     assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
 }
+
+async fn tcp_listener(transport: Transport) -> ListenerConfig {
+    ListenerConfig::new(TcpListener::bind("127.0.0.1:0").await.unwrap(), transport)
+}
+
+/// A wildcard in a mount point would make the listener's topic filters
+/// match other mount points' topics, and its topic names invalid.
+#[tokio::test]
+async fn mount_points_with_wildcards_fail_startup() {
+    for mount_point in ["tenant/+/", "tenant/#", "+/"] {
+        let mut value = tcp_listener(Transport::Mqtt).await;
+        value.mount_point = Some(mount_point.into());
+        let result = start_with(value).await;
+        assert!(
+            matches!(result, Err(ServerError::Config(_))),
+            "{mount_point}: {result:?}"
+        );
+    }
+}
+
+/// Only WebSocket listeners speak HTTP, so these settings would do nothing.
+#[tokio::test]
+async fn websocket_settings_on_mqtt_listeners_fail_startup() {
+    let mut value = tcp_listener(Transport::Mqtt).await;
+    value.http_dir = Some(std::env::temp_dir());
+    let result = start_with(value).await;
+    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+
+    let mut value = tcp_listener(Transport::Mqtt).await;
+    value.allowed_origins = Some(vec!["https://app.example".into()]);
+    let result = start_with(value).await;
+    assert!(matches!(result, Err(ServerError::Config(_))), "{result:?}");
+}
+
+/// A limit too large to count is no limit, not a panic.
+#[tokio::test]
+async fn huge_connection_limits_serve() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let extra_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = extra_listener.local_addr().unwrap();
+    let mut extra = ListenerConfig::new(extra_listener, Transport::Mqtt);
+    extra.max_connections = Some(usize::MAX);
+    let mut config = ServerConfig::default();
+    config.limits.max_connections = Some(usize::MAX);
+    config.listeners = vec![extra];
+    let server = tokio::spawn(run_with_config(
+        listener,
+        config,
+        std::future::pending::<()>(),
+    ));
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&[
+            0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x02, 0x00, 0x3c, 0x00, 0x00,
+            0x01, b'h',
+        ])
+        .await
+        .unwrap();
+    let mut first = [0u8; 1];
+    let read = timeout(Duration::from_secs(2), stream.read_exact(&mut first)).await;
+    assert!(
+        matches!(read, Ok(Ok(_))) && first[0] == 0x20,
+        "no CONNACK; server stopped: {}",
+        server.is_finished()
+    );
+}

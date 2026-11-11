@@ -475,6 +475,21 @@ impl Endpoint {
                     .into(),
             ));
         }
+        if let Some(mount_point) = config.mount_point.as_deref() {
+            if mount_point.contains(['+', '#']) {
+                return Err(ServerError::Config(format!(
+                    "mount point `{mount_point}` has a wildcard: its clients' topic filters \
+                     would reach other mount points' topics"
+                )));
+            }
+        }
+        if config.transport != Transport::WebSocket
+            && (config.http_dir.is_some() || config.allowed_origins.is_some())
+        {
+            return Err(ServerError::Config(
+                "http_dir and allowed_origins only apply to WebSocket listeners".into(),
+            ));
+        }
         // A Unix socket's file permissions decide who may send the header
         if config.proxy_protocol && config.proxy_from.is_empty() && !unix {
             return Err(ServerError::Config(
@@ -539,9 +554,7 @@ impl Endpoint {
             #[cfg(unix)]
             peer_filter: config.peer_filter,
             listener: config.listener,
-            connection_slots: config
-                .max_connections
-                .map(|max| Arc::new(Semaphore::new(max))),
+            connection_slots: config.max_connections.map(connection_slots),
             settings: EndpointSettings {
                 transport: config.transport,
                 tls_acceptor,
@@ -1008,6 +1021,12 @@ async fn validate_credentials(
     chain.authenticate(client, credentials).await
 }
 
+/// One permit per connection allowed. A semaphore holds fewer than
+/// `usize::MAX` permits; a limit beyond that many is out of reach anyway.
+fn connection_slots(max: usize) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS)))
+}
+
 /// Runs one step of connecting, such as a handshake or reading CONNECT,
 /// within the connect deadline. None if the server starts shutting down
 /// first: a client that isn't connected has nothing to be told, so it is
@@ -1163,9 +1182,7 @@ impl<St: MqttStore + 'static> Server<St> {
             broker,
             session_manager_holder,
             address_slots: Arc::default(),
-            connection_slots: limits
-                .max_connections
-                .map(|max| Arc::new(Semaphore::new(max))),
+            connection_slots: limits.max_connections.map(connection_slots),
             notify_shutdown,
             shutdown_complete,
             auth_config,
