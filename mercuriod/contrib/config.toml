@@ -184,6 +184,17 @@ allow_anonymous = false
 # timeout_seconds = 5
 # cache_seconds = 30
 
+[admin]
+# Unix socket for administering the broker from this machine, as mercurioctl
+# does. Its clients skip authentication and access control, so only root,
+# the broker's own user and the members of `group` may connect; others are
+# closed at once. Every directory on a custom socket path must be writable
+# only by root or the broker's user. "" turns it off. Linux only: elsewhere this is ignored.
+socket = "/run/mercurio/admin.sock"
+# Members are read when the broker starts; add an administrator with
+# `usermod -aG mercurio <user>`. "" leaves only root and the broker's user.
+group = "mercurio"
+
 # Extra listeners, each with its own protocol ("mqtt" or "websocket") and
 # TLS settings, on a TCP `port` (`host` defaults to 127.0.0.1) or a Unix
 # socket `path`.

@@ -23,6 +23,8 @@ use tokio::{net::TcpListener, signal};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[cfg(target_os = "linux")]
+mod admin_socket;
 mod bridge;
 mod config;
 mod credentials;
@@ -324,6 +326,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    #[cfg(target_os = "linux")]
+    let admin =
+        admin_socket::open(&config.admin.clone().unwrap_or_default()).map(|(listener, socket)| {
+            listeners.push(listener);
+            socket
+        });
+    #[cfg(not(target_os = "linux"))]
+    if config
+        .admin
+        .as_ref()
+        .is_some_and(|admin| !admin.socket.is_empty())
+    {
+        tracing::warn!("Ignoring [admin]: the admin socket needs Linux");
+    }
+
     let (connector, local_listener) = LocalConnector::new();
     let plugins = chain(&builtins, None);
 
@@ -361,6 +378,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await
         }
     };
+    // Removed now, as exiting skips destructors
+    #[cfg(target_os = "linux")]
+    drop(admin);
+
     // A non-zero status tells service managers the broker failed to start
     if let Err(e) = result {
         error!("Failed to start the broker: {}", e);
