@@ -21,8 +21,8 @@ use mercurio_core::{
 use mercurio_packets::connect::ConnectPacket;
 use mercurio_packets::connect::ConnectPayload;
 use mercurio_storage::{
-    BatchStore, InflightMessage, LoadedClient, RetainedMessageStore, SessionOwner, SessionState,
-    StoredClient, StoredSubscription, StoredWillMessage, Write,
+    BatchStore, InflightMessage, LoadedClient, RetainedMessageStore, SessionKey, SessionOwner,
+    SessionState, StoredClient, StoredSubscription, StoredWillMessage, Write,
 };
 use tracing::{error, warn};
 
@@ -783,7 +783,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         client_id: &str,
     ) -> mercurio_storage::Result<Option<StoredSession>> {
         self.writers.settle(client_id).await;
-        let Some(stored_session) = self.storage.load_session(client_id).await? else {
+        let key = SessionKey::unmounted(client_id);
+        let Some(stored_session) = self.storage.load_session(&key).await? else {
             return Ok(None);
         };
         info!(
@@ -791,8 +792,8 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             client_id,
             stored_session.subscriptions.len()
         );
-        let queue = self.storage.load_queue(client_id).await?;
-        let inflight = self.storage.load_inflight(client_id).await?;
+        let queue = self.storage.load_queue(&key).await?;
+        let inflight = self.storage.load_inflight(&key).await?;
         if !inflight.is_empty() {
             info!(
                 "Restoring {} inflight messages for client `{}`",
@@ -800,7 +801,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 client_id
             );
         }
-        let incoming_qos2 = self.storage.load_incoming_qos2(client_id).await?;
+        let incoming_qos2 = self.storage.load_incoming_qos2(&key).await?;
         Ok(Some((
             stored_session.subscriptions,
             queue,
@@ -917,7 +918,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers.settle(client_id).await;
         Ok(self
             .storage
-            .load_session(client_id)
+            .load_session(&SessionKey::unmounted(client_id))
             .await?
             .map(|stored| stored.owner))
     }
@@ -1239,15 +1240,16 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     ) -> mercurio_storage::Result<Vec<(String, WillMessage, Duration)>> {
         let now = unix_millis();
         let mut wills = Vec::new();
-        let mut after: Option<String> = None;
+        let mut after: Option<SessionKey> = None;
         loop {
             let page = self
                 .storage
-                .load_clients(after.as_deref(), RESTORE_PAGE)
+                .load_clients(after.as_ref(), RESTORE_PAGE)
                 .await?;
             let last_page = page.len() < RESTORE_PAGE;
-            after = page.last().map(|loaded| loaded.client_id.clone());
-            for LoadedClient { client_id, stored } in page {
+            after = page.last().map(|loaded| loaded.key.clone());
+            for LoadedClient { key, stored } in page {
+                let client_id = key.client_id;
                 match stored {
                     Ok(stored) => {
                         wills.extend(self.restore_client(client_id, stored, now, broker).await)
@@ -1661,6 +1663,10 @@ mod tests {
     };
     use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore};
 
+    fn key(client_id: &str) -> SessionKey {
+        SessionKey::unmounted(client_id)
+    }
+
     fn create_test_storage() -> Arc<MemoryStore> {
         Arc::new(MemoryStore::new())
     }
@@ -1673,7 +1679,7 @@ mod tests {
             client_id: &str,
             session: &SessionState,
         ) -> mercurio_storage::Result<()> {
-            self.apply(client_id, &[Write::SaveSession(session.clone())])
+            self.apply(&key(client_id), &[Write::SaveSession(session.clone())])
                 .await
         }
 
@@ -1682,7 +1688,7 @@ mod tests {
             client_id: &str,
             message: &InflightMessage,
         ) -> mercurio_storage::Result<()> {
-            self.apply(client_id, &[Write::StoreInflight(message.clone())])
+            self.apply(&key(client_id), &[Write::StoreInflight(message.clone())])
                 .await
         }
 
@@ -1691,7 +1697,7 @@ mod tests {
             client_id: &str,
             will: &StoredWillMessage,
         ) -> mercurio_storage::Result<()> {
-            self.apply(client_id, &[Write::StoreWill(will.clone())])
+            self.apply(&key(client_id), &[Write::StoreWill(will.clone())])
                 .await
         }
 
@@ -1701,8 +1707,11 @@ mod tests {
             sequence: u64,
             message: &Message,
         ) -> mercurio_storage::Result<()> {
-            self.apply(client_id, &[Write::Enqueue(sequence, message.clone())])
-                .await
+            self.apply(
+                &key(client_id),
+                &[Write::Enqueue(sequence, message.clone())],
+            )
+            .await
         }
 
         async fn get_inflight(
@@ -1711,7 +1720,7 @@ mod tests {
             packet_id: u16,
         ) -> mercurio_storage::Result<Option<InflightMessage>> {
             Ok(self
-                .load_inflight(client_id)
+                .load_inflight(&key(client_id))
                 .await?
                 .into_iter()
                 .find(|m| m.packet_id == packet_id))
@@ -1777,43 +1786,43 @@ mod tests {
             self.inner.is_durable()
         }
 
-        async fn apply(&self, client_id: &str, writes: &[Write]) -> mercurio_storage::Result<()> {
-            self.inner.apply(client_id, writes).await
+        async fn apply(&self, key: &SessionKey, writes: &[Write]) -> mercurio_storage::Result<()> {
+            self.inner.apply(key, writes).await
         }
 
         async fn load_session(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Option<SessionState>> {
-            self.stall("load_session", client_id).await;
-            self.inner.load_session(client_id).await
+            self.stall("load_session", &key.client_id).await;
+            self.inner.load_session(key).await
         }
 
-        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<String>> {
+        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<SessionKey>> {
             self.inner.list_sessions().await
         }
 
         async fn load_will(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Option<StoredWillMessage>> {
-            self.inner.load_will(client_id).await
+            self.inner.load_will(key).await
         }
 
         async fn load_inflight(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Vec<InflightMessage>> {
-            self.inner.load_inflight(client_id).await
+            self.inner.load_inflight(key).await
         }
 
-        async fn load_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
-            self.inner.load_incoming_qos2(client_id).await
+        async fn load_incoming_qos2(&self, key: &SessionKey) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner.load_incoming_qos2(key).await
         }
 
         async fn load_queue(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Vec<(u64, mercurio_core::message::Message)>> {
             if self
                 .fail_queue_loads
@@ -1823,13 +1832,13 @@ mod tests {
                     "unavailable".into(),
                 ));
             }
-            if self.undecodable.lock().unwrap().contains(client_id) {
+            if self.undecodable.lock().unwrap().contains(&key.client_id) {
                 return Err(mercurio_storage::StorageError::SerializationError(
                     "0xff is not a property identifier".into(),
                 ));
             }
-            self.stall("load_queue", client_id).await;
-            self.inner.load_queue(client_id).await
+            self.stall("load_queue", &key.client_id).await;
+            self.inner.load_queue(key).await
         }
     }
 
@@ -1866,49 +1875,49 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BatchStore for FailingWrites {
-        async fn apply(&self, client_id: &str, writes: &[Write]) -> mercurio_storage::Result<()> {
+        async fn apply(&self, key: &SessionKey, writes: &[Write]) -> mercurio_storage::Result<()> {
             if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(mercurio_storage::StorageError::OperationFailed(
                     "disk full".into(),
                 ));
             }
-            self.inner().apply(client_id, writes).await
+            self.inner().apply(key, writes).await
         }
 
         async fn load_session(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Option<SessionState>> {
-            self.inner().load_session(client_id).await
+            self.inner().load_session(key).await
         }
 
-        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<String>> {
+        async fn list_sessions(&self) -> mercurio_storage::Result<Vec<SessionKey>> {
             self.inner().list_sessions().await
         }
 
         async fn load_will(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Option<StoredWillMessage>> {
-            self.inner().load_will(client_id).await
+            self.inner().load_will(key).await
         }
 
         async fn load_inflight(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Vec<InflightMessage>> {
-            self.inner().load_inflight(client_id).await
+            self.inner().load_inflight(key).await
         }
 
-        async fn load_incoming_qos2(&self, client_id: &str) -> mercurio_storage::Result<Vec<u16>> {
-            self.inner().load_incoming_qos2(client_id).await
+        async fn load_incoming_qos2(&self, key: &SessionKey) -> mercurio_storage::Result<Vec<u16>> {
+            self.inner().load_incoming_qos2(key).await
         }
 
         async fn load_queue(
             &self,
-            client_id: &str,
+            key: &SessionKey,
         ) -> mercurio_storage::Result<Vec<(u64, Message)>> {
-            self.inner().load_queue(client_id).await
+            self.inner().load_queue(key).await
         }
     }
 
@@ -1972,7 +1981,7 @@ mod tests {
             .await;
         manager.flush().await;
         assert_eq!(failures(&manager), (1, 1));
-        let stored = storage.load_session("c").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("c")).await.unwrap().unwrap();
         assert!(stored.subscriptions.is_empty());
 
         // Changes made meanwhile don't pile up waiting for storage
@@ -1988,11 +1997,11 @@ mod tests {
         storage.fail(false);
         tokio::time::sleep(Duration::from_secs(120)).await;
         assert_eq!(failures(&manager), (1, 0));
-        let stored = storage.load_session("c").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("c")).await.unwrap().unwrap();
         assert_eq!(stored.subscriptions, [subscription]);
         assert_eq!(stored.owner, owned_by("alice"));
         assert_eq!(stored.expiry_interval, Some(3600));
-        let queue = storage.load_queue("c").await.unwrap();
+        let queue = storage.load_queue(&key("c")).await.unwrap();
         assert_eq!(queue.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [4]);
     }
 
@@ -2017,10 +2026,14 @@ mod tests {
         manager.store_incoming_qos2("c", 7).await;
         manager.flush().await;
         assert_eq!(failures(&manager), (1, 0));
-        assert_eq!(storage.load_incoming_qos2("c").await.unwrap(), [7]);
+        assert_eq!(storage.load_incoming_qos2(&key("c")).await.unwrap(), [7]);
         manager.remove_incoming_qos2("c", 7).await;
         manager.flush().await;
-        assert!(storage.load_incoming_qos2("c").await.unwrap().is_empty());
+        assert!(storage
+            .load_incoming_qos2(&key("c"))
+            .await
+            .unwrap()
+            .is_empty());
 
         // A session gone from the broker is gone from storage too
         storage.fail(true);
@@ -2028,10 +2041,10 @@ mod tests {
             .end_connection(started.lease, Some(Duration::ZERO))
             .await;
         manager.flush().await;
-        assert!(storage.load_session("c").await.unwrap().is_some());
+        assert!(storage.load_session(&key("c")).await.unwrap().is_some());
         storage.fail(false);
         manager.flush().await;
-        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert!(storage.load_session(&key("c")).await.unwrap().is_none());
         assert_eq!(failures(&manager), (2, 0));
     }
 
@@ -2066,7 +2079,7 @@ mod tests {
         storage.fail(false);
         manager.flush().await;
         assert_eq!(failures(&manager), (1, 0));
-        let stored = storage.load_session("c").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("c")).await.unwrap().unwrap();
         assert_eq!(stored.expiry_interval, Some(3600));
         assert_eq!(stored.expires_at, None);
     }
@@ -2130,8 +2143,8 @@ mod tests {
         let state = manager.shared.state.lock().await;
         assert!(state.sessions.is_empty());
         assert!(state.connections.is_empty());
-        assert!(storage.load_session("c").await.unwrap().is_none());
-        assert!(storage.load_inflight("c").await.unwrap().is_empty());
+        assert!(storage.load_session(&key("c")).await.unwrap().is_none());
+        assert!(storage.load_inflight(&key("c")).await.unwrap().is_empty());
     }
 
     struct ExpiryRecorder(std::sync::Mutex<Vec<String>>);
@@ -2261,7 +2274,7 @@ mod tests {
         assert!(resumed.resume);
         manager.flush().await;
 
-        let stored = storage.load_session("c").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("c")).await.unwrap().unwrap();
         assert_eq!(
             stored.subscriptions,
             vec![StoredSubscription::new("a", QoS::AtMostOnce)]
@@ -2393,8 +2406,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         manager.flush().await;
 
-        assert!(storage.load_session("expired").await.unwrap().is_none());
-        assert!(storage.load_session("forever").await.unwrap().is_some());
+        assert!(storage
+            .load_session(&key("expired"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .load_session(&key("forever"))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     fn stored_will(delay_secs: u32) -> StoredWillMessage {
@@ -2541,7 +2562,7 @@ mod tests {
             .unwrap();
         manager.flush().await;
 
-        assert!(storage.load_will("c").await.unwrap().is_none());
+        assert!(storage.load_will(&key("c")).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2614,13 +2635,33 @@ mod tests {
             .await;
         assert!(matches!(refused, Err(StartError::SetAside)));
         manager.flush().await;
-        assert!(storage.inner.load_session("bad").await.unwrap().is_some());
-        assert!(storage.inner.load_will("bad").await.unwrap().is_some());
+        assert!(storage
+            .inner
+            .load_session(&key("bad"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .inner
+            .load_will(&key("bad"))
+            .await
+            .unwrap()
+            .is_some());
 
         manager.delete_session("bad", false).await.unwrap();
         manager.flush().await;
-        assert!(storage.inner.load_session("bad").await.unwrap().is_none());
-        assert!(storage.inner.load_will("bad").await.unwrap().is_none());
+        assert!(storage
+            .inner
+            .load_session(&key("bad"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .inner
+            .load_will(&key("bad"))
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(manager.set_aside_count().await, 0);
         storage.undecodable.lock().unwrap().clear();
         manager
@@ -2665,8 +2706,8 @@ mod tests {
         assert!(second.take_restored_will("a").await);
         second.restored_will_published("a").await;
         second.flush().await;
-        assert!(storage.load_session("a").await.unwrap().is_none());
-        assert!(storage.load_will("a").await.unwrap().is_none());
+        assert!(storage.load_session(&key("a")).await.unwrap().is_none());
+        assert!(storage.load_will(&key("a")).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2756,7 +2797,7 @@ mod tests {
         storage.store_inflight("client1", &inflight2).await.unwrap();
 
         // Now create a new session manager and verify inflight messages are loaded
-        let all_inflight = storage.load_inflight("client1").await.unwrap();
+        let all_inflight = storage.load_inflight(&key("client1")).await.unwrap();
         assert_eq!(all_inflight.len(), 2);
 
         // Verify content
@@ -2806,12 +2847,12 @@ mod tests {
         assert!(stored.is_some());
 
         // Delete session (simulating clean_start)
-        storage.delete_session("client1").await.unwrap();
+        storage.delete_session(&key("client1")).await.unwrap();
 
         // For MemoryStore, deleting session clears all related data
         // For SqliteStore, we might need explicit cleanup
         // This test verifies the behavior after session deletion
-        let all_inflight = storage.load_inflight("client1").await.unwrap();
+        let all_inflight = storage.load_inflight(&key("client1")).await.unwrap();
         // Note: MemoryStore implementation may or may not clear inflight on session delete
         // This depends on implementation - the important thing is clean_start clears it
         // In our current implementation, session delete doesn't auto-clear inflight,
@@ -2843,7 +2884,7 @@ mod tests {
             )
             .await;
         manager.flush().await;
-        assert!(storage.load_inflight("c").await.unwrap().is_empty());
+        assert!(storage.load_inflight(&key("c")).await.unwrap().is_empty());
     }
 
     fn owned_by(username: &str) -> SessionOwner {
@@ -2998,7 +3039,7 @@ mod tests {
         // session as it was
         assert!(!manager.entry("gw-01").await.unwrap().connected);
         manager.flush().await;
-        let stored = storage.load_session("gw-01").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("gw-01")).await.unwrap().unwrap();
         assert_eq!(stored.owner, owned_by("alice"));
         assert_eq!(stored.subscriptions.len(), 1);
 
@@ -3495,7 +3536,7 @@ mod tests {
                 .await,
         );
         manager.flush().await;
-        let stored = storage.load_session("gw-01").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("gw-01")).await.unwrap().unwrap();
         assert_eq!(stored.owner, owned_by("alice"));
         assert_eq!(stored.subscriptions.len(), 1);
 
@@ -3535,7 +3576,7 @@ mod tests {
             .unwrap();
         manager.flush().await;
 
-        let stored = storage.load_session("c").await.unwrap().unwrap();
+        let stored = storage.load_session(&key("c")).await.unwrap().unwrap();
         assert!(stored.subscriptions.is_empty());
     }
 
@@ -3569,7 +3610,11 @@ mod tests {
         manager.flush().await;
 
         // Verify all are stored
-        let all = manager.storage.load_inflight("client1").await.unwrap();
+        let all = manager
+            .storage
+            .load_inflight(&key("client1"))
+            .await
+            .unwrap();
         assert_eq!(all.len(), 5);
 
         // Remove some
@@ -3578,7 +3623,11 @@ mod tests {
         manager.flush().await;
 
         // Verify remaining
-        let all = manager.storage.load_inflight("client1").await.unwrap();
+        let all = manager
+            .storage
+            .load_inflight(&key("client1"))
+            .await
+            .unwrap();
         assert_eq!(all.len(), 3);
 
         // Verify correct ones remain

@@ -24,7 +24,7 @@ use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 use crate::{
     encoding::{decode_subscriptions, encode_properties, int_to_qos, qos_to_int},
-    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore,
+    BanStore, BatchStore, InflightMessage, LoadedClient, Result, RetainedMessageStore, SessionKey,
     SessionOwner, SessionState, StorageError, StoredBan, StoredClient, StoredSubscription,
     StoredWillMessage, TopicRange, Write,
 };
@@ -134,7 +134,7 @@ fn create_private(path: &Path) -> Result<()> {
 /// database records how many it has in `user_version`. Released entries
 /// never change: a new schema change is a new entry.
 const MIGRATIONS: &[fn(&Connection) -> rusqlite::Result<()>] =
-    &[create_schema, index_retained_expiry];
+    &[create_schema, index_retained_expiry, key_by_mount_point];
 
 /// Lets the removal of expired retained messages find them without
 /// reading the table.
@@ -142,6 +142,98 @@ fn index_retained_expiry(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS retained_messages_expires_at
          ON retained_messages (expires_at) WHERE expires_at IS NOT NULL",
+    )
+}
+
+/// The tables of a client's state other than `sessions`, with their
+/// columns besides the key, as `key_by_mount_point` rebuilds them.
+const CLIENT_TABLES: [(&str, &str, &str); 5] = [
+    (
+        "subscriptions",
+        "topic_filter TEXT NOT NULL, qos INTEGER NOT NULL, no_local INTEGER NOT NULL,
+         retain_as_published INTEGER NOT NULL, subscription_identifier INTEGER,
+         PRIMARY KEY (mount_point, client_id, topic_filter)",
+        "topic_filter, qos, no_local, retain_as_published, subscription_identifier",
+    ),
+    (
+        "will_messages",
+        "topic TEXT NOT NULL, payload BLOB NOT NULL, qos INTEGER NOT NULL,
+         retain INTEGER NOT NULL, delay_secs INTEGER NOT NULL, properties BLOB NOT NULL,
+         PRIMARY KEY (mount_point, client_id)",
+        "topic, payload, qos, retain, delay_secs, properties",
+    ),
+    (
+        "inflight_messages",
+        "packet_id INTEGER NOT NULL, topic TEXT NOT NULL, payload BLOB, qos INTEGER NOT NULL,
+         dup INTEGER NOT NULL, sequence INTEGER NOT NULL, released INTEGER NOT NULL,
+         properties BLOB NOT NULL, subscription_identifiers TEXT,
+         retain INTEGER NOT NULL DEFAULT 0, expires_at INTEGER,
+         PRIMARY KEY (mount_point, client_id, packet_id)",
+        "packet_id, topic, payload, qos, dup, sequence, released, properties,
+         subscription_identifiers, retain, expires_at",
+    ),
+    (
+        "queued_messages",
+        "sequence INTEGER NOT NULL, topic TEXT NOT NULL, payload BLOB, qos INTEGER NOT NULL,
+         retain INTEGER NOT NULL, properties BLOB NOT NULL, expires_at INTEGER,
+         subscription_identifiers TEXT,
+         PRIMARY KEY (mount_point, client_id, sequence)",
+        "sequence, topic, payload, qos, retain, properties, expires_at,
+         subscription_identifiers",
+    ),
+    (
+        "incoming_qos2",
+        "packet_id INTEGER NOT NULL, PRIMARY KEY (mount_point, client_id, packet_id)",
+        "packet_id",
+    ),
+];
+
+/// Makes the mount point part of the key of every table of a client's
+/// state, so the same client id on two mount points keeps two sessions.
+/// Rows take the mount point of their session's owner, and those without a
+/// session none, stored as an empty string. SQLite can't change a primary
+/// key, so each table is rebuilt; the index on in-flight messages' client
+/// ids goes with its table, as the new primary key serves its lookups.
+fn key_by_mount_point(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, columns, names) in CLIENT_TABLES {
+        conn.execute_batch(&format!(
+            "CREATE TABLE {table}_keyed (
+                 mount_point TEXT NOT NULL DEFAULT '',
+                 client_id TEXT NOT NULL,
+                 {columns}
+             );
+             INSERT INTO {table}_keyed (mount_point, client_id, {names})
+             SELECT COALESCE(
+                        (SELECT s.owner_mount_point FROM sessions s
+                         WHERE s.client_id = t.client_id),
+                        ''
+                    ),
+                    t.client_id, {names}
+             FROM {table} t WHERE t.client_id IS NOT NULL;
+             DROP TABLE {table};
+             ALTER TABLE {table}_keyed RENAME TO {table};"
+        ))?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE sessions_keyed (
+             mount_point TEXT NOT NULL DEFAULT '',
+             client_id TEXT NOT NULL,
+             subscriptions TEXT NOT NULL,
+             clean_start INTEGER NOT NULL,
+             expiry_interval INTEGER,
+             expires_at INTEGER,
+             owner_username TEXT,
+             owner_mount_point TEXT,
+             PRIMARY KEY (mount_point, client_id)
+         );
+         INSERT INTO sessions_keyed
+             (mount_point, client_id, subscriptions, clean_start, expiry_interval, expires_at,
+              owner_username, owner_mount_point)
+         SELECT COALESCE(owner_mount_point, ''), client_id, subscriptions, clean_start,
+                expiry_interval, expires_at, owner_username, owner_mount_point
+         FROM sessions WHERE client_id IS NOT NULL;
+         DROP TABLE sessions;
+         ALTER TABLE sessions_keyed RENAME TO sessions;",
     )
 }
 
@@ -331,8 +423,22 @@ fn move_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
         let Ok(subscriptions) = decode_subscriptions(&subscriptions) else {
             continue;
         };
+        // The table as it was before the mount point was part of its key
         for subscription in subscriptions {
-            insert_subscription(conn, &client_id, &subscription, "INSERT OR IGNORE")?;
+            conn.execute(
+                "INSERT OR IGNORE INTO subscriptions
+                 (client_id, topic_filter, qos, no_local, retain_as_published,
+                  subscription_identifier)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    client_id,
+                    subscription.topic_filter,
+                    qos_to_int(subscription.qos),
+                    subscription.no_local,
+                    subscription.retain_as_published,
+                    subscription.subscription_identifier
+                ],
+            )?;
         }
         conn.execute(
             "UPDATE sessions SET subscriptions = '' WHERE client_id = ?1",
@@ -342,22 +448,20 @@ fn move_subscriptions(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Inserts one subscription row with `verb`, such as `INSERT OR REPLACE`.
+/// Inserts or replaces one subscription row.
 fn insert_subscription(
     conn: &Connection,
-    client_id: &str,
+    key: &SessionKey,
     subscription: &StoredSubscription,
-    verb: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        &format!(
-            "{verb} INTO subscriptions
-             (client_id, topic_filter, qos, no_local, retain_as_published,
-              subscription_identifier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-        ),
+        "INSERT OR REPLACE INTO subscriptions
+         (mount_point, client_id, topic_filter, qos, no_local, retain_as_published,
+          subscription_identifier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            client_id,
+            key.stored_mount_point(),
+            key.client_id,
             subscription.topic_filter,
             qos_to_int(subscription.qos),
             subscription.no_local,
@@ -437,10 +541,10 @@ const SESSION_COLUMNS: &str =
     "expiry_interval, expires_at, owner_username, owner_mount_point, subscriptions";
 
 /// A session, without its subscriptions, which have a table of their own.
-fn session_from_row(row: &rusqlite::Row, client_id: &str) -> rusqlite::Result<SessionState> {
+fn session_from_row(row: &rusqlite::Row, key: &SessionKey) -> rusqlite::Result<SessionState> {
     unmoved_subscriptions(row.get(4)?)?;
     Ok(SessionState {
-        client_id: client_id.to_string(),
+        client_id: key.client_id.clone(),
         subscriptions: Vec::new(),
         expiry_interval: row.get(0)?,
         expires_at: row.get::<_, Option<i64>>(1)?.map(|t| t as u64),
@@ -613,16 +717,21 @@ fn retained_page(
     }
 }
 
+/// The rows of one client.
+const KEY: &str = "mount_point = ?1 AND client_id = ?2";
+
 /// Applies one change; the caller holds the transaction.
-fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::Result<()> {
+fn apply_write(conn: &Connection, key: &SessionKey, write: &Write) -> rusqlite::Result<()> {
+    let (mount_point, client_id) = (key.stored_mount_point(), key.client_id.as_str());
     match write {
         Write::SaveSession(session) => {
             conn.execute(
                 "INSERT OR REPLACE INTO sessions
-                 (client_id, subscriptions, clean_start, expiry_interval, expires_at,
-                  owner_username, owner_mount_point)
-                 VALUES (?1, '', ?2, ?3, ?4, ?5, ?6)",
+                 (mount_point, client_id, subscriptions, clean_start, expiry_interval,
+                  expires_at, owner_username, owner_mount_point)
+                 VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7)",
                 params![
+                    mount_point,
                     client_id,
                     // No longer used; kept for databases that require it
                     false,
@@ -633,25 +742,25 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 ],
             )?;
             conn.execute(
-                "DELETE FROM subscriptions WHERE client_id = ?1",
-                params![client_id],
+                &format!("DELETE FROM subscriptions WHERE {KEY}"),
+                params![mount_point, client_id],
             )?;
             for subscription in &session.subscriptions {
-                insert_subscription(conn, client_id, subscription, "INSERT OR REPLACE")?;
+                insert_subscription(conn, key, subscription)?;
             }
         }
         Write::AddSubscription(subscription) => {
             let stored = conn
-                .prepare_cached("SELECT 1 FROM sessions WHERE client_id = ?1")?
-                .exists(params![client_id])?;
+                .prepare_cached(&format!("SELECT 1 FROM sessions WHERE {KEY}"))?
+                .exists(params![mount_point, client_id])?;
             if stored {
-                insert_subscription(conn, client_id, subscription, "INSERT OR REPLACE")?;
+                insert_subscription(conn, key, subscription)?;
             }
         }
         Write::RemoveSubscription(topic_filter) => {
             conn.execute(
-                "DELETE FROM subscriptions WHERE client_id = ?1 AND topic_filter = ?2",
-                params![client_id, topic_filter],
+                &format!("DELETE FROM subscriptions WHERE {KEY} AND topic_filter = ?3"),
+                params![mount_point, client_id, topic_filter],
             )?;
         }
         Write::SetExpiry {
@@ -659,16 +768,17 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
             expires_at,
         } => {
             conn.execute(
-                "UPDATE sessions SET expiry_interval = ?2, expires_at = ?3 WHERE client_id = ?1",
-                params![client_id, interval, *expires_at as i64],
+                &format!("UPDATE sessions SET expiry_interval = ?3, expires_at = ?4 WHERE {KEY}"),
+                params![mount_point, client_id, interval, *expires_at as i64],
             )?;
         }
         Write::StoreWill(will) => {
             conn.execute(
                 "INSERT OR REPLACE INTO will_messages
-                 (client_id, topic, payload, qos, retain, delay_secs, properties)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (mount_point, client_id, topic, payload, qos, retain, delay_secs, properties)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
+                    mount_point,
                     client_id,
                     will.topic,
                     &will.payload[..],
@@ -681,17 +791,18 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
         }
         Write::DeleteWill => {
             conn.execute(
-                "DELETE FROM will_messages WHERE client_id = ?1",
-                params![client_id],
+                &format!("DELETE FROM will_messages WHERE {KEY}"),
+                params![mount_point, client_id],
             )?;
         }
         Write::StoreInflight(message) => {
             conn.execute(
                 "INSERT OR REPLACE INTO inflight_messages
-                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties,
-                  subscription_identifiers, retain, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (mount_point, client_id, packet_id, topic, payload, qos, dup, sequence, released,
+                  properties, subscription_identifiers, retain, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
+                    mount_point,
                     client_id,
                     message.packet_id,
                     message.topic,
@@ -710,36 +821,40 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
         }
         Write::ReleaseInflight(packet_id) => {
             conn.execute(
-                "UPDATE inflight_messages SET released = 1, payload = NULL
-                 WHERE client_id = ?1 AND packet_id = ?2",
-                params![client_id, packet_id],
+                &format!(
+                    "UPDATE inflight_messages SET released = 1, payload = NULL
+                     WHERE {KEY} AND packet_id = ?3"
+                ),
+                params![mount_point, client_id, packet_id],
             )?;
         }
         Write::RemoveInflight(packet_id) => {
             conn.execute(
-                "DELETE FROM inflight_messages WHERE client_id = ?1 AND packet_id = ?2",
-                params![client_id, packet_id],
+                &format!("DELETE FROM inflight_messages WHERE {KEY} AND packet_id = ?3"),
+                params![mount_point, client_id, packet_id],
             )?;
         }
         Write::StoreIncomingQos2(packet_id) => {
             conn.execute(
-                "INSERT OR IGNORE INTO incoming_qos2 (client_id, packet_id) VALUES (?1, ?2)",
-                params![client_id, packet_id],
+                "INSERT OR IGNORE INTO incoming_qos2 (mount_point, client_id, packet_id)
+                 VALUES (?1, ?2, ?3)",
+                params![mount_point, client_id, packet_id],
             )?;
         }
         Write::RemoveIncomingQos2(packet_id) => {
             conn.execute(
-                "DELETE FROM incoming_qos2 WHERE client_id = ?1 AND packet_id = ?2",
-                params![client_id, packet_id],
+                &format!("DELETE FROM incoming_qos2 WHERE {KEY} AND packet_id = ?3"),
+                params![mount_point, client_id, packet_id],
             )?;
         }
         Write::Enqueue(sequence, message) => {
             conn.execute(
                 "INSERT OR REPLACE INTO queued_messages
-                 (client_id, sequence, topic, payload, qos, retain, properties, expires_at,
-                  subscription_identifiers)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (mount_point, client_id, sequence, topic, payload, qos, retain, properties,
+                  expires_at, subscription_identifiers)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
+                    mount_point,
                     client_id,
                     *sequence as i64,
                     &*message.topic,
@@ -754,14 +869,14 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
         }
         Write::Dequeue(sequence) => {
             conn.execute(
-                "DELETE FROM queued_messages WHERE client_id = ?1 AND sequence = ?2",
-                params![client_id, *sequence as i64],
+                &format!("DELETE FROM queued_messages WHERE {KEY} AND sequence = ?3"),
+                params![mount_point, client_id, *sequence as i64],
             )?;
         }
         Write::ClearQueue => {
             conn.execute(
-                "DELETE FROM queued_messages WHERE client_id = ?1",
-                params![client_id],
+                &format!("DELETE FROM queued_messages WHERE {KEY}"),
+                params![mount_point, client_id],
             )?;
         }
         Write::DeleteSession => {
@@ -774,8 +889,8 @@ fn apply_write(conn: &Connection, client_id: &str, write: &Write) -> rusqlite::R
                 "incoming_qos2",
             ] {
                 conn.execute(
-                    &format!("DELETE FROM {table} WHERE client_id = ?1"),
-                    params![client_id],
+                    &format!("DELETE FROM {table} WHERE {KEY}"),
+                    params![mount_point, client_id],
                 )?;
             }
         }
@@ -795,28 +910,29 @@ impl BatchStore for SqliteStore {
         Some(self)
     }
 
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
-        let client_id = client_id.to_string();
+    async fn apply(&self, key: &SessionKey, writes: &[Write]) -> Result<()> {
+        let key = key.clone();
         let writes = writes.to_vec();
         self.blocking(move |conn| {
             // Rolls back on drop, also when COMMIT itself fails
             let tx = conn.unchecked_transaction()?;
             for write in &writes {
-                apply_write(&tx, &client_id, write)?;
+                apply_write(&tx, &key, write)?;
             }
             tx.commit()
         })
         .await
     }
 
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
-        let client_id = client_id.to_string();
+    async fn load_session(&self, key: &SessionKey) -> Result<Option<SessionState>> {
+        let key = key.clone();
         self.blocking(move |conn| {
+            let params = params![key.stored_mount_point(), key.client_id];
             let Some(mut session) = conn
                 .query_row(
-                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE client_id = ?1"),
-                    params![client_id],
-                    |row| session_from_row(row, &client_id),
+                    &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE {KEY}"),
+                    params,
+                    |row| session_from_row(row, &key),
                 )
                 .optional()?
             else {
@@ -824,30 +940,32 @@ impl BatchStore for SqliteStore {
             };
             session.subscriptions = conn
                 .prepare_cached(&format!(
-                    "SELECT {SUBSCRIPTION_COLUMNS} FROM subscriptions WHERE client_id = ?1"
+                    "SELECT {SUBSCRIPTION_COLUMNS} FROM subscriptions WHERE {KEY}"
                 ))?
-                .query_map(params![client_id], subscription_from_row)?
+                .query_map(params, subscription_from_row)?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(Some(session))
         })
         .await
     }
 
-    async fn list_sessions(&self) -> Result<Vec<String>> {
+    async fn list_sessions(&self) -> Result<Vec<SessionKey>> {
         self.blocking(move |conn| {
-            let mut stmt = conn.prepare("SELECT client_id FROM sessions")?;
-            let rows = stmt.query_map([], |row| row.get(0))?;
+            let mut stmt = conn.prepare("SELECT mount_point, client_id FROM sessions")?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SessionKey::new(row.get(0)?, row.get::<_, String>(1)?))
+            })?;
             rows.collect()
         })
         .await
     }
 
-    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        let client_id = client_id.to_string();
+    async fn load_will(&self, key: &SessionKey) -> Result<Option<StoredWillMessage>> {
+        let key = key.clone();
         self.blocking(move |conn| {
             conn.query_row(
-                &format!("SELECT {WILL_COLUMNS} FROM will_messages WHERE client_id = ?1"),
-                params![client_id],
+                &format!("SELECT {WILL_COLUMNS} FROM will_messages WHERE {KEY}"),
+                params![key.stored_mount_point(), key.client_id],
                 will_from_row,
             )
             .optional()
@@ -855,45 +973,56 @@ impl BatchStore for SqliteStore {
         .await
     }
 
-    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
-        let client_id = client_id.to_string();
+    async fn load_inflight(&self, key: &SessionKey) -> Result<Vec<InflightMessage>> {
+        let key = key.clone();
         self.blocking(move |conn| {
             conn.prepare_cached(&format!(
-                "SELECT {INFLIGHT_COLUMNS} FROM inflight_messages WHERE client_id = ?1"
+                "SELECT {INFLIGHT_COLUMNS} FROM inflight_messages WHERE {KEY}"
             ))?
-            .query_map(params![client_id], inflight_from_row)?
+            .query_map(
+                params![key.stored_mount_point(), key.client_id],
+                inflight_from_row,
+            )?
             .collect()
         })
         .await
     }
 
-    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
-        let client_id = client_id.to_string();
+    async fn load_incoming_qos2(&self, key: &SessionKey) -> Result<Vec<u16>> {
+        let key = key.clone();
         self.blocking(move |conn| {
-            conn.prepare_cached("SELECT packet_id FROM incoming_qos2 WHERE client_id = ?1")?
-                .query_map(params![client_id], |row| row.get(0))?
+            conn.prepare_cached(&format!("SELECT packet_id FROM incoming_qos2 WHERE {KEY}"))?
+                .query_map(params![key.stored_mount_point(), key.client_id], |row| {
+                    row.get(0)
+                })?
                 .collect()
         })
         .await
     }
 
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>> {
-        let client_id = client_id.to_string();
+    async fn load_queue(&self, key: &SessionKey) -> Result<Vec<(u64, Message)>> {
+        let key = key.clone();
         self.blocking(move |conn| {
             conn.prepare_cached(&format!(
-                "SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE client_id = ?1
-                 ORDER BY sequence"
+                "SELECT {QUEUED_COLUMNS} FROM queued_messages WHERE {KEY} ORDER BY sequence"
             ))?
-            .query_map(params![client_id], queued_from_row)?
+            .query_map(
+                params![key.stored_mount_point(), key.client_id],
+                queued_from_row,
+            )?
             .collect()
         })
         .await
     }
 
     /// One query per table for the whole page: its sessions, then the rows
-    /// of every other table in the range of client ids the page covers.
-    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
-        let after = after.map(str::to_string);
+    /// of every other table in the range of keys the page covers.
+    async fn load_clients(
+        &self,
+        after: Option<&SessionKey>,
+        limit: usize,
+    ) -> Result<Vec<LoadedClient>> {
+        let after = after.cloned();
         let clients = self
             .blocking(move |conn| Ok(load_clients(conn, after, limit)))
             .await?;
@@ -902,35 +1031,48 @@ impl BatchStore for SqliteStore {
 }
 
 /// What `load_clients` gathers for each client of the page.
-type Gathered = BTreeMap<String, Result<StoredClient>>;
+type Gathered = BTreeMap<SessionKey, Result<StoredClient>>;
 
-/// Reads, for each row of `sql` over the page's range of client ids, its
-/// client id, the last column, and passes `read` the row for that client's
-/// entry. A row that can't be decoded fails its client's entry only.
+/// The key of a row whose last two columns are its mount point and client
+/// id.
+fn key_from_row(row: &rusqlite::Row) -> rusqlite::Result<SessionKey> {
+    let columns = row.as_ref().column_count();
+    Ok(SessionKey::new(
+        row.get(columns - 2)?,
+        row.get::<_, String>(columns - 1)?,
+    ))
+}
+
+/// Reads, for each row of `sql` over the page's range of keys, its key, the
+/// last two columns, and passes `read` the row for that client's entry. A
+/// row that can't be decoded fails its client's entry only.
 fn gather<T>(
     conn: &Connection,
     sql: &str,
-    (after, last): (&Option<String>, &str),
+    (after, last): (&Option<SessionKey>, &SessionKey),
     clients: &mut Gathered,
     read: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
     mut put: impl FnMut(&mut StoredClient, T),
 ) -> Result<()> {
     let mut stmt = conn.prepare_cached(sql).map_err(StorageError::database)?;
     let mut rows = stmt
-        .query(params![after, last])
+        .query(params![
+            after.as_ref().map(SessionKey::stored_mount_point),
+            after.as_ref().map(|key| &key.client_id),
+            last.stored_mount_point(),
+            last.client_id
+        ])
         .map_err(StorageError::database)?;
     while let Some(row) = rows.next().map_err(StorageError::database)? {
-        let client_id: String = row
-            .get(row.as_ref().column_count() - 1)
-            .map_err(StorageError::database)?;
+        let key = key_from_row(row).map_err(StorageError::database)?;
         // Rows of a client without a session are left out
-        let Some(Ok(client)) = clients.get_mut(&client_id) else {
+        let Some(Ok(client)) = clients.get_mut(&key) else {
             continue;
         };
         match read(row).map_err(StorageError::database) {
             Ok(value) => put(client, value),
             Err(e @ StorageError::SerializationError(_)) => {
-                clients.insert(client_id, Err(e));
+                clients.insert(key, Err(e));
             }
             Err(e) => return Err(e),
         }
@@ -938,25 +1080,33 @@ fn gather<T>(
     Ok(())
 }
 
+/// Rows after the key `?1`, `?2`, if given; SQLite compares row values in
+/// the order of the primary key, so the lookup reads it in that order.
+const AFTER: &str = "(?1 IS NULL OR (mount_point, client_id) > (?1, ?2))";
+
 fn load_clients(
     conn: &Connection,
-    after: Option<String>,
+    after: Option<SessionKey>,
     limit: usize,
 ) -> Result<Vec<LoadedClient>> {
     let mut clients = Gathered::new();
     {
         let mut stmt = conn
             .prepare_cached(&format!(
-                "SELECT {SESSION_COLUMNS}, client_id FROM sessions
-                 WHERE ?1 IS NULL OR client_id > ?1 ORDER BY client_id LIMIT ?2"
+                "SELECT {SESSION_COLUMNS}, mount_point, client_id FROM sessions
+                 WHERE {AFTER} ORDER BY mount_point, client_id LIMIT ?3"
             ))
             .map_err(StorageError::database)?;
         let mut rows = stmt
-            .query(params![after, limit as i64])
+            .query(params![
+                after.as_ref().map(SessionKey::stored_mount_point),
+                after.as_ref().map(|key| &key.client_id),
+                limit as i64
+            ])
             .map_err(StorageError::database)?;
         while let Some(row) = rows.next().map_err(StorageError::database)? {
-            let client_id: String = row.get(5).map_err(StorageError::database)?;
-            let stored = match session_from_row(row, &client_id).map_err(StorageError::database) {
+            let key = key_from_row(row).map_err(StorageError::database)?;
+            let stored = match session_from_row(row, &key).map_err(StorageError::database) {
                 Ok(session) => Ok(StoredClient {
                     session,
                     will: None,
@@ -967,17 +1117,21 @@ fn load_clients(
                 Err(e @ StorageError::SerializationError(_)) => Err(e),
                 Err(e) => return Err(e),
             };
-            clients.insert(client_id, stored);
+            clients.insert(key, stored);
         }
     }
     let Some(last) = clients.keys().next_back().cloned() else {
         return Ok(Vec::new());
     };
-    let range = (&after, last.as_str());
-    let within = "WHERE (?1 IS NULL OR client_id > ?1) AND client_id <= ?2 ORDER BY client_id";
+    let range = (&after, &last);
+    let within = format!(
+        "WHERE {AFTER} AND (mount_point, client_id) <= (?3, ?4)
+         ORDER BY mount_point, client_id"
+    );
+    let key = "mount_point, client_id";
     gather(
         conn,
-        &format!("SELECT {SUBSCRIPTION_COLUMNS}, client_id FROM subscriptions {within}"),
+        &format!("SELECT {SUBSCRIPTION_COLUMNS}, {key} FROM subscriptions {within}"),
         range,
         &mut clients,
         subscription_from_row,
@@ -985,7 +1139,7 @@ fn load_clients(
     )?;
     gather(
         conn,
-        &format!("SELECT {WILL_COLUMNS}, client_id FROM will_messages {within}"),
+        &format!("SELECT {WILL_COLUMNS}, {key} FROM will_messages {within}"),
         range,
         &mut clients,
         will_from_row,
@@ -993,7 +1147,7 @@ fn load_clients(
     )?;
     gather(
         conn,
-        &format!("SELECT {QUEUED_COLUMNS}, client_id FROM queued_messages {within}, sequence"),
+        &format!("SELECT {QUEUED_COLUMNS}, {key} FROM queued_messages {within}, sequence"),
         range,
         &mut clients,
         queued_from_row,
@@ -1001,7 +1155,7 @@ fn load_clients(
     )?;
     gather(
         conn,
-        &format!("SELECT {INFLIGHT_COLUMNS}, client_id FROM inflight_messages {within}"),
+        &format!("SELECT {INFLIGHT_COLUMNS}, {key} FROM inflight_messages {within}"),
         range,
         &mut clients,
         inflight_from_row,
@@ -1009,7 +1163,7 @@ fn load_clients(
     )?;
     gather(
         conn,
-        &format!("SELECT packet_id, client_id FROM incoming_qos2 {within}"),
+        &format!("SELECT packet_id, {key} FROM incoming_qos2 {within}"),
         range,
         &mut clients,
         |row| row.get::<_, u16>(0),
@@ -1017,7 +1171,7 @@ fn load_clients(
     )?;
     Ok(clients
         .into_iter()
-        .map(|(client_id, stored)| LoadedClient { client_id, stored })
+        .map(|(key, stored)| LoadedClient { key, stored })
         .collect())
 }
 
@@ -1168,7 +1322,7 @@ mod tests {
     use mercurio_core::qos::QoS;
 
     use super::*;
-    use crate::testing::message;
+    use crate::testing::{key, message};
 
     /// A database file of this test only, removed when dropped.
     struct TempPath(std::path::PathBuf);
@@ -1265,7 +1419,7 @@ mod tests {
             .unwrap();
 
         let store = SqliteStore::new(&path).unwrap();
-        let loaded = store.load_session("old").await.unwrap().unwrap();
+        let loaded = store.load_session(&key("old")).await.unwrap().unwrap();
         // Sessions from before owners were kept count as anonymous ones
         assert_eq!(loaded.owner, SessionOwner::default());
     }
@@ -1288,7 +1442,7 @@ mod tests {
             .unwrap();
 
         let store = SqliteStore::new(&path).unwrap();
-        let loaded = store.load_inflight("c").await.unwrap();
+        let loaded = store.load_inflight(&key("c")).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!((loaded[0].packet_id, loaded[0].sequence), (4, 9));
         assert!(!loaded[0].retain);
@@ -1367,13 +1521,13 @@ mod tests {
         drop(conn);
 
         let store = SqliteStore::new(&path).unwrap();
-        let mut loaded = store.load_session("old").await.unwrap().unwrap();
+        let mut loaded = store.load_session(&key("old")).await.unwrap().unwrap();
         loaded
             .subscriptions
             .sort_by(|a, b| b.topic_filter.cmp(&a.topic_filter));
         assert_eq!(loaded.subscriptions, subscriptions);
         assert_eq!(loaded.owner.username.as_deref(), Some("alice"));
-        let none = store.load_session("none").await.unwrap().unwrap();
+        let none = store.load_session(&key("none")).await.unwrap().unwrap();
         assert!(none.subscriptions.is_empty());
         drop(store);
 
@@ -1390,7 +1544,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blobs, 0);
-        let loaded = store.load_session("old").await.unwrap().unwrap();
+        let loaded = store.load_session(&key("old")).await.unwrap().unwrap();
         assert_eq!(loaded.subscriptions.len(), 2);
     }
 
@@ -1508,7 +1662,7 @@ mod tests {
             let store = store.clone();
             async move {
                 store
-                    .apply(client_id, &[Write::SaveSession(session(client_id))])
+                    .apply(&key(client_id), &[Write::SaveSession(session(client_id))])
                     .await
             }
         };
@@ -1549,7 +1703,7 @@ mod tests {
         for client_id in ["bad", "good"] {
             store
                 .apply(
-                    client_id,
+                    &key(client_id),
                     &[
                         Write::SaveSession(crate::testing::session(client_id)),
                         Write::StoreInflight(crate::testing::inflight_message(1)),
@@ -1577,27 +1731,27 @@ mod tests {
             )
             .unwrap();
 
-        assert!(is_undecodable(store.load_session("bad").await));
-        assert!(is_undecodable(store.load_inflight("bad").await));
-        assert!(is_undecodable(store.load_queue("bad").await));
-        assert!(is_undecodable(store.load_will("bad").await));
-        assert!(store.load_session("good").await.unwrap().is_some());
-        assert_eq!(store.load_inflight("good").await.unwrap().len(), 1);
-        assert_eq!(store.load_queue("good").await.unwrap().len(), 1);
-        assert!(store.load_will("good").await.unwrap().is_some());
+        assert!(is_undecodable(store.load_session(&key("bad")).await));
+        assert!(is_undecodable(store.load_inflight(&key("bad")).await));
+        assert!(is_undecodable(store.load_queue(&key("bad")).await));
+        assert!(is_undecodable(store.load_will(&key("bad")).await));
+        assert!(store.load_session(&key("good")).await.unwrap().is_some());
+        assert_eq!(store.load_inflight(&key("good")).await.unwrap().len(), 1);
+        assert_eq!(store.load_queue(&key("good")).await.unwrap().len(), 1);
+        assert!(store.load_will(&key("good")).await.unwrap().is_some());
         let loaded = store.load_clients(None, 10).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert!(matches!(
             loaded[0].stored,
             Err(StorageError::SerializationError(_))
         ));
-        assert_eq!(loaded[0].client_id, "bad");
+        assert_eq!(loaded[0].key, key("bad"));
         assert!(loaded[1].stored.is_ok());
 
         // Deleting the session removes the rows that can't be read too
-        store.delete_session("bad").await.unwrap();
-        assert!(store.load_session("bad").await.unwrap().is_none());
-        assert!(store.load_queue("bad").await.unwrap().is_empty());
+        store.delete_session(&key("bad")).await.unwrap();
+        assert!(store.load_session(&key("bad")).await.unwrap().is_none());
+        assert!(store.load_queue(&key("bad")).await.unwrap().is_empty());
     }
 
     /// Subscriptions an older version kept in the session's row that can't
@@ -1619,8 +1773,8 @@ mod tests {
         drop(conn);
 
         let store = SqliteStore::new(&path).unwrap();
-        assert!(is_undecodable(store.load_session("bad").await));
-        let good = store.load_session("good").await.unwrap().unwrap();
+        assert!(is_undecodable(store.load_session(&key("bad")).await));
+        let good = store.load_session(&key("good")).await.unwrap().unwrap();
         assert_eq!(
             good.subscriptions,
             [StoredSubscription::new("a", QoS::AtLeastOnce)]
@@ -1684,7 +1838,7 @@ mod tests {
         drop(conn);
 
         let store = SqliteStore::new(&path).unwrap();
-        assert!(store.load_session("c").await.unwrap().is_some());
+        assert!(store.load_session(&key("c")).await.unwrap().is_some());
         drop(store);
         assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
     }
@@ -1726,6 +1880,66 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    /// A database written before the mount point was part of the key moves
+    /// each session's rows under the mount point of its owner, and keeps
+    /// rows without a session under none.
+    #[tokio::test]
+    async fn test_rows_move_under_their_sessions_mount_point() {
+        let path = TempPath::new("mount-points");
+        let mut conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..2] {
+            migration(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO sessions VALUES
+                 ('a', '', 0, 60, NULL, 'alice', 'tenant-a/'),
+                 ('b', '', 0, NULL, NULL, 'bob', NULL);
+             INSERT INTO subscriptions VALUES ('a', 's/a', 1, 0, 0, NULL), ('b', 's/b', 0, 0, 0, NULL);
+             INSERT INTO will_messages VALUES ('a', 'w/a', x'', 0, 0, 0, x'');
+             INSERT INTO inflight_messages
+                 (client_id, packet_id, topic, payload, qos, dup, sequence, released, properties)
+                 VALUES ('a', 1, 'i/a', NULL, 1, 0, 1, 0, x''),
+                        ('orphan', 1, 'i/o', NULL, 1, 0, 1, 0, x'');
+             INSERT INTO queued_messages
+                 (client_id, sequence, topic, payload, qos, retain, properties)
+                 VALUES ('a', 4, 'q/a', NULL, 1, 0, x'');
+             INSERT INTO incoming_qos2 VALUES ('a', 7), ('orphan', 8);",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let store = SqliteStore::new(&path).unwrap();
+        let mounted = SessionKey::new(Some("tenant-a/".into()), "a");
+        assert!(store.load_session(&key("a")).await.unwrap().is_none());
+        let a = store.load_client(&mounted).await.unwrap().unwrap();
+        assert_eq!(a.session.owner.username.as_deref(), Some("alice"));
+        assert_eq!(a.session.subscriptions[0].topic_filter, "s/a");
+        assert_eq!(a.will.unwrap().topic, "w/a");
+        assert_eq!(a.inflight[0].topic, "i/a");
+        assert_eq!(a.queue[0].0, 4);
+        assert_eq!(a.incoming_qos2, [7]);
+        let b = store.load_client(&key("b")).await.unwrap().unwrap();
+        assert_eq!(b.session.subscriptions[0].topic_filter, "s/b");
+        assert_eq!(store.load_inflight(&key("orphan")).await.unwrap().len(), 1);
+        assert_eq!(store.load_incoming_qos2(&key("orphan")).await.unwrap(), [8]);
+        let mut listed = store.list_sessions().await.unwrap();
+        listed.sort();
+        assert_eq!(listed, [key("b"), mounted.clone()]);
+
+        // The same client id now has a session of its own on another mount
+        // point
+        store
+            .apply(&key("a"), &[Write::SaveSession(session("a"))])
+            .await
+            .unwrap();
+        assert_eq!(store.load_clients(None, 10).await.unwrap().len(), 3);
+        drop(store);
+        assert_eq!(user_version(&path), MIGRATIONS.len() as i64);
+    }
+
     #[tokio::test]
     async fn test_persistence_across_instances() {
         let path = TempPath::new("persistence");
@@ -1735,13 +1949,16 @@ mod tests {
         };
         SqliteStore::new(&path)
             .unwrap()
-            .apply("persistent_client", &[Write::SaveSession(stored.clone())])
+            .apply(
+                &key("persistent_client"),
+                &[Write::SaveSession(stored.clone())],
+            )
             .await
             .unwrap();
 
         let store = SqliteStore::new(&path).unwrap();
         assert_eq!(
-            store.load_session("persistent_client").await.unwrap(),
+            store.load_session(&key("persistent_client")).await.unwrap(),
             Some(stored)
         );
     }

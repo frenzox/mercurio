@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use mercurio_storage::{BatchStore, StorageError, Write};
+use mercurio_storage::{BatchStore, SessionKey, StorageError, Write};
 use tokio::{
     sync::{mpsc, oneshot, watch, Semaphore},
     time::Instant,
@@ -442,7 +442,10 @@ async fn apply<S: BatchStore>(
 ) -> Applied {
     let mut retry = Retry::default();
     loop {
-        let Err(e) = storage.apply(client_id, batch).await else {
+        let Err(e) = storage
+            .apply(&SessionKey::unmounted(client_id), batch)
+            .await
+        else {
             return Applied::Stored;
         };
         match retry.after(&e) {
@@ -478,7 +481,10 @@ async fn reconcile<S: BatchStore>(storage: &S, client_id: &str, health: &Health)
     let Some(writes) = snapshots.snapshot(client_id).await else {
         return false;
     };
-    match storage.apply(client_id, &writes).await {
+    match storage
+        .apply(&SessionKey::unmounted(client_id), &writes)
+        .await
+    {
         Ok(()) => {
             health.dirty.lock().unwrap().remove(client_id);
             info!("Stored the whole state of `{}` again", client_id);
@@ -652,7 +658,11 @@ mod tests {
         writers.close("c");
         writers.write("c", Write::DeleteSession);
         writers.settle("c").await;
-        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert!(storage
+            .load_session(&SessionKey::unmounted("c"))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -667,7 +677,11 @@ mod tests {
         // A later change starts a new writer
         writers.write("c", Write::DeleteSession);
         writers.settle("c").await;
-        assert!(storage.load_session("c").await.unwrap().is_none());
+        assert!(storage
+            .load_session(&SessionKey::unmounted("c"))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -691,6 +705,10 @@ mod tests {
         writers.settle("c").await;
         tokio::task::yield_now().await;
         assert!(writers.entries.lock().unwrap().is_empty());
-        assert!(storage.load_will("c").await.unwrap().is_none());
+        assert!(storage
+            .load_will(&SessionKey::unmounted("c"))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

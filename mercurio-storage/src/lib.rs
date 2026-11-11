@@ -98,6 +98,56 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
 /// Result type for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// What a client's stored state is kept and looked up by: its client id,
+/// within the mount point of the listener it connected to. The same client
+/// id on two mount points names two independent sessions.
+///
+/// Ordered by mount point, none first, then by client id, both in byte
+/// order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKey {
+    /// None for a listener without a mount point. Stores keep it as an
+    /// empty string, so an empty mount point is none: build keys with
+    /// [`SessionKey::new`], which makes it so.
+    pub mount_point: Option<String>,
+    pub client_id: String,
+}
+
+impl SessionKey {
+    /// The key of `client_id` under `mount_point`, an empty one counting as
+    /// none.
+    pub fn new(mount_point: Option<String>, client_id: impl Into<String>) -> Self {
+        SessionKey {
+            mount_point: mount_point.filter(|m| !m.is_empty()),
+            client_id: client_id.into(),
+        }
+    }
+
+    /// The key of `client_id` on a listener without a mount point.
+    pub fn unmounted(client_id: impl Into<String>) -> Self {
+        SessionKey {
+            mount_point: None,
+            client_id: client_id.into(),
+        }
+    }
+
+    /// The mount point as stores keep it: empty for none.
+    pub fn stored_mount_point(&self) -> &str {
+        self.mount_point.as_deref().unwrap_or_default()
+    }
+}
+
+/// The client id in backticks, followed by its mount point if it has one,
+/// for logs.
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.mount_point {
+            Some(mount_point) => write!(f, "`{}` on mount point `{}`", self.client_id, mount_point),
+            None => write!(f, "`{}`", self.client_id),
+        }
+    }
+}
+
 /// Serializable session state for persistence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionState {
@@ -111,8 +161,9 @@ pub struct SessionState {
     pub owner: SessionOwner,
 }
 
-/// Who a session belongs to. Only a client authenticated as the same user,
-/// on a listener with the same mount point, may resume it.
+/// Who a session belongs to. Only a client authenticated as the same user
+/// may resume it; the mount point is part of the session's [`SessionKey`],
+/// so a client on another mount point never reaches the session at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionOwner {
     /// The user the client authenticated as; None for anonymous clients
@@ -306,7 +357,7 @@ fn after_prefix(prefix: &str) -> Option<String> {
     None
 }
 
-/// A change to what is stored for one client.
+/// A change to what is stored for one client, named by its [`SessionKey`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Write {
@@ -374,78 +425,85 @@ pub trait BatchStore: Send + Sync {
         true
     }
 
-    /// Apply `writes` for `client_id` in order. Each write may be applied
-    /// again after a failure, so applying one twice must be harmless.
-    /// Stores that can should apply the batch atomically.
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()>;
+    /// Apply `writes` for the client of `key` in order. Each write may be
+    /// applied again after a failure, so applying one twice must be
+    /// harmless. Stores that can should apply the batch atomically.
+    async fn apply(&self, key: &SessionKey, writes: &[Write]) -> Result<()>;
 
     /// The client's stored session, with its subscriptions in no particular
     /// order.
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>>;
+    async fn load_session(&self, key: &SessionKey) -> Result<Option<SessionState>>;
 
-    /// The client ids of every stored session.
-    async fn list_sessions(&self) -> Result<Vec<String>>;
+    /// The keys of every stored session.
+    async fn list_sessions(&self) -> Result<Vec<SessionKey>>;
 
     /// The client's stored will.
-    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>>;
+    async fn load_will(&self, key: &SessionKey) -> Result<Option<StoredWillMessage>>;
 
     /// The client's messages sent and not yet acknowledged, in no particular
     /// order.
-    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>>;
+    async fn load_inflight(&self, key: &SessionKey) -> Result<Vec<InflightMessage>>;
 
     /// The packet ids of the client's QoS 2 messages awaiting PUBREL.
-    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>>;
+    async fn load_incoming_qos2(&self, key: &SessionKey) -> Result<Vec<u16>>;
 
     /// The client's queued messages, each with its position in the queue,
     /// in that order.
-    async fn load_queue(&self, client_id: &str) -> Result<Vec<(u64, Message)>>;
+    async fn load_queue(&self, key: &SessionKey) -> Result<Vec<(u64, Message)>>;
 
     /// Removes the client's session and everything stored with it, as
     /// `Write::DeleteSession` does.
-    async fn delete_session(&self, client_id: &str) -> Result<()> {
-        self.apply(client_id, &[Write::DeleteSession]).await
+    async fn delete_session(&self, key: &SessionKey) -> Result<()> {
+        self.apply(key, &[Write::DeleteSession]).await
     }
 
     /// The client's stored session with everything stored with it.
-    async fn load_client(&self, client_id: &str) -> Result<Option<StoredClient>> {
-        let Some(session) = self.load_session(client_id).await? else {
+    async fn load_client(&self, key: &SessionKey) -> Result<Option<StoredClient>> {
+        let Some(session) = self.load_session(key).await? else {
             return Ok(None);
         };
         Ok(Some(StoredClient {
             session,
-            will: self.load_will(client_id).await?,
-            queue: self.load_queue(client_id).await?,
-            inflight: self.load_inflight(client_id).await?,
-            incoming_qos2: self.load_incoming_qos2(client_id).await?,
+            will: self.load_will(key).await?,
+            queue: self.load_queue(key).await?,
+            inflight: self.load_inflight(key).await?,
+            incoming_qos2: self.load_incoming_qos2(key).await?,
         }))
     }
 
     /// At most `limit` stored sessions, each with everything stored with
-    /// it, ordered by client id in an order of the store's choosing, from
-    /// the first after the client id `after` on. Fewer than `limit` means
-    /// there are no more. The broker restores its sessions with this as it
-    /// starts, a page at a time.
+    /// it, ordered by key in an order of the store's choosing, from the
+    /// first after the key `after` on. Fewer than `limit` means there are
+    /// no more. Paging through them this way finds each stored session
+    /// once, the same client id under two mount points included. The
+    /// broker restores its sessions with this as it starts, a page at a
+    /// time.
     ///
     /// A client whose rows can't be decoded has its entry fail with
     /// `StorageError::SerializationError`; others fail the whole call.
     ///
-    /// The default reads each client on its own; stores should read each
-    /// kind of row for the whole page at once.
-    async fn load_clients(&self, after: Option<&str>, limit: usize) -> Result<Vec<LoadedClient>> {
-        let mut client_ids = self.list_sessions().await?;
-        client_ids.retain(|id| after.is_none_or(|after| id.as_str() > after));
-        client_ids.sort_unstable();
-        client_ids.truncate(limit);
-        let mut clients = Vec::with_capacity(client_ids.len());
-        for client_id in client_ids {
-            let stored = match self.load_client(&client_id).await {
+    /// The default reads each client on its own, in the order of
+    /// [`SessionKey`]; stores should read each kind of row for the whole
+    /// page at once.
+    async fn load_clients(
+        &self,
+        after: Option<&SessionKey>,
+        limit: usize,
+    ) -> Result<Vec<LoadedClient>> {
+        let mut keys = self.list_sessions().await?;
+        keys.retain(|key| after.is_none_or(|after| key > after));
+        keys.sort_unstable();
+        keys.truncate(limit);
+        let mut clients = Vec::with_capacity(keys.len());
+        for key in keys {
+            let stored = match self.load_client(&key).await {
                 Ok(Some(stored)) => Ok(stored),
                 // Deleted since it was listed
                 Ok(None) => continue,
                 Err(e @ StorageError::SerializationError(_)) => Err(e),
                 Err(e) => return Err(e),
             };
-            clients.push(LoadedClient { client_id, stored });
+            clients.push(LoadedClient { key, stored });
         }
         Ok(clients)
     }
@@ -468,7 +526,7 @@ pub struct StoredClient {
 /// A client as `BatchStore::load_clients` returns it.
 #[derive(Debug)]
 pub struct LoadedClient {
-    pub client_id: String,
+    pub key: SessionKey,
     /// What is stored for it, or `StorageError::SerializationError` when
     /// some of it can't be decoded
     pub stored: Result<StoredClient>,

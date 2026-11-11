@@ -14,8 +14,8 @@ use mercurio_core::{
 };
 
 use crate::{
-    BanStore, InflightMessage, LoadedClient, MqttStore, SessionOwner, SessionState, StoredBan,
-    StoredClient, StoredSubscription, StoredWillMessage, Write,
+    BanStore, InflightMessage, LoadedClient, MqttStore, SessionKey, SessionOwner, SessionState,
+    StoredBan, StoredClient, StoredSubscription, StoredWillMessage, Write,
 };
 
 /// Runs every check of the suite against `store`, which starts empty.
@@ -30,7 +30,9 @@ pub async fn conformance(store: &impl MqttStore) {
     }
     batches(store).await;
     delete_cascades(store).await;
+    mount_points(store).await;
     bulk_load(store).await;
+    bulk_load_across_mount_points(store).await;
     retained(store).await;
     retained_pages(store).await;
 }
@@ -77,6 +79,16 @@ pub fn inflight_message(packet_id: u16) -> InflightMessage {
     }
 }
 
+/// The key of `client_id` on a listener without a mount point.
+pub fn key(client_id: &str) -> SessionKey {
+    SessionKey::unmounted(client_id)
+}
+
+/// The key of `client_id` under `mount_point`.
+pub fn mounted(mount_point: &str, client_id: &str) -> SessionKey {
+    SessionKey::new(Some(mount_point.into()), client_id)
+}
+
 /// A session of `client_id` with every field set.
 pub fn session(client_id: &str) -> SessionState {
     SessionState {
@@ -108,21 +120,21 @@ fn sorted(state: Option<SessionState>) -> SessionState {
     state
 }
 
-async fn apply(store: &impl MqttStore, client_id: &str, writes: &[Write]) {
+async fn apply(store: &impl MqttStore, key: &SessionKey, writes: &[Write]) {
     store
-        .apply(client_id, writes)
+        .apply(key, writes)
         .await
         .unwrap_or_else(|e| panic!("applying {writes:?}: {e}"));
 }
 
 async fn sessions(store: &impl MqttStore) {
     assert!(store.list_sessions().await.unwrap().is_empty());
-    assert!(store.load_session("c").await.unwrap().is_none());
+    assert!(store.load_session(&key("c")).await.unwrap().is_none());
 
     let stored = session("c");
-    apply(store, "c", &[Write::SaveSession(stored.clone())]).await;
+    apply(store, &key("c"), &[Write::SaveSession(stored.clone())]).await;
     assert_eq!(
-        sorted(store.load_session("c").await.unwrap()),
+        sorted(store.load_session(&key("c")).await.unwrap()),
         sorted(Some(stored.clone()))
     );
 
@@ -134,19 +146,19 @@ async fn sessions(store: &impl MqttStore) {
         expires_at: None,
         owner: SessionOwner::default(),
     };
-    apply(store, "d", &[Write::SaveSession(plain.clone())]).await;
-    assert_eq!(store.load_session("d").await.unwrap(), Some(plain));
+    apply(store, &key("d"), &[Write::SaveSession(plain.clone())]).await;
+    assert_eq!(store.load_session(&key("d")).await.unwrap(), Some(plain));
 
     apply(
         store,
-        "c",
+        &key("c"),
         &[Write::SetExpiry {
             interval: 60,
             expires_at: 5,
         }],
     )
     .await;
-    let loaded = store.load_session("c").await.unwrap().unwrap();
+    let loaded = store.load_session(&key("c")).await.unwrap().unwrap();
     assert_eq!(
         (loaded.expiry_interval, loaded.expires_at),
         (Some(60), Some(5))
@@ -154,23 +166,23 @@ async fn sessions(store: &impl MqttStore) {
     // Recording an expiry stores no session
     apply(
         store,
-        "nobody",
+        &key("nobody"),
         &[Write::SetExpiry {
             interval: 60,
             expires_at: 5,
         }],
     )
     .await;
-    assert!(store.load_session("nobody").await.unwrap().is_none());
+    assert!(store.load_session(&key("nobody")).await.unwrap().is_none());
 
     let mut listed = store.list_sessions().await.unwrap();
     listed.sort();
-    assert_eq!(listed, ["c", "d"]);
+    assert_eq!(listed, [key("c"), key("d")]);
 
-    store.delete_session("c").await.unwrap();
-    store.delete_session("d").await.unwrap();
+    store.delete_session(&key("c")).await.unwrap();
+    store.delete_session(&key("d")).await.unwrap();
     // Deleting what isn't stored is no error
-    store.delete_session("d").await.unwrap();
+    store.delete_session(&key("d")).await.unwrap();
     assert!(store.list_sessions().await.unwrap().is_empty());
 }
 
@@ -187,8 +199,13 @@ async fn subscriptions(store: &impl MqttStore) {
         ..session("c")
     };
     // Without a stored session there is nothing to add to
-    apply(store, "c", &[Write::AddSubscription(detailed.clone())]).await;
-    assert!(store.load_session("c").await.unwrap().is_none());
+    apply(
+        store,
+        &key("c"),
+        &[Write::AddSubscription(detailed.clone())],
+    )
+    .await;
+    assert!(store.load_session(&key("c")).await.unwrap().is_none());
 
     let batch = [
         Write::SaveSession(base.clone()),
@@ -201,9 +218,9 @@ async fn subscriptions(store: &impl MqttStore) {
         Write::RemoveSubscription("never".into()),
     ];
     for _ in 0..2 {
-        apply(store, "c", &batch).await;
+        apply(store, &key("c"), &batch).await;
         assert_eq!(
-            sorted(store.load_session("c").await.unwrap()).subscriptions,
+            sorted(store.load_session(&key("c")).await.unwrap()).subscriptions,
             [
                 detailed.clone(),
                 StoredSubscription::new("b", QoS::AtLeastOnce)
@@ -212,9 +229,9 @@ async fn subscriptions(store: &impl MqttStore) {
     }
 
     // Saving the session whole replaces the subscriptions
-    apply(store, "c", &[Write::SaveSession(base.clone())]).await;
+    apply(store, &key("c"), &[Write::SaveSession(base.clone())]).await;
     assert_eq!(
-        sorted(store.load_session("c").await.unwrap()).subscriptions,
+        sorted(store.load_session(&key("c")).await.unwrap()).subscriptions,
         [
             StoredSubscription::new("b", QoS::AtMostOnce),
             StoredSubscription::new("old", QoS::AtMostOnce)
@@ -225,14 +242,14 @@ async fn subscriptions(store: &impl MqttStore) {
         client_id: "other".into(),
         ..base.clone()
     };
-    apply(store, "other", &[Write::SaveSession(other)]).await;
-    apply(store, "c", &[Write::DeleteSession]).await;
-    assert!(store.load_session("c").await.unwrap().is_none());
+    apply(store, &key("other"), &[Write::SaveSession(other)]).await;
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
+    assert!(store.load_session(&key("c")).await.unwrap().is_none());
     // A session stored again doesn't find the subscriptions of the one
     // deleted
     apply(
         store,
-        "c",
+        &key("c"),
         &[Write::SaveSession(SessionState {
             subscriptions: Vec::new(),
             ..base
@@ -240,7 +257,7 @@ async fn subscriptions(store: &impl MqttStore) {
     )
     .await;
     assert!(store
-        .load_session("c")
+        .load_session(&key("c"))
         .await
         .unwrap()
         .unwrap()
@@ -248,7 +265,7 @@ async fn subscriptions(store: &impl MqttStore) {
         .is_empty());
     assert_eq!(
         store
-            .load_session("other")
+            .load_session(&key("other"))
             .await
             .unwrap()
             .unwrap()
@@ -256,8 +273,8 @@ async fn subscriptions(store: &impl MqttStore) {
             .len(),
         2
     );
-    apply(store, "c", &[Write::DeleteSession]).await;
-    apply(store, "other", &[Write::DeleteSession]).await;
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
+    apply(store, &key("other"), &[Write::DeleteSession]).await;
 }
 
 async fn wills(store: &impl MqttStore) {
@@ -269,9 +286,12 @@ async fn wills(store: &impl MqttStore) {
         delay_secs: u32::MAX,
         properties: properties(),
     };
-    assert!(store.load_will("c").await.unwrap().is_none());
-    apply(store, "c", &[Write::StoreWill(will.clone())]).await;
-    assert_eq!(store.load_will("c").await.unwrap(), Some(will.clone()));
+    assert!(store.load_will(&key("c")).await.unwrap().is_none());
+    apply(store, &key("c"), &[Write::StoreWill(will.clone())]).await;
+    assert_eq!(
+        store.load_will(&key("c")).await.unwrap(),
+        Some(will.clone())
+    );
 
     let replaced = StoredWillMessage {
         payload: Bytes::new(),
@@ -281,10 +301,10 @@ async fn wills(store: &impl MqttStore) {
         properties: Default::default(),
         ..will
     };
-    apply(store, "c", &[Write::StoreWill(replaced.clone())]).await;
-    assert_eq!(store.load_will("c").await.unwrap(), Some(replaced));
-    apply(store, "c", &[Write::DeleteWill, Write::DeleteWill]).await;
-    assert!(store.load_will("c").await.unwrap().is_none());
+    apply(store, &key("c"), &[Write::StoreWill(replaced.clone())]).await;
+    assert_eq!(store.load_will(&key("c")).await.unwrap(), Some(replaced));
+    apply(store, &key("c"), &[Write::DeleteWill, Write::DeleteWill]).await;
+    assert!(store.load_will(&key("c")).await.unwrap().is_none());
 }
 
 async fn inflight(store: &impl MqttStore) {
@@ -307,7 +327,7 @@ async fn inflight(store: &impl MqttStore) {
     };
     apply(
         store,
-        "c",
+        &key("c"),
         &[
             Write::StoreInflight(full.clone()),
             Write::StoreInflight(plain.clone()),
@@ -315,26 +335,26 @@ async fn inflight(store: &impl MqttStore) {
     )
     .await;
     assert_eq!(
-        sorted(store.load_inflight("c").await.unwrap()),
+        sorted(store.load_inflight(&key("c")).await.unwrap()),
         [plain.clone(), full.clone()]
     );
 
     // Released, only the record stays
-    apply(store, "c", &[Write::ReleaseInflight(u16::MAX)]).await;
+    apply(store, &key("c"), &[Write::ReleaseInflight(u16::MAX)]).await;
     let released = InflightMessage {
         released: true,
         payload: None,
         ..full.clone()
     };
     assert_eq!(
-        sorted(store.load_inflight("c").await.unwrap()),
+        sorted(store.load_inflight(&key("c")).await.unwrap()),
         [plain, released]
     );
 
     // Releasing or removing what isn't stored is no error
     apply(
         store,
-        "c",
+        &key("c"),
         &[
             Write::RemoveInflight(1),
             Write::RemoveInflight(1),
@@ -343,7 +363,7 @@ async fn inflight(store: &impl MqttStore) {
         ],
     )
     .await;
-    assert!(store.load_inflight("c").await.unwrap().is_empty());
+    assert!(store.load_inflight(&key("c")).await.unwrap().is_empty());
 }
 
 /// Batches apply in order, applying one twice is harmless, and deleting
@@ -362,20 +382,24 @@ async fn incoming_qos2(store: &impl MqttStore) {
         Write::StoreIncomingQos2(1),
     ];
     for _ in 0..2 {
-        apply(store, "c", &batch).await;
+        apply(store, &key("c"), &batch).await;
         assert_eq!(
-            sorted(store.load_incoming_qos2("c").await.unwrap()),
+            sorted(store.load_incoming_qos2(&key("c")).await.unwrap()),
             [1, u16::MAX]
         );
     }
-    apply(store, "other", &[Write::StoreIncomingQos2(1)]).await;
+    apply(store, &key("other"), &[Write::StoreIncomingQos2(1)]).await;
     // Removing what isn't stored is no error
-    apply(store, "c", &[Write::RemoveIncomingQos2(2)]).await;
+    apply(store, &key("c"), &[Write::RemoveIncomingQos2(2)]).await;
 
-    apply(store, "c", &[Write::DeleteSession]).await;
-    assert!(store.load_incoming_qos2("c").await.unwrap().is_empty());
-    assert_eq!(store.load_incoming_qos2("other").await.unwrap(), [1]);
-    apply(store, "other", &[Write::DeleteSession]).await;
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
+    assert!(store
+        .load_incoming_qos2(&key("c"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.load_incoming_qos2(&key("other")).await.unwrap(), [1]);
+    apply(store, &key("other"), &[Write::DeleteSession]).await;
 }
 
 fn payloads(queue: Vec<(u64, Message)>) -> Vec<(u64, String)> {
@@ -398,8 +422,13 @@ async fn queue(store: &impl MqttStore) {
     detailed.properties = properties();
     detailed.expires_at = Some(u64::MAX >> 1);
     detailed.subscription_identifiers = vec![4, 268_435_455];
-    apply(store, "c", &[Write::Enqueue(u64::MAX, detailed.clone())]).await;
-    let loaded = store.load_queue("c").await.unwrap();
+    apply(
+        store,
+        &key("c"),
+        &[Write::Enqueue(u64::MAX, detailed.clone())],
+    )
+    .await;
+    let loaded = store.load_queue(&key("c")).await.unwrap();
     assert_eq!(loaded.len(), 1);
     let (sequence, loaded) = &loaded[0];
     assert_eq!(*sequence, u64::MAX);
@@ -423,8 +452,8 @@ async fn queue(store: &impl MqttStore) {
             &detailed.subscription_identifiers
         )
     );
-    apply(store, "c", &[Write::ClearQueue]).await;
-    assert!(store.load_queue("c").await.unwrap().is_empty());
+    apply(store, &key("c"), &[Write::ClearQueue]).await;
+    assert!(store.load_queue(&key("c")).await.unwrap().is_empty());
 
     let batch = [
         Write::Enqueue(1, message("q", "1")),
@@ -440,24 +469,29 @@ async fn queue(store: &impl MqttStore) {
         Write::Dequeue(10),
     ];
     for _ in 0..2 {
-        apply(store, "c", &batch).await;
+        apply(store, &key("c"), &batch).await;
         assert_eq!(
-            payloads(store.load_queue("c").await.unwrap()),
+            payloads(store.load_queue(&key("c")).await.unwrap()),
             [(2, "2".to_string()), (3, "3 again".to_string())]
         );
-        let inflight = store.load_inflight("c").await.unwrap();
+        let inflight = store.load_inflight(&key("c")).await.unwrap();
         assert_eq!(inflight.len(), 1);
         assert_eq!(inflight[0].packet_id, 9);
     }
-    apply(store, "other", &[Write::Enqueue(2, message("q", "other"))]).await;
-    apply(store, "c", &[Write::Dequeue(2)]).await;
+    apply(
+        store,
+        &key("other"),
+        &[Write::Enqueue(2, message("q", "other"))],
+    )
+    .await;
+    apply(store, &key("c"), &[Write::Dequeue(2)]).await;
     assert_eq!(
-        payloads(store.load_queue("c").await.unwrap()),
+        payloads(store.load_queue(&key("c")).await.unwrap()),
         [(3, "3 again".to_string())]
     );
-    assert_eq!(store.load_queue("other").await.unwrap().len(), 1);
-    apply(store, "c", &[Write::DeleteSession]).await;
-    apply(store, "other", &[Write::DeleteSession]).await;
+    assert_eq!(store.load_queue(&key("other")).await.unwrap().len(), 1);
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
+    apply(store, &key("other"), &[Write::DeleteSession]).await;
 }
 
 /// The changes of one batch apply in the order given, whichever kind they
@@ -478,14 +512,14 @@ async fn batches(store: &impl MqttStore) {
         Write::RemoveInflight(1),
         Write::Enqueue(1, message("q", "1")),
     ];
-    apply(store, "c", &first).await;
-    let loaded = store.load_session("c").await.unwrap().unwrap();
+    apply(store, &key("c"), &first).await;
+    let loaded = store.load_session(&key("c")).await.unwrap().unwrap();
     assert_eq!(loaded.subscriptions.len(), 1);
     assert_eq!(
         (loaded.expiry_interval, loaded.expires_at),
         (Some(60), Some(5))
     );
-    let left = store.load_inflight("c").await.unwrap();
+    let left = store.load_inflight(&key("c")).await.unwrap();
     assert_eq!(left.len(), 1);
     assert!(left[0].released);
 
@@ -493,7 +527,7 @@ async fn batches(store: &impl MqttStore) {
     // and clears the queue between two enqueues
     apply(
         store,
-        "c",
+        &key("c"),
         &[
             Write::StoreInflight(inflight_message(4)),
             Write::StoreInflight(inflight_message(5)),
@@ -519,8 +553,8 @@ async fn batches(store: &impl MqttStore) {
     ];
     // Applied again, as after a failure, it leaves the same
     for _ in 0..2 {
-        apply(store, "c", &second).await;
-        let mut left = store.load_inflight("c").await.unwrap();
+        apply(store, &key("c"), &second).await;
+        let mut left = store.load_inflight(&key("c")).await.unwrap();
         left.sort_by_key(|m| m.packet_id);
         let summary: Vec<_> = left
             .iter()
@@ -536,18 +570,18 @@ async fn batches(store: &impl MqttStore) {
         );
         if store.is_durable() {
             assert_eq!(
-                payloads(store.load_queue("c").await.unwrap()),
+                payloads(store.load_queue(&key("c")).await.unwrap()),
                 [(6, "kept, again".to_string())]
             );
         }
-        assert_eq!(store.load_incoming_qos2("c").await.unwrap(), [4]);
+        assert_eq!(store.load_incoming_qos2(&key("c")).await.unwrap(), [4]);
     }
 
     // A session saved after its deletion in the same batch is stored, with
     // only what came after the deletion
     apply(
         store,
-        "c",
+        &key("c"),
         &[
             Write::DeleteSession,
             Write::SaveSession(SessionState {
@@ -559,15 +593,19 @@ async fn batches(store: &impl MqttStore) {
         ],
     )
     .await;
-    let loaded = store.load_session("c").await.unwrap().unwrap();
+    let loaded = store.load_session(&key("c")).await.unwrap().unwrap();
     assert_eq!(
         loaded.subscriptions,
         [StoredSubscription::new("x", QoS::AtLeastOnce)]
     );
-    let left = store.load_inflight("c").await.unwrap();
+    let left = store.load_inflight(&key("c")).await.unwrap();
     assert_eq!(left.iter().map(|m| m.packet_id).collect::<Vec<_>>(), [8]);
-    assert!(store.load_incoming_qos2("c").await.unwrap().is_empty());
-    apply(store, "c", &[Write::DeleteSession]).await;
+    assert!(store
+        .load_incoming_qos2(&key("c"))
+        .await
+        .unwrap()
+        .is_empty());
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
 }
 
 /// Deleting a session removes everything stored for its client, and only
@@ -590,29 +628,33 @@ async fn delete_cascades(store: &impl MqttStore) {
         ]
     };
     for client_id in ["a", "b", "kept"] {
-        apply(store, client_id, &everything(client_id)).await;
+        apply(store, &key(client_id), &everything(client_id)).await;
     }
-    apply(store, "a", &[Write::DeleteSession]).await;
-    store.delete_session("b").await.unwrap();
+    apply(store, &key("a"), &[Write::DeleteSession]).await;
+    store.delete_session(&key("b")).await.unwrap();
     for client_id in ["a", "b"] {
-        assert!(store.load_session(client_id).await.unwrap().is_none());
-        assert!(store.load_will(client_id).await.unwrap().is_none());
-        assert!(store.load_inflight(client_id).await.unwrap().is_empty());
+        assert!(store.load_session(&key(client_id)).await.unwrap().is_none());
+        assert!(store.load_will(&key(client_id)).await.unwrap().is_none());
         assert!(store
-            .load_incoming_qos2(client_id)
+            .load_inflight(&key(client_id))
             .await
             .unwrap()
             .is_empty());
-        assert!(store.load_queue(client_id).await.unwrap().is_empty());
+        assert!(store
+            .load_incoming_qos2(&key(client_id))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.load_queue(&key(client_id)).await.unwrap().is_empty());
     }
-    assert!(store.load_session("kept").await.unwrap().is_some());
-    assert!(store.load_will("kept").await.unwrap().is_some());
-    assert_eq!(store.load_inflight("kept").await.unwrap().len(), 1);
-    assert_eq!(store.load_incoming_qos2("kept").await.unwrap(), [2]);
+    assert!(store.load_session(&key("kept")).await.unwrap().is_some());
+    assert!(store.load_will(&key("kept")).await.unwrap().is_some());
+    assert_eq!(store.load_inflight(&key("kept")).await.unwrap().len(), 1);
+    assert_eq!(store.load_incoming_qos2(&key("kept")).await.unwrap(), [2]);
     if store.is_durable() {
-        assert_eq!(store.load_queue("kept").await.unwrap().len(), 1);
+        assert_eq!(store.load_queue(&key("kept")).await.unwrap().len(), 1);
     }
-    store.delete_session("kept").await.unwrap();
+    store.delete_session(&key("kept")).await.unwrap();
     assert!(store.list_sessions().await.unwrap().is_empty());
 }
 
@@ -659,13 +701,13 @@ async fn bulk_load(store: &impl MqttStore) {
                 Write::StoreIncomingQos2(i as u16),
             ]);
         }
-        apply(store, &client_id, &writes).await;
-        expected.push(client_id);
+        apply(store, &key(&client_id), &writes).await;
+        expected.push(key(&client_id));
     }
     // Rows of clients without a session
     apply(
         store,
-        "orphan",
+        &key("orphan"),
         &[
             Write::StoreInflight(inflight_message(1)),
             Write::StoreIncomingQos2(1),
@@ -673,31 +715,239 @@ async fn bulk_load(store: &impl MqttStore) {
     )
     .await;
 
-    let mut found = Vec::new();
+    let found = load_all(store, 3).await;
+    let mut keys: Vec<SessionKey> = found.iter().map(|c| c.key.clone()).collect();
+    keys.sort();
+    assert_eq!(keys, expected);
+    for client in found {
+        let alone = store.load_client(&client.key).await.unwrap().unwrap();
+        let loaded = client.stored.unwrap();
+        assert_eq!(loaded.session.client_id, client.key.client_id);
+        assert_eq!(summary(loaded), summary(alone), "{}", client.key);
+    }
+    assert!(store.load_client(&key("orphan")).await.unwrap().is_none());
+
+    for key in expected.iter().chain([&key("orphan")]) {
+        store.delete_session(key).await.unwrap();
+    }
+    assert!(store.load_clients(None, 3).await.unwrap().is_empty());
+}
+
+/// Every stored session, read `page` at a time, each page starting after
+/// the last key of the one before, which is checked to list no key twice.
+async fn load_all(store: &impl MqttStore, page: usize) -> Vec<LoadedClient> {
+    let mut found: Vec<LoadedClient> = Vec::new();
     loop {
-        let after = found.last().map(|c: &LoadedClient| c.client_id.clone());
-        let page = store.load_clients(after.as_deref(), 3).await.unwrap();
-        assert!(page.len() <= 3);
-        let last = page.len() < 3;
-        found.extend(page);
+        let after = found.last().map(|c| c.key.clone());
+        let next = store.load_clients(after.as_ref(), page).await.unwrap();
+        assert!(next.len() <= page);
+        let last = next.len() < page;
+        for client in next {
+            assert!(
+                found.iter().all(|seen| seen.key != client.key),
+                "{} is listed twice",
+                client.key
+            );
+            found.push(client);
+        }
         if last {
-            break;
+            return found;
         }
     }
-    let mut ids: Vec<String> = found.iter().map(|c| c.client_id.clone()).collect();
-    ids.sort();
-    assert_eq!(ids, expected);
-    for client in found {
-        let alone = store.load_client(&client.client_id).await.unwrap().unwrap();
-        let loaded = client.stored.unwrap();
-        assert_eq!(loaded.session.client_id, client.client_id);
-        assert_eq!(summary(loaded), summary(alone), "{}", client.client_id);
-    }
-    assert!(store.load_client("orphan").await.unwrap().is_none());
+}
 
-    for client_id in expected.iter().map(String::as_str).chain(["orphan"]) {
-        store.delete_session(client_id).await.unwrap();
+/// A row of each kind for `client_id`, marked with `marker`.
+fn everything(client_id: &str, marker: &str) -> Vec<Write> {
+    vec![
+        Write::SaveSession(SessionState {
+            subscriptions: vec![StoredSubscription::new(marker, QoS::AtLeastOnce)],
+            ..session(client_id)
+        }),
+        Write::StoreWill(StoredWillMessage {
+            topic: marker.into(),
+            payload: Bytes::from_static(b"bye"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            delay_secs: 0,
+            properties: Default::default(),
+        }),
+        Write::StoreInflight(InflightMessage {
+            topic: marker.into(),
+            ..inflight_message(1)
+        }),
+        Write::StoreIncomingQos2(2),
+        Write::Enqueue(3, message(marker, marker)),
+    ]
+}
+
+/// What is stored for `key`, as `everything` stored it: the marker of each
+/// kind of row, and the packet ids of incoming QoS 2 messages.
+async fn markers(store: &impl MqttStore, key: &SessionKey) -> Vec<String> {
+    let mut found = Vec::new();
+    if let Some(session) = store.load_session(key).await.unwrap() {
+        found.extend(
+            session
+                .subscriptions
+                .into_iter()
+                .map(|s| format!("subscription {}", s.topic_filter)),
+        );
     }
+    if let Some(will) = store.load_will(key).await.unwrap() {
+        found.push(format!("will {}", will.topic));
+    }
+    for message in store.load_inflight(key).await.unwrap() {
+        found.push(format!("inflight {}", message.topic));
+    }
+    for packet_id in store.load_incoming_qos2(key).await.unwrap() {
+        found.push(format!("incoming {packet_id}"));
+    }
+    if store.is_durable() {
+        for (_, message) in store.load_queue(key).await.unwrap() {
+            found.push(format!("queued {}", message.topic));
+        }
+    }
+    found
+}
+
+/// The same client id under two mount points, or under one and none, is
+/// two clients: each kind of row is kept apart, changes and deletions touch
+/// their own key only, and an empty mount point is none.
+async fn mount_points(store: &impl MqttStore) {
+    let keys = [key("c"), mounted("a/", "c"), mounted("b/", "c")];
+    for (key, marker) in keys.iter().zip(["none", "a", "b"]) {
+        apply(store, key, &everything("c", marker)).await;
+    }
+    let mut listed = store.list_sessions().await.unwrap();
+    listed.sort();
+    assert_eq!(listed, keys);
+    let expected = |marker: &str| {
+        let mut expected = vec![
+            format!("subscription {marker}"),
+            format!("will {marker}"),
+            format!("inflight {marker}"),
+            "incoming 2".to_string(),
+        ];
+        if store.is_durable() {
+            expected.push(format!("queued {marker}"));
+        }
+        expected
+    };
+    for (key, marker) in keys.iter().zip(["none", "a", "b"]) {
+        assert_eq!(markers(store, key).await, expected(marker), "{key}");
+    }
+    assert_eq!(
+        store
+            .load_session(&mounted("a/", "c"))
+            .await
+            .unwrap()
+            .unwrap()
+            .client_id,
+        "c"
+    );
+    // Stored with an empty mount point is stored with none
+    assert_eq!(SessionKey::new(Some(String::new()), "c"), key("c"));
+
+    // Each kind of change touches its own key only
+    apply(
+        store,
+        &mounted("a/", "c"),
+        &[
+            Write::RemoveSubscription("a".into()),
+            Write::AddSubscription(StoredSubscription::new("a2", QoS::AtMostOnce)),
+            Write::DeleteWill,
+            Write::RemoveInflight(1),
+            Write::RemoveIncomingQos2(2),
+            Write::ClearQueue,
+            Write::SetExpiry {
+                interval: 1,
+                expires_at: 2,
+            },
+        ],
+    )
+    .await;
+    assert_eq!(
+        markers(store, &mounted("a/", "c")).await,
+        ["subscription a2"]
+    );
+    for (key, marker) in [(key("c"), "none"), (mounted("b/", "c"), "b")] {
+        assert_eq!(markers(store, &key).await, expected(marker), "{key}");
+        let stored = store.load_session(&key).await.unwrap().unwrap();
+        assert_eq!(stored.expires_at, session("c").expires_at);
+    }
+
+    // Deleting one session leaves the others whole
+    store.delete_session(&mounted("b/", "c")).await.unwrap();
+    assert!(markers(store, &mounted("b/", "c")).await.is_empty());
+    assert!(store
+        .load_session(&mounted("b/", "c"))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(markers(store, &key("c")).await, expected("none"));
+    apply(store, &key("c"), &[Write::DeleteSession]).await;
+    assert!(markers(store, &key("c")).await.is_empty());
+    assert_eq!(
+        markers(store, &mounted("a/", "c")).await,
+        ["subscription a2"]
+    );
+    store.delete_session(&mounted("a/", "c")).await.unwrap();
+    assert!(store.list_sessions().await.unwrap().is_empty());
+}
+
+/// Paging finds each session once, whatever the page size, with client
+/// ids under several mount points and mount points with several client
+/// ids, and leaves out the rows of mount points without a session.
+async fn bulk_load_across_mount_points(store: &impl MqttStore) {
+    let mut expected = Vec::new();
+    for mount_point in [None, Some("a/"), Some("b/"), Some("a/b/")] {
+        for client_id in ["x", "y", "z"] {
+            let key = SessionKey::new(mount_point.map(str::to_string), client_id);
+            let marker = format!("{}{client_id}", mount_point.unwrap_or_default());
+            apply(store, &key, &everything(client_id, &marker)).await;
+            expected.push((key, marker));
+        }
+    }
+    // Rows of a client id under a mount point it has no session on
+    apply(
+        store,
+        &mounted("c/", "x"),
+        &[
+            Write::StoreInflight(inflight_message(1)),
+            Write::StoreIncomingQos2(1),
+        ],
+    )
+    .await;
+    expected.sort();
+    for page in [1, 2, 5, 12, 13] {
+        let found = load_all(store, page).await;
+        let mut keys: Vec<SessionKey> = found.iter().map(|c| c.key.clone()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            expected
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            "pages of {page}"
+        );
+        for client in found {
+            let (_, marker) = expected.iter().find(|(key, _)| *key == client.key).unwrap();
+            let stored = client.stored.unwrap();
+            assert_eq!(stored.session.subscriptions[0].topic_filter, *marker);
+            assert_eq!(stored.will.unwrap().topic, *marker);
+            assert_eq!(stored.inflight.len(), 1);
+            assert_eq!(stored.inflight[0].topic, *marker);
+            assert_eq!(stored.incoming_qos2, [2]);
+            if store.is_durable() {
+                assert_eq!(stored.queue.len(), 1);
+                assert_eq!(&*stored.queue[0].1.topic, marker.as_str());
+            }
+        }
+    }
+    for (key, _) in &expected {
+        store.delete_session(key).await.unwrap();
+    }
+    store.delete_session(&mounted("c/", "x")).await.unwrap();
     assert!(store.load_clients(None, 3).await.unwrap().is_empty());
 }
 

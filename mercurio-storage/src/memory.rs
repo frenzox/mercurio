@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use mercurio_core::{message::Message, topic::topic_matches_filter};
 
 use crate::{
-    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionState,
+    BanStore, BatchStore, InflightMessage, Result, RetainedMessageStore, SessionKey, SessionState,
     StorageError, StoredBan, StoredWillMessage, TopicRange, Write,
 };
 
@@ -24,20 +24,20 @@ type BanKey = (String, String, bool);
 /// What the store holds for the clients.
 #[derive(Debug, Default)]
 struct Clients {
-    sessions: HashMap<String, SessionState>,
-    wills: HashMap<String, StoredWillMessage>,
-    inflight: HashMap<String, HashMap<u16, InflightMessage>>,
-    incoming_qos2: HashMap<String, HashSet<u16>>,
+    sessions: HashMap<SessionKey, SessionState>,
+    wills: HashMap<SessionKey, StoredWillMessage>,
+    inflight: HashMap<SessionKey, HashMap<u16, InflightMessage>>,
+    incoming_qos2: HashMap<SessionKey, HashSet<u16>>,
 }
 
 impl Clients {
-    fn apply(&mut self, client_id: &str, write: &Write) {
+    fn apply(&mut self, key: &SessionKey, write: &Write) {
         match write {
             Write::SaveSession(session) => {
-                self.sessions.insert(client_id.to_string(), session.clone());
+                self.sessions.insert(key.clone(), session.clone());
             }
             Write::AddSubscription(subscription) => {
-                if let Some(session) = self.sessions.get_mut(client_id) {
+                if let Some(session) = self.sessions.get_mut(key) {
                     session
                         .subscriptions
                         .retain(|s| s.topic_filter != subscription.topic_filter);
@@ -45,7 +45,7 @@ impl Clients {
                 }
             }
             Write::RemoveSubscription(topic_filter) => {
-                if let Some(session) = self.sessions.get_mut(client_id) {
+                if let Some(session) = self.sessions.get_mut(key) {
                     session
                         .subscriptions
                         .retain(|s| s.topic_filter != *topic_filter);
@@ -55,27 +55,27 @@ impl Clients {
                 interval,
                 expires_at,
             } => {
-                if let Some(session) = self.sessions.get_mut(client_id) {
+                if let Some(session) = self.sessions.get_mut(key) {
                     session.expiry_interval = Some(*interval);
                     session.expires_at = Some(*expires_at);
                 }
             }
             Write::StoreWill(will) => {
-                self.wills.insert(client_id.to_string(), will.clone());
+                self.wills.insert(key.clone(), will.clone());
             }
             Write::DeleteWill => {
-                self.wills.remove(client_id);
+                self.wills.remove(key);
             }
             Write::StoreInflight(message) => {
                 self.inflight
-                    .entry(client_id.to_string())
+                    .entry(key.clone())
                     .or_default()
                     .insert(message.packet_id, message.clone());
             }
             Write::ReleaseInflight(packet_id) => {
                 if let Some(message) = self
                     .inflight
-                    .get_mut(client_id)
+                    .get_mut(key)
                     .and_then(|messages| messages.get_mut(packet_id))
                 {
                     message.released = true;
@@ -83,24 +83,24 @@ impl Clients {
                 }
             }
             Write::RemoveInflight(packet_id) => {
-                if let Some(messages) = self.inflight.get_mut(client_id) {
+                if let Some(messages) = self.inflight.get_mut(key) {
                     messages.remove(packet_id);
                     if messages.is_empty() {
-                        self.inflight.remove(client_id);
+                        self.inflight.remove(key);
                     }
                 }
             }
             Write::StoreIncomingQos2(packet_id) => {
                 self.incoming_qos2
-                    .entry(client_id.to_string())
+                    .entry(key.clone())
                     .or_default()
                     .insert(*packet_id);
             }
             Write::RemoveIncomingQos2(packet_id) => {
-                if let Some(ids) = self.incoming_qos2.get_mut(client_id) {
+                if let Some(ids) = self.incoming_qos2.get_mut(key) {
                     ids.remove(packet_id);
                     if ids.is_empty() {
-                        self.incoming_qos2.remove(client_id);
+                        self.incoming_qos2.remove(key);
                     }
                 }
             }
@@ -108,10 +108,10 @@ impl Clients {
             // not copied
             Write::Enqueue(..) | Write::Dequeue(_) | Write::ClearQueue => {}
             Write::DeleteSession => {
-                self.sessions.remove(client_id);
-                self.wills.remove(client_id);
-                self.inflight.remove(client_id);
-                self.incoming_qos2.remove(client_id);
+                self.sessions.remove(key);
+                self.wills.remove(key);
+                self.inflight.remove(key);
+                self.incoming_qos2.remove(key);
             }
         }
     }
@@ -157,47 +157,47 @@ impl BatchStore for MemoryStore {
     }
 
     /// Applies the batch under one lock, so readers see all of it or none.
-    async fn apply(&self, client_id: &str, writes: &[Write]) -> Result<()> {
+    async fn apply(&self, key: &SessionKey, writes: &[Write]) -> Result<()> {
         let mut clients = self.clients.write().map_err(poisoned)?;
         for write in writes {
-            clients.apply(client_id, write);
+            clients.apply(key, write);
         }
         Ok(())
     }
 
-    async fn load_session(&self, client_id: &str) -> Result<Option<SessionState>> {
-        self.read(|clients| clients.sessions.get(client_id).cloned())
+    async fn load_session(&self, key: &SessionKey) -> Result<Option<SessionState>> {
+        self.read(|clients| clients.sessions.get(key).cloned())
     }
 
-    async fn list_sessions(&self) -> Result<Vec<String>> {
+    async fn list_sessions(&self) -> Result<Vec<SessionKey>> {
         self.read(|clients| clients.sessions.keys().cloned().collect())
     }
 
-    async fn load_will(&self, client_id: &str) -> Result<Option<StoredWillMessage>> {
-        self.read(|clients| clients.wills.get(client_id).cloned())
+    async fn load_will(&self, key: &SessionKey) -> Result<Option<StoredWillMessage>> {
+        self.read(|clients| clients.wills.get(key).cloned())
     }
 
-    async fn load_inflight(&self, client_id: &str) -> Result<Vec<InflightMessage>> {
+    async fn load_inflight(&self, key: &SessionKey) -> Result<Vec<InflightMessage>> {
         self.read(|clients| {
             clients
                 .inflight
-                .get(client_id)
+                .get(key)
                 .map(|messages| messages.values().cloned().collect())
                 .unwrap_or_default()
         })
     }
 
-    async fn load_incoming_qos2(&self, client_id: &str) -> Result<Vec<u16>> {
+    async fn load_incoming_qos2(&self, key: &SessionKey) -> Result<Vec<u16>> {
         self.read(|clients| {
             clients
                 .incoming_qos2
-                .get(client_id)
+                .get(key)
                 .map(|ids| ids.iter().copied().collect())
                 .unwrap_or_default()
         })
     }
 
-    async fn load_queue(&self, _client_id: &str) -> Result<Vec<(u64, Message)>> {
+    async fn load_queue(&self, _key: &SessionKey) -> Result<Vec<(u64, Message)>> {
         Ok(Vec::new())
     }
 }
