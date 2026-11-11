@@ -502,7 +502,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
 
         let storage_error =
             |e: mercurio_storage::StorageError| StartError::Storage(Error::Storage(e.to_string()));
-        let claim = match self
+        let mut claim = match self
             .acquire_client_id(&connect_packet.payload.client_id, &owner)
             .await
             .map_err(storage_error)?
@@ -539,6 +539,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         // Marks the previous connection's pending will as superseded, whether
         // this connection resumes the session or replaces it
         if let Some(existing) = &existing {
+            // The session's expiry timer stops seeing it as the previous
+            // connection's from here on, so abandoned, the start ends the
+            // session as this connection would have
+            claim.on_drop = OnDrop::End(expiry);
             existing.set_generation(generation).await;
         }
 
@@ -572,12 +576,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         session.set_generation(generation).await;
         session.set_owner(owner.clone()).await;
 
+        claim.on_drop = OnDrop::End(expiry);
         let discarded = {
             let mut manager = self.shared.state.lock().await;
             // Reconnecting cancels a will left over from before a restart
             manager.restored_wills.remove(&client_id);
-            // After the generation changed, so an expiry timer the previous
-            // connection schedules from now on sees it was superseded
+            // The previous connection scheduled its timer before letting go
+            // of the client id, so this stops it
             manager.stop_expiry_timer(&client_id);
             match from_memory {
                 true => None,
@@ -602,8 +607,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 persistent_clients.remove(&client_id);
             }
         }
-        session.set_generation(generation).await;
-        session.set_owner(owner.clone()).await;
         if !queue_to_restore.is_empty() {
             session.restore_queue(queue_to_restore);
             self.writers.write(&client_id, Write::ClearQueue);
@@ -918,16 +921,19 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             }
         }
         if let Some(expiry) = expiry.filter(|e| !e.is_zero()) {
-            // Recorded so a restarted broker still expires the session
-            self.writers.write(
-                client_id,
-                Write::SetExpiry {
-                    interval: expiry.as_secs() as u32,
-                    expires_at: unix_millis() + expiry.as_millis() as u64,
-                },
-            );
-            self.schedule_end(client_id.to_string(), generation, expiry)
-                .await;
+            if self
+                .schedule_end(client_id.to_string(), generation, expiry)
+                .await
+            {
+                // Recorded so a restarted broker still expires the session
+                self.writers.write(
+                    client_id,
+                    Write::SetExpiry {
+                        interval: expiry.as_secs() as u32,
+                        expires_at: unix_millis() + expiry.as_millis() as u64,
+                    },
+                );
+            }
         }
     }
 
@@ -1044,8 +1050,9 @@ impl<S: BatchStore + 'static> SessionManager<S> {
     }
 
     /// Ends the session of `client_id` after `delay`, unless a connection
-    /// newer than `generation` uses it in the meantime.
-    async fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) {
+    /// newer than `generation` uses it in the meantime. False if the
+    /// session was gone or taken over already.
+    async fn schedule_end(&self, client_id: String, generation: u64, delay: Duration) -> bool {
         let mut manager = self.shared.state.lock().await;
         // The session may be gone already, deleted while this connection
         // was closing, and a deleted session never expires. Generation 0
@@ -1057,7 +1064,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 None => false,
             };
             if !current {
-                return;
+                return false;
             }
         }
         manager.next_generation += 1;
@@ -1081,6 +1088,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         if let Some(replaced) = manager.expiry_timers.insert(client_id, timer) {
             replaced.task.abort();
         }
+        true
     }
 
     /// Schedules the expiry of sessions persisted by a previous run, and
@@ -2586,6 +2594,41 @@ mod tests {
         drop(held);
         assert!(poll_briefly(&mut ending).await.is_none());
         drop(ending);
+        let _ = release.send(());
+
+        assert!(gone(&manager, "c").await, "the session never expires");
+    }
+
+    #[tokio::test]
+    async fn test_a_start_abandoned_after_taking_the_session_leaves_it_to_expire() {
+        let mut manager: SessionManager<MemoryStore> = SessionManager::new(create_test_storage());
+        let first = manager
+            .start_session(resuming("c"), SessionOwner::default())
+            .await
+            .unwrap();
+        let mut taking_over = manager.clone();
+        let mut second = Box::pin(async move {
+            taking_over
+                .start_session(resuming("c"), SessionOwner::default())
+                .await
+                .map(|_| ())
+        });
+        assert!(poll_briefly(&mut second).await.is_none());
+        manager
+            .end_connection(first.lease, Some(Duration::from_millis(100)))
+            .await;
+
+        // Holds the lease, and waits for the manager's lock to look the
+        // session up
+        let held = manager.shared.state.lock().await;
+        assert!(poll_briefly(&mut second).await.is_none());
+        // Takes the session over, then waits for the manager's lock again
+        // to put it in place
+        let release = queue_for_lock(&manager).await;
+        drop(held);
+        assert!(poll_briefly(&mut second).await.is_none());
+        assert!(manager.shared.state.try_lock().is_err());
+        drop(second);
         let _ = release.send(());
 
         assert!(gone(&manager, "c").await, "the session never expires");
