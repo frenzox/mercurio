@@ -1,21 +1,21 @@
 //! Posts a small JSON document to a URL for every client event.
 
-use mercurio_plugin::{export_plugin, host, Event, Hooks, Level, Plugin, Registration};
+use std::sync::OnceLock;
+
+use mercurio_plugin::{export_plugin, host, Config, Event, Hooks, Level, Plugin, Registration};
 use wasip2::http::{
     outgoing_handler,
     types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme},
 };
 
+/// Set by `init`; settings never change, so each copy keeps its own.
+static URL: OnceLock<String> = OnceLock::new();
+
 struct WebhookAudit;
 
 impl Plugin for WebhookAudit {
-    fn init(config: Vec<(String, String)>) -> Result<Registration, String> {
-        let url = config
-            .into_iter()
-            .find(|(key, _)| key == "url")
-            .map(|(_, value)| value)
-            .ok_or("missing `url`")?;
-        host::kv_set("url", url.as_bytes())?;
+    fn init(config: Config) -> Result<Registration, String> {
+        let _ = URL.set(config.require("url")?.to_string());
         Ok(Registration {
             hooks: Hooks::ON_EVENT,
             auth_methods: Vec::new(),
@@ -23,8 +23,7 @@ impl Plugin for WebhookAudit {
     }
 
     fn on_event(event: Event) {
-        let Some(url) = host::kv_get("url").and_then(|url| String::from_utf8(url).ok()) else {
-            host::log(Level::Warn, "the stored `url` is missing");
+        let Some(url) = URL.get() else {
             return;
         };
         let body = match event {
@@ -34,7 +33,7 @@ impl Plugin for WebhookAudit {
             Event::Unsubscribed(sub) => object("unsubscribed", &sub.client.client_id),
             Event::SessionExpired(client_id) => object("session-expired", &client_id),
         };
-        if let Err(error) = post(&url, body.as_bytes()) {
+        if let Err(error) = post(url, body.as_bytes()) {
             host::log(Level::Warn, &format!("posting to {url} failed: {error}"));
         }
     }

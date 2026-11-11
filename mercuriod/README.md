@@ -444,8 +444,11 @@ group = "mercurio"
 # remote_prefix = "site1/"
 
 # WebAssembly plugins, run in this order after the built-in authentication
-# and access control. SIGHUP rereads the file at `path`; other changes need
-# a restart
+# and access control. Components built for plugin interface 0.2 or 0.1 load;
+# listPlugins shows which. A plugin publishes as the in-process client
+# mercurio-plugin-<name>, never to $ topics, 64 KiB a message and 100
+# messages a second at most. SIGHUP rereads the file at `path`; other
+# changes need a restart. See docs/plugins.html
 # [[plugins]]
 # path = "/etc/mercurio/plugins/deny_topic.wasm"
 # Names the plugin in logs, in $CONTROL/<name>/ and in a listener's

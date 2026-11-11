@@ -195,7 +195,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_writer(std::io::stderr)
             .with_env_filter("warn")
             .init();
-        prepare(&config).await?;
+        // Nothing serves it, so plugins publishing at load get an error
+        let (unserved, _) = LocalConnector::new();
+        prepare(&config, &unserved).await?;
         println!("{}: the configuration is valid", cli.config.display());
         return Ok(());
     }
@@ -206,6 +208,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .inspect_err(|e| tracing::warn!("getConfig will be unavailable: {}", e))
         .ok();
 
+    // Before the plugins load, as they publish through it
+    let (connector, local_listener) = LocalConnector::new();
     let Prepared {
         limits,
         policy,
@@ -215,7 +219,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         dynsec,
         listeners: prepared_listeners,
         reloadable,
-    } = prepare(&config).await?;
+    } = prepare(&config, &connector).await?;
 
     // Determine listen address (CLI overrides config)
     let interface = config.server.bind_interface.as_deref();
@@ -338,8 +342,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Ignoring [admin]: the admin socket needs Linux");
     }
 
-    let (connector, local_listener) = LocalConnector::new();
-
     let bridges = config
         .bridges
         .into_iter()
@@ -455,8 +457,12 @@ struct PreparedListener {
 
 /// Checks the settings a start needs, loads the files of `[auth]` and of
 /// every listener, the TLS certificates and keys, and the WebAssembly
-/// plugins, binding nothing and leaving storage alone.
-async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>> {
+/// plugins, binding nothing and leaving storage alone. Plugins publish
+/// through `broker`.
+async fn prepare(
+    config: &Config,
+    broker: &LocalConnector,
+) -> Result<Prepared, Box<dyn std::error::Error>> {
     let limits = config.server.limits()?;
     let mut policy = ConnectPolicy::default();
     policy.response_information = config.server.response_information.clone();
@@ -476,6 +482,7 @@ async fn prepare(config: &Config) -> Result<Prepared, Box<dyn std::error::Error>
     let wasm = load_plugins(
         &config.plugins,
         config.server.plugin_timeout(),
+        broker,
         &mut reloadable,
     )
     .await?;
@@ -753,6 +760,7 @@ fn build_auth(
 async fn load_plugins(
     plugins: &[config::PluginConfig],
     plugin_timeout: Duration,
+    broker: &LocalConnector,
     reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {
@@ -775,6 +783,7 @@ async fn load_plugins(
                 .timeout_ms
                 .map_or(plugin_timeout, Duration::from_millis),
             memory: plugin.memory_mb << 20,
+            broker: Some(broker.clone()),
         };
         let loaded_plugin = wasm::WasmPlugin::load(&runtime, settings)
             .await
@@ -793,6 +802,7 @@ async fn load_plugins(
 async fn load_plugins(
     plugins: &[config::PluginConfig],
     _plugin_timeout: Duration,
+    _broker: &LocalConnector,
     _reloadable: &mut Vec<Arc<dyn Reload>>,
 ) -> Result<Vec<(String, Arc<dyn Plugin>)>, String> {
     if plugins.is_empty() {

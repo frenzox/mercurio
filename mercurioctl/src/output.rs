@@ -62,6 +62,7 @@ const BRIDGES: &[Column] = &[
 const PLUGINS: &[Column] = &[
     ("NAME", &["name"]),
     ("KIND", &["kind"]),
+    ("INTERFACE", &["interface"]),
     ("HOOKS", &["hooks"]),
     ("INSTANCES", &["instances"]),
     ("FAILURES", &["failures"]),

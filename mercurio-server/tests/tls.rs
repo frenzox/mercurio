@@ -4,6 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use mercurio_server::{
     auth::SimpleCredentialValidator,
+    plugin::{ready, BoxFuture, ClientInfo, Event, Plugin},
     server::{run_with_config, ServerConfig},
     tls::{CertificateName, Tls, TlsConfig},
 };
@@ -240,6 +241,50 @@ async fn optional_client_certificates_let_clients_log_in_by_password() {
     assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
 
     assert!(refused(addr, Some("mallory")).await);
+}
+
+/// Keeps the client of every `Connected` event.
+#[derive(Default)]
+struct Connections(std::sync::Mutex<Vec<ClientInfo>>);
+
+impl Plugin for Connections {
+    fn name(&self) -> &str {
+        "connections"
+    }
+
+    fn on_event<'a>(&'a self, event: &'a Event) -> BoxFuture<'a, ()> {
+        if let Event::Connected { client, .. } = event {
+            self.0.lock().unwrap().push(client.clone());
+        }
+        ready(())
+    }
+}
+
+#[tokio::test]
+async fn plugins_see_tls_and_the_certificate_name() {
+    let connections = Arc::new(Connections::default());
+    let mut files = server_files().with_client_auth(fixture("root.pem"));
+    files.username_from_certificate = Some(CertificateName::CommonName);
+    let mut config = ServerConfig::default();
+    config.tls = Some(Tls::new(files).unwrap());
+    config.plugins = vec![connections.clone()];
+    let addr = start(config).await;
+
+    let mut alice = handshake(addr, Some("alice")).await.unwrap();
+    assert_eq!(mqtt_connect(&mut alice, "alice", None).await, Some(0));
+    let seen = async {
+        loop {
+            if let Some(client) = connections.0.lock().unwrap().first() {
+                return client.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let client = timeout(Duration::from_secs(2), seen).await.unwrap();
+    assert_eq!(client.username.as_deref(), Some("alice"));
+    let connection = client.connection.expect("the connection");
+    assert!(connection.tls);
+    assert_eq!(connection.certificate.as_deref(), Some("alice"));
 }
 
 #[test]

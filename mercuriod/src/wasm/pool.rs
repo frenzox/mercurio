@@ -15,12 +15,8 @@ use tokio::sync::Semaphore;
 use wasmtime::{Store, UpdateDeadline};
 
 use super::{
-    runtime::{
-        bindings::{
-            self, exports::mercurio::plugin::guest::Guest, mercurio::plugin::types::Registration,
-        },
-        TICK,
-    },
+    guest::{Guest, Pre},
+    runtime::{bindings::mercurio::plugin::types::Registration, TICK},
     sandbox::State,
 };
 
@@ -72,7 +68,7 @@ impl Health {
 
 pub(crate) struct Pool {
     name: Arc<str>,
-    pre: bindings::PluginPre<State>,
+    pre: Pre,
     make: Box<dyn Fn() -> State + Send + Sync>,
     config: Vec<(String, String)>,
     timeout: Duration,
@@ -85,7 +81,7 @@ pub(crate) struct Pool {
 impl Pool {
     pub(crate) fn new(
         name: Arc<str>,
-        pre: bindings::PluginPre<State>,
+        pre: Pre,
         make: Box<dyn Fn() -> State + Send + Sync>,
         config: Vec<(String, String)>,
         timeout: Duration,
@@ -129,9 +125,8 @@ impl Pool {
         // Epochs count only time spent running; a plugin waiting in a host
         // call, such as an HTTP request, needs a clock too
         let init = async {
-            let plugin = self.pre.instantiate_async(&mut store).await?;
-            let guest = plugin.mercurio_plugin_guest().clone();
-            let registration = guest.call_init(&mut store, &self.config).await?;
+            let guest = self.pre.instantiate(&mut store).await?;
+            let registration = guest.init(&mut store, &self.config).await?;
             Ok::<_, wasmtime::Error>((guest, registration))
         };
         let (guest, registration) =

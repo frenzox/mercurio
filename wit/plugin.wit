@@ -1,15 +1,32 @@
 // Versioning: the broker matches a plugin's imports and exports to these
 // types by structure, so any change to a function, record, variant, enum or
 // flags breaks plugins built for the old shape. New hooks, fields or cases
-// therefore need a new minor version, 0.2.0. Releases 0.1.x change only
-// documentation.
-package mercurio:plugin@0.1.0;
+// therefore need a new minor version. Releases 0.2.x change only
+// documentation. The broker keeps loading plugins built for 0.1, whose
+// interface is frozen in `mercuriod/wit-0.1`.
+package mercurio:plugin@0.2.0;
 
 interface types {
   enum level { trace, debug, info, warn, error }
   enum access { read, write, subscribe }
   enum decision { allow, deny, defer }
   enum qos { at-most-once, at-least-once, exactly-once }
+
+  /// The connection a client came in on.
+  record connection {
+    /// The listener's address, such as `0.0.0.0:1883`, or its Unix socket
+    /// path; `local` for clients inside the broker's process
+    listener: string,
+    /// The MQTT version of the CONNECT: 3 for 3.1, 4 for 3.1.1, 5 for 5.0
+    protocol-version: u8,
+    tls: bool,
+    /// The name taken from the client's certificate, on a listener that
+    /// takes user names from certificates
+    certificate: option<string>,
+    /// The listener's mount point. It prefixes every topic the client
+    /// uses, and topics reach plugins with it.
+    mount-point: option<string>,
+  }
 
   /// `username` is set only for a user the broker verified, except in
   /// `authenticate` and in `auth-step` during CONNECT, where it is the user
@@ -18,6 +35,9 @@ interface types {
     client-id: string,
     username: option<string>,
     peer: option<string>,
+    /// None where no connection is known, such as for the publisher of a
+    /// retained message
+    connection: option<connection>,
   }
 
   /// A published message. The properties are MQTT 5's application
@@ -51,7 +71,15 @@ interface types {
   }
 
   /// The hooks a plugin implements; the broker calls no others.
-  flags hooks { authenticate, authorize, on-message, on-event, on-tick, on-control }
+  flags hooks {
+    authenticate,
+    authorize,
+    on-message,
+    on-event,
+    on-tick,
+    on-control,
+    authorize-control,
+  }
 
   record registration {
     hooks: hooks,
@@ -62,14 +90,19 @@ interface types {
   /// What `continue` sends: `data` goes to the client, and the broker
   /// keeps `state` for the next step.
   record challenge { data: list<u8>, state: list<u8> }
+  /// What `success` accepts the client as: the user it names, if any, and
+  /// `data`, such as SCRAM's final server message, sent to the client as
+  /// Authentication Data in the CONNACK or in the AUTH that ends a
+  /// re-authentication.
+  record success { username: option<string>, data: option<list<u8>> }
   /// The result of one step of enhanced authentication. `continue` sends
-  /// a challenge to the client; `success` accepts it, as the user it
-  /// names, if any; `failed` refuses it with an MQTT reason code.
-  variant auth-result { %continue(challenge), success(option<string>), failed(u8) }
+  /// a challenge to the client; `success` accepts it; `failed` refuses it
+  /// with an MQTT reason code.
+  variant auth-result { %continue(challenge), success(success), failed(u8) }
 }
 
 interface host {
-  use types.{level};
+  use types.{level, message};
 
   log: func(level: level, message: string);
 
@@ -81,6 +114,18 @@ interface host {
   kv-set: func(key: string, value: list<u8>) -> result<_, string>;
   kv-delete: func(key: string);
   kv-list: func(prefix: string) -> list<string>;
+
+  /// Publishes `message` as the client `mercurio-plugin-<name>`, inside
+  /// the broker, which skips access control. It returns once the message
+  /// is queued; it reaches subscribers shortly after, once the broker
+  /// serves clients. It fails, and nothing is published, for a topic that
+  /// starts with `$` or isn't a valid topic name, for a message over
+  /// 64 KiB counting its topic, payload and properties, and when the
+  /// plugin publishes faster than its rate limit allows: bursts of 100,
+  /// 100 messages a second on average, for all copies together. The other
+  /// plugins' `on-message` see the message; the publishing plugin's own
+  /// does not.
+  publish: func(message: message) -> result<_, string>;
 }
 
 interface guest {
@@ -93,6 +138,12 @@ interface guest {
   /// re-authentication, the verified user.
   auth-step: func(client: client-info, method: string, state: option<list<u8>>, data: option<list<u8>>) -> auth-result;
   authorize: func(client: client-info, topic: string, access: access) -> decision;
+  /// Whether `client` may publish to `topic`, a `$CONTROL/...` topic,
+  /// which administers the broker or a plugin. A request to
+  /// `$CONTROL/broker/v1` is asked about twice: for that topic, then for
+  /// each of its commands as `$CONTROL/broker/v1/<command>`. When every
+  /// plugin defers, the client is refused.
+  authorize-control: func(client: client-info, topic: string) -> decision;
   on-message: func(client: client-info, message: message) -> message-action;
   on-event: func(event: event);
   on-tick: func();

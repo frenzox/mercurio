@@ -13,3 +13,7 @@ wasip2 = "2.0.1"
 
 [profile.release]
 opt-level = "s"
+
+# Its own workspace: cargo would otherwise take the nearest workspace above it,
+# which in a checkout nested in another (a git worktree) does not list it
+[workspace]

@@ -28,7 +28,9 @@ use std::{
 
 use bytes::Bytes;
 use futures_util::FutureExt;
-use mercurio_core::{message::MessageProperties, qos::QoS, reason::ReasonCode};
+use mercurio_core::{
+    message::MessageProperties, protocol::ProtocolVersion, qos::QoS, reason::ReasonCode,
+};
 use serde::Serialize;
 use tracing::{error, warn};
 
@@ -79,6 +81,10 @@ pub struct PluginStatus {
     /// WASM plugins: the last failure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// WASM plugins: the version of the plugin interface it was built for,
+    /// such as `0.2.0`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
 }
 
 impl PluginStatus {
@@ -91,6 +97,7 @@ impl PluginStatus {
             instances: None,
             failures: None,
             last_error: None,
+            interface: None,
         }
     }
 
@@ -126,6 +133,9 @@ pub struct ClientInfo {
     /// None for in-process clients and for the publishers of retained
     /// messages.
     pub peer: Option<SocketAddr>,
+    /// The connection the client came in on. None for the publishers of
+    /// retained messages, whose connection may be long gone.
+    pub connection: Option<Arc<ConnectionInfo>>,
 }
 
 impl ClientInfo {
@@ -134,6 +144,38 @@ impl ClientInfo {
             client_id: client_id.into(),
             username,
             peer: None,
+            connection: None,
+        }
+    }
+}
+
+/// The connection a client came in on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnectionInfo {
+    /// The listener's address or Unix socket path; `local` for in-process
+    /// clients
+    pub listener: Arc<str>,
+    /// The MQTT version of the CONNECT
+    pub protocol_version: ProtocolVersion,
+    /// Whether the connection is TLS
+    pub tls: bool,
+    /// The name taken from the client's certificate, on a listener that
+    /// takes user names from certificates
+    pub certificate: Option<String>,
+    /// The listener's mount point, which prefixes every topic the client
+    /// uses; topics reach plugins with it
+    pub mount_point: Option<String>,
+}
+
+impl ConnectionInfo {
+    pub fn new(listener: impl Into<Arc<str>>, protocol_version: ProtocolVersion) -> Self {
+        ConnectionInfo {
+            listener: listener.into(),
+            protocol_version,
+            tls: false,
+            certificate: None,
+            mount_point: None,
         }
     }
 }
