@@ -286,6 +286,12 @@ allow_anonymous = false
 # No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
+# For https:// endpoints: CA certificates their certificates must chain to,
+# in place of the bundled roots, and a client certificate with its key for
+# endpoints that ask for one. Each file is PEM.
+# ca_path = "/etc/mercurio/auth-ca.pem"
+# cert_path = "/etc/mercurio/auth-client.pem"
+# key_path = "/etc/mercurio/auth-client-key.pem"
 
 [admin]
 # Unix socket for administering the broker from this machine, as mercurioctl
@@ -548,7 +554,10 @@ topic check, it POSTs
 `{"username", "clientid", "topic", "acc"}` to `acl_url`, with `acc` 1 to
 receive, 2 to publish and 4 to subscribe. A 2xx status allows; anything else, a timeout
 included, denies. Topic answers are reused for `cache_seconds`, since
-every message is checked. `user_url` replaces `password_file` and
+every message is checked. Over `https://`, `ca_path` names the CA
+certificates endpoints' certificates must chain to, in place of the bundled
+roots, and `cert_path` and `key_path` a client certificate for endpoints
+that ask for one. `user_url` replaces `password_file` and
 `acl_url` replaces `acl_file`.
 
 ### Reloading

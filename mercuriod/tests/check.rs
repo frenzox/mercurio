@@ -187,6 +187,27 @@ fn broken(dir: &TempDir) -> Vec<(&'static str, PathBuf, Vec<String>)> {
             vec!["`timeout_seconds`".into(), "`plugin_timeout`".into()],
         ),
         (
+            "missing HTTP auth CA file",
+            config(
+                "http-ca.toml",
+                format!(
+                    "[auth.http]\nacl_url = \"https://127.0.0.1:9/acl\"\nca_path = \"{}\"\n",
+                    missing_cert.display()
+                ),
+            ),
+            vec![missing_cert.display().to_string()],
+        ),
+        (
+            "HTTP auth client certificate without its key",
+            config(
+                "http-cert.toml",
+                format!(
+                    "[auth.http]\nacl_url = \"https://127.0.0.1:9/acl\"\ncert_path = \"{FIXTURES}/cert.pem\"\n"
+                ),
+            ),
+            vec!["cert_path".into(), "key_path".into()],
+        ),
+        (
             "unreadable configuration",
             not_a_file.clone(),
             vec![not_a_file.display().to_string()],

@@ -217,6 +217,12 @@ allow_anonymous = false
 # No longer than [server] plugin_timeout
 # timeout_seconds = 5
 # cache_seconds = 30
+# For https:// endpoints: CA certificates their certificates must chain to,
+# in place of the bundled roots, and a client certificate with its key for
+# endpoints that ask for one. Each file is PEM.
+# ca_path = "/etc/mercurio/auth-ca.pem"
+# cert_path = "/etc/mercurio/auth-client.pem"
+# key_path = "/etc/mercurio/auth-client-key.pem"
 
 [admin]
 # Unix socket for administering the broker from this machine, as mercurioctl

@@ -199,6 +199,12 @@ cache_seconds = 30</pre>
 <tr><td><code>acl_url</code>, at each topic check</td><td><code>{"username": "alice", "clientid": "c1", "topic": "a/b", "acc": 2}</code></td></tr>
 </table>
 <p><code>acc</code> is 1 to receive, 2 to publish and 4 to subscribe, and 8 to publish to a <code>$CONTROL/...</code> topic, which <a href="admin.html#remote">administers the broker</a>; answer 8 with 2xx only for administrators. A 2xx status allows and a 4xx status denies. Topic answers are reused for <code>cache_seconds</code>, since every message is checked. Any other status, an error or a timeout also denies, but is not cached, so the check is asked again once the service is back; the broker logs these failures at <code>warn</code>, at most once every 10 seconds. At most 32 requests run at once, and identical checks made while one is out wait for its answer. A <code>user_url</code> that is plain <code>http://</code> to another host is logged at startup, as passwords then cross the network unencrypted. <code>user_url</code> replaces <code>password_file</code>, and <code>acl_url</code> replaces <code>acl_file</code>; either can be used alone.</p>
+<p>Over <code>https://</code>, endpoint certificates are checked against the bundled Mozilla roots. For a service with a certificate of a private CA, give that CA's certificates with <code>ca_path</code>, which then replaces the bundled roots; for a service that authenticates the broker with a client certificate, give it with <code>cert_path</code> and its key with <code>key_path</code>. All three are PEM files, read at startup and by <code>mercuriod --check</code>; a file that can't be read or holds no certificate or key stops the broker from starting, and a change needs a restart.</p>
+<pre>[auth.http]
+acl_url = "https://auth.internal/mqtt/acl"
+ca_path = "/etc/mercurio/auth-ca.pem"
+cert_path = "/etc/mercurio/auth-client.pem"
+key_path = "/etc/mercurio/auth-client-key.pem"</pre>
 <p>A minimal service, in Python:</p>
 <pre>from http.server import BaseHTTPRequestHandler, HTTPServer
 import json

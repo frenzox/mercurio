@@ -173,6 +173,9 @@ mount_point = "tenant1/"</pre>
 <tr><td><code>acl_url</code></td><td></td><td>Endpoint checking topic access; replaces <code>acl_file</code>.</td></tr>
 <tr><td><code>timeout_seconds</code></td><td><code>5</code></td><td>Longest wait for an answer; a timeout denies. No longer than <code>[server]</code> <code>plugin_timeout</code>.</td></tr>
 <tr><td><code>cache_seconds</code></td><td><code>30</code></td><td>How long topic answers are reused.</td></tr>
+<tr><td><code>ca_path</code></td><td></td><td>PEM file of the CA certificates that <code>https://</code> endpoints' certificates must chain to, in place of the bundled roots.</td></tr>
+<tr><td><code>cert_path</code></td><td></td><td>PEM certificate chain presented to <code>https://</code> endpoints that ask for one. Needs <code>key_path</code>.</td></tr>
+<tr><td><code>key_path</code></td><td></td><td>PEM private key of <code>cert_path</code>.</td></tr>
 </table>
 
 <h2 id="admin">[admin]</h2>

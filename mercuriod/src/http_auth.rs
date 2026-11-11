@@ -24,8 +24,9 @@ use mercurio_server::plugin::{
 use serde_json::json;
 use tokio::sync::{OnceCell, Semaphore};
 use tracing::warn;
+use ureq::tls::{Certificate, ClientCert, PemItem, PrivateKey, RootCerts, TlsConfig};
 
-use crate::config::redacted_http_url;
+use crate::config::{redacted_http_url, HttpAuthConfig};
 
 /// The `acc` of a request to publish to a `$CONTROL` topic.
 const CONTROL_ACC: u8 = 8;
@@ -60,6 +61,21 @@ pub struct HttpAuth {
 }
 
 impl HttpAuth {
+    /// The checks `[auth.http]` describes, with its certificate files
+    /// loaded.
+    pub fn from_config(config: &HttpAuthConfig) -> Result<Self, String> {
+        let mut auth = Self::new(
+            config.user_url.clone(),
+            config.acl_url.clone(),
+            Duration::from_secs(config.timeout_seconds),
+            Duration::from_secs(config.cache_seconds),
+        );
+        if let Some(tls) = tls_config(config)? {
+            auth.agent = agent(Duration::from_secs(config.timeout_seconds), tls);
+        }
+        Ok(auth)
+    }
+
     pub fn new(
         user_url: Option<String>,
         acl_url: Option<String>,
@@ -75,12 +91,8 @@ impl HttpAuth {
                 redacted_http_url(url)
             );
         }
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .build()
-            .into();
         Self {
-            agent,
+            agent: agent(timeout, TlsConfig::default()),
             user_url,
             acl_url,
             cache: Mutex::new(Cache::new(CACHE_LIMIT, cache_for)),
@@ -138,6 +150,67 @@ impl HttpAuth {
         }
         None
     }
+}
+
+fn agent(timeout: Duration, tls: TlsConfig) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .tls_config(tls)
+        .build()
+        .into()
+}
+
+/// The TLS settings of `config`'s certificate files, None when it names
+/// none.
+fn tls_config(config: &HttpAuthConfig) -> Result<Option<TlsConfig>, String> {
+    let mut tls = TlsConfig::builder();
+    match &config.ca_path {
+        Some(path) => tls = tls.root_certs(RootCerts::new_with_certs(&certificates(path)?)),
+        None if config.cert_path.is_none() && config.key_path.is_none() => return Ok(None),
+        None => {}
+    }
+    match (&config.cert_path, &config.key_path) {
+        (Some(cert), Some(key)) => {
+            let key = private_key(key)?;
+            tls = tls.client_cert(Some(ClientCert::new_with_certs(&certificates(cert)?, key)));
+        }
+        (None, None) => {}
+        _ => return Err("[auth.http] cert_path and key_path go together".to_string()),
+    }
+    Ok(Some(tls.build()))
+}
+
+fn read_pem(path: &str) -> Result<Vec<PemItem<'static>>, String> {
+    let contents = std::fs::read(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
+    ureq::tls::parse_pem(&contents)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Invalid PEM in {path}: {e}"))
+}
+
+/// The certificates of the PEM file at `path`, at least one.
+fn certificates(path: &str) -> Result<Vec<Certificate<'static>>, String> {
+    let certificates: Vec<_> = read_pem(path)?
+        .into_iter()
+        .filter_map(|item| match item {
+            PemItem::Certificate(certificate) => Some(certificate),
+            _ => None,
+        })
+        .collect();
+    if certificates.is_empty() {
+        return Err(format!("{path} holds no certificate"));
+    }
+    Ok(certificates)
+}
+
+/// The first private key of the PEM file at `path`.
+fn private_key(path: &str) -> Result<PrivateKey<'static>, String> {
+    read_pem(path)?
+        .into_iter()
+        .find_map(|item| match item {
+            PemItem::PrivateKey(key) => Some(key),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{path} holds no private key"))
 }
 
 /// Whether `url` is plain HTTP to a host other than this machine's loopback.
@@ -449,6 +522,132 @@ mod tests {
             }
         });
         (backend.url, backend.requests)
+    }
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/http-auth");
+
+    /// An HTTPS backend allowing every request, with a certificate of the
+    /// test CA, that only takes clients presenting a certificate of the
+    /// same CA.
+    fn tls_backend() -> String {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certs = |name: &str| {
+            CertificateDer::pem_file_iter(format!("{FIXTURES}/{name}"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(certs("ca.pem"));
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(format!("{FIXTURES}/server-key.pem")).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs("server.pem"), key)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let connection = rustls::ServerConnection::new(Arc::clone(&config)).unwrap();
+                let tls = rustls::StreamOwned::new(connection, stream.unwrap());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(tls);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        // A client that gave up on the handshake
+                        if reader.read_line(&mut line).is_err() {
+                            return;
+                        }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let mut tls = reader.into_inner();
+                    let response =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = tls.write_all(response.as_bytes());
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                });
+            }
+        });
+        url
+    }
+
+    fn tls_config(url: &str, files: [Option<&str>; 3]) -> HttpAuthConfig {
+        let path = |name: Option<&str>| name.map(|name| format!("{FIXTURES}/{name}"));
+        HttpAuthConfig {
+            user_url: None,
+            acl_url: Some(url.to_string()),
+            timeout_seconds: 5,
+            cache_seconds: 60,
+            ca_path: path(files[0]),
+            cert_path: path(files[1]),
+            key_path: path(files[2]),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backends_are_reached_with_the_ca_and_client_certificate_given() {
+        let url = tls_backend();
+        let alice = ClientInfo::new("c", Some("alice".to_string()));
+        let all = [Some("ca.pem"), Some("client.pem"), Some("client-key.pem")];
+        let auth = HttpAuth::from_config(&tls_config(&url, all)).unwrap();
+        assert_eq!(
+            auth.authorize(&alice, "t", Access::Write).await,
+            Decision::Allow
+        );
+
+        // Without the client certificate the backend refuses the
+        // connection, and with the bundled roots its certificate is unknown
+        for files in [
+            [Some("ca.pem"), None, None],
+            [None, Some("client.pem"), Some("client-key.pem")],
+        ] {
+            let auth = HttpAuth::from_config(&tls_config(&url, files)).unwrap();
+            assert_eq!(
+                auth.authorize(&alice, "t", Access::Write).await,
+                Decision::Deny,
+                "{files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tls_files_must_load() {
+        let url = "https://127.0.0.1:1/";
+        for (files, expected) in [
+            ([Some("missing.pem"), None, None], "missing.pem"),
+            ([Some("client-key.pem"), None, None], "no certificate"),
+            ([None, Some("client.pem"), None], "together"),
+            ([None, None, Some("client-key.pem")], "together"),
+            (
+                [None, Some("client.pem"), Some("client.pem")],
+                "no private key",
+            ),
+            (
+                [None, Some("client-key.pem"), Some("client-key.pem")],
+                "no certificate",
+            ),
+        ] {
+            let error = HttpAuth::from_config(&tls_config(url, files))
+                .err()
+                .unwrap_or_else(|| panic!("{files:?} loaded"));
+            assert!(error.contains(expected), "{files:?}: {error}");
+        }
     }
 
     #[tokio::test]

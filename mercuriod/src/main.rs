@@ -682,15 +682,14 @@ fn build_auth(
         return Ok((value, vec![security.clone()], Some(security)));
     }
 
-    let http = config.http.as_ref().map(|http| {
-        let auth = Arc::new(HttpAuth::new(
-            http.user_url.clone(),
-            http.acl_url.clone(),
-            Duration::from_secs(http.timeout_seconds),
-            Duration::from_secs(http.cache_seconds),
-        ));
-        (auth, http.user_url.is_some(), http.acl_url.is_some())
-    });
+    let http = match &config.http {
+        Some(http) => Some((
+            Arc::new(HttpAuth::from_config(http)?),
+            http.user_url.is_some(),
+            http.acl_url.is_some(),
+        )),
+        None => None,
+    };
     let (http_users, http_acl) = http
         .as_ref()
         .map_or((false, false), |(_, users, acl)| (*users, *acl));
