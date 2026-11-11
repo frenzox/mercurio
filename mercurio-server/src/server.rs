@@ -120,7 +120,10 @@ pub struct Limits {
     /// Largest CONNECT accepted, and AUTH during enhanced authentication,
     /// fixed header included. These come before the client is
     /// authenticated, so they get less room than `max_packet_size`, which
-    /// still caps it. A larger one is refused as Packet Too Large.
+    /// still caps it. A larger one is refused as Packet Too Large. On
+    /// WebSocket listeners, which buffer whole messages, the bytes a client
+    /// sends before it is authenticated are held to twice this, framing
+    /// included, and the connection closed past that.
     pub max_connect_packet_size: usize,
     /// Messages waiting to be sent to one session.
     pub queue: QueueLimits,
@@ -819,7 +822,10 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 };
                 match handshake {
                     Ok(Ok(websocket)) => {
-                        Box::pin(self.handle(Connection::new(websocket), peer_addr)).await
+                        let budget = websocket.read_budget();
+                        let mut connection = Connection::new(websocket);
+                        connection.set_read_budget(budget);
+                        Box::pin(self.handle(connection, peer_addr)).await
                     }
                     Ok(Err(e)) => debug!(
                         target: CONNECTIONS,

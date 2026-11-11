@@ -278,7 +278,15 @@ async fn messages_larger_than_the_largest_packet_are_refused() {
         false,
     );
     let _ = websocket.send(Message::Frame(fragment)).await;
-    let closed = timeout(Duration::from_secs(2), async {
+    assert!(
+        closed(&mut websocket).await,
+        "still waiting for the rest of the message"
+    );
+}
+
+/// Whether the broker closes `websocket` within two seconds.
+async fn closed(websocket: &mut WebSocketStream<TcpStream>) -> bool {
+    timeout(Duration::from_secs(2), async {
         loop {
             match websocket.next().await {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
@@ -286,6 +294,67 @@ async fn messages_larger_than_the_largest_packet_are_refused() {
             }
         }
     })
-    .await;
-    assert!(closed.is_ok(), "still waiting for the rest of the message");
+    .await
+    .is_ok()
+}
+
+/// Before CONNECT is accepted, a client gets as little room as on TCP,
+/// not a whole message as large as the largest packet; once connected, it
+/// gets the rest.
+#[tokio::test]
+async fn messages_before_connect_get_the_connect_limit() {
+    use tokio_tungstenite::tungstenite::protocol::frame::{coding::Data, coding::OpCode, Frame};
+
+    let (_, websocket_addr) = start_broker().await;
+    let mut websocket = websocket_connect(websocket_addr).await;
+    // Larger than a CONNECT may be, smaller than a packet, never finished
+    let fragment = Frame::message(vec![0u8; 512 * 1024], OpCode::Data(Data::Binary), false);
+    let _ = websocket.send(Message::Frame(fragment)).await;
+    assert!(
+        closed(&mut websocket).await,
+        "still waiting for the rest of the message"
+    );
+
+    let mut websocket = websocket_connect(websocket_addr).await;
+    let mut buffer = BytesMut::new();
+    websocket
+        .send(Message::Binary(Bytes::from_static(&CONNECT)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut websocket, &mut buffer).await,
+        ControlPacket::ConnAck(_)
+    ));
+    // SUBSCRIBE to "t", then a 512 KiB PUBLISH on it comes back
+    let subscribe = [0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b't', 0x00];
+    websocket
+        .send(Message::Binary(Bytes::copy_from_slice(&subscribe)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_packet(&mut websocket, &mut buffer).await,
+        ControlPacket::SubAck(_)
+    ));
+    let payload = 512 * 1024;
+    let length = 3 + 1 + payload;
+    let mut publish = vec![0x30];
+    let mut rest = length;
+    loop {
+        let byte = (rest % 128) as u8;
+        rest /= 128;
+        publish.push(if rest > 0 { byte | 0x80 } else { byte });
+        if rest == 0 {
+            break;
+        }
+    }
+    publish.extend_from_slice(&[0x00, 0x01, b't', 0x00]);
+    publish.resize(publish.len() + payload, 7);
+    websocket
+        .send(Message::Binary(Bytes::from(publish)))
+        .await
+        .unwrap();
+    let ControlPacket::Publish(received) = next_packet(&mut websocket, &mut buffer).await else {
+        panic!("Expected Publish");
+    };
+    assert_eq!(received.payload.unwrap().len(), payload);
 }

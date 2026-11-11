@@ -4,6 +4,10 @@
 use std::{
     io,
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
@@ -69,11 +73,20 @@ where
     let config = WebSocketConfig::default()
         .max_message_size(Some(max_message_size))
         .max_frame_size(Some(max_message_size));
+    let budget = ReadBudget {
+        remaining: Arc::new(AtomicUsize::new(usize::MAX)),
+        ceiling: max_message_size,
+    };
+    let stream = Budgeted {
+        stream,
+        budget: budget.clone(),
+    };
     let websocket =
         tokio_tungstenite::accept_hdr_async_with_config(stream, select_mqtt, Some(config)).await?;
     Ok(WebSocketTransport {
         websocket,
         pending: Bytes::new(),
+        budget,
     })
 }
 
@@ -83,11 +96,97 @@ fn refusal(status: StatusCode, reason: &str) -> ErrorResponse {
     response
 }
 
+/// Bytes a WebSocket client may still send, while its packets are held to
+/// a smaller size than the WebSocket's own message limit, such as CONNECT
+/// before the client is authenticated.
+///
+/// tungstenite buffers a whole message, up to the limit set at the
+/// handshake, before handing it on, and tokio-tungstenite can't change that
+/// limit afterwards. So the bytes read from the socket under the WebSocket
+/// are counted instead, and reading past the budget fails.
+#[derive(Clone)]
+pub(crate) struct ReadBudget {
+    /// `usize::MAX` when unbounded
+    remaining: Arc<AtomicUsize>,
+    /// The WebSocket's own message limit, past which no budget is needed
+    ceiling: usize,
+}
+
+impl ReadBudget {
+    /// Holds the client to packets of `max_packet_size`, from now on.
+    /// Twice that many bytes may be read, which leaves room for framing.
+    pub(crate) fn limit(&self, max_packet_size: usize) {
+        let remaining = match max_packet_size >= self.ceiling {
+            true => usize::MAX,
+            false => max_packet_size.saturating_mul(2),
+        };
+        self.remaining.store(remaining, Ordering::Relaxed);
+    }
+}
+
+/// The socket under a WebSocket, read within its `ReadBudget`.
+struct Budgeted<S> {
+    stream: S,
+    budget: ReadBudget,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Budgeted<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let remaining = self.budget.remaining.load(Ordering::Relaxed);
+        if remaining == usize::MAX {
+            return Pin::new(&mut self.stream).poll_read(cx, buf);
+        }
+        if remaining == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the client sent more than its packet size limit allows",
+            )));
+        }
+        // Never read past the budget, so pipelined packets wait in the
+        // socket until the limit is lifted
+        let mut limited = ReadBuf::new(buf.initialize_unfilled_to(remaining.min(buf.remaining())));
+        ready!(Pin::new(&mut self.stream).poll_read(cx, &mut limited))?;
+        let read = limited.filled().len();
+        buf.advance(read);
+        self.budget.remaining.fetch_sub(read, Ordering::Relaxed);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Budgeted<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 /// Presents a WebSocket as the plain byte stream MQTT expects.
 pub(crate) struct WebSocketTransport<S> {
-    websocket: WebSocketStream<S>,
+    websocket: WebSocketStream<Budgeted<S>>,
     /// Received bytes not read yet
     pending: Bytes,
+    budget: ReadBudget,
+}
+
+impl<S> WebSocketTransport<S> {
+    pub(crate) fn read_budget(&self) -> ReadBudget {
+        self.budget.clone()
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketTransport<S> {

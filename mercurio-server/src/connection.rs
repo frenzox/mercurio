@@ -14,7 +14,10 @@ use mercurio_core::{
 use mercurio_packets::ControlPacket;
 use tracing::warn;
 
-use crate::sys::{ClientCounters, Stats};
+use crate::{
+    sys::{ClientCounters, Stats},
+    websocket::ReadBudget,
+};
 
 /// Initial capacity of the read buffer, which grows for larger packets.
 /// Kept small, as most connections are idle or exchange small packets, and
@@ -98,6 +101,9 @@ where
     /// A write timed out partway through a packet, so nothing more can be
     /// framed on the stream
     stalled: bool,
+    /// On a WebSocket, holds what is read from the socket to
+    /// `max_packet_size` too, as whole messages are buffered below this
+    read_budget: Option<ReadBudget>,
 }
 
 /// Moves the topics a client sent under `mount_point`. Empty names are left
@@ -166,7 +172,13 @@ where
             counters: None,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             stalled: false,
+            read_budget: None,
         }
+    }
+
+    pub(crate) fn set_read_budget(&mut self, budget: ReadBudget) {
+        budget.limit(self.max_packet_size);
+        self.read_budget = Some(budget);
     }
 
     /// How long writing one packet may take before the connection is given
@@ -193,6 +205,9 @@ where
 
     pub fn set_max_packet_size(&mut self, max_packet_size: usize) {
         self.max_packet_size = max_packet_size;
+        if let Some(budget) = &self.read_budget {
+            budget.limit(max_packet_size);
+        }
     }
 
     pub fn set_protocol_version(&mut self, version: ProtocolVersion) {
