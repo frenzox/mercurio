@@ -316,6 +316,18 @@ group = "mercurio"
 # other clients send none and are not affected); any origin when unset
 # allowed_origins = ["https://app.example.com"]
 #
+# Health and Prometheus metrics endpoints over HTTP, on WebSocket listeners
+# only and off by default: GET /healthz answers 200 while the broker serves,
+# GET /metrics the statistics. Metrics tell anyone who reaches the listener
+# how loaded the broker is, so give them a listener of their own on a
+# loopback address
+# [[listeners]]
+# host = "127.0.0.1"
+# port = 9883
+# protocol = "websocket"
+# health = true
+# metrics = true
+#
 # Unix domain socket, for clients on the same machine. It belongs to the
 # broker's user with mode 0600, so only that user may connect, unless
 # `group` and `mode` open it to others (Linux only)
@@ -679,6 +691,13 @@ may subscribe to them, but not publish to `$SYS` topics. Retained `$SYS`
 messages, bridge states included, are kept in memory: new subscribers get
 the latest values, but they are not stored and don't count toward
 `max_retained_messages`.
+
+A WebSocket listener with `health = true` answers `GET /healthz` with 200
+while the broker serves; with `metrics = true`, `GET /metrics` gets the same
+counters in the Prometheus text format, as `mercurio_*` metrics. Both are
+off by default. Metrics show anyone who reaches the listener how loaded the
+broker is, so serve them on a listener of their own on a loopback address,
+as in the sample above.
 
 ## Running
 

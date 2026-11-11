@@ -55,8 +55,8 @@ const DROPPED_BY_CAUSE: [&str; 6] = [
 ];
 
 /// Counters the connection handlers update.
-#[derive(Default)]
 pub(crate) struct Stats {
+    pub started: Instant,
     pub connected: AtomicU64,
     /// Most clients connected at once
     pub max_connected: AtomicU64,
@@ -67,6 +67,22 @@ pub(crate) struct Stats {
     pub bytes_sent: AtomicU64,
     /// By `DropCause`, in its order
     dropped: [AtomicU64; DROPPED_BY_CAUSE.len()],
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            started: Instant::now(),
+            connected: Default::default(),
+            max_connected: Default::default(),
+            connections: Default::default(),
+            messages_received: Default::default(),
+            messages_sent: Default::default(),
+            bytes_received: Default::default(),
+            bytes_sent: Default::default(),
+            dropped: Default::default(),
+        }
+    }
 }
 
 impl Stats {
@@ -267,6 +283,116 @@ pub(crate) fn counters(
     counters
 }
 
+/// The counters published under `$SYS/broker/`, read now.
+pub(crate) async fn current<St: MqttStore + 'static>(
+    broker: &Broker<St>,
+    session_manager: &SessionManager<St>,
+    stats: &Stats,
+) -> Vec<(&'static str, u64)> {
+    counters(
+        stats,
+        session_manager.session_count().await,
+        session_manager.expired_count(),
+        broker.retained_count().await,
+        broker.topics().subscription_count(),
+    )
+}
+
+/// The Prometheus metric a `$SYS/broker/` counter is exposed as: its name,
+/// help and type. None for the total of dropped messages, which the
+/// metric's `cause` label splits.
+fn metric(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let (counter, gauge) = ("counter", "gauge");
+    Some(match name {
+        "clients/connected" => ("mercurio_clients_connected", "Clients connected now", gauge),
+        "clients/total" => ("mercurio_sessions", "Sessions, connected or not", gauge),
+        "clients/disconnected" => (
+            "mercurio_sessions_disconnected",
+            "Sessions kept for clients that are not connected",
+            gauge,
+        ),
+        "clients/maximum" => (
+            "mercurio_clients_connected_max",
+            "Most clients connected at once",
+            gauge,
+        ),
+        "clients/expired" => (
+            "mercurio_sessions_expired_total",
+            "Sessions ended by their expiry",
+            counter,
+        ),
+        "messages/received" => (
+            "mercurio_messages_received_total",
+            "PUBLISH packets received",
+            counter,
+        ),
+        "messages/sent" => (
+            "mercurio_messages_sent_total",
+            "PUBLISH packets sent",
+            counter,
+        ),
+        "bytes/received" => ("mercurio_bytes_received_total", "Bytes received", counter),
+        "bytes/sent" => ("mercurio_bytes_sent_total", "Bytes sent", counter),
+        "retained messages/count" => (
+            "mercurio_retained_messages",
+            "Retained messages stored, $SYS ones not counted",
+            gauge,
+        ),
+        "subscriptions/count" => ("mercurio_subscriptions", "Subscriptions", gauge),
+        "store/batches/retried" => (
+            "mercurio_storage_batches_retried_total",
+            "Batches of session changes written again after a storage error",
+            counter,
+        ),
+        "store/batches/dropped" => (
+            "mercurio_storage_batches_dropped_total",
+            "Batches of session changes given up on after storage errors",
+            counter,
+        ),
+        "connections" => (
+            "mercurio_connections_total",
+            "Connections accepted",
+            counter,
+        ),
+        "uptime" => (
+            "mercurio_uptime_seconds",
+            "Seconds since the broker started",
+            gauge,
+        ),
+        _ if name.starts_with("publish/messages/dropped/") => (
+            "mercurio_messages_dropped_total",
+            "Messages lost before reaching a subscriber, by cause",
+            counter,
+        ),
+        _ => return None,
+    })
+}
+
+/// `counters`, as returned by `current`, in the Prometheus text exposition
+/// format, with the connections accepted and the uptime.
+pub(crate) fn prometheus(counters: &[(&'static str, u64)], stats: &Stats) -> String {
+    let extra = [
+        ("connections", stats.connections.load(Ordering::Relaxed)),
+        ("uptime", stats.started.elapsed().as_secs()),
+    ];
+    let mut text = String::new();
+    let mut described = "";
+    for (name, value) in counters.iter().copied().chain(extra) {
+        let Some((metric, help, kind)) = metric(name) else {
+            continue;
+        };
+        if metric != described {
+            text.push_str(&format!("# HELP {metric} {help}\n# TYPE {metric} {kind}\n"));
+            described = metric;
+        }
+        match name.strip_prefix("publish/messages/dropped/") {
+            Some(cause) => text.push_str(&format!("{metric}{{cause=\"{cause}\"}} {value}\n")),
+            None => text.push_str(&format!("{metric} {value}\n")),
+        }
+    }
+    text
+}
+
 /// Publishes the statistics every `interval` until the process ends.
 pub(crate) fn spawn_publisher<St: MqttStore + 'static>(
     broker: Broker<St>,
@@ -293,13 +419,7 @@ pub(crate) fn spawn_publisher<St: MqttStore + 'static>(
         let mut ticks = time::interval(interval);
         loop {
             ticks.tick().await;
-            let current = counters(
-                &stats,
-                session_manager.session_count().await,
-                session_manager.expired_count(),
-                broker.retained_count().await,
-                broker.topics().subscription_count(),
-            );
+            let current = current(&broker, &session_manager, &stats).await;
             let mut values = vec![(
                 "uptime".to_string(),
                 format!("{} seconds", started.elapsed().as_secs()),

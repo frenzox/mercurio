@@ -306,6 +306,14 @@ pub struct ListenerConfig {
     /// connect timeout, and a listener sends 32 at once at most; requests
     /// beyond that get Service Unavailable.
     pub http_dir: Option<PathBuf>,
+    /// On WebSocket listeners, answer `GET /healthz` with 200 OK while the
+    /// broker serves and 503 Service Unavailable once it is stopping.
+    pub health: bool,
+    /// On WebSocket listeners, answer `GET /metrics` with the `$SYS`
+    /// counters in the Prometheus text format. They tell anyone who reaches
+    /// the listener how loaded the broker is, so enable it on a listener
+    /// only monitoring can reach, such as one on a loopback address.
+    pub metrics: bool,
     /// On WebSocket listeners, the origins of the web pages that may
     /// connect, such as `https://app.example.com`. Browsers say which page
     /// opens a WebSocket in its `Origin` header; an upgrade from any other
@@ -345,6 +353,8 @@ impl ListenerConfig {
             plugins: None,
             max_connections: None,
             http_dir: None,
+            health: false,
+            metrics: false,
             allowed_origins: None,
             trusted: false,
             #[cfg(unix)]
@@ -447,7 +457,7 @@ struct EndpointSettings {
     mount_point: Option<String>,
     auth: Option<Arc<AuthConfig>>,
     chain: Option<Chain>,
-    http_files: Option<Arc<http::Files>>,
+    http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
 }
 
@@ -484,10 +494,14 @@ impl Endpoint {
             }
         }
         if config.transport != Transport::WebSocket
-            && (config.http_dir.is_some() || config.allowed_origins.is_some())
+            && (config.http_dir.is_some()
+                || config.allowed_origins.is_some()
+                || config.health
+                || config.metrics)
         {
             return Err(ServerError::Config(
-                "http_dir and allowed_origins only apply to WebSocket listeners".into(),
+                "http_dir, allowed_origins, health and metrics only apply to WebSocket listeners"
+                    .into(),
             ));
         }
         // A Unix socket's file permissions decide who may send the header
@@ -568,7 +582,15 @@ impl Endpoint {
                     false => config.auth.map(Arc::new),
                 },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
-                http_files: config.http_dir.map(|dir| Arc::new(http::Files::new(dir))),
+                http_site: (config.http_dir.is_some() || config.health || config.metrics).then(
+                    || {
+                        Arc::new(http::Site::new(
+                            config.http_dir,
+                            config.health,
+                            config.metrics,
+                        ))
+                    },
+                ),
                 allowed_origins: config.allowed_origins.map(Into::into),
             },
         })
@@ -623,7 +645,7 @@ struct HandlerParts<St: MqttStore + 'static> {
     /// user name
     cert_identity: Option<String>,
     mount_point: Option<String>,
-    http_files: Option<Arc<http::Files>>,
+    http_site: Option<Arc<http::Site>>,
     allowed_origins: Option<Arc<[String]>>,
     /// An in-process connection, from the local listener
     local: bool,
@@ -724,7 +746,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             }
         }
         self.mount_point = settings.mount_point;
-        self.http_files = settings.http_files;
+        self.http_site = settings.http_site;
         self.allowed_origins = settings.allowed_origins;
         if let Some(auth) = settings.auth {
             self.auth_config = auth;
@@ -765,14 +787,14 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         }
     }
 
-    /// Reads the HTTP request on a WebSocket listener with files to serve.
+    /// Reads the HTTP request on a WebSocket listener with a site to serve.
     /// A WebSocket upgrade is returned to complete; any other request is
-    /// answered from `files`, under its own deadline as sending a file may
+    /// answered from `site`, under its own deadline as sending a file may
     /// take longer than connecting does, and None returned.
     async fn serve_http<S>(
         &mut self,
         stream: S,
-        files: &http::Files,
+        site: &http::Site,
         peer_addr: Option<SocketAddr>,
     ) -> Option<http::Rewind<S>>
     where
@@ -782,7 +804,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         let (stream, head) =
             match connect_step(&mut self.shutdown, self.connect_deadline, request).await? {
                 Ok(Ok(http::Request::Upgrade(upgrade))) => return Some(upgrade),
-                Ok(Ok(http::Request::Files(stream, head))) => (stream, head),
+                Ok(Ok(http::Request::Plain(stream, head))) => (stream, head),
                 Ok(Err(e)) => {
                     debug!(target: CONNECTIONS, "HTTP request from {:?} failed: {}", peer_addr, e);
                     return None;
@@ -793,8 +815,37 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
                 }
             };
         let deadline = Instant::now() + http::RESPONSE_TIMEOUT;
-        let response = Box::pin(http::respond(stream, &head, files));
-        match connect_step(&mut self.shutdown, deadline, response).await? {
+        let stopping = self.shutdown.is_signalled();
+        let (broker, session_manager, stats) = (&self.broker, &self.session_manager, &self.stats);
+        let page = |endpoint| async move {
+            match endpoint {
+                http::Endpoint::Health if stopping => http::Page {
+                    status: "503 Service Unavailable",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "stopping\n".into(),
+                },
+                http::Endpoint::Health => http::Page {
+                    status: "200 OK",
+                    content_type: "text/plain; charset=utf-8",
+                    body: "ok\n".into(),
+                },
+                http::Endpoint::Metrics => {
+                    let counters = sys::current(broker, session_manager, stats).await;
+                    http::Page {
+                        status: "200 OK",
+                        content_type: "text/plain; version=0.0.4; charset=utf-8",
+                        body: sys::prometheus(&counters, stats),
+                    }
+                }
+            }
+        };
+        let response = Box::pin(http::respond(stream, &head, site, page));
+        // Once stopping, the answer must not be cut short by it
+        let answered = match stopping {
+            true => Some(time::timeout_at(deadline, response).await),
+            false => connect_step(&mut self.shutdown, deadline, response).await,
+        };
+        match answered? {
             Ok(Err(e)) => debug!(
                 target: CONNECTIONS,
                 "HTTP response to {:?} failed: {}", peer_addr, e
@@ -814,9 +865,8 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
         match transport {
             Transport::Mqtt => Box::pin(self.handle(Connection::new(stream), peer_addr)).await,
             Transport::WebSocket => {
-                let stream = match self.http_files.clone() {
-                    Some(files) => match Box::pin(self.serve_http(stream, &files, peer_addr)).await
-                    {
+                let stream = match self.http_site.clone() {
+                    Some(site) => match Box::pin(self.serve_http(stream, &site, peer_addr)).await {
                         Some(upgrade) => upgrade,
                         None => return,
                     },
@@ -1412,7 +1462,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 stats: Arc::clone(&self.stats),
                 cert_identity: None,
                 mount_point: None,
-                http_files: None,
+                http_site: None,
                 allowed_origins: None,
                 local: false,
                 connect_deadline: Instant::now() + self.limits.connect_timeout,

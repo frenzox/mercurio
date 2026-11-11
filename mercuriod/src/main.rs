@@ -288,6 +288,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         value.mount_point = extra.mount_point.clone();
         value.max_connections = extra.max_connections;
         value.http_dir = extra.http_dir.clone().map(Into::into);
+        value.health = extra.health;
+        value.metrics = extra.metrics;
         value.allowed_origins = extra.allowed_origins.clone();
         value.auth = prepared.auth;
         value.plugins = prepared.plugins;

@@ -93,6 +93,16 @@ protocol = "websocket"
 http_dir = "/var/www/mercurio"</pre>
 <p>Plain HTTP GET requests are answered from the directory, with <code>index.html</code> for <code>/</code> and directories; WebSocket upgrades on the same port go to MQTT. A directory named without its trailing slash is redirected to the slash form, and paths leaving the directory are refused. Files are streamed; each response may take a minute, apart from the connect timeout, and a listener sends 32 at once, answering further requests with 503 Service Unavailable. <code>[server] http_dir</code> does the same for <code>websocket_port</code>.</p>
 
+<h3 id="endpoints">Health and metrics endpoints</h3>
+<p>A WebSocket listener can answer <code>GET /healthz</code> and <code>GET /metrics</code>, with or without <code>http_dir</code>. Both are off by default. Metrics tell anyone who reaches the listener how loaded the broker is, so give them a listener of their own that only monitoring can reach:</p>
+<pre>[[listeners]]
+host = "127.0.0.1"
+port = 9883
+protocol = "websocket"
+health = true
+metrics = true</pre>
+<p>The same limits as for files apply: request size, 32 responses at once and the timeouts. See <a href="operations.html#metrics">Health and metrics</a> for what they answer.</p>
+
 <h2 id="unix">Unix domain sockets</h2>
 <p>For clients on the same machine: no TCP overhead, and access restricted by file permissions.</p>
 <pre>[[listeners]]
