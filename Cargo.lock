@@ -1972,7 +1972,6 @@ dependencies = [
  "mercurio-server",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
