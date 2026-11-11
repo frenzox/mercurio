@@ -65,9 +65,7 @@ use crate::{
         cap_expiry_interval, cap_session_expiry, effective_keepalive, Handled, Outgoing, Session,
         WillMessage,
     },
-    session_manager::{
-        session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
-    },
+    session_manager::{session_expiry, Close, ConnectionLease, SessionManager, StartError},
     shutdown::{Shutdown, Tasks},
     sys::{self, ConnectedGuard, DropCause, Stats},
     tls::{certificate_name, Tls},
@@ -634,7 +632,7 @@ struct Listener<St: MqttStore + 'static> {
     /// starve the others
     next_endpoint: usize,
     broker: Broker<St>,
-    session_manager_holder: SessionManagerDropGuard<St>,
+    session_manager: SessionManager<St>,
     notify_shutdown: broadcast::Sender<()>,
     /// Cloned into every connection handler; see `Handler::_shutdown_complete`
     shutdown_complete: mpsc::Sender<()>,
@@ -954,7 +952,7 @@ impl<St: MqttStore + 'static> ServerBuilder<St> {
             .counted_in(Arc::clone(&stats))
             .with_share_strategy(share_strategy)
             .with_share_redelivery(share_redelivery);
-        let session_manager_holder = SessionManagerDropGuard::new(
+        let session_manager = SessionManager::for_broker(
             Arc::clone(&storage),
             limits.queue,
             limits.write_timeout,
@@ -962,7 +960,6 @@ impl<St: MqttStore + 'static> ServerBuilder<St> {
             Arc::clone(&stats),
             tasks.clone(),
         );
-        let session_manager = session_manager_holder.session_manager();
         session_manager.set_share_groups(Arc::new(broker.clone()));
         // A PostgreSQL standby gets here once it took the database over, so
         // it serves with the bans in force then
@@ -1002,7 +999,7 @@ impl<St: MqttStore + 'static> ServerBuilder<St> {
             trusted_chain: chain.trusted("in-process"),
             next_endpoint: 0,
             broker,
-            session_manager_holder,
+            session_manager: session_manager.clone(),
             address_slots: Arc::default(),
             connection_slots: limits.max_connections.map(connection_slots),
             notify_shutdown,
@@ -1085,7 +1082,7 @@ impl<St: MqttStore + 'static> Server<St> {
             sys_interval,
         } = self;
 
-        let session_manager = server.session_manager_holder.session_manager();
+        let session_manager = server.session_manager.clone();
         let tasks = server.tasks.clone();
         if !plugins.is_empty() {
             let mut ticks = time::interval(plugin_tick_interval);
@@ -1290,7 +1287,7 @@ impl<St: MqttStore + 'static> Listener<St> {
 
             let parts = HandlerParts {
                 broker: self.broker.clone(),
-                session_manager: self.session_manager_holder.session_manager(),
+                session_manager: self.session_manager.clone(),
                 shutdown: Shutdown::new(self.notify_shutdown.subscribe()),
                 shutdown_complete: self.shutdown_complete.clone(),
                 auth_config: Arc::clone(&self.auth_config),

@@ -36,10 +36,6 @@ use crate::{
     writer::{Snapshots, StorageHealth, Writers},
 };
 
-pub(crate) struct SessionManagerDropGuard<S: BatchStore> {
-    session_manager: SessionManager<S>,
-}
-
 pub(crate) struct SessionManager<S: BatchStore> {
     shared: Arc<Shared>,
     storage: Arc<S>,
@@ -450,24 +446,23 @@ impl<S: BatchStore + 'static> Drop for Claim<S> {
     }
 }
 
-impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
-    pub(crate) fn new(
+impl<S: BatchStore + 'static> SessionManager<S> {
+    /// The broker's manager: it waits `takeover_wait` for a connection to
+    /// let go of a client id and holds up to `max_sessions` sessions that
+    /// outlive their connection.
+    pub(crate) fn for_broker(
         storage: Arc<S>,
         queue_limits: QueueLimits,
         takeover_wait: Duration,
         max_sessions: Option<usize>,
         stats: Arc<Stats>,
         tasks: Tasks,
-    ) -> SessionManagerDropGuard<S> {
+    ) -> SessionManager<S> {
         let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits, tasks);
         session_manager.takeover_wait = Some(takeover_wait);
         session_manager.max_sessions = max_sessions;
         session_manager.stats = stats;
-        SessionManagerDropGuard { session_manager }
-    }
-
-    pub(crate) fn session_manager(&self) -> SessionManager<S> {
-        self.session_manager.clone()
+        session_manager
     }
 }
 
