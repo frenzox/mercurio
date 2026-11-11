@@ -16,6 +16,10 @@ pub enum AuthMethod {
     /// never reaches the broker, and the broker proves it knows it
     #[value(name = "scram-sha-256")]
     ScramSha256,
+    /// SCRAM-SHA-256-PLUS, SCRAM-SHA-256 bound to the TLS 1.3 connection,
+    /// so a man in the middle can't relay the login; needs --tls
+    #[value(name = "scram-sha-256-plus")]
+    ScramSha256Plus,
 }
 
 /// Where the broker is and how to log in to it. Flatten it into a clap
@@ -149,9 +153,14 @@ impl ConnectArgs {
             options = options.client_id(id);
         }
         match (self.auth_method, &self.username) {
-            (Some(AuthMethod::ScramSha256), Some(user)) => {
+            (
+                Some(method @ (AuthMethod::ScramSha256 | AuthMethod::ScramSha256Plus)),
+                Some(user),
+            ) => {
                 let password = self.password.clone().unwrap_or_default();
-                options = options.authenticator(ScramSha256::new(user, password));
+                let bind = method == AuthMethod::ScramSha256Plus;
+                options =
+                    options.authenticator(ScramSha256::new(user, password).channel_binding(bind));
             }
             _ => {
                 if let Some(user) = &self.username {
@@ -322,6 +331,14 @@ mod tests {
             "SCRAM without a user name"
         );
         assert!(parse(&["--auth-method", "plain", "-u", "a"]).is_err());
+    }
+
+    #[test]
+    fn scram_plus_binds_the_exchange_to_the_channel() {
+        let args = parse(&["--auth-method", "scram-sha-256-plus", "-u", "alice"]).unwrap();
+        assert_eq!(args.auth_method, Some(AuthMethod::ScramSha256Plus));
+        let shown = format!("{:?}", args.to_connect_options());
+        assert!(shown.contains("SCRAM-SHA-256-PLUS"), "{shown}");
     }
 
     #[test]
