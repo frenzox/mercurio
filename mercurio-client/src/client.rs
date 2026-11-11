@@ -103,9 +103,25 @@ impl MqttClient {
             return Ok((connection, session));
         }
 
+        let connect_timeout = Duration::from_secs(options.connect_timeout_secs);
+        #[cfg(unix)]
+        if let Some(path) = &options.unix_path {
+            info!("Connecting to MQTT broker at {}", path.display());
+            let stream = timeout(connect_timeout, tokio::net::UnixStream::connect(path))
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
+            let mut connection = Connection::new(
+                stream,
+                options.protocol_version,
+                options.maximum_packet_size,
+            );
+            let session = Self::perform_connect(&mut connection, options).await?;
+            return Ok((connection, session));
+        }
+
         let addr = format!("{}:{}", options.host, options.port);
         info!("Connecting to MQTT broker at {}", addr);
-        let connect_timeout = Duration::from_secs(options.connect_timeout_secs);
 
         let stream = timeout(connect_timeout, TcpStream::connect(&addr))
             .await

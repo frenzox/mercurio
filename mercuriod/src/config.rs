@@ -44,6 +44,9 @@ pub struct Config {
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
 
+    /// The admin socket; on with its defaults when absent, on Linux
+    pub admin: Option<AdminConfig>,
+
     /// Directory of extra `*.toml` files merged into this configuration
     pub include_dir: Option<String>,
 }
@@ -760,6 +763,28 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// The Unix socket administrators on this host reach the broker through,
+/// with no credentials or access control.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Path of the socket; empty turns it off
+    pub socket: String,
+
+    /// Group whose members may use it, besides root and the broker's own
+    /// user; nobody else when empty
+    pub group: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            socket: "/run/mercurio/admin.sock".to_string(),
+            group: "mercurio".to_string(),
+        }
+    }
+}
+
 /// Authentication configuration.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -832,7 +857,7 @@ fn default_allow_anonymous() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Protocol};
+    use super::{AdminConfig, Config, Protocol};
 
     #[test]
     fn test_tls_acceptor_builds_with_every_dependency_linked() {
@@ -1007,5 +1032,35 @@ mod tests {
         );
         assert!(matches!(websocket.protocol, Protocol::Websocket));
         assert!(websocket.tls.build().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_admin_socket_is_on_by_default_and_can_be_turned_off() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.admin.is_none());
+        let admin = AdminConfig::default();
+        assert_eq!(
+            (admin.socket.as_str(), admin.group.as_str()),
+            ("/run/mercurio/admin.sock", "mercurio")
+        );
+
+        let config: Config = toml::from_str("[admin]\ngroup = \"wheel\"\n").unwrap();
+        let admin = config.admin.unwrap();
+        assert_eq!(
+            (admin.socket.as_str(), admin.group.as_str()),
+            ("/run/mercurio/admin.sock", "wheel")
+        );
+        let config: Config = toml::from_str("[admin]\nsocket = \"\"\n").unwrap();
+        assert!(config.admin.unwrap().socket.is_empty());
+        assert!(toml::from_str::<Config>("[admin]\nsockets = \"/x\"\n").is_err());
+    }
+
+    #[test]
+    fn test_shipped_config_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/contrib/config.toml");
+        let config = Config::from_file(std::path::Path::new(path)).unwrap();
+        let admin = config.admin.expect("the shipped config has [admin]");
+        assert_eq!(admin.socket, "/run/mercurio/admin.sock");
+        assert_eq!(admin.group, "mercurio");
     }
 }

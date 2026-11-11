@@ -1,31 +1,14 @@
 //! Shared utilities for recado.
 
 use clap::Args;
-use mercurio_client::ConnectOptions;
+use mercurio_client::{cli::ConnectArgs, ConnectOptions};
 use mercurio_core::protocol::ProtocolVersion;
 
 /// Common connection arguments shared between pub and sub tools.
 #[derive(Args, Debug, Clone)]
 pub struct ConnectionArgs {
-    /// MQTT broker hostname
-    #[arg(short = 'H', long, default_value = "localhost")]
-    pub host: String,
-
-    /// MQTT broker port
-    #[arg(short = 'p', long, default_value = "1883")]
-    pub port: u16,
-
-    /// Client ID (auto-generated if not specified)
-    #[arg(short = 'i', long)]
-    pub client_id: Option<String>,
-
-    /// Username for authentication
-    #[arg(short = 'u', long)]
-    pub username: Option<String>,
-
-    /// Password for authentication
-    #[arg(short = 'P', long)]
-    pub password: Option<String>,
+    #[command(flatten)]
+    pub connect: ConnectArgs,
 
     /// Keep-alive interval in seconds
     #[arg(short = 'k', long, default_value = "60")]
@@ -44,18 +27,6 @@ pub struct ConnectionArgs {
     #[arg(short = 'V', long, default_value = "5")]
     pub protocol_version: String,
 
-    /// Enable TLS for the connection
-    #[arg(long)]
-    pub tls: bool,
-
-    /// Path to CA certificate file (PEM format) for TLS verification
-    #[arg(long)]
-    pub cafile: Option<String>,
-
-    /// Skip TLS certificate verification (insecure, for testing only)
-    #[arg(long)]
-    pub insecure: bool,
-
     /// Enable verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
@@ -64,37 +35,12 @@ pub struct ConnectionArgs {
 impl ConnectionArgs {
     /// Convert CLI arguments to ConnectOptions.
     pub fn to_connect_options(&self) -> ConnectOptions {
-        let mut opts = ConnectOptions::new(&self.host, self.port)
+        self.connect
+            .to_connect_options()
             .keep_alive(self.keep_alive)
             .clean_start(!self.no_clean_start)
             .session_expiry(self.session_expiry)
-            .protocol_version(self.parse_protocol_version());
-
-        if let Some(ref id) = self.client_id {
-            opts = opts.client_id(id);
-        }
-
-        if let Some(ref user) = self.username {
-            opts = opts.username(user);
-        }
-
-        if let Some(ref pass) = self.password {
-            opts = opts.password(pass.as_bytes().to_vec());
-        }
-
-        if self.tls {
-            opts = opts.tls(true);
-        }
-
-        if let Some(ref ca) = self.cafile {
-            opts = opts.ca_path(ca);
-        }
-
-        if self.insecure {
-            opts = opts.danger_skip_tls_verify(true);
-        }
-
-        opts
+            .protocol_version(self.parse_protocol_version())
     }
 
     fn parse_protocol_version(&self) -> ProtocolVersion {

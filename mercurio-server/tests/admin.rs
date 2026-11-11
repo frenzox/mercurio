@@ -26,6 +26,10 @@ use mercurio_server::{
 use mercurio_storage::{memory::MemoryStore, sqlite::SqliteStore, BanStore};
 
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use tokio::net::{unix::UCred, UnixListener, UnixStream};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -317,8 +321,16 @@ async fn wait_for(admin: &mut Client, client_id: &str, done: impl Fn(&Value) -> 
 /// The reason code of the CONNACK `packet` gets on a new connection, sent
 /// after `header`, such as a PROXY header.
 async fn connack_reason(addr: SocketAddr, header: &[u8], packet: ConnectPacket) -> ReasonCode {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    connack_reason_on(stream, header, packet).await
+}
+
+async fn connack_reason_on<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    header: &[u8],
+    packet: ConnectPacket,
+) -> ReasonCode {
     let version = packet.protocol_version;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut bytes = BytesMut::from(header);
     ControlPacket::Connect(packet).encode_with_version(&mut bytes, version);
     stream.write_all(&bytes).await.unwrap();
@@ -1484,4 +1496,155 @@ async fn expired_bans_are_dropped_from_the_list_and_storage() {
         connack_reason(addr, b"", connect_packet("brief")).await,
         ReasonCode::Success
     );
+}
+
+/// A Unix socket listener in the temp directory, its path unique to `name`
+/// and this test run.
+#[cfg(unix)]
+fn unix_listener(name: &str) -> (UnixListener, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!("mercurio-{name}-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    (UnixListener::bind(&path).unwrap(), path)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_unix_listeners_skip_authentication_and_access_control() {
+    let (socket, path) = unix_listener("trusted");
+    let mut trusted = ListenerConfig::new(socket, Transport::Mqtt);
+    trusted.trusted = true;
+    // Every client must log in, and the ACL grants nothing they could use
+    let acl = AclFile::parse("topic read nothing/#\n").unwrap();
+    let mut config = config(vec![Arc::new(acl)]);
+    config.auth.require_auth = true;
+    config.listeners = vec![trusted];
+    let (addr, _) = start(config).await;
+
+    assert_eq!(
+        connack_reason(addr, b"", connect_packet("outsider")).await,
+        ReasonCode::BadUserNameOrPassword
+    );
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let mut admin = Client::handshake(stream, connect_packet("admin")).await;
+    admin.subscribe("replies/admin").await;
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert_eq!(info["data"]["version"], env!("CARGO_PKG_VERSION"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_admin_socket_admits_the_brokers_own_user() {
+    let (socket, path) = unix_listener("own-uid");
+    // The socket file belongs to the user this test, and so the broker,
+    // runs as
+    let own_uid = std::fs::metadata(&path).unwrap().uid();
+    let mut admin_socket = ListenerConfig::new(socket, Transport::Mqtt);
+    admin_socket.trusted = true;
+    admin_socket.peer_filter = Some(Arc::new(move |peer: &UCred| peer.uid() == own_uid));
+    let mut config = config(Vec::new());
+    config.listeners = vec![admin_socket];
+    start(config).await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let mut admin = Client::handshake(stream, connect_packet("admin")).await;
+    admin.subscribe("replies/admin").await;
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert!(info.get("error").is_none(), "{info}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clients_the_peer_filter_refuses_are_closed_unanswered() {
+    let (socket, path) = unix_listener("refused-peer");
+    let mut admin_socket = ListenerConfig::new(socket, Transport::Mqtt);
+    admin_socket.trusted = true;
+    admin_socket.peer_filter = Some(Arc::new(|_: &UCred| false));
+    let mut config = config(Vec::new());
+    config.listeners = vec![admin_socket];
+    start(config).await;
+
+    let mut stream = UnixStream::connect(&path).await.unwrap();
+    let mut bytes = BytesMut::new();
+    ControlPacket::Connect(connect_packet("intruder"))
+        .encode_with_version(&mut bytes, ProtocolVersion::V5);
+    // The broker may have closed it already
+    let _ = stream.write_all(&bytes).await;
+    let mut buffer = [0u8; 16];
+    let read = timeout(Duration::from_secs(2), stream.read(&mut buffer))
+        .await
+        .expect("the connection was left open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_unix_listeners_ignore_limits() {
+    let (socket, path) = unix_listener("trusted-full");
+    let mut trusted = ListenerConfig::new(socket, Transport::Mqtt);
+    trusted.trusted = true;
+    let mut config = config(Vec::new());
+    config.limits.max_connections = Some(1);
+    config.listeners = vec![trusted];
+    let (addr, _) = start(config).await;
+
+    // Once its CONNACK is back the client holds the only slot
+    let _full = Client::connect(addr, "full").await;
+    let mut refused = TcpStream::connect(addr).await.unwrap();
+    let mut buffer = [0u8; 16];
+    let read = timeout(Duration::from_secs(2), refused.read(&mut buffer))
+        .await
+        .expect("the connection was left open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let mut admin = Client::handshake(stream, connect_packet("admin")).await;
+    admin.subscribe("replies/admin").await;
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert!(info.get("error").is_none(), "{info}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_unix_listeners_ignore_redirects_and_client_id_prefixes() {
+    let (socket, path) = unix_listener("trusted-redirect");
+    let mut trusted = ListenerConfig::new(socket, Transport::Mqtt);
+    trusted.trusted = true;
+    let mut config = config(Vec::new());
+    config.policy.redirect = Some(mercurio_server::server::Redirect::new("other:1883", true));
+    config.policy.client_id_prefixes = vec!["app-".into()];
+    config.listeners = vec![trusted];
+    let (_, _) = start(config).await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let mut admin = Client::handshake(stream, connect_packet("admin")).await;
+    admin.subscribe("replies/admin").await;
+    let info = admin.run(json!({"command": "getBrokerInfo"})).await;
+    assert!(info.get("error").is_none(), "{info}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bans_still_apply_on_trusted_unix_listeners() {
+    let (socket, path) = unix_listener("trusted-ban");
+    let mut trusted = ListenerConfig::new(socket, Transport::Mqtt);
+    trusted.trusted = true;
+    let mut config = config(Vec::new());
+    config.listeners = vec![trusted];
+    let (_, admin) = start(config).await;
+    admin
+        .add_ban(NewBan::new(BanKey::new(BanKind::ClientId, "bad")))
+        .await
+        .unwrap();
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    assert_eq!(
+        connack_reason_on(stream, b"", connect_packet("bad")).await,
+        ReasonCode::Banned
+    );
+    let _ = std::fs::remove_file(&path);
 }

@@ -17,7 +17,7 @@ use std::{
 use crate::error::ServerError;
 use crate::CONNECTIONS;
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{unix::UCred, UnixListener, UnixStream};
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream},
     net::{TcpListener, TcpStream},
@@ -231,6 +231,12 @@ impl From<UnixListener> for Socket {
     }
 }
 
+/// Decides from a Unix socket client's credentials, as the kernel reports
+/// them, whether it may connect. It runs on the accept loop, so it must not
+/// block.
+#[cfg(unix)]
+pub type PeerFilter = Arc<dyn Fn(&UCred) -> bool + Send + Sync>;
+
 /// A listener with its own transport and TLS settings.
 #[non_exhaustive]
 pub struct ListenerConfig {
@@ -260,6 +266,20 @@ pub struct ListenerConfig {
     /// On WebSocket listeners, answer plain HTTP requests with the files of
     /// this directory.
     pub http_dir: Option<PathBuf>,
+    /// Its clients skip authentication and access control, `$CONTROL` and
+    /// every admin command included, as in-process connections do. They also
+    /// skip the connection limits, the redirect and the client id prefixes,
+    /// so an operator can reach a full or redirecting broker; bans still
+    /// apply. Only a Unix socket listener without `auth`, `plugins`,
+    /// `proxy_protocol` or the WebSocket transport can be trusted, as a proxy
+    /// in front of it would make every remote client trusted; give it a `peer_filter`, or make sure the socket's
+    /// permissions keep everyone else out.
+    pub trusted: bool,
+    /// On a Unix socket listener, decides from each client's credentials
+    /// whether it may connect, before anything is read from it. Clients it
+    /// refuses, or whose credentials can't be read, are closed at once.
+    #[cfg(unix)]
+    pub peer_filter: Option<PeerFilter>,
 }
 
 impl ListenerConfig {
@@ -277,6 +297,9 @@ impl ListenerConfig {
             plugins: None,
             max_connections: None,
             http_dir: None,
+            trusted: false,
+            #[cfg(unix)]
+            peer_filter: None,
         }
     }
 }
@@ -334,6 +357,10 @@ struct Endpoint {
     /// One permit per allowed concurrent connection, when limited
     connection_slots: Option<Arc<Semaphore>>,
     state: Arc<ListenerState>,
+    /// Its connections get the trusted chain, set by `Server::new`
+    trusted: bool,
+    #[cfg(unix)]
+    peer_filter: Option<PeerFilter>,
 }
 
 /// A listener as the admin API reports it, with its open connections.
@@ -376,6 +403,34 @@ struct EndpointSettings {
 
 impl Endpoint {
     fn new(config: ListenerConfig, timeout: Duration) -> std::result::Result<Self, ServerError> {
+        let unix = !matches!(config.listener, Socket::Tcp(_));
+        if config.trusted && !unix {
+            return Err(ServerError::Config(
+                "only a Unix socket listener can be trusted: anyone who reaches a TCP one \
+                 would administer the broker"
+                    .into(),
+            ));
+        }
+        if config.trusted && (config.auth.is_some() || config.plugins.is_some()) {
+            return Err(ServerError::Config(
+                "a trusted listener skips authentication and access control, so it takes no \
+                 auth or plugins"
+                    .into(),
+            ));
+        }
+        if config.trusted && (config.proxy_protocol || config.transport == Transport::WebSocket) {
+            return Err(ServerError::Config(
+                "a trusted listener can't sit behind a proxy: the kernel reports the proxy's \
+                 credentials, so every remote client would be trusted"
+                    .into(),
+            ));
+        }
+        #[cfg(unix)]
+        if config.peer_filter.is_some() && !unix {
+            return Err(ServerError::Config(
+                "a peer filter needs a Unix socket listener".into(),
+            ));
+        }
         let (address, path) = match &config.listener {
             Socket::Tcp(listener) => (listener.local_addr().ok().map(|a| a.to_string()), None),
             #[cfg(unix)]
@@ -414,6 +469,9 @@ impl Endpoint {
         let tls_acceptor = config.tls.map(|tls| tls.build_acceptor()).transpose()?;
         Ok(Self {
             state,
+            trusted: config.trusted,
+            #[cfg(unix)]
+            peer_filter: config.peer_filter,
             listener: config.listener,
             connection_slots: config
                 .max_connections
@@ -425,11 +483,48 @@ impl Endpoint {
                 proxy_protocol: config.proxy_protocol,
                 proxy_from: config.proxy_from.into(),
                 mount_point: config.mount_point,
-                auth: config.auth.map(Arc::new),
+                // Trusted clients log in as in-process ones do
+                auth: match config.trusted {
+                    true => Some(Arc::new(AuthConfig::default())),
+                    false => config.auth.map(Arc::new),
+                },
                 chain: config.plugins.map(|p| Chain::new(p, timeout)),
                 http_dir: config.http_dir.map(Arc::new),
             },
         })
+    }
+}
+
+impl Endpoint {
+    /// Whether a client of this Unix socket may be served: always without a
+    /// peer filter, otherwise only when its credentials can be read and the
+    /// filter accepts them. A filter that panics refuses.
+    #[cfg(unix)]
+    fn admits(&self, socket: &UnixStream) -> bool {
+        let Some(filter) = &self.peer_filter else {
+            return true;
+        };
+        let peer = match socket.peer_cred() {
+            Ok(peer) => peer,
+            Err(e) => {
+                warn!(
+                    "Closing a client of {}: its credentials can't be read: {}",
+                    self.state.name, e
+                );
+                return false;
+            }
+        };
+        let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter(&peer)));
+        if !matches!(admitted, Ok(true)) {
+            warn!(
+                "Closing a client of {}: user {} (process {:?}) may not connect",
+                self.state.name,
+                peer.uid(),
+                peer.pid()
+            );
+            return false;
+        }
+        true
     }
 }
 
@@ -901,11 +996,14 @@ impl<St: MqttStore + 'static> Server<St> {
         });
         let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
         for endpoint in &mut endpoints {
-            endpoint.settings.chain = endpoint
-                .settings
-                .chain
-                .take()
-                .map(|chain| chain.with_admin(admin.clone()));
+            endpoint.settings.chain = match endpoint.trusted {
+                true => Some(chain.trusted()),
+                false => endpoint
+                    .settings
+                    .chain
+                    .take()
+                    .map(|chain| chain.with_admin(admin.clone())),
+            };
         }
 
         let server = Listener {
@@ -1053,6 +1151,12 @@ impl<St: MqttStore + 'static> Listener<St> {
     async fn run(&mut self) {
         loop {
             let accepted = self.accept().await;
+            #[cfg(unix)]
+            if let Accepted::Unix(socket, endpoint) = &accepted {
+                if !self.endpoints[*endpoint].admits(socket) {
+                    continue;
+                }
+            }
             let peer_addr = match &accepted {
                 Accepted::Tcp(socket, _) => socket.peer_addr().ok(),
                 _ => None,
@@ -1064,20 +1168,23 @@ impl<St: MqttStore + 'static> Listener<St> {
                 Accepted::Local(_) => None,
             };
 
-            // Held by the connection's task for as long as it runs
+            let trusted = endpoint.is_some_and(|i| self.endpoints[i].trusted);
+
+            // Held by the connection's task for as long as it runs. Trusted
+            // clients take none, so an operator can reach a full broker.
             let slot = match &self.connection_slots {
-                Some(slots) => match Arc::clone(slots).try_acquire_owned() {
+                Some(slots) if !trusted => match Arc::clone(slots).try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(_) => {
                         warn!("Connection limit reached, refusing {:?}", peer_addr);
                         continue;
                     }
                 },
-                None => None,
+                _ => None,
             };
             let listener_slots = endpoint.and_then(|i| self.endpoints[i].connection_slots.clone());
             let listener_slot = match listener_slots {
-                Some(slots) => match slots.try_acquire_owned() {
+                Some(slots) if !trusted => match slots.try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(_) => {
                         warn!(
@@ -1087,7 +1194,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         continue;
                     }
                 },
-                None => None,
+                _ => None,
             };
             let slots = [slot, listener_slot];
 
@@ -1126,8 +1233,17 @@ impl<St: MqttStore + 'static> Listener<St> {
                 }
                 #[cfg(unix)]
                 Accepted::Unix(socket, endpoint) => {
+                    let policy = match self.endpoints[endpoint].trusted {
+                        true => Arc::new(ConnectPolicy {
+                            redirect: None,
+                            client_id_prefixes: Vec::new(),
+                            ..(*parts.policy).clone()
+                        }),
+                        false => Arc::clone(&parts.policy),
+                    };
                     let parts = HandlerParts {
                         listener: Arc::clone(&self.endpoints[endpoint].state.name),
+                        policy,
                         ..parts
                     };
                     let settings = self.endpoints[endpoint].settings.clone();

@@ -364,3 +364,79 @@ fn parse_qos(qos: u8) -> Result<QoS, Box<dyn std::error::Error>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Commands};
+
+    #[test]
+    fn arguments_are_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn connection_flags_keep_their_names() {
+        let cli = Cli::try_parse_from([
+            "recado",
+            "sub",
+            "-H",
+            "broker",
+            "-p",
+            "8883",
+            "-i",
+            "me",
+            "-u",
+            "alice",
+            "-P",
+            "secret",
+            "--tls",
+            "--cafile",
+            "ca.pem",
+            "--insecure",
+            "-k",
+            "30",
+            "-c",
+            "-x",
+            "60",
+            "-V",
+            "311",
+            "-v",
+            "-t",
+            "a",
+        ])
+        .unwrap();
+        let Commands::Sub { connection, .. } = cli.command else {
+            panic!("expected sub");
+        };
+        let connect = &connection.connect;
+        assert_eq!(connect.host.as_deref(), Some("broker"));
+        assert_eq!(connect.port, Some(8883));
+        assert_eq!(connect.client_id.as_deref(), Some("me"));
+        assert_eq!(connect.username.as_deref(), Some("alice"));
+        assert_eq!(connect.password.as_deref(), Some("secret"));
+        assert!(connect.tls && connect.insecure);
+        assert_eq!(connect.cafile.as_deref(), Some("ca.pem"));
+        assert_eq!(connection.keep_alive, 30);
+        assert!(connection.no_clean_start && connection.verbose);
+        assert_eq!(connection.session_expiry, 60);
+        assert_eq!(connection.protocol_version, "311");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pub_and_sub_connect_through_a_unix_socket() {
+        let path = "/run/mercurio/admin.sock";
+        for command in ["pub", "sub"] {
+            let cli = Cli::try_parse_from(["recado", command, "--unix", path, "-t", "a"]).unwrap();
+            let (Commands::Pub { connection, .. } | Commands::Sub { connection, .. }) = cli.command;
+            assert_eq!(
+                connection.connect.unix.as_deref(),
+                Some(std::path::Path::new(path))
+            );
+            let both = ["recado", command, "--unix", path, "-H", "broker", "-t", "a"];
+            assert!(Cli::try_parse_from(both).is_err(), "{command}");
+        }
+    }
+}

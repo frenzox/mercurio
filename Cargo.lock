@@ -1387,6 +1387,7 @@ name = "mercurio-client"
 version = "0.4.0"
 dependencies = [
  "bytes",
+ "clap",
  "mercurio-core",
  "mercurio-packets",
  "mercurio-server",
