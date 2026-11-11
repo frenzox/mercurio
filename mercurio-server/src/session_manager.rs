@@ -1418,7 +1418,6 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         self.writers.flush_all().await;
     }
 
-    /// How many sessions the broker holds, connected or not.
     /// How many sessions ended by their expiry.
     pub(crate) fn expired_count(&self) -> u64 {
         self.shared
@@ -1426,6 +1425,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many sessions the broker holds, connected or not.
     pub(crate) async fn session_count(&self) -> usize {
         self.shared.state.lock().await.sessions.len()
     }

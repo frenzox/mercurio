@@ -3239,22 +3239,10 @@ where
                     Some(packet) => packet,
                 };
 
-                if matches!(packet, ControlPacket::Publish(_)) {
-                    Stats::add(&self.stats.messages_received);
-                }
-
                 let is_subscription_change = matches!(
                     packet,
                     ControlPacket::Subscribe(_) | ControlPacket::Unsubscribe(_)
                 );
-
-                // Check if this is an ack that completes an inflight message
-                let inflight_completed = match &packet {
-                    ControlPacket::PubAck(ack) => Some(ack.packet_id),
-                    ControlPacket::PubComp(comp) => Some(comp.packet_id),
-                    ControlPacket::PubRec(rec) if rec.reason.code() >= 0x80 => Some(rec.packet_id),
-                    _ => None,
-                };
 
                 let maybe_res = session
                     .process_incoming(packet, &self.broker, &self.chain)
@@ -3266,20 +3254,6 @@ where
                     self.session_manager
                         .save_subscription_changes(key, changes)
                         .await;
-                }
-
-                // Remove inflight message after acknowledgment
-                if let Some(packet_id) = inflight_completed {
-                    self.session_manager.remove_inflight(key, packet_id).await;
-                }
-
-                // After PUBREC only PUBREL remains to be sent for a QoS 2 message
-                if let Some(ControlPacket::PubRel(ref pubrel)) = maybe_res {
-                    if pubrel.reason == ReasonCode::Success {
-                        self.session_manager
-                            .release_inflight(key, pubrel.packet_id)
-                            .await;
-                    }
                 }
 
                 // A re-authentication may land on a banned user name; the
@@ -3522,6 +3496,7 @@ enum Secured<S> {
 /// idle, and boxing the packet would cost an allocation per packet.
 #[allow(clippy::large_enum_variant)]
 enum Wake {
+    /// A packet other than the `HotPacket`s, or None once the client closed
     Packet(Option<ControlPacket>),
     KeepAliveExpired,
     Closed(Close),

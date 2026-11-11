@@ -153,8 +153,6 @@ fn message_properties(properties: Option<&PublishProperties>) -> MessageProperti
     }
 }
 
-/// The PUBLISH properties forwarding a message's application properties,
-/// along with the identifiers of the subscriptions it was delivered through.
 /// Whether the client that published `message` may still publish to its
 /// topic. Messages from the broker itself, such as `$SYS` ones, always may.
 async fn publisher_may_write(chain: &Chain, message: &Message) -> bool {
@@ -168,6 +166,8 @@ async fn publisher_may_write(chain: &Chain, message: &Message) -> bool {
     }
 }
 
+/// The PUBLISH properties forwarding a message's application properties,
+/// along with the identifiers of the subscriptions it was delivered through.
 fn publish_properties(
     properties: &MessageProperties,
     subscription_identifiers: &[u32],
@@ -188,9 +188,6 @@ fn publish_properties(
     })
 }
 
-/// Lowers the session expiry an MQTT 5 client asks for to the server's
-/// maximum, no expiry included, so every later use of the CONNECT sees the
-/// expiry the session will have.
 /// Ends the connection of a client whose PUBLISH couldn't be stored, such
 /// as a retained message, without acknowledging it, so the client sends it
 /// again rather than lose it.
@@ -199,6 +196,9 @@ fn storage_failure(error: Error) -> Error {
     ReasonCode::ImplementationSpecificError.into()
 }
 
+/// Lowers the session expiry an MQTT 5 client asks for to the server's
+/// maximum, no expiry included, so every later use of the CONNECT sees the
+/// expiry the session will have.
 pub(crate) fn cap_session_expiry(connect_packet: &mut ConnectPacket, limits: &Limits) {
     let Some(max) = limits.max_session_expiry else {
         return;
