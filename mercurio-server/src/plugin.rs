@@ -34,7 +34,7 @@ use mercurio_core::{
 use serde::Serialize;
 use tracing::{error, warn};
 
-use crate::admin::Admin;
+use crate::{admin::Admin, shutdown::Tasks};
 
 pub use crate::acl::Access;
 
@@ -499,6 +499,9 @@ pub(crate) struct Chain {
     events: Arc<Events>,
     /// Serves `$CONTROL/broker/v1`; set on every chain the server builds
     admin: Option<Admin>,
+    /// Where the task handing events to the plugins runs; set on every
+    /// chain the server builds, so the task stops with the server
+    tasks: Option<Tasks>,
 }
 
 /// An enhanced authentication in progress, with the plugin carrying it out.
@@ -527,12 +530,20 @@ impl Chain {
             trusted: None,
             events: Arc::default(),
             admin: None,
+            tasks: None,
         }
     }
 
     pub(crate) fn with_admin(self, admin: Admin) -> Chain {
         Chain {
             admin: Some(admin),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_tasks(self, tasks: Tasks) -> Chain {
+        Chain {
+            tasks: Some(tasks),
             ..self
         }
     }
@@ -685,7 +696,7 @@ impl Chain {
             // the event rate lose events instead of growing it without end.
             let (sender, mut receiver) = tokio::sync::mpsc::channel::<Event>(EVENT_QUEUE);
             let (plugins, timeout) = (Arc::clone(&self.plugins), self.timeout);
-            tokio::spawn(async move {
+            let hand_out = async move {
                 while let Some(event) = receiver.recv().await {
                     for plugin in plugins.iter() {
                         guarded(plugin.name(), "on_event", timeout, || {
@@ -694,7 +705,15 @@ impl Chain {
                         .await;
                     }
                 }
-            });
+            };
+            match &self.tasks {
+                Some(tasks) => {
+                    tasks.spawn(hand_out);
+                }
+                None => {
+                    tokio::spawn(hand_out);
+                }
+            }
             sender
         });
         use std::sync::atomic::Ordering::Relaxed;

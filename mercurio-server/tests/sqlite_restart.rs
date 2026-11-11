@@ -2,81 +2,51 @@ mod common;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use mercurio_server::server::ServerConfig;
+use mercurio_server::{error::ServerError, server::ServerConfig};
 use mercurio_storage::sqlite::SqliteStore;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
+    task::JoinHandle,
     time::{sleep, timeout},
 };
 
-/// A broker on a runtime of its own, as a process of its own would be.
-/// Stopping it ends every task it left, so the database is free for the
-/// next.
+/// A broker serving from a database; once stopped, it has let go of it.
 struct Broker {
-    runtime: Option<tokio::runtime::Runtime>,
-    stop: Option<oneshot::Sender<()>>,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<Result<(), ServerError>>,
 }
 
 impl Broker {
-    async fn stop(mut self) {
-        let _ = self.stop.take().unwrap().send(());
-        sleep(Duration::from_millis(100)).await;
-        self.runtime.take().unwrap().shutdown_background();
-    }
-}
-
-impl Drop for Broker {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        timeout(Duration::from_secs(15), self.task)
+            .await
+            .expect("the broker didn't stop")
+            .unwrap()
+            .unwrap();
     }
 }
 
 async fn start_broker(db: &PathBuf) -> (SocketAddr, Broker) {
+    start_broker_with(db, ServerConfig::default()).await
+}
+
+async fn start_broker_with(db: &PathBuf, config: ServerConfig) -> (SocketAddr, Broker) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // The broker stopped before lets go of the database once its runtime
-    // has dropped its tasks
-    let mut attempts = 0;
-    let storage = loop {
-        match SqliteStore::new(db) {
-            Ok(store) => break Arc::new(store),
-            Err(_) if attempts < 50 => {
-                attempts += 1;
-                sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => panic!("{e}"),
-        }
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let listener = listener.into_std().unwrap();
+    let storage = Arc::new(SqliteStore::new(db).unwrap());
     let (stop, stopped) = oneshot::channel::<()>();
-    runtime.spawn(async move {
-        let listener = TcpListener::from_std(listener).unwrap();
-        mercurio_server::server::run_with_storage(
-            listener,
-            ServerConfig::default(),
-            storage,
-            async {
-                let _ = stopped.await;
-            },
-        )
-        .await
-    });
-    (
-        addr,
-        Broker {
-            runtime: Some(runtime),
-            stop: Some(stop),
+    let task = tokio::spawn(mercurio_server::server::run_with_storage(
+        listener,
+        config,
+        storage,
+        async {
+            let _ = stopped.await;
         },
-    )
+    ));
+    (addr, Broker { stop, task })
 }
 
 /// MQTT 5 CONNECT with a one hour session expiry; returns whether the
@@ -219,6 +189,51 @@ async fn messages_for_offline_clients_survive_a_restart() {
         received.extend(payload);
     }
     assert_eq!(received, b"1234");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// Once `run` returns, the broker's tasks are gone, those holding its
+/// storage included: an offline session's expiry timer and the writer of
+/// its stored queue, the `$SYS` publisher, and a will waiting for its
+/// delay. The same database opens again at once, on the same runtime.
+#[tokio::test]
+async fn a_stopped_broker_lets_go_of_its_database() {
+    let db = std::env::temp_dir().join(format!("mercurio-reopen-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let mut config = ServerConfig::default();
+    config.sys_interval = Some(Duration::from_millis(100));
+    let (addr, broker) = start_broker_with(&db, config).await;
+
+    let (mut subscriber, _) = connect(addr, b's', true).await;
+    subscriber
+        .write_all(&[0x82, 0x07, 0x00, 0x01, 0x00, 0x00, 0x01, b'q', 0x01])
+        .await
+        .unwrap();
+    let mut suback = [0u8; 6];
+    subscriber.read_exact(&mut suback).await.unwrap();
+    drop(subscriber);
+    sleep(Duration::from_millis(100)).await;
+    let (mut publisher, _) = connect(addr, b'p', true).await;
+    publish(&mut publisher, 1, b'1').await;
+
+    // MQTT 5 CONNECT with a will on "w" delayed by an hour, in a session
+    // that expires an hour after the connection
+    let mut willing = TcpStream::connect(addr).await.unwrap();
+    willing
+        .write_all(&[
+            0x10, 0x21, 0x00, 0x04, b'M', b'Q', b'T', b'T', 0x05, 0x06, 0x00, 0x3c, 0x05, 0x11,
+            0x00, 0x00, 0x0e, 0x10, 0x00, 0x01, b'w', 0x05, 0x18, 0x00, 0x00, 0x0e, 0x10, 0x00,
+            0x01, b'w', 0x00, 0x03, b'b', b'y', b'e',
+        ])
+        .await
+        .unwrap();
+    common::read_connack(&mut willing).await;
+    drop(willing);
+    sleep(Duration::from_millis(300)).await;
+
+    broker.stop().await;
+    SqliteStore::new(&db).expect("the stopped broker still holds the database");
 
     let _ = std::fs::remove_file(&db);
 }

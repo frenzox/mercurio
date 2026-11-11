@@ -59,6 +59,7 @@ use crate::{
     },
     queue::{MessageQueue, QueueLimits, Subscriber},
     server::{ConnectPolicy, Limits},
+    shutdown::Tasks,
     sys::{ClientCounters, DropCause, Stats},
     topic_tree::TopicTree,
 };
@@ -335,6 +336,8 @@ struct RetainedDelivery {
 
 pub struct SessionDropGuard {
     session: Session,
+    /// Where unsubscribing runs when it has to wait
+    tasks: Tasks,
 }
 
 #[derive(Clone)]
@@ -464,12 +467,6 @@ pub(crate) struct SessionSnapshot {
     pub counters: Arc<ClientCounters>,
 }
 
-impl From<Session> for SessionDropGuard {
-    fn from(session: Session) -> Self {
-        SessionDropGuard { session }
-    }
-}
-
 /// Takes the session's subscriptions out of the topic tree once the
 /// session leaves the session manager, even when what removed it is
 /// cancelled before it unsubscribed: nothing is queued for a session no one
@@ -482,7 +479,8 @@ impl Drop for SessionDropGuard {
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let session = self.session.clone();
-            runtime.spawn(async move { session.unsubscribe_all().await });
+            self.tasks
+                .spawn_on(async move { session.unsubscribe_all().await }, &runtime);
         }
     }
 }
@@ -492,10 +490,17 @@ impl SessionDropGuard {
         connect_packet: ConnectPacket,
         queue_limits: QueueLimits,
         stats: Arc<Stats>,
+        tasks: Tasks,
     ) -> Self {
         SessionDropGuard {
             session: Session::with_queue_limits(connect_packet, queue_limits, stats),
+            tasks,
         }
+    }
+
+    /// Guards `session`, unsubscribing in `tasks` when that has to wait.
+    pub(crate) fn guarding(session: Session, tasks: Tasks) -> Self {
+        SessionDropGuard { session, tasks }
     }
 
     pub(crate) fn session(&self) -> Session {

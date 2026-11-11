@@ -324,10 +324,12 @@ fn database(name: &str) -> std::path::PathBuf {
 async fn same_client_id_on_two_mount_points_on_sqlite() {
     let path = database("sqlite");
     let storage = Arc::new(SqliteStore::new(&path).unwrap());
-    // The stopped broker's tasks in this runtime still hold the database's
-    // lock, so the new broker gets the same store, from which it reads
-    // every session again
-    same_client_id_on_two_mount_points(storage, |storage| async move { storage }).await;
+    // As a restarted broker opens it
+    same_client_id_on_two_mount_points(storage, |storage| async move {
+        drop(storage);
+        Arc::new(SqliteStore::new(&path).unwrap())
+    })
+    .await;
     drop(database("sqlite"));
 }
 

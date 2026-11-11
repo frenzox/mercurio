@@ -72,7 +72,7 @@ use crate::{
     session_manager::{
         session_expiry, Close, ConnectionLease, SessionManager, SessionManagerDropGuard, StartError,
     },
-    shutdown::Shutdown,
+    shutdown::{Shutdown, Tasks},
     sys::{self, ConnectedGuard, DropCause, Stats},
     tls::{certificate_name, Tls},
     websocket,
@@ -903,6 +903,8 @@ struct HandlerParts<St: MqttStore + 'static> {
     use_username_as_clientid: bool,
     /// Where its failed logins are counted; None when they aren't
     failed_logins: Option<Arc<FailedLogins>>,
+    /// Where tasks outliving the connection run, such as a delayed will
+    tasks: Tasks,
 }
 
 impl<St: MqttStore + 'static> HandlerParts<St> {
@@ -1182,6 +1184,7 @@ impl<St: MqttStore + 'static> HandlerParts<St> {
             bans: self.bans,
             use_username_as_clientid: self.use_username_as_clientid,
             failed_logins: self.failed_logins,
+            tasks: self.tasks,
             _shutdown_complete: self.shutdown_complete,
         };
         Listener::<St>::handle_connection(&mut handler).await;
@@ -1252,6 +1255,8 @@ struct Listener<St: MqttStore + 'static> {
     connection_slots: Option<Arc<Semaphore>>,
     bans: Arc<Bans>,
     failed_logins: Option<Arc<FailedLogins>>,
+    /// Where connections and everything else the server starts run
+    tasks: Tasks,
 }
 
 struct Handler<St, S>
@@ -1283,6 +1288,7 @@ where
     bans: Arc<Bans>,
     use_username_as_clientid: bool,
     failed_logins: Option<Arc<FailedLogins>>,
+    tasks: Tasks,
     /// Dropped when the handler finishes, so shutdown can wait for it
     _shutdown_complete: mpsc::Sender<()>,
 }
@@ -1460,6 +1466,7 @@ impl<St: MqttStore + 'static> Server<St> {
 
         let auth_config = Arc::new(auth_config);
         let all_plugins = distinct_plugins(&plugins, &listener_plugins);
+        let tasks = Tasks::default();
         let broker = Broker::new(Arc::clone(&storage))
             .counted_in(Arc::clone(&stats))
             .with_share_strategy(share_strategy);
@@ -1469,6 +1476,7 @@ impl<St: MqttStore + 'static> Server<St> {
             limits.write_timeout,
             limits.max_sessions,
             Arc::clone(&stats),
+            tasks.clone(),
         );
         let session_manager = session_manager_holder.session_manager();
         // A PostgreSQL standby gets here once it took the database over, so
@@ -1486,8 +1494,11 @@ impl<St: MqttStore + 'static> Server<St> {
             extension: admin_extension,
             plugins: all_plugins.clone(),
             bans: Arc::clone(&bans),
+            tasks: tasks.clone(),
         });
-        let chain = Chain::new(plugins, plugin_timeout).with_admin(admin.clone());
+        let chain = Chain::new(plugins, plugin_timeout)
+            .with_admin(admin.clone())
+            .with_tasks(tasks.clone());
         for endpoint in &mut endpoints {
             endpoint.limits = endpoint.overrides.apply(limits);
             endpoint.settings.chain = match endpoint.trusted {
@@ -1496,7 +1507,7 @@ impl<St: MqttStore + 'static> Server<St> {
                     .settings
                     .chain
                     .take()
-                    .map(|chain| chain.with_admin(admin.clone())),
+                    .map(|chain| chain.with_admin(admin.clone()).with_tasks(tasks.clone())),
             };
         }
 
@@ -1520,9 +1531,12 @@ impl<St: MqttStore + 'static> Server<St> {
             failed_logins: limits
                 .login_failures
                 .map(|l| Arc::new(FailedLogins::new(l))),
+            tasks: tasks.clone(),
         };
 
-        session_manager.set_expiry_chain(Chain::new(all_plugins.clone(), plugin_timeout));
+        session_manager.set_expiry_chain(
+            Chain::new(all_plugins.clone(), plugin_timeout).with_tasks(tasks.clone()),
+        );
         let restored_wills = session_manager.restore_from_storage(&server.broker).await?;
 
         Ok(Server {
@@ -1543,7 +1557,11 @@ impl<St: MqttStore + 'static> Server<St> {
     }
 
     /// Serves clients until `shutdown` completes, then lets connections
-    /// close and storage catch up, for a few seconds at most.
+    /// close and storage catch up, for a few seconds at most. Every task
+    /// the server started has ended by the time this returns, those still
+    /// running aborted, and the server holds `storage` no more: it may be
+    /// opened again at once. [`Admin`] handles kept from
+    /// [`Server::admin`] still hold it until dropped.
     pub async fn run(self, shutdown: impl Future) -> std::result::Result<(), ServerError> {
         let Server {
             listener: mut server,
@@ -1557,11 +1575,12 @@ impl<St: MqttStore + 'static> Server<St> {
         } = self;
 
         let session_manager = server.session_manager_holder.session_manager();
+        let tasks = server.tasks.clone();
         if !plugins.is_empty() {
             let mut ticks = time::interval(plugin_tick_interval);
             ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             let mut stop = server.notify_shutdown.subscribe();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 loop {
                     tokio::select! {
                         _ = ticks.tick() => {}
@@ -1578,6 +1597,7 @@ impl<St: MqttStore + 'static> Server<St> {
         }
         if let Some(interval) = sys_interval {
             sys::spawn_publisher(
+                &tasks,
                 server.broker.clone(),
                 session_manager.clone(),
                 Arc::clone(&server.stats),
@@ -1588,7 +1608,7 @@ impl<St: MqttStore + 'static> Server<St> {
         // Lookups leave expired retained messages out; this removes them
         let broker = server.broker.clone();
         let mut stop = server.notify_shutdown.subscribe();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut ticks = time::interval(RETAINED_SWEEP);
             ticks.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
@@ -1602,7 +1622,7 @@ impl<St: MqttStore + 'static> Server<St> {
         // Its own timer: the $SYS publisher may be off, or slower
         let bans = Arc::clone(&server.bans);
         let mut stop = server.notify_shutdown.subscribe();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut ticks = time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -1615,7 +1635,7 @@ impl<St: MqttStore + 'static> Server<St> {
         for (key, will, due) in restored_wills {
             let broker = server.broker.clone();
             let session_manager = session_manager.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 time::sleep(due).await;
                 if session_manager.take_restored_will(&key).await {
                     publish_will(&broker, will, &key).await;
@@ -1652,6 +1672,9 @@ impl<St: MqttStore + 'static> Server<St> {
         {
             warn!("Storage still writing after waiting to shut down");
         }
+        // What is left, such as expiry timers, delayed wills and idle
+        // writers, ends here: a restarted broker takes it up from storage
+        tasks.stop().await;
         Ok(())
     }
 }
@@ -1777,6 +1800,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                 use_username_as_clientid: false,
                 // Trusted clients skip authentication altogether
                 failed_logins: self.failed_logins.clone().filter(|_| !trusted),
+                tasks: self.tasks.clone(),
             };
             match accepted {
                 Accepted::Tcp(socket, endpoint) => {
@@ -1787,7 +1811,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(Box::new(parts).serve_accepted(
+                    self.tasks.spawn(Box::new(parts).serve_accepted(
                         socket,
                         settings,
                         peer_addr,
@@ -1813,7 +1837,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                     };
                     let settings = self.endpoints[endpoint].settings.clone();
                     let counted = ListenerSlot::new(&self.endpoints[endpoint].state);
-                    tokio::spawn(Box::new(parts).serve_accepted(
+                    self.tasks.spawn(Box::new(parts).serve_accepted(
                         socket,
                         settings,
                         peer_addr,
@@ -1829,7 +1853,7 @@ impl<St: MqttStore + 'static> Listener<St> {
                         local: true,
                         ..parts
                     };
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         let _slots = slots;
                         parts.serve(stream, Transport::Mqtt, None).await;
                     });
@@ -2439,10 +2463,10 @@ where
 
             if delay.is_zero() {
                 Box::pin(publish).await;
-            } else {
+            } else if let Some(task) = self.tasks.spawn(publish) {
                 // Aborted, freeing the will, as soon as a new connection
-                // takes the session over or the session is deleted
-                let task = tokio::spawn(publish).abort_handle();
+                // takes the session over or the session is deleted. Once the
+                // server has stopped, the stored will waits for a restart.
                 session.set_pending_will(generation, task, pending).await;
             }
         }

@@ -17,7 +17,9 @@ use mercurio_storage::{MqttStore, Result as StorageResult, RetainedMessageStore}
 use tokio::time;
 use tracing::warn;
 
-use crate::{broker::Broker, session_manager::SessionManager, writer::StorageHealth};
+use crate::{
+    broker::Broker, session_manager::SessionManager, shutdown::Tasks, writer::StorageHealth,
+};
 
 /// Why the broker lost a message it had accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,15 +468,17 @@ pub(crate) fn prometheus(counters: &[(&'static str, u64)], stats: &Stats) -> Str
     text
 }
 
-/// Publishes the statistics every `interval` until the process ends.
+/// Publishes the statistics every `interval`, in `tasks`, until the server
+/// stops.
 pub(crate) fn spawn_publisher<St: MqttStore + 'static>(
+    tasks: &Tasks,
     broker: Broker<St>,
     session_manager: SessionManager<St>,
     stats: Arc<Stats>,
     started: Instant,
     interval: Duration,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         publish(
             &broker,
             "version",

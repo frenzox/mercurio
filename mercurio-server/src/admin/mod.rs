@@ -39,6 +39,7 @@ use crate::{
     server::{AddressRange, ListenerState},
     session::SessionSnapshot,
     session_manager::{ClientEntry, Close, DeleteRefused, SessionManager},
+    shutdown::Tasks,
     sys::{self, Stats},
     topic_tree::TopicTree,
 };
@@ -63,6 +64,8 @@ struct Inner {
     extension: Option<Arc<dyn AdminExtension>>,
     plugins: Vec<Arc<dyn Plugin>>,
     bans: Arc<Bans>,
+    /// Where deletions run that outlast the command waiting for them
+    tasks: Tasks,
 }
 
 /// Why a command failed: a stable [`ErrorCode`] for scripts, and a message
@@ -283,6 +286,7 @@ pub(crate) struct AdminParts {
     pub extension: Option<Arc<dyn AdminExtension>>,
     pub plugins: Vec<Arc<dyn Plugin>>,
     pub bans: Arc<Bans>,
+    pub tasks: Tasks,
 }
 
 /// The sessions as the admin API reaches them, whatever the storage the
@@ -404,6 +408,7 @@ impl Admin {
                 extension: parts.extension,
                 plugins: parts.plugins,
                 bans: parts.bans,
+                tasks: parts.tasks,
             }),
         }
     }
@@ -572,13 +577,18 @@ impl Admin {
         // id claimed by no connection.
         let directory = Arc::clone(&self.inner.directory);
         let id = key.clone();
-        let deletion = tokio::spawn(async move { directory.delete_session(&id, disconnect).await });
+        let (done, deletion) = tokio::sync::oneshot::channel();
+        self.inner.tasks.spawn(async move {
+            let _ = done.send(directory.delete_session(&id, disconnect).await);
+        });
         let unavailable = |message: &str| AdminError::new(ErrorCode::Unavailable, message);
         let deleted = match tokio::time::timeout(DELETE_TIMEOUT, deletion).await {
             Ok(Ok(deleted)) => deleted,
+            // Also once the broker has stopped
             Ok(Err(_)) => return Err(unavailable("deleting the session failed")),
             Err(_) => return Err(unavailable("timed out waiting for the client to close")),
         };
+
         deleted.map_err(|refused| match refused {
             DeleteRefused::NotFound => {
                 AdminError::not_found(format!("no session for client {key}"))

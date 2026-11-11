@@ -17,7 +17,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::plugin::BoxFuture;
+use crate::{plugin::BoxFuture, shutdown::Tasks};
 
 /// Most changes applied in one batch.
 const MAX_BATCH: usize = 256;
@@ -148,6 +148,8 @@ pub(crate) struct Writers<S> {
     entries: Arc<Mutex<HashMap<SessionKey, Entry>>>,
     next_id: Arc<AtomicU64>,
     health: Arc<Health>,
+    /// Where the writers run
+    tasks: Tasks,
 }
 
 impl<S> Clone for Writers<S> {
@@ -157,17 +159,19 @@ impl<S> Clone for Writers<S> {
             entries: Arc::clone(&self.entries),
             next_id: Arc::clone(&self.next_id),
             health: Arc::clone(&self.health),
+            tasks: self.tasks.clone(),
         }
     }
 }
 
 impl<S: BatchStore + 'static> Writers<S> {
-    pub(crate) fn new(storage: Arc<S>) -> Self {
+    pub(crate) fn new(storage: Arc<S>, tasks: Tasks) -> Self {
         Writers {
             storage,
             entries: Default::default(),
             next_id: Default::default(),
             health: Default::default(),
+            tasks,
         }
     }
 
@@ -206,7 +210,9 @@ impl<S: BatchStore + 'static> Writers<S> {
                 id,
             },
         );
-        tokio::spawn(run(
+        // Once the server has stopped, the writer doesn't run: what it is
+        // sent is lost, as in a crash, and flushes return at once
+        self.tasks.spawn(run(
             Arc::clone(&writer.pending),
             Arc::clone(&self.storage),
             key.clone(),
@@ -649,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_new_writer_waits_for_the_previous_one() {
         let storage = Arc::new(MemoryStore::new());
-        let writers = Writers::new(Arc::clone(&storage));
+        let writers = Writers::new(Arc::clone(&storage), Default::default());
         writers.write(&key("c"), Write::RemoveSubscription("t".into()));
         writers.close(&key("c"));
         writers.write(&key("c"), Write::DeleteSession);
@@ -660,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn test_idle_writers_stop_and_start_again() {
         let storage = Arc::new(MemoryStore::new());
-        let writers = Writers::new(Arc::clone(&storage));
+        let writers = Writers::new(Arc::clone(&storage), Default::default());
         writers.write(&key("c"), Write::RemoveSubscription("t".into()));
         writers.settle(&key("c")).await;
         tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
@@ -675,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn test_writers_held_elsewhere_stay() {
         let storage = Arc::new(MemoryStore::new());
-        let writers = Writers::new(Arc::clone(&storage));
+        let writers = Writers::new(Arc::clone(&storage), Default::default());
         // As a disconnected session's queue journal holds it
         let held = writers.get(&key("c"));
         tokio::time::sleep(LINGER + Duration::from_millis(300)).await;
@@ -687,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn test_writers_stop_once_closed() {
         let storage = Arc::new(MemoryStore::new());
-        let writers = Writers::new(Arc::clone(&storage));
+        let writers = Writers::new(Arc::clone(&storage), Default::default());
         writers.write(&key("c"), Write::DeleteWill);
         writers.close(&key("c"));
         writers.settle(&key("c")).await;

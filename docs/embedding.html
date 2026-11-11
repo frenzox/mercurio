@@ -64,6 +64,7 @@ async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
 <tr><td><code>run_with_storage(listener, config, storage, shutdown)</code></td><td>Your configuration and storage</td></tr>
 </table>
 <p>They fail without serving anyone if the configuration can't be used, such as a mount point with a wildcard.</p>
+<p>When they return, every task the broker started has ended: connections still open after a few seconds, session expiry timers, wills waiting for their delay and the <code>$SYS</code> publisher are stopped, and what they were waiting for is taken up from storage by the next broker. The broker no longer holds its storage, so the same SQLite file can be opened again in the same process. An <code>Admin</code> handle kept from <code>Server::admin</code> still holds it until dropped.</p>
 
 <h2>Configuration</h2>
 <p><code>ServerConfig</code> mirrors the daemon's configuration file:</p>

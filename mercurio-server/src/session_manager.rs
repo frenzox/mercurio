@@ -31,6 +31,7 @@ use crate::{
     plugin::{BoxFuture, Chain, Event},
     queue::QueueLimits,
     session::{Session, SessionDropGuard, WillMessage},
+    shutdown::Tasks,
     sys::Stats,
     writer::{Snapshots, StorageHealth, Writers},
 };
@@ -52,6 +53,8 @@ pub(crate) struct SessionManager<S: BatchStore> {
     takeover_wait: Option<Duration>,
     /// Sessions outliving their connection the broker may hold
     max_sessions: Option<usize>,
+    /// Where the manager's tasks run, such as expiry timers
+    tasks: Tasks,
 }
 
 impl<S: BatchStore> Clone for SessionManager<S> {
@@ -64,6 +67,7 @@ impl<S: BatchStore> Clone for SessionManager<S> {
             stats: Arc::clone(&self.stats),
             takeover_wait: self.takeover_wait,
             max_sessions: self.max_sessions,
+            tasks: self.tasks.clone(),
         }
     }
 }
@@ -234,7 +238,10 @@ impl<S: BatchStore + 'static> Drop for Admission<S> {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let manager = self.manager.clone();
             let key = std::mem::take(&mut self.key);
-            runtime.spawn(async move { manager.leave_admission(&key, lock).await });
+            self.manager.tasks.spawn_on(
+                async move { manager.leave_admission(&key, lock).await },
+                &runtime,
+            );
         }
     }
 }
@@ -375,16 +382,20 @@ impl<S: BatchStore + 'static> Abandon for SessionManager<S> {
             OnDrop::Nothing => {}
             OnDrop::LetGo => {
                 drop(guard);
-                runtime.spawn(async move { manager.let_go(&key, generation).await });
+                self.tasks.spawn_on(
+                    async move { manager.let_go(&key, generation).await },
+                    &runtime,
+                );
             }
             // The lease stays held until the session is dealt with, so a
             // connection waiting to take over finds it as it is left
             OnDrop::End(expiry) => {
-                runtime.spawn(async move {
+                let end = async move {
                     manager.end_own_session(&key, generation, expiry).await;
                     drop(guard);
                     manager.let_go(&key, generation).await;
-                });
+                };
+                self.tasks.spawn_on(end, &runtime);
             }
         }
     }
@@ -444,8 +455,9 @@ impl<S: BatchStore + 'static> SessionManagerDropGuard<S> {
         takeover_wait: Duration,
         max_sessions: Option<usize>,
         stats: Arc<Stats>,
+        tasks: Tasks,
     ) -> SessionManagerDropGuard<S> {
-        let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits);
+        let mut session_manager = SessionManager::with_queue_limits(storage, queue_limits, tasks);
         session_manager.takeover_wait = Some(takeover_wait);
         session_manager.max_sessions = max_sessions;
         session_manager.stats = stats;
@@ -487,12 +499,15 @@ pub(crate) struct SessionStartResult {
 impl<S: BatchStore + 'static> SessionManager<S> {
     #[cfg(test)]
     pub(crate) fn new(storage: Arc<S>) -> SessionManager<S> {
-        Self::with_queue_limits(storage, QueueLimits::default())
+        Self::with_queue_limits(storage, QueueLimits::default(), Tasks::default())
     }
 
+    /// A manager whose sessions' queues hold up to `queue_limits`, running
+    /// its tasks in `tasks`.
     pub(crate) fn with_queue_limits(
         storage: Arc<S>,
         queue_limits: QueueLimits,
+        tasks: Tasks,
     ) -> SessionManager<S> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -510,7 +525,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             expiry_chain: Default::default(),
         });
 
-        let writers = Writers::new(Arc::clone(&storage));
+        let writers = Writers::new(Arc::clone(&storage), tasks.clone());
         writers.set_snapshots(Box::new(StoredState {
             shared: Arc::downgrade(&shared),
             durable: storage.is_durable(),
@@ -523,6 +538,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             stats: Default::default(),
             takeover_wait: None,
             max_sessions: None,
+            tasks,
         }
     }
 
@@ -649,10 +665,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 session.set_connect_packet(connect_packet).await;
                 session
             }
-            None => {
-                SessionDropGuard::new(connect_packet, self.queue_limits, Arc::clone(&self.stats))
-                    .session()
-            }
+            None => SessionDropGuard::new(
+                connect_packet,
+                self.queue_limits,
+                Arc::clone(&self.stats),
+                self.tasks.clone(),
+            )
+            .session(),
         };
         session.hand_over(generation).await;
         session.set_owner(owner.clone()).await;
@@ -669,9 +688,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
             manager.stop_expiry_timer(&key);
             match from_memory {
                 true => None,
-                false => manager
-                    .sessions
-                    .insert(key.clone(), SessionDropGuard::from(session.clone())),
+                false => manager.sessions.insert(
+                    key.clone(),
+                    SessionDropGuard::guarding(session.clone(), self.tasks.clone()),
+                ),
             }
         };
         if let Some(discarded) = discarded {
@@ -1204,7 +1224,7 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         let token = manager.next_generation;
         let ender = self.clone();
         let ended = key.clone();
-        let task = tokio::spawn(async move {
+        let task = self.tasks.spawn(async move {
             tokio::time::sleep(delay).await;
             if ender.end_session(&ended, generation, Some(token)).await {
                 ender
@@ -1218,11 +1238,14 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                     });
                 }
             }
-        })
-        .abort_handle();
-        let timer = ExpiryTimer { token, task };
-        if let Some(replaced) = manager.expiry_timers.insert(key, timer) {
-            replaced.task.abort();
+        });
+        // Once the server has stopped, sessions expire when a restarted
+        // broker says so
+        if let Some(task) = task {
+            let timer = ExpiryTimer { token, task };
+            if let Some(replaced) = manager.expiry_timers.insert(key, timer) {
+                replaced.task.abort();
+            }
         }
         true
     }
@@ -1346,9 +1369,13 @@ impl<S: BatchStore + 'static> SessionManager<S> {
                 ..Default::default()
             },
         };
-        let mut session =
-            SessionDropGuard::new(connect_packet, self.queue_limits, Arc::clone(&self.stats))
-                .session();
+        let mut session = SessionDropGuard::new(
+            connect_packet,
+            self.queue_limits,
+            Arc::clone(&self.stats),
+            self.tasks.clone(),
+        )
+        .session();
         // The session is found under the mount point it was stored with
         let owner = SessionOwner {
             mount_point: key.mount_point.clone(),
@@ -1375,12 +1402,10 @@ impl<S: BatchStore + 'static> SessionManager<S> {
         session.start_queue_journal(self.writers.get(key), true);
         self.shared.persistent.lock().unwrap().insert(key.clone());
 
-        self.shared
-            .state
-            .lock()
-            .await
-            .sessions
-            .insert(key.clone(), SessionDropGuard::from(session));
+        self.shared.state.lock().await.sessions.insert(
+            key.clone(),
+            SessionDropGuard::guarding(session, self.tasks.clone()),
+        );
     }
 
     /// Waits until every change made so far is in storage, as on shutdown.
