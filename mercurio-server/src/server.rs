@@ -16,6 +16,7 @@ use std::{
 
 use crate::error::ServerError;
 use crate::CONNECTIONS;
+use futures_util::FutureExt;
 #[cfg(unix)]
 use tokio::net::{unix::UCred, UnixListener, UnixStream};
 use tokio::{
@@ -2679,23 +2680,7 @@ where
             // a boxed future while it lasts: an idle connection holds just
             // what waiting takes, not the state of its heaviest handling
             let step = tokio::select! {
-                // So are the packets most clients send, PUBLISH and its
-                // acknowledgements; the rest are boxed
-                packet = self.connection.read_packet(), if reading => match HotPacket::try_from(packet?) {
-                    Ok(packet) => {
-                        let published = match &packet {
-                            HotPacket::Publish(p) => Some(p.payload.as_ref().map_or(0, |p| p.len())),
-                            _ => None,
-                        };
-                        let flow = self.handle_hot(&session, &key, packet).await?;
-                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
-                            reading = false;
-                            paused.as_mut().reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
-                        }
-                        Step::Done(flow)
-                    }
-                    Err(packet) => Step::Wake(Wake::Packet(packet)),
-                },
+                packet = self.connection.read_packet(), if reading => Step::Read(packet?),
                 // The client is sending, so it is alive: its keep-alive
                 // starts over once it may send again
                 _ = &mut paused, if !reading => {
@@ -2707,7 +2692,19 @@ where
                 (message, journaled) = session.next_outgoing(window_open) => {
                     Step::Done(self.send_outgoing(&session, &key, message, journaled).await?)
                 }
-                _ = &mut deadline, if timeout_duration.is_some() && reading => Step::Wake(Wake::KeepAliveExpired),
+                // A task that runs late, starved by others, can find the
+                // deadline passed and a packet waiting that came in time;
+                // the select picks either at random, so the packet is
+                // looked for before giving up on the client. Biasing the
+                // select towards reading would do it too, but a client
+                // sending without pause would then hold off its outgoing
+                // messages, takeovers and shutdown for as long as it sends.
+                _ = &mut deadline, if timeout_duration.is_some() && reading => {
+                    match self.connection.read_packet().now_or_never() {
+                        Some(packet) => Step::Read(packet?),
+                        None => Step::Wake(Wake::KeepAliveExpired),
+                    }
+                }
                 Ok(()) = lease.close.changed() => {
                     let close = (*lease.close.borrow_and_update()).unwrap_or(Close::TakenOver);
                     Step::Wake(Wake::Closed(close))
@@ -2716,9 +2713,34 @@ where
                     return Err(ReasonCode::ServerShuttingDown.into());
                 }
             };
-            let flow = match step {
-                Step::Done(flow) => flow,
-                Step::Wake(wake) => {
+            let handled = match step {
+                Step::Done(flow) => Ok(flow),
+                Step::Wake(wake) => Err(wake),
+                // So are the packets most clients send, PUBLISH and its
+                // acknowledgements; the rest are boxed
+                Step::Read(packet) => match HotPacket::try_from(packet) {
+                    Ok(packet) => {
+                        let published = match &packet {
+                            HotPacket::Publish(p) => {
+                                Some(p.payload.as_ref().map_or(0, |p| p.len()))
+                            }
+                            _ => None,
+                        };
+                        let flow = self.handle_hot(&session, &key, packet).await?;
+                        if let Some(wait) = published.and_then(|bytes| pacing.publish(bytes)) {
+                            reading = false;
+                            paused
+                                .as_mut()
+                                .reset(Instant::now().checked_add(wait).unwrap_or_else(far_future));
+                        }
+                        Ok(flow)
+                    }
+                    Err(packet) => Err(Wake::Packet(packet)),
+                },
+            };
+            let flow = match handled {
+                Ok(flow) => flow,
+                Err(wake) => {
                     Box::pin(self.handle_wake(
                         wake,
                         &session,
@@ -3250,11 +3272,12 @@ impl HotPacket {
     }
 }
 
-/// A wake-up either handled already or to be handled.
+/// A wake-up either handled already or to be handled, or a packet read.
 #[allow(clippy::large_enum_variant)]
 enum Step {
     Done(Flow),
     Wake(Wake),
+    Read(Option<ControlPacket>),
 }
 
 /// What a connection does once it handled what woke it.
