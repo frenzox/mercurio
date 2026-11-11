@@ -25,7 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - `publish` and `subscribe` resolve once the broker acknowledges them.
 - Automatic reconnection with exponential backoff, in-flight messages
-  sent again and QoS 1 and 2 publishes held while disconnected.
+  sent again, QoS 1 and 2 publishes held while disconnected, and
+  optionally the subscriptions made again when the broker lost the
+  session.
 - Optional manual acknowledgement of received messages, for
   at-least-once processing with the broker's flow control.
 - MQTT 5 properties, subscription options and identifiers, topic

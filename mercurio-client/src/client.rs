@@ -45,11 +45,14 @@ use crate::options::{
     check_length, Backoff, ConnectOptions, MessageProperties, SharedAuthenticator, Will,
 };
 
+/// Topic filters with the options to subscribe to each with.
+type Filters = Vec<(String, SubscriptionOptions)>;
+
 /// Command sent to the client event loop.
 enum Command {
     Publish(PublishRequest),
     Subscribe {
-        topics: Vec<(String, SubscriptionOptions)>,
+        topics: Filters,
         subscription_id: Option<u32>,
         response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
     },
@@ -382,12 +385,14 @@ impl MqttClient {
             manual_acks: options.manual_acks,
             unacknowledged: VecDeque::new(),
             next_delivery: 0,
+            subscriptions: Vec::new(),
+            held: None,
         };
         let mut keep_alive = session.connack.keep_alive;
         let mut backoff = options.reconnect_backoff();
 
+        let mut reason = state.run(&mut command_rx, keep_alive).await;
         loop {
-            let reason = state.run(&mut command_rx, keep_alive).await;
             let reconnect = backoff.as_mut().filter(|_| should_reconnect(&reason));
             state.deliver(Event::Disconnected { reason });
             let Some(backoff) = reconnect else { break };
@@ -420,8 +425,26 @@ impl MqttClient {
             keep_alive = session.connack.keep_alive;
             let session_present = session.connack.session_present;
             *connack.write().unwrap_or_else(|e| e.into_inner()) = session.connack;
+            let mut held = VecDeque::new();
+            if !session_present {
+                if options.resubscribe {
+                    match state.resubscribe(options.connect_timeout).await {
+                        Ok(events) => held = events,
+                        Err(lost) => {
+                            reason = lost;
+                            continue;
+                        }
+                    }
+                } else {
+                    state.subscriptions.clear();
+                }
+            }
             state.deliver(Event::Reconnected { session_present });
+            for event in held {
+                state.deliver(event);
+            }
             state.resume(session_present).await;
+            reason = state.run(&mut command_rx, keep_alive).await;
         }
 
         // Fail every request still waiting for the broker, and refuse new
@@ -848,6 +871,18 @@ struct EventLoop {
     /// Numbers deliveries, so a token never matches a later message that
     /// reuses its packet identifier
     next_delivery: u64,
+    /// The subscriptions the broker granted, in the order they were made,
+    /// to make again after reconnecting without a session
+    subscriptions: Vec<Subscription>,
+    /// Events held back while resubscribing
+    held: Option<VecDeque<Event>>,
+}
+
+/// A subscription the broker granted.
+struct Subscription {
+    filter: String,
+    options: SubscriptionOptions,
+    id: Option<u32>,
 }
 
 /// A message delivered to the application, awaiting its acknowledgement.
@@ -975,8 +1010,10 @@ struct PendingUnsubscribe {
 }
 
 struct PendingSubscribe {
-    topics: Vec<(String, QoS)>,
-    response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
+    topics: Filters,
+    subscription_id: Option<u32>,
+    /// The application waiting, or `None` when resubscribing
+    response: Option<oneshot::Sender<Result<Vec<SubscribeResult>>>>,
 }
 
 impl EventLoop {
@@ -1011,45 +1048,11 @@ impl EventLoop {
             tokio::select! {
                 // Handle incoming packets
                 maybe_packet = self.connection.read_packet(), if reading => {
-                    match maybe_packet {
-                        Ok(Some(ControlPacket::Disconnect(disconnect))) => {
-                            // The broker is closing the connection [MQTT-3.14.4-1]
-                            info!("Received DISCONNECT from server: {:?}", disconnect.reason);
-                            let properties = disconnect.properties.unwrap_or_default();
-                            return DisconnectReason::ServerInitiated {
-                                reason: disconnect.reason,
-                                reason_string: properties.reason_string.map(|r| r.value),
-                                server_reference: properties.server_reference.map(|r| r.value),
-                            };
-                        }
-                        Ok(Some(packet)) => {
-                            if matches!(packet, ControlPacket::PingResp(_)) {
-                                awaiting_pingresp = false;
-                            }
-                            match self.handle_incoming(packet).await {
-                                Err(ClientError::BrokerViolation(reason)) => {
-                                    return self.disconnect_for(reason).await;
-                                }
-                                Err(ClientError::AuthenticationFailed(e)) => {
-                                    warn!("Re-authentication failed: {}", e);
-                                    return self.disconnect_for(ReasonCode::NotAuthorized).await;
-                                }
-                                Err(e) => warn!("Error handling packet: {}", e),
-                                Ok(()) => {}
-                            }
-                        }
-                        Ok(None) => {
-                            // Connection closed
-                            info!("Connection closed by server");
-                            return DisconnectReason::ConnectionClosed;
-                        }
-                        Err(ClientError::BrokerViolation(reason)) => {
-                            return self.disconnect_for(reason).await;
-                        }
-                        Err(e) => {
-                            error!("Error reading packet: {}", e);
-                            return DisconnectReason::ConnectionLost;
-                        }
+                    if matches!(maybe_packet, Ok(Some(ControlPacket::PingResp(_)))) {
+                        awaiting_pingresp = false;
+                    }
+                    if let Some(reason) = self.receive(maybe_packet).await {
+                        return reason;
                     }
                 }
 
@@ -1069,7 +1072,7 @@ impl EventLoop {
                     match cmd {
                         Command::Publish(request) => self.publish(request).await,
                         Command::Subscribe { topics, subscription_id, response } => {
-                            self.subscribe(topics, subscription_id, response).await;
+                            self.subscribe(topics, subscription_id, Some(response)).await;
                         }
                         Command::Unsubscribe { topics, response } => {
                             self.unsubscribe(topics, response).await;
@@ -1115,9 +1118,110 @@ impl EventLoop {
         }
     }
 
+    /// Handles what reading from the broker gave, returning why the
+    /// connection ended if it did.
+    async fn receive(&mut self, read: Result<Option<ControlPacket>>) -> Option<DisconnectReason> {
+        match read {
+            Ok(Some(ControlPacket::Disconnect(disconnect))) => {
+                // The broker is closing the connection [MQTT-3.14.4-1]
+                info!("Received DISCONNECT from server: {:?}", disconnect.reason);
+                let properties = disconnect.properties.unwrap_or_default();
+                Some(DisconnectReason::ServerInitiated {
+                    reason: disconnect.reason,
+                    reason_string: properties.reason_string.map(|r| r.value),
+                    server_reference: properties.server_reference.map(|r| r.value),
+                })
+            }
+            Ok(Some(packet)) => match self.handle_incoming(packet).await {
+                Err(ClientError::BrokerViolation(reason)) => {
+                    Some(self.disconnect_for(reason).await)
+                }
+                Err(ClientError::AuthenticationFailed(e)) => {
+                    warn!("Re-authentication failed: {}", e);
+                    Some(self.disconnect_for(ReasonCode::NotAuthorized).await)
+                }
+                Err(e) => {
+                    warn!("Error handling packet: {}", e);
+                    None
+                }
+                Ok(()) => None,
+            },
+            Ok(None) => {
+                info!("Connection closed by server");
+                Some(DisconnectReason::ConnectionClosed)
+            }
+            Err(ClientError::BrokerViolation(reason)) => Some(self.disconnect_for(reason).await),
+            Err(e) => {
+                error!("Error reading packet: {}", e);
+                Some(DisconnectReason::ConnectionLost)
+            }
+        }
+    }
+
+    /// Makes the subscriptions of the previous connections again, on a
+    /// connection whose broker kept no session, waiting up to `wait` for
+    /// its answers. Events meanwhile are held and returned, for after
+    /// `Event::Reconnected`; refusals are among them.
+    async fn resubscribe(
+        &mut self,
+        wait: Duration,
+    ) -> std::result::Result<VecDeque<Event>, DisconnectReason> {
+        // One SUBSCRIBE per identifier, which applies to the whole packet
+        let mut groups: Vec<(Option<u32>, Filters)> = Vec::new();
+        for subscription in &self.subscriptions {
+            let entry = (subscription.filter.clone(), subscription.options);
+            match groups.iter_mut().find(|(id, _)| *id == subscription.id) {
+                Some((_, filters)) => filters.push(entry),
+                None => groups.push((subscription.id, vec![entry])),
+            }
+        }
+        self.held = Some(VecDeque::new());
+        for (id, filters) in groups {
+            self.subscribe(filters, id, None).await;
+        }
+        let answered = time::timeout(wait, async {
+            while self.subscribes.values().any(|p| p.response.is_none()) {
+                if self.connection.is_broken() {
+                    return Err(DisconnectReason::ConnectionLost);
+                }
+                let read = self.connection.read_packet().await;
+                if let Some(reason) = self.receive(read).await {
+                    return Err(reason);
+                }
+            }
+            Ok(())
+        })
+        .await;
+        let held = self.held.take().unwrap_or_default();
+        match answered {
+            Ok(Ok(())) => Ok(held),
+            Ok(Err(reason)) => {
+                self.requeue(held);
+                Err(reason)
+            }
+            Err(_) => {
+                warn!("The broker didn't answer the subscriptions made again");
+                self.requeue(held);
+                Err(DisconnectReason::KeepAliveTimeout)
+            }
+        }
+    }
+
+    /// Delivers events held while resubscribing on a connection that then
+    /// ended.
+    fn requeue(&mut self, held: VecDeque<Event>) {
+        for event in held {
+            self.deliver(event);
+        }
+    }
+
     /// Hands an event to the application, or holds it while the event
     /// channel is full.
     fn deliver(&mut self, event: Event) {
+        if let Some(held) = &mut self.held {
+            held.push_back(event);
+            return;
+        }
         if self.pending_events.is_empty() {
             match self.event_tx.try_send(event) {
                 Ok(()) | Err(TrySendError::Closed(_)) => {}
@@ -1499,33 +1603,47 @@ impl EventLoop {
         }
     }
 
+    /// Sends a SUBSCRIBE for the application, or with `response` `None`
+    /// for a subscription made again, which the broker judges itself.
     async fn subscribe(
         &mut self,
-        topics: Vec<(String, SubscriptionOptions)>,
+        topics: Filters,
         subscription_id: Option<u32>,
-        response: oneshot::Sender<Result<Vec<SubscribeResult>>>,
+        response: Option<oneshot::Sender<Result<Vec<SubscribeResult>>>>,
     ) {
-        let uses_wildcards = topics
-            .iter()
-            .any(|(t, _)| t.split('/').any(|level| level == "+" || level == "#"));
-        let uses_shared = topics.iter().any(|(t, _)| t.starts_with("$share/"));
-        if (uses_wildcards && !self.limits.wildcard_subscriptions)
-            || (uses_shared && !self.limits.shared_subscriptions)
-        {
-            let _ = response.send(Err(ClientError::NotSupported(
-                "wildcard or shared subscriptions",
-            )));
-            return;
-        }
-        if subscription_id.is_some() && !self.limits.subscription_identifiers {
-            let _ = response.send(Err(ClientError::NotSupported("subscription identifiers")));
-            return;
+        let fail = |response: Option<oneshot::Sender<_>>, error| {
+            if let Some(response) = response {
+                let _ = response.send(Err(error));
+            }
+        };
+        if response.is_some() {
+            let uses_wildcards = topics
+                .iter()
+                .any(|(t, _)| t.split('/').any(|level| level == "+" || level == "#"));
+            let uses_shared = topics.iter().any(|(t, _)| t.starts_with("$share/"));
+            if (uses_wildcards && !self.limits.wildcard_subscriptions)
+                || (uses_shared && !self.limits.shared_subscriptions)
+            {
+                fail(
+                    response,
+                    ClientError::NotSupported("wildcard or shared subscriptions"),
+                );
+                return;
+            }
+            if subscription_id.is_some() && !self.limits.subscription_identifiers {
+                fail(
+                    response,
+                    ClientError::NotSupported("subscription identifiers"),
+                );
+                return;
+            }
         }
 
         let Some(packet_id) = self.next_packet_id() else {
-            let _ = response.send(Err(ClientError::Protocol(
-                "no free packet identifier".into(),
-            )));
+            fail(
+                response,
+                ClientError::Protocol("no free packet identifier".into()),
+            );
             return;
         };
 
@@ -1544,18 +1662,50 @@ impl EventLoop {
             }),
             payload,
         };
-        let topics = topics.into_iter().map(|(t, o)| (t, o.qos)).collect();
         match self
             .connection
             .write_packet(ControlPacket::Subscribe(subscribe))
             .await
         {
             Ok(()) => {
-                self.subscribes
-                    .insert(packet_id, PendingSubscribe { topics, response });
+                self.subscribes.insert(
+                    packet_id,
+                    PendingSubscribe {
+                        topics,
+                        subscription_id,
+                        response,
+                    },
+                );
             }
-            Err(e) => {
-                let _ = response.send(Err(e));
+            Err(e) => fail(response, e),
+        }
+    }
+
+    /// Remembers the subscriptions the broker granted, and reports those
+    /// it refused to make again.
+    fn record_subscriptions(&mut self, pending: &PendingSubscribe, results: &[SubscribeResult]) {
+        for ((filter, options), result) in pending.topics.iter().zip(results) {
+            let existing = self.subscriptions.iter().position(|s| s.filter == *filter);
+            match (result.success, existing) {
+                (true, Some(index)) => {
+                    self.subscriptions[index].options = *options;
+                    self.subscriptions[index].id = pending.subscription_id;
+                }
+                (true, None) => self.subscriptions.push(Subscription {
+                    filter: filter.clone(),
+                    options: *options,
+                    id: pending.subscription_id,
+                }),
+                (false, _) if pending.response.is_none() => {
+                    if let Some(index) = existing {
+                        self.subscriptions.remove(index);
+                    }
+                    self.deliver(Event::ResubscribeFailed {
+                        topic: filter.clone(),
+                        reason: result.reason,
+                    });
+                }
+                (false, _) => {}
             }
         }
     }
@@ -1673,15 +1823,15 @@ impl EventLoop {
                     .await?;
             }
             ControlPacket::SubAck(ack) => {
-                if let Some(pending) = self.subscribes.remove(&ack.packet_id) {
-                    let results = pending
+                if let Some(mut pending) = self.subscribes.remove(&ack.packet_id) {
+                    let results: Vec<SubscribeResult> = pending
                         .topics
-                        .into_iter()
+                        .iter()
                         .zip(ack.payload)
                         .map(|((topic, _), granted)| {
                             let code = granted.reason_code.get_code();
                             SubscribeResult {
-                                topic,
+                                topic: topic.clone(),
                                 qos: if code < 0x80 {
                                     code.into()
                                 } else {
@@ -1692,7 +1842,10 @@ impl EventLoop {
                             }
                         })
                         .collect();
-                    let _ = pending.response.send(Ok(results));
+                    self.record_subscriptions(&pending, &results);
+                    if let Some(response) = pending.response.take() {
+                        let _ = response.send(Ok(results));
+                    }
                 }
             }
             ControlPacket::UnsubAck(ack) => {
@@ -1712,7 +1865,10 @@ impl EventLoop {
                             success: reason.get_code() < 0x80,
                             reason,
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    for result in results.iter().filter(|r| r.success) {
+                        self.subscriptions.retain(|s| s.filter != result.topic);
+                    }
                     let _ = pending.response.send(Ok(results));
                 }
             }

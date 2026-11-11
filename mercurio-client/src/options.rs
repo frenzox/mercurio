@@ -375,6 +375,7 @@ pub struct ConnectOptions {
     pub(crate) reconnect_max: Option<Duration>,
     pub(crate) write_timeout: Option<Duration>,
     pub(crate) manual_acks: bool,
+    pub(crate) resubscribe: bool,
     pub(crate) receive_maximum: Option<u16>,
     pub(crate) maximum_packet_size: Option<u32>,
     pub(crate) topic_alias_maximum: u16,
@@ -411,6 +412,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("reconnect_max", &self.reconnect_max)
             .field("write_timeout", &self.write_timeout)
             .field("manual_acks", &self.manual_acks)
+            .field("resubscribe", &self.resubscribe)
             .field("receive_maximum", &self.receive_maximum)
             .field("maximum_packet_size", &self.maximum_packet_size)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
@@ -506,6 +508,7 @@ impl ConnectOptions {
             reconnect_max: None,
             write_timeout: None,
             manual_acks: false,
+            resubscribe: false,
             receive_maximum: None,
             maximum_packet_size: None,
             topic_alias_maximum: 0,
@@ -654,6 +657,17 @@ impl ConnectOptions {
     /// the broker keeps subscriptions and messages in flight meanwhile.
     pub fn reconnect(mut self, delay: Duration) -> Self {
         self.reconnect_delay = Some(delay);
+        self
+    }
+
+    /// After reconnecting to a broker that kept no session, make the
+    /// subscriptions it granted before again, with their options and
+    /// identifiers, before `Event::Reconnected` arrives. A subscription the
+    /// broker refuses this time is reported with `Event::ResubscribeFailed`
+    /// after `Event::Reconnected`, and isn't made again later. Unsubscribing
+    /// forgets a subscription. Off unless set.
+    pub fn resubscribe(mut self, resubscribe: bool) -> Self {
+        self.resubscribe = resubscribe;
         self
     }
 

@@ -36,6 +36,12 @@ pub enum Event {
     #[non_exhaustive]
     Reconnected { session_present: bool },
 
+    /// With [`resubscribe`](crate::ConnectOptions::resubscribe) on, the
+    /// broker refused to take back this subscription after reconnecting
+    /// without a session; the client forgets it.
+    #[non_exhaustive]
+    ResubscribeFailed { topic: String, reason: ReasonCode },
+
     /// Reconnecting failed for good, as when the broker refused the
     /// credentials; the last event before [`MqttClient::recv`] returns
     /// `None`.
