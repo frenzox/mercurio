@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-scram"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "SCRAM-SHA-256 and SCRAM-SHA-256-PLUS message handling and key derivation for the Mercurio MQTT implementation"
