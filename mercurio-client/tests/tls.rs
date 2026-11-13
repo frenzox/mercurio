@@ -58,3 +58,17 @@ async fn a_broker_outside_the_trusted_roots_is_refused() {
         result.err()
     );
 }
+
+/// Plain MQTT to a TLS port gets a TLS alert back, which is told apart from
+/// a malformed MQTT packet.
+#[tokio::test]
+async fn plain_mqtt_to_a_tls_port_says_the_broker_wants_tls() {
+    let port = start_broker().await;
+    let result = MqttClient::connect(ConnectOptions::new("localhost", port)).await;
+    let Err(error) = result else {
+        panic!("connected without TLS to a TLS port");
+    };
+    assert!(matches!(error, ClientError::Tls { .. }), "{error:?}");
+    assert!(error.to_string().contains("TLS"), "{error}");
+    assert!(!error.is_transient());
+}
