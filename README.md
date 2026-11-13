@@ -107,8 +107,9 @@ sudo mercurioctl broker log-level debug
   their own authentication
 - [Authentication](https://frenzox.github.io/mercurio/security.html) with
   password files (Argon2 or mosquitto's hashes), client certificates, an
-  HTTP service or dynamic security managed at runtime, and SCRAM-SHA-256
-  for the users of password files and dynamic security
+  HTTP service, JSON Web Tokens or dynamic security managed at runtime, and
+  SCRAM-SHA-256 for the users of password files and dynamic security, with
+  channel binding (SCRAM-SHA-256-PLUS) on TLS 1.3
 - Topic access control in mosquitto's `acl_file` format
 - [Bridges](https://frenzox.github.io/mercurio/bridges.html) to other
   brokers, over MQTT 5 or 3.1.1, with failover and mutual TLS
