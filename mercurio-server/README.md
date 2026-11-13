@@ -28,7 +28,8 @@ It supports:
 - Plugins: one `Plugin` trait for authentication, MQTT 5 enhanced
   authentication, topic access control, message hooks, lifecycle events,
   periodic work and `$CONTROL` commands, run as a chain. Built in:
-  SCRAM-SHA-256 over credentials you store, a password list, PLAIN, and
+  SCRAM-SHA-256 and SCRAM-SHA-256-PLUS (channel binding on TLS 1.3)
+  over credentials you store, a password list, PLAIN, and
   mosquitto's `acl_file` format.
 - TLS client certificates.
 - Persistent sessions, retained messages, wills, shared subscriptions,
