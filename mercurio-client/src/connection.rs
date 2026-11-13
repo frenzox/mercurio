@@ -116,6 +116,14 @@ impl Connection {
     /// Uses version-aware parsing based on the configured protocol version.
     pub async fn read_packet(&mut self) -> Result<Option<ControlPacket>> {
         loop {
+            // A TLS alert record, which a TLS listener sends back when it
+            // gets plain MQTT; no MQTT packet a broker sends starts so
+            if self.read_buffer.starts_with(&[0x15, 0x03]) {
+                return Err(ClientError::tls(
+                    "the broker answered with TLS: this port needs a TLS connection",
+                    None,
+                ));
+            }
             // Refused from the fixed header, before buffering the body
             match ControlPacket::frame_len(&self.read_buffer) {
                 Ok(len) if len > self.max_incoming_size as usize => {
