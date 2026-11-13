@@ -1,6 +1,6 @@
 [package]
 name = "mercurio-server"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "MQTT broker library for the Mercurio implementation"
@@ -34,7 +34,7 @@ async-trait.workspace = true
 
 mercurio-core = { path = "../mercurio-core", version = "0.3.0" }
 mercurio-packets = { path = "../mercurio-packets", version = "0.3.0" }
-mercurio-scram = { path = "../mercurio-scram", version = "0.2.0" }
+mercurio-scram = { path = "../mercurio-scram", version = "0.2.1" }
 mercurio-storage = { path = "../mercurio-storage", version = "0.4.0" }
 x509-parser = "0.18"
 

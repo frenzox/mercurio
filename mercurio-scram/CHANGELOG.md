@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/frenzox/mercurio/compare/mercurio-scram-v0.2.0...mercurio-scram-v0.2.1) - 2026-11-13
+
+### Other
+
+- describe SCRAM channel binding in the READMEs
+
 ## [0.2.0](https://github.com/frenzox/mercurio/compare/mercurio-scram-v0.1.0...mercurio-scram-v0.2.0) - 2026-11-11
 
 ### Added

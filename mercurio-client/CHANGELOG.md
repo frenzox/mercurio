@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.6.0...mercurio-client-v0.6.1) - 2026-11-13
+
+### Fixed
+
+- *(client)* say the broker wants TLS when it answers plain MQTT with TLS
+
+### Other
+
+- Merge branch 'docs/scram-channel-binding'
+- describe SCRAM channel binding in the READMEs
+
 ## [0.6.0](https://github.com/frenzox/mercurio/compare/mercurio-client-v0.5.0...mercurio-client-v0.6.0) - 2026-11-11
 
 ### Added

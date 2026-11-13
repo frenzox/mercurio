@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/frenzox/mercurio/compare/mercurioctl-v0.2.1...mercurioctl-v0.2.2) - 2026-11-13
+
+### Other
+
+- updated the following local packages: mercurio-client
+
 ## [0.2.1](https://github.com/frenzox/mercurio/compare/mercurioctl-v0.2.0...mercurioctl-v0.2.1) - 2026-11-11
 
 ### Other
