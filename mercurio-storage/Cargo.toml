@@ -33,7 +33,7 @@ mercurio-core = { path = "../mercurio-core", version = "0.3.0" }
 async-trait.workspace = true
 bytes = { workspace = true, features = ["std"] }
 thiserror.workspace = true
-rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+rusqlite = { version = "0.43", features = ["bundled"], optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
